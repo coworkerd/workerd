@@ -335,9 +335,11 @@ wd_cc_library(
     name = "server",
     srcs = [
         "server.c++",
+        "coworkerd-cpu-limit.c++",
     ],
     hdrs = [
         "server.h",
+        "coworkerd-cpu-limit.h",
     ],
     deps = [
         ":actor-id-impl",

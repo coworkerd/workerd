@@ -28,6 +28,7 @@ class V8System;
 namespace workerd::server {
 
 using api::pyodide::PythonConfig;
+class CpuIsolateLimitEnforcer;
 
 // Implements the single-tenant Workers Runtime server / CLI.
 //
@@ -366,7 +367,8 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
       const WorkerDef& def,
       capnp::List<config::Extension>::Reader extensions,
       Worker::Isolate::InspectorPolicy inspectorPolicy,
-      kj::Maybe<jsg::SnapshotConfig> snapshotConfig);
+      kj::Maybe<jsg::SnapshotConfig> snapshotConfig,
+      kj::Own<CpuIsolateLimitEnforcer>& cpuLimits);
 
   // Creates a throwaway zygote Worker in PREPARE_SNAPSHOT mode and returns the filled snapshot
   // artifact, or kj::none when the zygote failed to start.

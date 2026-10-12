@@ -6,6 +6,7 @@
 
 #include "alarm-scheduler.h"
 #include "container-client.h"
+#include "coworkerd-cpu-limit.h"
 #include "pyodide.h"
 #include "workerd-api.h"
 
@@ -3537,6 +3538,7 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::String> containerEgressInterceptorImageParam,
       ActorStorageIsLocalDisk actorStorageIsLocalDisk,
       bool isDynamic,
+      kj::Own<CpuIsolateLimitEnforcer> cpuLimits,
       kj::Maybe<kj::Function<void()>> abortIsolateCallback = kj::none,
       kj::Maybe<kj::String> accessBlobHeaderNameParam = kj::none)
       : channelTokenHandler(channelTokenHandler),
@@ -3556,6 +3558,7 @@ class Server::WorkerService final: public Service,
         containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImageParam)),
         actorStorageIsLocalDisk(actorStorageIsLocalDisk),
         isDynamic(isDynamic),
+        cpuLimits(kj::mv(cpuLimits)),
         abortIsolateCallback(kj::mv(abortIsolateCallback)),
         accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)) {}
 
@@ -4128,9 +4131,14 @@ class Server::WorkerService final: public Service,
       }
     }
 
-    return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
-        kj::mv(props), kj::mv(actor),
+    auto requestLimits = wrapCpuRequestLimits(
         kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
+        *cpuLimits, metadata.cfBlobJson, [this]() {
+          KJ_IF_SOME(cb, abortIsolateCallback) { cb(); }
+        });
+    auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
+        kj::mv(props), kj::mv(actor),
+        kj::mv(requestLimits),
         {},  // ioContextDependency
         addRefToThis(), kj::mv(observer), waitUntilTasks,
         true,                  // tunnelExceptions
@@ -4140,6 +4148,7 @@ class Server::WorkerService final: public Service,
         kj::mv(triggerContext), IsDynamicDispatch::NO, kj::mv(accessInfo),
         kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
         kj::mv(metadata.clientAddress));
+    return wrapCpuWorkerInterface(kj::mv(entry), *cpuLimits);
   }
 
  private:
@@ -4395,6 +4404,7 @@ class Server::WorkerService final: public Service,
   // `hasLocalDiskActorStorage()` when validating Workflow bindingService storage.
   ActorStorageIsLocalDisk actorStorageIsLocalDisk;
   bool isDynamic;
+  kj::Own<CpuIsolateLimitEnforcer> cpuLimits;
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
   kj::Maybe<kj::String> accessBlobHeaderName;
   kj::Maybe<kj::uint> accessBindingServiceChannel;
@@ -5924,10 +5934,13 @@ kj::Own<Worker::Isolate> Server::makeWorkerIsolate(kj::StringPtr name,
     const WorkerDef& def,
     capnp::List<config::Extension>::Reader extensions,
     Worker::Isolate::InspectorPolicy inspectorPolicy,
-    kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
+    kj::Maybe<jsg::SnapshotConfig> snapshotConfig,
+    kj::Own<CpuIsolateLimitEnforcer>& cpuLimits) {
   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
   auto observer = kj::atomicRefcounted<IsolateObserver>();
-  auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
+  cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
+      kj::refcounted<NullIsolateLimitEnforcer>(), name, def.isDynamic);
+  auto limitEnforcer = kj::addRef(*cpuLimits);
   auto isolateGroup = jsg::newIsolateGroup();
 
   kj::Array<Worker::Api::InboundListener> listeners;
@@ -5986,9 +5999,10 @@ kj::Maybe<kj::Own<jsg::SnapshotArtifact>> Server::makeSnapshot(
 
   auto snapshotArtifact = kj::atomicRefcounted<jsg::SnapshotArtifact>();
   auto zygoteName = kj::str(name, "-snapshot");
+  kj::Own<CpuIsolateLimitEnforcer> zygoteLimits;
   auto zygoteIsolate = makeWorkerIsolate(zygoteName, name, def, extensions,
       Worker::Isolate::InspectorPolicy::DISALLOW,
-      jsg::SnapshotConfig(jsg::MutableSnapshot{.artifact = kj::mv(snapshotArtifact)}));
+      jsg::SnapshotConfig(jsg::MutableSnapshot{.artifact = kj::mv(snapshotArtifact)}), zygoteLimits);
 
   auto zygoteWorkerFs = newWorkerFileSystem(kj::heap<FsMap>(), getBundleDirectory(def.source));
   auto zygoteArtifactBundler = workerd::api::pyodide::ArtifactBundler::makeDisabledBundler();
@@ -6100,8 +6114,9 @@ kj::Promise<kj::Rc<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr 
     // For workerd, if the inspector is enabled, it is always fully trusted.
     inspectorPolicy = Worker::Isolate::InspectorPolicy::ALLOW_FULLY_TRUSTED;
   }
-  auto isolate =
-      makeWorkerIsolate(name, name, def, extensions, inspectorPolicy, kj::mv(snapshotConfig));
+  kj::Own<CpuIsolateLimitEnforcer> cpuLimits;
+  auto isolate = makeWorkerIsolate(
+      name, name, def, extensions, inspectorPolicy, kj::mv(snapshotConfig), cpuLimits);
 
   // If we are using the inspector, we need to register the Worker::Isolate
   // with the inspector service.
@@ -6473,7 +6488,7 @@ kj::Promise<kj::Rc<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr 
           kj::mv(errorReporter.workflowClasses), kj::mv(linkCallback),
           KJ_BIND_METHOD(*this, abortAllActors), KJ_BIND_METHOD(*this, deleteAllActors),
           kj::mv(dockerPath), kj::mv(containerEgressInterceptorImage), actorStorageIsLocalDisk,
-          isDynamic, kj::mv(abortIsolateCallback), kj::mv(accessBlobHeaderName));
+          isDynamic, kj::mv(cpuLimits), kj::mv(abortIsolateCallback), kj::mv(accessBlobHeaderName));
   result->initActorNamespaces(localActorConfigs, actorNamespacesByUniqueKey, network);
   co_return result;
 }
