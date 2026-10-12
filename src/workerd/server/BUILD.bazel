@@ -336,10 +336,12 @@ wd_cc_library(
     srcs = [
         "server.c++",
         "coworkerd-cpu-limit.c++",
+        "coworkerd-idle-eviction.c++",
     ],
     hdrs = [
         "server.h",
         "coworkerd-cpu-limit.h",
+        "coworkerd-idle-eviction.h",
     ],
     deps = [
         ":actor-id-impl",

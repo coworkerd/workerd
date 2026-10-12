@@ -1,4 +1,5 @@
 #pragma once
+#include "coworkerd-idle-eviction.h"
 
 #include <workerd/io/actor-cache.h>
 #include <workerd/io/limit-enforcer.h>
@@ -26,10 +27,11 @@ void recordPlatformFacts(kj::StringPtr name, bool dynamic);
 // CPU accounting stays on the isolate thread; only termination and file writes cross threads.
 class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  public:
-  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic)
+  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic,
+      IdleWorkerRef idleWorker = nullptr)
       : fallback(kj::mv(fallback)), name(kj::str(name)),
         cpuNs(uint64_t(cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
-        state(cpuStateFromEnvironment()) {
+        state(cpuStateFromEnvironment()), idleWorker(kj::mv(idleWorker)) {
     recordPlatformFacts(name, dynamic);
     auto paf = kj::newPromiseAndFulfiller<void>();
     failure = paf.promise.fork();
@@ -54,6 +56,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   void markPerfEvent(kj::LiteralStringConst name) const override { fallback->markPerfEvent(name); }
   void customizeIsolate(v8::Isolate* value) override { isolate = value; }
   bool isEnabled() const { return cpuNs != 0; }
+  const IdleWorkerRef& activity() const { return idleWorker; }
   kj::Maybe<EventOutcome> outcome() {
     return exceeded.load() ? kj::Maybe<EventOutcome>(EventOutcome::EXCEEDED_CPU) : kj::none;
   }
@@ -204,6 +207,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   kj::String name;
   uint64_t cpuNs;
   kj::String state;
+  IdleWorkerRef idleWorker;
   v8::Isolate* isolate = nullptr;
   uint64_t startupUsed = 0;
   std::atomic<bool> exceeded{false};

@@ -4139,7 +4139,7 @@ class Server::WorkerService final: public Service,
     auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
         kj::mv(props), kj::mv(actor),
         kj::mv(requestLimits),
-        {},  // ioContextDependency
+        idleActivity(cpuLimits->activity()),  // ioContextDependency
         addRefToThis(), kj::mv(observer), waitUntilTasks,
         true,                  // tunnelExceptions
         kj::mv(workerTracer),  // workerTracer
@@ -4148,7 +4148,7 @@ class Server::WorkerService final: public Service,
         kj::mv(triggerContext), IsDynamicDispatch::NO, kj::mv(accessInfo),
         kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
         kj::mv(metadata.clientAddress));
-    return wrapCpuWorkerInterface(kj::mv(entry), *cpuLimits);
+    return wrapIdleWorkerInterface(wrapCpuWorkerInterface(kj::mv(entry), *cpuLimits), cpuLimits->activity());
   }
 
  private:
@@ -5324,6 +5324,7 @@ struct Server::WorkerDef {
   // Callback invoked when abortIsolate() is called. Used by dynamic workers to remove
   // themselves from the loader's isolate map.
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
+  IdleWorkerRef idleWorker;
 
   // HTTP header name from which to extract the per-request Cloudflare Access JSON blob.
   // Set from Worker.accessBlobHeader in the config; kj::none for most workers.
@@ -5334,10 +5335,12 @@ struct Server::WorkerDef {
 };
 
 class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet::ErrorHandler {
+  class WorkerStubImpl;
  public:
   WorkerLoaderNamespace(Server& server, kj::String namespaceName)
       : server(server),
         namespaceName(kj::mv(namespaceName)),
+        reaper(idleReaper(server.timer)),
         startupTasks(*this) {}
 
   void unlink() {
@@ -5362,8 +5365,8 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         kj::Function<void()> onAborted = [this, mapKey = kj::str(n)]() { removeIsolate(mapKey); };
 
         return {.key = kj::mv(n),
-          .value = kj::rc<WorkerStubImpl>(
-              server, kj::mv(isolateName), kj::mv(onAborted), kj::mv(fetchSource))};
+          .value = keepStarting(kj::rc<WorkerStubImpl>(
+              server, kj::mv(isolateName), kj::mv(onAborted), kj::mv(fetchSource)))};
       })
           .addRef()
           .toOwn();
@@ -5387,6 +5390,12 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     }
   }
 
+  kj::Rc<WorkerStubImpl> keepStarting(kj::Rc<WorkerStubImpl> stub) {
+    startupTasks.add(stub->whenStartupDone().then(
+        [keep = stub.addRef()]() {}, [](kj::Exception&&) {}));
+    return stub;
+  }
+
   void removeIsolate(kj::StringPtr name) {
     // This is called by abortIsolate()
     isolates.erase(name);
@@ -5395,8 +5404,8 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
  private:
   Server& server;
   kj::String namespaceName;
+  std::shared_ptr<IdleReaper> reaper;
 
-  class WorkerStubImpl;
   kj::HashMap<kj::String, kj::Rc<WorkerStubImpl>> isolates;
 
   // Holds tasks that keep unnamed WorkerStubImpl instances alive while their
@@ -5443,7 +5452,13 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         kj::Maybe<kj::Function<void()>> onAborted,
         kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource)
         : onAborted(kj::mv(onAborted)),
-          startupTask(start(server, kj::mv(isolateName), kj::mv(fetchSource)).fork()),
+          idleWorker(registerIdleWorker(idleReaper(server.timer), isolateName,
+              [this]() { onAbortIsolate(); }, this->onAborted != kj::none)),
+          startupTask(start(server, kj::mv(isolateName), kj::mv(fetchSource))
+              .catch_([this](kj::Exception&& error) -> kj::Promise<void> {
+                idleWorkerFailed(idleWorker);
+                return kj::mv(error);
+              }).fork()),
           cleanupTaskSet(server.tasks) {}
 
     // Returns a branch of the startup task promise. Used by the namespace to
@@ -5453,6 +5468,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     }
 
     ~WorkerStubImpl() {
+      detachIdleWorker(idleWorker);
       // Defer unlink and destruction of `WorkerService` to the next turn of the event loop. This
       // is needed because worker stubs are typically destroyed while some other isolate is
       // current, and so we cannot enter the dynamic worker's isolate to tear it down. It's even
@@ -5490,6 +5506,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     // Callback to remove the worker stub from the isolates map. None for
     // unnamed dynamic isolates.
     kj::Maybe<kj::Function<void()>> onAborted;
+    IdleWorkerRef idleWorker;
 
     kj::Maybe<kj::Rc<WorkerService>> service;  // null if still starting up
     kj::ForkedPromise<void> startupTask;       // resolves when `service` is non-null
@@ -5498,6 +5515,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     bool unlinked = false;
 
     void onAbortIsolate() {
+      idleWorkerRemoved(idleWorker, "cpu");
       KJ_IF_SOME(cb, onAborted) {
         auto callback = kj::mv(cb);
         onAborted = kj::none;
@@ -5594,6 +5612,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         // The callback is owned by the WorkerService, which is owned by `this`, so a raw
         // pointer is safe.
         .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
+        .idleWorker = idleWorker,
         // clang-format on
       };
 
@@ -5607,6 +5626,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       errorReporter.throwIfErrors();
 
       this->service = kj::mv(service);
+      idleWorkerReady(idleWorker);
     }
 
     class SubrequestChannelImpl final: public IoChannelFactory::SubrequestChannel {
@@ -5937,9 +5957,9 @@ kj::Own<Worker::Isolate> Server::makeWorkerIsolate(kj::StringPtr name,
     kj::Maybe<jsg::SnapshotConfig> snapshotConfig,
     kj::Own<CpuIsolateLimitEnforcer>& cpuLimits) {
   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
-  auto observer = kj::atomicRefcounted<IsolateObserver>();
+  auto observer = idleIsolateObserver(name, def.isDynamic, def.idleWorker);
   cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
-      kj::refcounted<NullIsolateLimitEnforcer>(), name, def.isDynamic);
+      kj::refcounted<NullIsolateLimitEnforcer>(), name, def.isDynamic, def.idleWorker);
   auto limitEnforcer = kj::addRef(*cpuLimits);
   auto isolateGroup = jsg::newIsolateGroup();
 
