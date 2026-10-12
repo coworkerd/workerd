@@ -2222,13 +2222,16 @@ class Server::ExternalTcpService final: public Service, private WorkerInterface 
 // Service used when the service is configured as external HTTP service.
 class Server::ExternalHttpService final: public Service {
  public:
+  enum class Transport { HTTP, CAPNP };
+
   ExternalHttpService(kj::Own<kj::NetworkAddress> addrParam,
       kj::Own<HttpRewriter> rewriter,
       kj::HttpHeaderTable& headerTable,
       kj::Timer& timer,
       kj::EntropySource& entropySource,
       capnp::ByteStreamFactory& byteStreamFactory,
-      capnp::HttpOverCapnpFactory& httpOverCapnpFactory)
+      capnp::HttpOverCapnpFactory& httpOverCapnpFactory,
+      Transport transport = Transport::HTTP)
       : addr(kj::mv(addrParam)),
         webSocketErrorHandler(kj::heap<JsgifyWebSocketErrors>()),
         inner(kj::newHttpClient(timer,
@@ -2241,9 +2244,21 @@ class Server::ExternalHttpService final: public Service {
         rewriter(kj::mv(rewriter)),
         headerTable(headerTable),
         byteStreamFactory(byteStreamFactory),
-        httpOverCapnpFactory(httpOverCapnpFactory) {}
+        httpOverCapnpFactory(httpOverCapnpFactory),
+        transport(transport) {}
 
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    if (transport == Transport::CAPNP) {
+      auto request = getOutgoingCapnp(*inner).startEventRequest();
+      KJ_IF_SOME(cf, metadata.cfBlobJson) {
+        request.setCfBlobJson(cf);
+      }
+      request.setFromPersistentStub(metadata.fromPersistentStub.toBool());
+      auto dispatcher = request.send().getDispatcher();
+      return kj::heap<RpcWorkerInterface>(httpOverCapnpFactory, byteStreamFactory,
+          getUnsupportedFrankenvalueHandler(), kj::mv(dispatcher))
+          .attach(kj::addRef(*this));
+    }
     return kj::heap<WorkerInterfaceImpl>(*this, kj::mv(metadata));
   }
 
@@ -2268,6 +2283,7 @@ class Server::ExternalHttpService final: public Service {
   kj::HttpHeaderTable& headerTable;
   capnp::ByteStreamFactory& byteStreamFactory;
   capnp::HttpOverCapnpFactory& httpOverCapnpFactory;
+  Transport transport;
 
   struct CapnpClient {
     kj::Own<kj::AsyncIoStream> connection;
@@ -2423,14 +2439,22 @@ kj::Rc<Server::Service> Server::makeExternalService(kj::StringPtr name,
   }
 
   switch (conf.which()) {
-    case config::ExternalServer::HTTP: {
+    case config::ExternalServer::HTTP:
+    case config::ExternalServer::CAPNP: {
       // We have to construct the rewriter upfront before waiting on any promises, since the
       // HeaderTable::Builder is only available synchronously.
-      auto rewriter = kj::heap<HttpRewriter>(conf.getHttp(), headerTableBuilder);
+      auto options = conf.isCapnp() ? conf.getCapnp() : conf.getHttp();
+      if (conf.isCapnp() && !options.hasCapnpConnectHost()) {
+        reportConfigError(kj::str("Cap'n Proto external service requires capnpConnectHost"));
+        return makeInvalidConfigService();
+      }
+      auto rewriter = kj::heap<HttpRewriter>(options, headerTableBuilder);
       auto addr = kj::heap<PromisedNetworkAddress>(network.parseAddress(addrStr, 80));
       return kj::rc<ExternalHttpService>(kj::mv(addr), kj::mv(rewriter),
           headerTableBuilder.getFutureTable(), timer, entropySource,
-          globalContext->byteStreamFactory, globalContext->httpOverCapnpFactory);
+          globalContext->byteStreamFactory, globalContext->httpOverCapnpFactory,
+          conf.isCapnp() ? ExternalHttpService::Transport::CAPNP
+                         : ExternalHttpService::Transport::HTTP);
     }
     case config::ExternalServer::HTTPS: {
       auto httpsConf = conf.getHttps();

@@ -932,7 +932,9 @@ struct ExternalServer {
       certificateHost @6 :Text;
     }
 
-    # TODO(someday): Cap'n Proto RPC
+    capnp @7 :HttpOptions;
+    # Use WorkerdBootstrap and RpcWorkerInterface for every event, including fetch().
+    # Establish the connection with HTTP CONNECT; capnpConnectHost must be specified.
   }
 }
 
