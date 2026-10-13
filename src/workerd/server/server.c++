@@ -5325,6 +5325,7 @@ struct Server::WorkerDef {
   // themselves from the loader's isolate map.
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
   IdleWorkerRef idleWorker;
+  kj::StringPtr startupIdentity;
 
   // HTTP header name from which to extract the per-request Cloudflare Access JSON blob.
   // Set from Worker.accessBlobHeader in the config; kj::none for most workers.
@@ -5454,6 +5455,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         : onAborted(kj::mv(onAborted)),
           idleWorker(registerIdleWorker(idleReaper(server.timer), isolateName,
               [this]() { onAbortIsolate(); }, this->onAborted != kj::none)),
+          startupIdentity(captureMemoryStartupIdentity()),
           startupTask(start(server, kj::mv(isolateName), kj::mv(fetchSource))
               .catch_([this](kj::Exception&& error) -> kj::Promise<void> {
                 idleWorkerFailed(idleWorker);
@@ -5507,6 +5509,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     // unnamed dynamic isolates.
     kj::Maybe<kj::Function<void()>> onAborted;
     IdleWorkerRef idleWorker;
+    kj::String startupIdentity;
 
     kj::Maybe<kj::Rc<WorkerService>> service;  // null if still starting up
     kj::ForkedPromise<void> startupTask;       // resolves when `service` is non-null
@@ -5613,6 +5616,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         // pointer is safe.
         .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
         .idleWorker = idleWorker,
+        .startupIdentity = startupIdentity,
         // clang-format on
       };
 
@@ -5959,7 +5963,7 @@ kj::Own<Worker::Isolate> Server::makeWorkerIsolate(kj::StringPtr name,
   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
   auto observer = idleIsolateObserver(name, def.isDynamic, def.idleWorker);
   cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
-      kj::refcounted<NullIsolateLimitEnforcer>(), name, def.isDynamic, def.idleWorker);
+      kj::refcounted<NullIsolateLimitEnforcer>(), name, def.isDynamic, def.idleWorker, def.startupIdentity);
   auto limitEnforcer = kj::addRef(*cpuLimits);
   auto isolateGroup = jsg::newIsolateGroup();
 

@@ -5,6 +5,26 @@
 #include <v8-isolate.h>
 
 namespace workerd::server {
+namespace {
+thread_local kj::StringPtr startupExecutionIdentity;
+}
+MemoryStartupIdentityScope::MemoryStartupIdentityScope(kj::StringPtr identity)
+    : previous(startupExecutionIdentity) { startupExecutionIdentity = identity; }
+MemoryStartupIdentityScope::~MemoryStartupIdentityScope() { startupExecutionIdentity = previous; }
+kj::String captureMemoryStartupIdentity() { return kj::str(startupExecutionIdentity); }
+
+kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey() {
+  static const auto key = kj::arc<jsg::AsyncContextFrame::StorageKey>();
+  return key.addRef();
+}
+kj::String memoryExecutionIdentity(jsg::Lock& lock) {
+  KJ_IF_SOME(frame, jsg::AsyncContextFrame::current(lock)) {
+    KJ_IF_SOME(value, frame.get(*memoryExecutionKey())) {
+      return lock.toString(value.getHandle(lock));
+    }
+  }
+  return kj::str("");
+}
 uint32_t cpuLimitFromEnvironment() {
   const char* text = std::getenv("COWORKERD_CPU_LIMIT_MS");
   if (text == nullptr) return 0;
@@ -117,7 +137,21 @@ class RequestLimits final: public LimitEnforcer {
     ~RequestLimits() noexcept(false) {
       if (cpuUsed) limits->record("completed", identity, cpuUsed);
     }
-    kj::Own<void> enterJs(jsg::Lock&, IoContext&) override {
+    struct IdentityScope {
+      jsg::AsyncContextFrame::StorageScope frame;
+      MemoryStartupIdentityScope startup;
+      kj::Own<void> limit;
+      IdentityScope(jsg::Lock& lock, RequestLimits& owner)
+          : frame(lock, memoryExecutionKey(),
+                lock.v8Ref<v8::Value>(jsg::v8Str(lock.v8Isolate, owner.identity))),
+            startup(owner.identity),
+            limit(owner.limits->enterRequestJs(owner.cpuUsed, owner.identity,
+                [&owner]() { if (owner.limits->publish()) owner.abortIsolate(); })) {}
+    };
+    kj::Own<void> enterJs(jsg::Lock& lock, IoContext&) override {
+      if (limits->publish()) abortIsolate();
+      limits->requireNotExceeded();
+      if (memoryLimitFromEnvironment()) return kj::heap<IdentityScope>(lock, *this);
       return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
     }
     void topUpActor() override {}
@@ -132,7 +166,10 @@ class RequestLimits final: public LimitEnforcer {
     kj::Maybe<EventOutcome> getLimitsExceeded() override { return limits->outcome(); }
     kj::Promise<void> onLimitsExceeded() override { return limits->onExceeded(); }
     void setCpuLimitNearlyExceededCallback(kj::Function<void()>) override {}
-    void requireLimitsNotExceeded() override { limits->requireNotExceeded(); }
+    void requireLimitsNotExceeded() override {
+      if (limits->publish()) abortIsolate();
+      limits->requireNotExceeded();
+    }
     void reportMetrics(RequestObserver&) override {}
     kj::Duration consumeTimeElapsedForPeriodicLogging() override { return 0 * kj::SECONDS; }
     size_t getSqliteMemoryUsage() const override { return 0; }
@@ -150,7 +187,7 @@ class RequestLimits final: public LimitEnforcer {
 kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
     kj::Function<void()> abortIsolate) {
-  if (!limits.isEnabled()) return fallback;
+  if (!limits.isEnabled() && !memoryLimitFromEnvironment()) return fallback;
   return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
 }
 kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,

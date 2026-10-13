@@ -344,6 +344,7 @@ wd_cc_library(
         "coworkerd-idle-eviction.h",
     ],
     deps = [
+        ":coworkerd-memory-limit",
         ":actor-id-impl",
         ":alarm-scheduler",
         ":channel-token",
@@ -445,6 +446,7 @@ wd_cc_library(
         "v8-platform-impl.h",
     ],
     deps = [
+        ":coworkerd-memory-limit",
         "//src/workerd/io",
         "//src/workerd/jsg",
         "@capnp-cpp//src/kj",
@@ -555,4 +557,11 @@ kj_test(
         "@capnp-cpp//src/kj:kj-async-core",
         "@capnp-cpp//src/kj:kj-async-io",
     ],
+)
+
+wd_cc_library(
+    name = "coworkerd-memory-limit",
+    srcs = ["coworkerd-memory-limit.c++"],
+    hdrs = ["coworkerd-memory-limit.h"],
+    deps = ["@workerd-v8//:v8", "@capnp-cpp//src/kj"],
 )
