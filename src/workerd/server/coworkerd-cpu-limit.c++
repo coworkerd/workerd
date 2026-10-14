@@ -1,6 +1,7 @@
 #include "coworkerd-cpu-limit.h"
 #include <workerd/util/autogate.h>
 #include <cstdlib>
+#include <fcntl.h>
 #include <limits>
 #include <v8-isolate.h>
 
@@ -42,6 +43,18 @@ kj::String cpuStateFromEnvironment() {
   if (value == nullptr) return kj::str("");
   KJ_REQUIRE(*value != '\0', "COWORKERD_CPU_STATE must be a non-empty path");
   return kj::str(value);
+}
+int cpuEventsDescriptor() {
+  // Opened once per process, when the first enabled limit enforcer is created.
+  static const int descriptor = []() {
+    auto state = cpuStateFromEnvironment();
+    if (state.size() == 0) return -1;
+    auto path = kj::str(state, ".events");
+    int fd;
+    do { fd = open(path.cStr(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600); } while (fd < 0 && errno == EINTR);
+    return fd;
+  }();
+  return descriptor;
 }
 void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
   auto line = kj::str("[coworkerd-platform] {\"isolate\":", escapeCpuJsonString(name),

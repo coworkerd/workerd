@@ -23,6 +23,8 @@
 namespace workerd::server {
 uint32_t cpuLimitFromEnvironment();
 kj::String cpuStateFromEnvironment();
+// The process-wide append-only descriptor of <state>.events, opened on first use; -1 without state.
+int cpuEventsDescriptor();
 kj::String escapeCpuJsonString(kj::StringPtr text);
 void recordPlatformFacts(kj::StringPtr name, bool dynamic);
 kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey();
@@ -49,6 +51,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
       auto limit = memoryLimitFromEnvironment();
       if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded, state);
     }
+    if (state.size() && isEnabled()) events = cpuEventsDescriptor();
     recordPlatformFacts(name, dynamic);
     auto paf = kj::newPromiseAndFulfiller<void>();
     failure = paf.promise.fork();
@@ -147,11 +150,13 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     auto log = kj::str("[cpu-limit] ", row);
     ssize_t written;
     do { written = write(STDERR_FILENO, log.cStr(), log.size()); } while (written < 0 && errno == EINTR);
-    if (state.size() == 0) return;
-    auto path = kj::str(state, ".events");
-    if (auto* file = fopen(path.cStr(), "a")) {
-      fwrite(row.cStr(), 1, row.size(), file);
-      fclose(file);
+    // One unbuffered write() per row on the descriptor opened once: the row reaches the
+    // file before record() returns, so a later SIGKILL cannot lose it.
+    for (size_t done = 0; events >= 0 && done < row.size();) {
+      written = write(events, row.cStr() + done, row.size() - done);
+      if (written < 0 && errno == EINTR) continue;
+      if (written <= 0) break;
+      done += written;
     }
   }
   void culprit(kj::StringPtr identity, uint64_t used) {
@@ -296,6 +301,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   kj::String name;
   uint64_t cpuNs;
   kj::String state;
+  int events = -1;
   IdleWorkerRef idleWorker;
   kj::String startupIdentity;
   v8::Isolate* isolate = nullptr;
