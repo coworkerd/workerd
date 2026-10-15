@@ -16,6 +16,14 @@ thread_local MemoryExecution executingMemory;
 char oomPath[4096] = {}, oomTemporaryPath[4112] = {}, unknownOomReport[256] = {};
 int oomSignalFd = -1;
 std::atomic<bool> oomReportReady{false};
+std::atomic<void (*)()> limitStateObserver{nullptr};
+
+void raiseLimitState(const IsolateLimitState& state) {
+  auto expected = IsolateLimitCause::NONE;
+  if (state->compare_exchange_strong(expected, IsolateLimitCause::MEMORY)) {
+    if (auto observer = limitStateObserver.load()) observer();
+  }
+}
 
 void raisePeak(std::atomic<size_t>& peak, size_t value) {
   auto old = peak.load();
@@ -53,6 +61,7 @@ uint32_t memoryLimitFromEnvironment() {
   }
   return value;
 }
+void setLimitStateObserver(void (*observer)()) { limitStateObserver.store(observer); }
 
 IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state, kj::StringPtr reportPath)
     : limitBytes(uint64_t(limitMiB) << 20), state(kj::mv(state)), inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {
@@ -76,8 +85,7 @@ bool IsolateMemoryLimit::charge(size_t bytes) {
     auto base = heapBytes.load() + otherBytes.load();
     if (bytes > limitBytes || base > limitBytes - bytes || used > limitBytes - bytes - base) {
       raisePeak(deniedBytes, bytes);
-      auto expected = IsolateLimitCause::NONE;
-      state->compare_exchange_strong(expected, IsolateLimitCause::MEMORY);
+      raiseLimitState(state);
       return false;
     }
     if (ownedBytes.compare_exchange_weak(used, used + bytes)) {
@@ -124,8 +132,7 @@ void IsolateMemoryLimit::observe() {
   if (total >= limitBytes) terminate();
 }
 void IsolateMemoryLimit::terminate() {
-  auto expected = IsolateLimitCause::NONE;
-  state->compare_exchange_strong(expected, IsolateLimitCause::MEMORY);
+  raiseLimitState(state);
   isolate->TerminateExecution();
 }
 size_t IsolateMemoryLimit::nearHeap(void* data, size_t current, size_t initial) {

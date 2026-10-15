@@ -12,6 +12,9 @@ namespace workerd::server {
 enum class IsolateLimitCause { NONE, CPU, MEMORY };
 using IsolateLimitState = std::shared_ptr<std::atomic<IsolateLimitCause>>;
 uint32_t memoryLimitFromEnvironment();
+// Called after a memory limit moves a limit state from NONE, so that the limit watchdog
+// terminates the isolate without waiting for a CPU deadline. Set by the watchdog; may be null.
+void setLimitStateObserver(void (*observer)());
 
 struct MemoryExecution {
   class IsolateMemoryLimit* owner = nullptr;
