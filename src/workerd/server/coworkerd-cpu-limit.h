@@ -23,9 +23,6 @@
 
 namespace workerd::server {
 uint32_t cpuLimitFromEnvironment();
-kj::String cpuStateFromEnvironment();
-// The process-wide append-only descriptor of <state>.events, opened on first use; -1 without state.
-int cpuEventsDescriptor();
 kj::String escapeCpuJsonString(kj::StringPtr text);
 void recordPlatformFacts(kj::StringPtr name, bool dynamic);
 kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey();
@@ -90,20 +87,19 @@ class LimitWatchdog {
   void run();
 };
 
-// CPU accounting stays on the isolate thread; only termination and file writes cross threads.
+// CPU accounting stays on the isolate thread; only termination and event writes cross threads.
 class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  public:
   CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic,
       IdleWorkerRef idleWorker = nullptr, kj::StringPtr startupIdentity = "")
       : fallback(kj::mv(fallback)), name(kj::str(name)),
         cpuNs(uint64_t(cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
-        state(cpuStateFromEnvironment()), idleWorker(kj::mv(idleWorker)),
+        dynamic(dynamic), idleWorker(kj::mv(idleWorker)),
         startupIdentity(kj::str(startupIdentity)) {
     if (dynamic) {
       auto limit = memoryLimitFromEnvironment();
-      if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded, state);
+      if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
     }
-    if (state.size() && isEnabled()) events = cpuEventsDescriptor();
     if (isEnabled()) watchdog = &LimitWatchdog::start();
     recordPlatformFacts(name, dynamic);
     auto paf = kj::newPromiseAndFulfiller<void>();
@@ -152,6 +148,8 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     if (memory) memory->customize(value);
   }
   bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
+  // A dynamic Worker's request contexts report their end on the event pipe, limits or not.
+  bool reportsCompletion() const { return dynamic && cpuEventsDescriptor() >= 0; }
   const IdleWorkerRef& activity() const { return idleWorker; }
   kj::Maybe<EventOutcome> outcome() {
     if (exceeded->load() == IsolateLimitCause::NONE) return kj::none;
@@ -195,34 +193,26 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   kj::String report(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
     return kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":", escapeCpuJsonString(name),
         ',', identity, "\"cpuUsedNs\":", used, ",\"cpuLimitMs\":", cpuNs / 1000000,
-        ",\"pid\":", getpid(), memory ? memory->metrics() : kj::str(""), "}\n");
+        ",\"pid\":", coworkerdPid(), memory ? memory->metrics() : kj::str(""), "}\n");
   }
   void record(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
     auto row = report(event, identity, used);
-    // All workerd processes append to one log: emit the prefix and JSON in one syscall.
-    auto log = kj::str("[cpu-limit] ", row);
-    ssize_t written;
-    do { written = write(STDERR_FILENO, log.cStr(), log.size()); } while (written < 0 && errno == EINTR);
-    // One unbuffered write() per row on the descriptor opened once: the row reaches the
-    // file before record() returns, so a later SIGKILL cannot lose it.
-    for (size_t done = 0; events >= 0 && done < row.size();) {
-      written = write(events, row.cStr() + done, row.size() - done);
-      if (written < 0 && errno == EINTR) continue;
-      if (written <= 0) break;
-      done += written;
+    if (isEnabled()) {
+      // All workerd processes append to one log: emit the prefix and JSON in one syscall.
+      auto log = kj::str("[cpu-limit] ", row);
+      ssize_t written;
+      do { written = write(STDERR_FILENO, log.cStr(), log.size()); } while (written < 0 && errno == EINTR);
     }
+    writeLimitEvent(row);
   }
-  void culprit(kj::StringPtr identity, uint64_t used) {
-    if (state.size() == 0) return;
-    auto row = report("culprit", identity, used);
-    auto path = kj::str(state, ".tmp");
-    if (auto* file = fopen(path.cStr(), "w")) {
-      auto written = fwrite(row.cStr(), 1, row.size(), file);
-      auto closed = fclose(file);
-      if (written == row.size() && closed == 0) rename(path.cStr(), state.cStr());
-      else unlink(path.cStr());
-    }
+  // The end of a dynamic Worker's request context (after its waitUntil work), whether or not it
+  // ever ran JavaScript; without limits only the event pipe gets the row.
+  void completed(kj::StringPtr identity, uint64_t used) {
+    if (dynamic) record("completed", identity, used);
   }
+  // Written while a termination has not taken effect; a later terminated row for the same
+  // invocation withdraws it.
+  void culprit(kj::StringPtr identity, uint64_t used) { writeLimitEvent(report("culprit", identity, used)); }
 
   struct CpuClock {
 #if __APPLE__
@@ -324,7 +314,6 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
         }
       }
       if (owner.memory) owner.memory->leave(previousMemory);
-      if (reported && owner.state.size()) unlink(owner.state.cStr());
       if (owner.exceeded->load() != IsolateLimitCause::NONE) {
         owner.record(owner.exceeded->load() == IsolateLimitCause::MEMORY ? "memory-terminated" : "terminated", identity, used);
       }
@@ -377,8 +366,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   kj::Own<IsolateLimitEnforcer> fallback;
   kj::String name;
   uint64_t cpuNs;
-  kj::String state;
-  int events = -1;
+  bool dynamic;
   IdleWorkerRef idleWorker;
   kj::String startupIdentity;
   v8::Isolate* isolate = nullptr;

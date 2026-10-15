@@ -13,8 +13,7 @@
 namespace workerd::server {
 namespace {
 thread_local MemoryExecution executingMemory;
-char oomPath[4096] = {}, oomTemporaryPath[4112] = {}, unknownOomReport[256] = {};
-int oomSignalFd = -1;
+char unknownOomReport[256] = {};
 std::atomic<bool> oomReportReady{false};
 std::atomic<void (*)()> limitStateObserver{nullptr};
 
@@ -30,24 +29,39 @@ void raisePeak(std::atomic<size_t>& peak, size_t value) {
   while (old < value && !peak.compare_exchange_weak(old, value)) {}
 }
 
-// The fatal path performs only file syscalls on data prepared before entering JS.
-void writeOomReport(kj::StringPtr report) {
-  if (!oomReportReady.load(std::memory_order_acquire)) return;
-  auto fd = open(oomTemporaryPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-  if (fd < 0) return;
-  size_t offset = 0;
-  while (offset < report.size()) {
-    auto n = write(fd, report.cStr() + offset, report.size() - offset);
+}  // namespace
+
+int coworkerdPid() {
+  static const int pid = getpid();
+  return pid;
+}
+int cpuEventsDescriptor() {
+  static const int descriptor = []() {
+    const char* text = std::getenv("COWORKERD_EVENT_FD");
+    if (text == nullptr) return -1;
+    KJ_REQUIRE(*text != '\0', "COWORKERD_EVENT_FD must be a descriptor number");
+    int value = 0;
+    for (const char* p = text; *p; ++p) {
+      KJ_REQUIRE(*p >= '0' && *p <= '9' && value < 1000000, "COWORKERD_EVENT_FD must be a descriptor number");
+      value = value * 10 + (*p - '0');
+    }
+    KJ_REQUIRE(value > STDERR_FILENO && fcntl(value, F_GETFD) >= 0, "COWORKERD_EVENT_FD is not an open descriptor");
+    // Kept from any process this one might start.
+    fcntl(value, F_SETFD, FD_CLOEXEC);
+    return value;
+  }();
+  return descriptor;
+}
+void writeLimitEvent(kj::StringPtr row) {
+  auto fd = cpuEventsDescriptor();
+  // A row of at most PIPE_BUF bytes is written whole by this one call or not at all.
+  for (size_t done = 0; fd >= 0 && done < row.size();) {
+    auto n = write(fd, row.cStr() + done, row.size() - done);
     if (n < 0 && errno == EINTR) continue;
     if (n <= 0) break;
-    offset += n;
+    done += n;
   }
-  auto closed = close(fd);
-  if (offset == report.size() && closed == 0) rename(oomTemporaryPath, oomPath);
-  else unlink(oomTemporaryPath);
 }
-
-}  // namespace
 
 uint32_t memoryLimitFromEnvironment() {
   auto* text = std::getenv("COWORKERD_MEMORY_LIMIT_MIB");
@@ -63,17 +77,12 @@ uint32_t memoryLimitFromEnvironment() {
 }
 void setLimitStateObserver(void (*observer)()) { limitStateObserver.store(observer); }
 
-IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state, kj::StringPtr reportPath)
+IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state)
     : limitBytes(uint64_t(limitMiB) << 20), state(kj::mv(state)), inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {
-  if (!reportPath.size()) return;
-  KJ_REQUIRE(reportPath.size() + 8 <= sizeof(oomPath), "OOM report path too long");
+  // Everything the fatal path needs is prepared here: the descriptor and the bare OOM row.
+  if (cpuEventsDescriptor() < 0) return;
   if (!oomReportReady.load(std::memory_order_acquire)) {
-    snprintf(oomPath, sizeof(oomPath), "%s.memory", reportPath.cStr());
-    snprintf(oomTemporaryPath, sizeof(oomTemporaryPath), "%s.tmp", oomPath);
-    snprintf(unknownOomReport, sizeof(unknownOomReport), "{\"event\":\"memory-oom-undetermined\",\"pid\":%d}\n", getpid());
-    char signalPath[4112];
-    snprintf(signalPath, sizeof(signalPath), "%s.memory-oom", reportPath.cStr());
-    oomSignalFd = open(signalPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    snprintf(unknownOomReport, sizeof(unknownOomReport), "{\"event\":\"memory-oom-undetermined\",\"pid\":%d}\n", coworkerdPid());
     oomReportReady.store(true, std::memory_order_release);
   }
 }
@@ -155,7 +164,7 @@ void IsolateMemoryLimit::logSample(const char* event) const {
   auto length = snprintf(row, sizeof(row),
       "[memory-limit-sample] {\"event\":\"%s\",\"pid\":%d,\"memoryLimitMiB\":%zu,\"heapUsedBytes\":%zu,"
       "\"externalOwnedBytes\":%zu,\"arrayBufferBytes\":%zu,\"peakUsedBytes\":%zu,"
-      "\"headroomBytes\":%zu,\"nearHeapCalls\":%zu}\n", event, getpid(), limitBytes >> 20,
+      "\"headroomBytes\":%zu,\"nearHeapCalls\":%zu}\n", event, coworkerdPid(), limitBytes >> 20,
       heapBytes.load(), ownedBytes.load(), bufferBytes.load(), peakUsedBytes.load(),
       grantedHeadroomBytes.load(), nearCalls.load());
   if (length > 0 && static_cast<size_t>(length) < sizeof(row)) {
@@ -164,14 +173,12 @@ void IsolateMemoryLimit::logSample(const char* event) const {
   }
 }
 void IsolateMemoryLimit::oom(const char*, const v8::OOMDetails&) {
-  // A preopened descriptor distinguishes OOM even if the detailed atomic report fails.
-  if (oomSignalFd >= 0) {
-    auto report = kj::StringPtr(unknownOomReport);
-    ssize_t written;
-    do { written = write(oomSignalFd, report.cStr(), report.size()); } while (written < 0 && errno == EINTR);
-  }
-  if (executingMemory.owner != nullptr && executingMemory.report.size()) writeOomReport(executingMemory.report);
-  else writeOomReport(unknownOomReport);
+  // Only writes of rows prepared before entering JS, on the descriptor inherited at startup: first
+  // the bare OOM row, which tells an OOM apart even if nothing else is known, then the identity of
+  // the execution that hit it.
+  if (!oomReportReady.load(std::memory_order_acquire)) return;
+  writeLimitEvent(unknownOomReport);
+  if (executingMemory.owner != nullptr && executingMemory.report.size()) writeLimitEvent(executingMemory.report);
   // V8 invokes the original process-wide jsg OOM callback after this returns.
 }
 kj::String IsolateMemoryLimit::metrics() const {

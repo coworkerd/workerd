@@ -106,24 +106,6 @@ uint32_t cpuLimitFromEnvironment() {
   }
   return static_cast<uint32_t>(value);
 }
-kj::String cpuStateFromEnvironment() {
-  const char* value = std::getenv("COWORKERD_CPU_STATE");
-  if (value == nullptr) return kj::str("");
-  KJ_REQUIRE(*value != '\0', "COWORKERD_CPU_STATE must be a non-empty path");
-  return kj::str(value);
-}
-int cpuEventsDescriptor() {
-  // Opened once per process, when the first enabled limit enforcer is created.
-  static const int descriptor = []() {
-    auto state = cpuStateFromEnvironment();
-    if (state.size() == 0) return -1;
-    auto path = kj::str(state, ".events");
-    int fd;
-    do { fd = open(path.cStr(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600); } while (fd < 0 && errno == EINTR);
-    return fd;
-  }();
-  return descriptor;
-}
 void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
   auto line = kj::str("[coworkerd-platform] {\"isolate\":", escapeCpuJsonString(name),
       ",\"dynamic\":", dynamic ? "true" : "false", ",\"canCreateNewIsolateGroups\":",
@@ -215,9 +197,8 @@ class RequestLimits final: public LimitEnforcer {
         kj::String identity, kj::Function<void()> abortIsolate)
         : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
           abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
-    ~RequestLimits() noexcept(false) {
-      if (cpuUsed) limits->record("completed", identity, cpuUsed);
-    }
+    // The request context ends here, after its waitUntil work, whether or not it ran JavaScript.
+    ~RequestLimits() noexcept(false) { limits->completed(identity, cpuUsed); }
     struct IdentityScope {
       jsg::AsyncContextFrame::StorageScope frame;
       MemoryStartupIdentityScope startup;
@@ -268,7 +249,7 @@ class RequestLimits final: public LimitEnforcer {
 kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
     kj::Function<void()> abortIsolate) {
-  if (!limits.isEnabled() && !memoryLimitFromEnvironment()) return fallback;
+  if (!limits.isEnabled() && !memoryLimitFromEnvironment() && !limits.reportsCompletion()) return fallback;
   return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
 }
 kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,

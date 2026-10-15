@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <limits>
 #include <string>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace workerd::server {
 namespace {
@@ -37,13 +39,89 @@ void emit(kj::StringPtr row) {
   auto line = kj::str("[coworkerd-lifecycle] ", row, '\n');
   ssize_t n;
   do { n = write(STDERR_FILENO, line.cStr(), line.size()); } while (n < 0 && errno == EINTR);
-  const char* state = std::getenv("COWORKERD_CPU_STATE");
-  if (state && *state) {
-    auto path = kj::str(state, ".lifecycle.events");
-    if (auto* f = fopen(path.cStr(), "a")) {
-      fwrite(row.cStr(), 1, row.size(), f); fputc('\n', f); fclose(f);
-    }
+}
+// A shared memory object the Server created before this process started, inherited under the
+// descriptor number in `variable`; mapped here, and the descriptor closed. Null without one.
+void* mapInherited(const char* variable, size_t& size, int protection) {
+  const char* text = std::getenv(variable);
+  if (!text) return nullptr;
+  KJ_REQUIRE(*text, "descriptor setting must be a number", variable);
+  int fd = 0;
+  for (auto* p = text; *p; ++p) {
+    KJ_REQUIRE(*p >= '0' && *p <= '9' && fd < 1000000, "descriptor setting must be a number", variable);
+    fd = fd * 10 + (*p - '0');
   }
+  KJ_REQUIRE(fd > STDERR_FILENO, "invalid inherited descriptor", variable);
+  auto closeFd = kj::defer([&] { close(fd); });
+  struct stat info;
+  KJ_REQUIRE(fstat(fd, &info) == 0 && info.st_size > 0, "invalid inherited shared memory", variable);
+  size = size_t(info.st_size);
+  auto mapping = mmap(nullptr, size, protection, MAP_SHARED, fd, 0);
+  KJ_REQUIRE(mapping != MAP_FAILED, "cannot map inherited shared memory", variable);
+  return mapping;
+}
+// The lifecycle snapshot channel: shared memory from the Server (COWORKERD_LIFECYCLE_FD) holding
+// the latest snapshot this process published. Layout, shared with the Server:
+//   [0, 8)    publications completed; the latest snapshot is in buffer (publications % 2)
+//   [8, 12)   magic 0x434c5743 ("CWLC")
+//   [12, 16)  capacity of each buffer's data in bytes
+//   buffer i at 64 + i * (16 + capacity): sequence (8; odd while being written), length (4),
+//             4 unused, data
+// One writer, this process; a reader copies the published buffer and keeps the copy only if its
+// sequence did not change meanwhile. A writer killed mid-write leaves the published buffer intact.
+class LifecycleChannel {
+ public:
+  static constexpr uint32_t MAGIC = 0x434c5743;
+  LifecycleChannel() {
+    size_t size = 0;
+    base = static_cast<char*>(mapInherited("COWORKERD_LIFECYCLE_FD", size, PROT_READ | PROT_WRITE));
+    if (!base) return;
+    KJ_REQUIRE(size >= 64 && *reinterpret_cast<uint32_t*>(base + 8) == MAGIC, "invalid lifecycle channel");
+    capacity = *reinterpret_cast<uint32_t*>(base + 12);
+    KJ_REQUIRE(64 + 2 * (16 + uint64_t(capacity)) <= size, "invalid lifecycle channel size");
+    mappedSize = size;
+  }
+  ~LifecycleChannel() { if (base) munmap(base, mappedSize); }
+  explicit operator bool() const { return base != nullptr; }
+  // False when the snapshot does not fit; the previous one stays published.
+  bool publish(kj::StringPtr row) {
+    auto lock = mutex.lockExclusive();
+    if (row.size() > capacity) return false;
+    auto* published = reinterpret_cast<uint64_t*>(base);
+    auto next = __atomic_load_n(published, __ATOMIC_RELAXED) + 1;
+    auto* buffer = base + 64 + (next % 2) * (16 + uint64_t(capacity));
+    auto* sequence = reinterpret_cast<uint64_t*>(buffer);
+    auto start = __atomic_load_n(sequence, __ATOMIC_RELAXED);
+    __atomic_store_n(sequence, start + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    memcpy(buffer + 16, row.begin(), row.size());
+    __atomic_store_n(reinterpret_cast<uint32_t*>(buffer + 8), uint32_t(row.size()), __ATOMIC_RELAXED);
+    __atomic_store_n(sequence, start + 2, __ATOMIC_RELEASE);
+    __atomic_store_n(published, next, __ATOMIC_RELEASE);
+    return true;
+  }
+ private:
+  kj::MutexGuarded<bool> mutex;
+  char* base = nullptr;
+  size_t mappedSize = 0;
+  uint32_t capacity = 0;
+};
+// The inherited descriptors are mapped once per process and closed.
+LifecycleChannel& lifecycleChannel() {
+  static LifecycleChannel channel;
+  return channel;
+}
+// The band the Server publishes, in shared memory passed at startup (COWORKERD_MEMORY_BAND_FD).
+const uint32_t* inheritedBand() {
+  static const uint32_t* band = []() -> const uint32_t* {
+    size_t size = 0;
+    auto* mapping = mapInherited("COWORKERD_MEMORY_BAND_FD", size, PROT_READ);
+    if (mapping) {
+      KJ_REQUIRE(size == 4096, "invalid memory band channel");
+    }
+    return static_cast<const uint32_t*>(mapping);
+  }();
+  return band;
 }
 }  // namespace
 
@@ -68,21 +146,10 @@ class IdleReaper {
       : timer(timer), threshold(setting("COWORKERD_IDLE_EVICT_MS", 0)),
         interval(setting("COWORKERD_IDLE_DESTROY_INTERVAL_MS", 10)) {
     KJ_REQUIRE(interval > 0, "COWORKERD_IDLE_DESTROY_INTERVAL_MS must be positive");
-    const char* channel = std::getenv("COWORKERD_MEMORY_BAND_FILE");
-    if (channel && *channel) {
-      int fd = open(channel, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-      KJ_REQUIRE(fd >= 0, "cannot open published memory band");
-      auto closeFd = kj::defer([&] { close(fd); });
-      struct stat info;
-      KJ_REQUIRE(fstat(fd, &info) == 0 && info.st_size == 4096, "invalid memory band channel");
-      auto mapping = mmap(nullptr, 4096, PROT_READ, MAP_SHARED, fd, 0);
-      KJ_REQUIRE(mapping != MAP_FAILED, "cannot map published memory band");
-      publishedBand = static_cast<const uint32_t*>(mapping);
-    }
+    publishedBand = inheritedBand();
     publish();
     if (threshold || publishedBand) task = loop().eagerlyEvaluate(nullptr);
   }
-  ~IdleReaper() { if (publishedBand) munmap(const_cast<uint32_t*>(publishedBand), 4096); }
   kj::Timer& timer;
   uint32_t threshold, interval;
   uint64_t nextId = 1, created = 0, destroyed = 0, evicted = 0, failed = 0, pending = 0;
@@ -98,7 +165,7 @@ class IdleReaper {
   void event(const IdleWorker& worker, kj::StringPtr event, double elapsed = 0, uint64_t cpu = 0) {
     emit(kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":",
         escapeCpuJsonString(worker.name), ",\"instance\":", worker.id,
-        ",\"pid\":", getpid(), ",\"monotonicMs\":", monotonicMs(),
+        ",\"pid\":", coworkerdPid(), ",\"monotonicMs\":", monotonicMs(),
         ",\"active\":", worker.active, ",\"lastEndMs\":", worker.lastEnd,
         ",\"reason\":", escapeCpuJsonString(worker.reason), ",\"elapsedMs\":", elapsed,
         ",\"cpuUsedNs\":", cpu, ",\"idleEvictMs\":", threshold,
@@ -106,8 +173,8 @@ class IdleReaper {
         ",\"idleDestroyIntervalMs\":", interval, "}"));
   }
   void publish() {
-    const char* state = std::getenv("COWORKERD_CPU_STATE");
-    if (!state || !*state) return;
+    auto& channel = lifecycleChannel();
+    if (!channel) return;
     kj::Vector<kj::String> entries;
     for (auto it = workers.begin(); it != workers.end();) {
       if (auto worker = it->lock()) {
@@ -118,19 +185,18 @@ class IdleReaper {
         it = workers.erase(it);
       }
     }
-    auto row = kj::str("{\"pid\":", getpid(), ",\"residentIsolates\":", created - destroyed,
+    auto row = kj::str("{\"pid\":", coworkerdPid(), ",\"residentIsolates\":", created - destroyed,
         ",\"createdIsolates\":", created, ",\"destroyedIsolates\":", destroyed,
         ",\"idleEvictions\":", evicted, ",\"watermarkEvictions\":", watermarkEvicted,
         ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
         ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
         ",\"residentWorkers\":[", kj::strArray(entries, ","), "]}");
-    auto path = kj::str(state, ".lifecycle"), temporary = kj::str(path, ".tmp");
-    if (auto* f = fopen(temporary.cStr(), "w")) {
-      auto written = fwrite(row.cStr(), 1, row.size(), f);
-      if (fclose(f) == 0 && written == row.size()) rename(temporary.cStr(), path.cStr());
-      else unlink(temporary.cStr());
+    if (!channel.publish(row) && !overflowReported) {
+      overflowReported = true;
+      emit(kj::str("{\"event\":\"snapshot-too-large\",\"pid\":", coworkerdPid(), ",\"bytes\":", row.size(), "}"));
     }
   }
+  bool overflowReported = false;
  private:
   kj::Promise<void> loop() {
     while (true) {
