@@ -7,6 +7,7 @@
 #include "alarm-scheduler.h"
 #include "container-client.h"
 #include "coworkerd-cpu-limit.h"
+#include "coworkerd-steady.h"
 #include "pyodide.h"
 #include "workerd-api.h"
 
@@ -4131,6 +4132,10 @@ class Server::WorkerService final: public Service,
       }
     }
 
+    // The first request of this process -- the node's readiness probe, before it has answered anything --
+    // is the moment it serves: from here on it is non-dumpable and runs under the steady-state system call
+    // filter (Coworkerd v49, coworkerd-steady.h).
+    coworkerdServing();
     auto requestLimits = wrapCpuRequestLimits(
         kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
         *cpuLimits, metadata.cfBlobJson, [this]() {

@@ -106,6 +106,25 @@ uint32_t cpuLimitFromEnvironment() {
   }
   return static_cast<uint32_t>(value);
 }
+CoworkerdNamedLimits coworkerdNamedLimits(kj::StringPtr isolateName) {
+  // The loader key's last segment, written by the node's runtime bridge only: `limits=<cpuMs>:<memoryMiB>`.
+  // Anything else -- another segment, a number that does not fit, a name of any other shape -- names no limit.
+  const auto text = isolateName.asArray();
+  size_t at = text.size();
+  while (at > 0 && text[at - 1] != '#') --at;
+  const kj::StringPtr marker = "limits="_kj;
+  if (at == 0 || text.size() - at <= marker.size()) return {};
+  for (size_t i = 0; i < marker.size(); ++i) if (text[at + i] != marker[i]) return {};
+  uint64_t values[2] = {0, 0};
+  size_t field = 0;
+  for (size_t p = at + marker.size(); p < text.size(); ++p) {
+    if (text[p] == ':' && field == 0) { ++field; continue; }
+    if (text[p] < '0' || text[p] > '9') return {};
+    values[field] = values[field] * 10 + static_cast<uint64_t>(text[p] - '0');
+    if (values[field] > std::numeric_limits<uint32_t>::max()) return {};
+  }
+  return {static_cast<uint32_t>(values[0]), static_cast<uint32_t>(values[1])};
+}
 void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
   auto line = kj::str("[coworkerd-platform] {\"isolate\":", escapeCpuJsonString(name),
       ",\"dynamic\":", dynamic ? "true" : "false", ",\"canCreateNewIsolateGroups\":",
@@ -213,7 +232,7 @@ class RequestLimits final: public LimitEnforcer {
     kj::Own<void> enterJs(jsg::Lock& lock, IoContext&) override {
       if (limits->publish()) abortIsolate();
       limits->requireNotExceeded();
-      if (memoryLimitFromEnvironment()) return kj::heap<IdentityScope>(lock, *this);
+      if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
       return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
     }
     void topUpActor() override {}
@@ -249,7 +268,7 @@ class RequestLimits final: public LimitEnforcer {
 kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
     kj::Function<void()> abortIsolate) {
-  if (!limits.isEnabled() && !memoryLimitFromEnvironment() && !limits.reportsCompletion()) return fallback;
+  if (!limits.isEnabled() && !limits.memoryIdentityWanted() && !limits.reportsCompletion()) return fallback;
   return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
 }
 kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
