@@ -9,6 +9,7 @@
 #include "coworkerd-cpu-limit.h"
 #include "coworkerd-gc.h"
 #include "coworkerd-steady.h"
+#include "coworkerd-wal-shipper.h"
 #include "pyodide.h"
 #include "workerd-api.h"
 
@@ -789,6 +790,11 @@ class Server::ActorNamespace final {
     }
 
     void cloneFacet(kj::StringPtr src, kj::StringPtr dst) override {
+      // Coworkerd: a clone copies a database's files behind SQLite's back, so none of it reaches the node's log.
+      // Until there is a record for it, a shipped namespace refuses to clone (docs/compatibility.md).
+      JSG_REQUIRE(!(durableLogEnabled() && ns.config.tryGet<Durable>() != kj::none), Error,
+          "cloneFacet() is not supported for Durable Objects on this platform.");
+
       // Replacing a facet implies aborting it.
       abortFacet(dst, JSG_KJ_EXCEPTION(FAILED, Error, "Facet was cloned-over."));
 
@@ -876,6 +882,10 @@ class Server::ActorNamespace final {
     // ID of this facet. Initialized when getFacetId() is first called.
     kj::Maybe<uint> facetId;
 
+    // Coworkerd: the name this object was made with (idFromName()/getByName()), kept on the root so that the
+    // frames of every database of the object reach the node's replicator under the name the node knows it by.
+    kj::Maybe<kj::String> durableObjectName;
+
     ActorMap facets;
 
     static kj::Rc<kj::TimePoint> makeLastAccess(
@@ -947,6 +957,14 @@ class Server::ActorNamespace final {
 
     void deleteFacetImpl(const kj::Directory& dir, FacetTreeIndex& index, uint facetId) {
       deleteDescendantStorage(dir, index, facetId);
+
+      // Coworkerd: the facet's database goes away outside its own transactions, so the node is told rather than
+      // left to find an object whose history ends without a reason.
+      if (durableLogEnabled() && ns.config.tryGet<Durable>() != kj::none) {
+        durableLogFacetDeleted(root.durableObjectName.map([](kj::String& n) {
+          return kj::str(n);
+        }).orDefault([&]() { return kj::str(root.key); }), facetId);
+      }
 
       // Remove the database, WAL, and SHM files, if present. Note that the database may not
       // exist at all if this facet didn't exist before delete() was called on it.
@@ -1267,6 +1285,13 @@ class Server::ActorNamespace final {
         }
       }
 
+      // Coworkerd: the root's name is how the node knows this object (its databases are named after the id).
+      if (parent == kj::none) {
+        KJ_IF_SOME(n, actorName) {
+          durableObjectName = kj::str(n);
+        }
+      }
+
       auto makeActorCache = [this, actorName = kj::mv(actorName)](
                                 const ActorCache::SharedLru& sharedLru, OutputGate& outputGate,
                                 ActorCache::Hooks& hooks, SqliteObserver& sqliteObserver) mutable {
@@ -1296,8 +1321,37 @@ class Server::ActorNamespace final {
             // do this after reset() is used, so register a callback for that.
             db->run("PRAGMA journal_mode=WAL;");
 
-            db->afterReset([this, &dir = *as.directory, selfId](SqliteDatabase& db) {
+            // Coworkerd: ship every commit's WAL frames to the node's replicator and hold the output gate
+            // until it confirms them, so that the object's data outlives this machine's files.
+            kj::Maybe<kj::Own<DurableLogShipper>> shipper;
+            if (durableLogEnabled()) {
+              uint parentFacetId = 0;
+              kj::String facetName;
+              KJ_IF_SOME(p, parent) {
+                parentFacetId = p.getFacetId();
+                facetName = kj::str(key);
+              }
+              DurableObjectName name{
+                .objectName = root.durableObjectName.map([](kj::String& n) {
+                  return kj::str(n);
+                }).orDefault([&]() { return kj::str(root.key); }),
+                .storageId = kj::str(root.key),
+                .facetId = selfId,
+                .parentFacetId = parentFacetId,
+                .facetName = kj::mv(facetName),
+              };
+              shipper = kj::heap<DurableLogShipper>(*as.directory,
+                  getSqlitePathForId(selfId, "-wal"_kj), getSqlitePathForId(selfId), kj::mv(name),
+                  *db, timer);
+            }
+            DurableLogShipper* shipperPtr = nullptr;
+            KJ_IF_SOME(s, shipper) {
+              shipperPtr = s.get();
+            }
+
+            db->afterReset([this, &dir = *as.directory, selfId, shipperPtr](SqliteDatabase& db) {
               db.run("PRAGMA journal_mode=WAL;");
+              if (shipperPtr != nullptr) shipperPtr->afterReset(db);
 
               // reset() is used when the app called deleteAll(), in which case we also want to
               // delete all child facets.
@@ -1310,8 +1364,15 @@ class Server::ActorNamespace final {
               deleteDescendantStorage(dir, selfId);
             });
 
-            return kj::heap<ActorSqlite>(kj::mv(db), outputGate,
-                [](SpanParent) -> kj::Promise<void> { return kj::READY_NOW; }, *sqliteHooks)
+            kj::Function<kj::Promise<void>(SpanParent)> commitCallback =
+                [](SpanParent) -> kj::Promise<void> { return kj::READY_NOW; };
+            KJ_IF_SOME(s, shipper) {
+              commitCallback = [s = kj::mv(s)](SpanParent) mutable -> kj::Promise<void> {
+                return s->onCommit();
+              };
+            }
+            return kj::heap<ActorSqlite>(
+                kj::mv(db), outputGate, kj::mv(commitCallback), *sqliteHooks)
                 .attach(kj::mv(sqliteHooks));
           } else {
             // Create an ActorCache backed by a fake, empty storage. Elsewhere, we configure

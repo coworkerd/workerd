@@ -4,6 +4,7 @@
 
 #include "cli-main.h"
 
+#include "coworkerd-wal-shipper.h"
 #include "server.h"
 
 #include <workerd/io/compatibility-date.capnp.h>
@@ -187,6 +188,9 @@ class CliMain {
   }
 
   void applyServeOptions(const ServeOptions& options) {
+    // Coworkerd: the descriptor the node passed for its Durable Object log is wrapped with this process's own
+    // I/O provider; nothing is opened by path after startup (patches/workerd 0008).
+    setDurableLogProvider(*io.lowLevelProvider);
     for (auto& o: options.socket_addr_overrides) {
       server->overrideSocket(kj::str(o.name), kj::str(o.value));
     }

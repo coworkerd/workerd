@@ -339,6 +339,7 @@ wd_cc_library(
         "coworkerd-gc.c++",
         "coworkerd-idle-eviction.c++",
         "coworkerd-steady.c++",
+        "coworkerd-wal-shipper.c++",
     ],
     hdrs = [
         "server.h",
@@ -346,9 +347,11 @@ wd_cc_library(
         "coworkerd-gc.h",
         "coworkerd-idle-eviction.h",
         "coworkerd-steady.h",
+        "coworkerd-wal-shipper.h",
     ],
     deps = [
         ":coworkerd-memory-limit",
+        "@sqlite3",
         ":actor-id-impl",
         ":alarm-scheduler",
         ":channel-token",
