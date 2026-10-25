@@ -155,11 +155,27 @@ struct Writer {
 
 // To the replicator.
 constexpr uint8_t MSG_HELLO = 1, MSG_FRAMES = 2, MSG_OPEN = 3, MSG_CHECKPOINT = 4, MSG_RESET = 5,
-                  MSG_DELETED = 6, MSG_CLOSED = 7, MSG_GAVE_UP = 8;
+                  MSG_DELETED = 6, MSG_CLOSED = 7, MSG_GAVE_UP = 8, MSG_ALARM = 9, MSG_RESIDENCY = 10;
 // From the replicator.
 constexpr uint8_t MSG_ACK = 1, MSG_SEALED = 2, MSG_BREAK = 3, MSG_CHECKPOINT_ASKED = 4;
-// An ACK's status.
-constexpr uint8_t ACK_OK = 0;
+// An ACK's status. A refusal carries the code the caller sees: the node could not make the write durable, the
+// object is past its own size limit, or the tenant's Durable Object storage quota is exhausted. Reads are not
+// refused for any of them -- only the write is.
+constexpr uint8_t ACK_OK = 0, ACK_TOO_LARGE = 3, ACK_QUOTA = 4;
+
+kj::StringPtr ackRefusal(uint8_t status) {
+  switch (status) {
+    case ACK_TOO_LARGE:
+      return "jsg.Error: Durable Object is too large: the write would take it past "
+             "durableObjects.objectBytes (DO_OBJECT_TOO_LARGE)"_kj;
+    case ACK_QUOTA:
+      return "jsg.Error: the tenant's Durable Object storage quota is exhausted: the write was refused "
+             "(QUOTA_EXCEEDED)"_kj;
+    default:
+      return "jsg.Error: Durable Object storage is unavailable: the node refused the write "
+             "(STORAGE_UNAVAILABLE)"_kj;
+  }
+}
 
 kj::LowLevelAsyncIoProvider* logProvider = nullptr;
 
@@ -344,9 +360,9 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
           if (status == ACK_OK) {
             p.fulfiller->fulfill();
           } else {
-            p.fulfiller->reject(KJ_EXCEPTION(FAILED,
-                "jsg.Error: Durable Object storage is unavailable: the node refused the write "
-                "(STORAGE_UNAVAILABLE)"));
+            // kj::str, so the description is the message alone: KJ_EXCEPTION labels anything else, and a jsg.Error
+            // is only recognised when its prefix starts the description.
+            p.fulfiller->reject(KJ_EXCEPTION(FAILED, kj::str(ackRefusal(status))));
           }
           pending.erase(request);
           KJ_IF_SOME(shipper, shippers.find(key)) {
@@ -408,6 +424,45 @@ void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId) {
   Replicator::get().send(w.finish());
 }
 
+void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime) {
+  if (!durableLogEnabled()) return;
+  Writer w;
+  w.u8(MSG_ALARM);
+  w.str(kj::str(objectName, "/", facetId));
+  w.str(objectName);
+  w.u32(facetId);
+  KJ_IF_SOME(time, scheduledTime) {
+    w.u8(1);
+    w.u64(uint64_t((time - kj::UNIX_EPOCH) / kj::MILLISECONDS));
+  } else {
+    w.u8(0);
+    w.u64(0);
+  }
+  w.u64(monoNs());
+  Replicator::get().send(w.finish());
+}
+
+void durableLogResidency(const DurableResidency& residency) {
+  if (!durableLogEnabled()) return;
+  Writer w;
+  w.u8(MSG_RESIDENCY);
+  w.u64(residency.resident);
+  w.u64(residency.limit);
+  w.u64(residency.evicted);
+  w.u64(residency.woken);
+  w.u64(residency.wakes);
+  w.u64(residency.wakeUsTotal);
+  w.u64(residency.wakeUsMax);
+  w.u64(monoNs());
+  Replicator::get().send(w.finish());
+}
+
+uint64_t durableResidentLimit() {
+  static const uint64_t value =
+      numberFromEnvironment("COWORKERD_DO_RESIDENT_OBJECTS", 4096, 1ull << 32);
+  return value;
+}
+
 DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
     kj::Path walPath,
     kj::Path databasePath,
@@ -447,6 +502,9 @@ DurableLogShipper::~DurableLogShipper() noexcept(false) {
   w.u8(MSG_CLOSED);
   w.str(key);
   w.u64(monoNs());
+  // The database's size as this instance leaves it: a small object may never checkpoint, and the node needs its
+  // size for the tenant's storage and for the object's own limit.
+  w.u64(databaseBytes());
   Replicator::get().send(w.finish());
 }
 

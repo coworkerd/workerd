@@ -31,6 +31,23 @@ bool durableLogEnabled();
 // A facet's files were removed outside its own transactions (deleteFacet(), or the parent's deleteAll()).
 void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId);
 
+// The alarm of one database, as that database itself holds it (_cf_METADATA): the node schedules the firing, so it
+// is told at every change (ActorSqlite's scheduleRun hook) and whenever a database is opened -- which is how a node
+// that took the shard over learns, from the object's own files, what is still due and what has already run.
+void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime);
+
+// How many objects this process holds resident, how many it has evicted for the resident limit and how many it has
+// woken again, with the time the wakes took. Sent when the numbers change, at most once a second.
+struct DurableResidency {
+  uint64_t resident = 0, limit = 0, evicted = 0, woken = 0, wakes = 0;
+  // Microseconds: waking an object whose class is still loaded takes well under a millisecond.
+  uint64_t wakeUsTotal = 0, wakeUsMax = 0;
+};
+void durableLogResidency(const DurableResidency& residency);
+
+// The resident object limit of this process (COWORKERD_DO_RESIDENT_OBJECTS; 0: no limit).
+uint64_t durableResidentLimit();
+
 // Which database this is, in the node's terms. `objectName` is the name the object's Host was made with --
 // "<namespace>/<object>/<data epoch>" -- so the node needs no map from a path to an object; `storageId` is the
 // hexadecimal actor id its files are named after. `facetId` is 0 for the object itself, and a facet also carries its
