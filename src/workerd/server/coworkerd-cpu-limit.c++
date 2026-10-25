@@ -236,14 +236,23 @@ class RequestLimits final: public LimitEnforcer {
       if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
       return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); }, &gcExcluded);
     }
-    // Upstream's contract: each new event delivered to an actor starts with its limits topped up -- an actor's
-    // requests share one IoContext, and this enforcer, for the actor's whole life -- and nothing happens for any
-    // other request. The idle reaper hears of the event too (coworkerd-idle-eviction.h).
+    // Each new event a request receives starts with its CPU topped up: a message of a WebSocket it accepted, a call on
+    // an RPC target it handed out, and -- upstream's contract, which tops up actors only -- an actor's request (an
+    // actor's requests share one IoContext, and this enforcer, for the actor's whole life). A connection's messages are
+    // thus limited one by one, as requests are, instead of together; what each charged stays in the completed row, and
+    // while the request lasts its total so far goes on the event pipe at most once per PROGRESS_INTERVAL, so that the
+    // node meters a long connection as it runs. The idle reaper hears of an actor's events (coworkerd-idle-eviction.h);
+    // a request's own events need not tell it, the request being open.
     void topUpActor() override {
-      if (!actor) return;
       toppedUp += cpuUsed;
       cpuUsed = 0;
-      idleWorkerActorEvent(limits->activity());
+      if (actor) idleWorkerActorEvent(limits->activity());
+      const auto now = LimitWatchdog::now();
+      if (toppedUp + gcExcluded > reported && now - lastProgress >= PROGRESS_INTERVAL) {
+        lastProgress = now;
+        reported = toppedUp + gcExcluded;
+        limits->progress(identity, toppedUp, gcExcluded);
+      }
     }
     void newSubrequest(bool inHouse) override { fallback->newSubrequest(inHouse); }
     void newKvRequest(KvOpType type) override { fallback->newKvRequest(type); }
@@ -271,6 +280,10 @@ class RequestLimits final: public LimitEnforcer {
     bool actor;
     // What the limit charged since the last top-up, before it, and the GC CPU it did not charge.
     uint64_t cpuUsed = 0, toppedUp = 0, gcExcluded = 0;
+    // The last progress row: when, and the CPU it reported.
+    static constexpr kj::Duration PROGRESS_INTERVAL = 1 * kj::SECONDS;
+    kj::TimePoint lastProgress = kj::origin<kj::TimePoint>();
+    uint64_t reported = 0;
   };
 
 

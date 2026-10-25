@@ -243,6 +243,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   void completed(kj::StringPtr identity, uint64_t used, uint64_t gcExcluded) {
     if (dynamic) record("completed", identity, used, gcExcluded);
   }
+  // A request's CPU so far while it lasts -- a WebSocket's events top it up, and its context ends only with the
+  // connection --, in the completed row's terms: on the event pipe only, where the node meters it, never in the log.
+  void progress(kj::StringPtr identity, uint64_t used, uint64_t gcExcluded) {
+    if (dynamic) writeLimitEvent(report("cpu-progress", identity, used, gcExcluded));
+  }
   // Written while a termination has not taken effect; a later terminated row for the same
   // invocation withdraws it.
   void culprit(kj::StringPtr identity, uint64_t used) { writeLimitEvent(report("culprit", identity, used)); }
