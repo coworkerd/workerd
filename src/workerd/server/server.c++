@@ -7,6 +7,7 @@
 #include "alarm-scheduler.h"
 #include "container-client.h"
 #include "coworkerd-cpu-limit.h"
+#include "coworkerd-gc.h"
 #include "coworkerd-steady.h"
 #include "pyodide.h"
 #include "workerd-api.h"
@@ -3563,6 +3564,9 @@ class Server::WorkerService final: public Service,
         abortIsolateCallback(kj::mv(abortIsolateCallback)),
         accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)) {}
 
+  // A strong reference to this service's Worker: an idle collection holds it while it waits for the Worker's lock.
+  kj::Own<const Worker> workerRef() { return kj::atomicAddRef(*worker); }
+
   // Call immediately after the constructor to set up `actorNamespaces`. This can't happen during
   // the constructor itself since it sets up cyclic references, which will throw an exception if
   // done during the constructor.
@@ -4140,7 +4144,7 @@ class Server::WorkerService final: public Service,
         kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
         *cpuLimits, metadata.cfBlobJson, [this]() {
           KJ_IF_SOME(cb, abortIsolateCallback) { cb(); }
-        });
+        }, actor != kj::none);
     auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
         kj::mv(props), kj::mv(actor),
         kj::mv(requestLimits),
@@ -5636,6 +5640,18 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
 
       this->service = kj::mv(service);
       idleWorkerReady(idleWorker);
+      // The idle reaper may collect this isolate between requests (coworkerd-gc.h). The stub detaches the collector
+      // when it is destroyed; a collection in progress holds the Worker itself.
+      if (gcSettings().idleCollectMs) {
+        idleWorkerSetCollector(idleWorker,
+            [this](std::shared_ptr<IsolateGc> gc,
+                kj::Function<bool()> stillIdle) -> kj::Maybe<kj::Promise<IdleCollection>> {
+          KJ_IF_SOME(s, this->service) {
+            return collectIdleIsolate(s->workerRef(), kj::mv(gc), kj::mv(stillIdle));
+          }
+          return kj::none;
+        });
+      }
     }
 
     class SubrequestChannelImpl final: public IoChannelFactory::SubrequestChannel {

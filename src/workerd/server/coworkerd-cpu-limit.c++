@@ -213,11 +213,12 @@ class CpuWorkerInterface final: public WorkerInterface {
 class RequestLimits final: public LimitEnforcer {
    public:
     RequestLimits(kj::Own<LimitEnforcer> fallback, CpuIsolateLimitEnforcer& limits,
-        kj::String identity, kj::Function<void()> abortIsolate)
+        kj::String identity, kj::Function<void()> abortIsolate, bool actor)
         : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
-          abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
-    // The request context ends here, after its waitUntil work, whether or not it ran JavaScript.
-    ~RequestLimits() noexcept(false) { limits->completed(identity, cpuUsed); }
+          abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)), actor(actor) {}
+    // The request context ends here, after its waitUntil work, whether or not it ran JavaScript. An actor's context
+    // ends with the actor: its row has the CPU of all its events.
+    ~RequestLimits() noexcept(false) { limits->completed(identity, toppedUp + cpuUsed, gcExcluded); }
     struct IdentityScope {
       jsg::AsyncContextFrame::StorageScope frame;
       MemoryStartupIdentityScope startup;
@@ -227,15 +228,23 @@ class RequestLimits final: public LimitEnforcer {
                 lock.v8Ref<v8::Value>(jsg::v8Str(lock.v8Isolate, owner.identity))),
             startup(owner.identity),
             limit(owner.limits->enterRequestJs(owner.cpuUsed, owner.identity,
-                [&owner]() { if (owner.limits->publish()) owner.abortIsolate(); })) {}
+                [&owner]() { if (owner.limits->publish()) owner.abortIsolate(); }, &owner.gcExcluded)) {}
     };
     kj::Own<void> enterJs(jsg::Lock& lock, IoContext&) override {
       if (limits->publish()) abortIsolate();
       limits->requireNotExceeded();
       if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
-      return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
+      return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); }, &gcExcluded);
     }
-    void topUpActor() override {}
+    // Upstream's contract: each new event delivered to an actor starts with its limits topped up -- an actor's
+    // requests share one IoContext, and this enforcer, for the actor's whole life -- and nothing happens for any
+    // other request. The idle reaper hears of the event too (coworkerd-idle-eviction.h).
+    void topUpActor() override {
+      if (!actor) return;
+      toppedUp += cpuUsed;
+      cpuUsed = 0;
+      idleWorkerActorEvent(limits->activity());
+    }
     void newSubrequest(bool inHouse) override { fallback->newSubrequest(inHouse); }
     void newKvRequest(KvOpType type) override { fallback->newKvRequest(type); }
     void newAnalyticsEngineRequest() override { fallback->newAnalyticsEngineRequest(); }
@@ -259,7 +268,9 @@ class RequestLimits final: public LimitEnforcer {
     kj::Own<CpuIsolateLimitEnforcer> limits;
     kj::Function<void()> abortIsolate;
     kj::String identity;
-    uint64_t cpuUsed = 0;
+    bool actor;
+    // What the limit charged since the last top-up, before it, and the GC CPU it did not charge.
+    uint64_t cpuUsed = 0, toppedUp = 0, gcExcluded = 0;
   };
 
 
@@ -267,9 +278,9 @@ class RequestLimits final: public LimitEnforcer {
 
 kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
-    kj::Function<void()> abortIsolate) {
+    kj::Function<void()> abortIsolate, bool actor) {
   if (!limits.isEnabled() && !limits.memoryIdentityWanted() && !limits.reportsCompletion()) return fallback;
-  return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
+  return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate), actor);
 }
 kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
     CpuIsolateLimitEnforcer& limits) {

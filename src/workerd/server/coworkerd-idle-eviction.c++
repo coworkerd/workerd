@@ -1,5 +1,6 @@
 #include "coworkerd-idle-eviction.h"
 #include "coworkerd-cpu-limit.h"
+#include "coworkerd-gc.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -135,6 +136,11 @@ struct IdleWorker {
   double lastEnd = monotonicMs(), loadStart = lastEnd, teardownStart = 0;
   uint64_t loadCpu = cpuNs();
   kj::String reason = kj::str("");
+  // Its collections and its collector (fix B); the actor events it received and their last time.
+  std::shared_ptr<IsolateGc> gc;
+  kj::Maybe<IdleCollector> collect;
+  uint64_t actorEvents = 0, idleCollections = 0;
+  double lastActorEvent = 0;
   IdleWorker(std::shared_ptr<IdleReaper> owner, kj::StringPtr name,
       kj::Function<void()> remove, uint64_t id)
       : owner(owner), name(kj::str(name)), remove(kj::mv(remove)), id(id) {}
@@ -148,7 +154,8 @@ class IdleReaper {
     KJ_REQUIRE(interval > 0, "COWORKERD_IDLE_DESTROY_INTERVAL_MS must be positive");
     publishedBand = inheritedBand();
     publish();
-    if (threshold || publishedBand) task = loop().eagerlyEvaluate(nullptr);
+    if (threshold || publishedBand || gcSettings().observes()) task = loop().eagerlyEvaluate(nullptr);
+    if (gcSettings().idleCollectMs) collectTask = collectLoop().eagerlyEvaluate(nullptr);
   }
   kj::Timer& timer;
   uint32_t threshold, interval;
@@ -160,7 +167,8 @@ class IdleReaper {
   uint32_t effectiveThreshold() const { return band == 2 ? 1000 : band == 1 ? 5000 : threshold; }
   double lastDestroy = 0;
   std::list<std::weak_ptr<IdleWorker>> workers;
-  kj::Promise<void> task = nullptr;
+  kj::Promise<void> task = nullptr, collectTask = nullptr;
+  uint64_t publishedGc = 0;
 
   void event(const IdleWorker& worker, kj::StringPtr event, double elapsed = 0, uint64_t cpu = 0) {
     emit(kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":",
@@ -170,7 +178,8 @@ class IdleReaper {
         ",\"reason\":", escapeCpuJsonString(worker.reason), ",\"elapsedMs\":", elapsed,
         ",\"cpuUsedNs\":", cpu, ",\"idleEvictMs\":", threshold,
         ",\"memoryBand\":" , band, ",\"effectiveIdleEvictMs\":" , effectiveThreshold(),
-        ",\"idleDestroyIntervalMs\":", interval, "}"));
+        ",\"idleDestroyIntervalMs\":", interval, ",\"actorEvents\":", worker.actorEvents,
+        ",\"idleCollections\":", worker.idleCollections, "}"));
   }
   void publish() {
     auto& channel = lifecycleChannel();
@@ -190,7 +199,9 @@ class IdleReaper {
         ",\"idleEvictions\":", evicted, ",\"watermarkEvictions\":", watermarkEvicted,
         ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
         ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
+        gcSettings().observes() ? processGcJson() : kj::str(""),
         ",\"residentWorkers\":[", kj::strArray(entries, ","), "]}");
+    if (gcSettings().observes()) publishedGc = processGcVersion();
     if (!channel.publish(row) && !overflowReported) {
       overflowReported = true;
       emit(kj::str("{\"event\":\"snapshot-too-large\",\"pid\":", coworkerdPid(), ",\"bytes\":", row.size(), "}"));
@@ -198,6 +209,71 @@ class IdleReaper {
   }
   bool overflowReported = false;
  private:
+  // The isolate fix B collects next: idle for the threshold, not hosting actors, its old generation grown the most since
+  // its last full collection and by at least the minimum. `responsiveSince` is when the event loop last came out of a stall:
+  // idle time counts from there too. `deferred` says a candidate was due by its own idle time but the loop has not been
+  // free that long.
+  IdleWorkerRef idleCandidate(double now, double responsiveSince, bool& deferred) {
+    const auto& settings = gcSettings();
+    IdleWorkerRef best;
+    uint64_t bestGrowth = 0;
+    for (auto& entry: workers) {
+      auto worker = entry.lock();
+      if (!worker || !worker->gc || worker->collect == kj::none || !worker->ready || !worker->created ||
+          worker->removed || worker->destroyed || worker->active || worker->actorEvents ||
+          now - worker->lastEnd < settings.idleCollectMs) continue;
+      auto growth = worker->gc->oldGrowth();
+      if (growth && growth >= settings.idleCollectMinBytes && growth > bestGrowth) { best = worker; bestGrowth = growth; }
+    }
+    deferred = best && now - responsiveSince < settings.idleCollectMs;
+    return deferred ? IdleWorkerRef() : best;
+  }
+  // Fix B (coworkerd-gc.h): one isolate at a time, collected between its requests. Idle is not only a matter of the
+  // isolate's clock: while the event loop is busy -- running another isolate's request, or paused by a collection -- the
+  // requests that arrive meanwhile wait unread, and the isolate looks idle because its own next request is among them; a
+  // collection then would lengthen the wait rather than use idle time. The loop's own ticks tell: one that comes more
+  // than STALL_MS late ends a stall, and the isolate must also have been idle that long since then. Before collecting, what
+  // is already queued on the event loop runs first (until it would sleep, waiting no longer than the idle threshold), and
+  // the isolate must still be idle when its lock is taken.
+  static constexpr double STALL_MS = 10;
+  kj::Promise<void> collectLoop() {
+    const auto& settings = gcSettings();
+    const auto tick = std::clamp(interval, 10u, 100u);
+    double responsiveSince = monotonicMs();
+    while (true) {
+      const auto expected = monotonicMs() + tick;
+      co_await timer.afterDelay(tick * kj::MILLISECONDS);
+      const auto now = monotonicMs();
+      if (now - expected > STALL_MS) responsiveSince = now;
+      bool deferred = false;
+      auto candidate = idleCandidate(now, responsiveSince, deferred);
+      if (deferred) countIdleCollection(IdleCollection::BUSY, true);
+      if (!candidate) continue;
+      bool quiet = co_await kj::yieldUntilWouldSleep().then([]() { return true; }).exclusiveJoin(
+          timer.afterDelay(settings.idleCollectMs * kj::MILLISECONDS).then([]() { return false; }));
+      auto lastEnd = candidate->lastEnd;
+      auto stillIdle = [candidate, lastEnd]() {
+        return !candidate->active && candidate->lastEnd == lastEnd && !candidate->removed && !candidate->destroyed;
+      };
+      if (!quiet || !stillIdle()) {
+        countIdleCollection(IdleCollection::BUSY, true);
+        continue;
+      }
+      kj::Maybe<kj::Promise<IdleCollection>> started;
+      KJ_IF_SOME(collect, candidate->collect) { started = collect(candidate->gc, kj::mv(stillIdle)); }
+      auto outcome = IdleCollection::GONE;
+      KJ_IF_SOME(promise, started) {
+        try {
+          outcome = co_await kj::mv(promise);
+        } catch (kj::Exception& error) {
+          emit(kj::str("{\"event\":\"idle-collection-failed\",\"isolate\":", escapeCpuJsonString(candidate->name),
+              ",\"pid\":", coworkerdPid(), ",\"reason\":", escapeCpuJsonString(error.getDescription()), "}"));
+        }
+      }
+      if (outcome == IdleCollection::COLLECTED) ++candidate->idleCollections;
+      countIdleCollection(outcome, false);
+    }
+  }
   kj::Promise<void> loop() {
     while (true) {
       co_await timer.afterDelay(std::min(interval, 100u) * kj::MILLISECONDS);
@@ -207,7 +283,12 @@ class IdleReaper {
         bandReadNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count();
         ++bandReads;
-        if (monotonicMs() - lastPublish >= 1000) { publish(); lastPublish = monotonicMs(); }
+      }
+      // At most once a second: for the band, and for the collections when they changed.
+      if (monotonicMs() - lastPublish >= 1000 &&
+          (publishedBand || (gcSettings().observes() && processGcVersion() != publishedGc))) {
+        publish();
+        lastPublish = monotonicMs();
       }
       auto minimum = effectiveThreshold();
       if (!minimum || pending || monotonicMs() - lastDestroy < interval) continue;
@@ -267,7 +348,20 @@ void idleWorkerFailed(const IdleWorkerRef& worker) {
     idleWorkerRemoved(worker, "load-failed"); remove();
   }
 }
-void detachIdleWorker(const IdleWorkerRef& worker) { if (worker) worker->remove = kj::none; }
+void detachIdleWorker(const IdleWorkerRef& worker) {
+  if (worker) { worker->remove = kj::none; worker->collect = kj::none; }
+}
+void idleWorkerSetGc(const IdleWorkerRef& worker, std::shared_ptr<IsolateGc> gc) { if (worker) worker->gc = kj::mv(gc); }
+void idleWorkerSetCollector(const IdleWorkerRef& worker, IdleCollector collect) {
+  if (worker) worker->collect = kj::mv(collect);
+}
+void idleWorkerActorEvent(const IdleWorkerRef& worker) {
+  if (!worker) return;
+  ++worker->actorEvents;
+  // An actor's events never pass through the isolate's entry (activity()), so its last one counts as its last use: the
+  // reaper does not evict an isolate whose actors are still receiving events.
+  worker->lastActorEvent = worker->lastEnd = monotonicMs();
+}
 
 namespace {
 struct Activity {
