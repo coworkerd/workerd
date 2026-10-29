@@ -195,8 +195,12 @@ class MockActorChannel: public IoChannelFactory::ActorChannel {
 
 class MockWorkerStubChannel final: public WorkerStubChannel {
  public:
+  kj::Maybe<kj::String> boundInvocationIdentity;
+
   kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
-      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
+      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits,
+      kj::Maybe<kj::String> invocationIdentity) override {
+    boundInvocationIdentity = kj::mv(invocationIdentity);
     return kj::rc<MockSubrequestChannel>(
         ServiceTriplet("outer", kj::none, kj::mv(props)), Persistent::NO);
   }
@@ -546,7 +550,9 @@ KJ_TEST("resolving channel props keeps promised caps alive") {
   caps.add(newPromisedChannel<IoChannelFactory::SubrequestChannel>(kj::mv(paf.promise)).toOwn());
 
   auto worker = kj::refcounted<MockWorkerStubChannel>();
-  auto channel = worker->getEntrypoint(kj::none, propsWithCaps(kj::mv(caps)), kj::none);
+  auto identity = kj::str("{\"workerId\":\"tenant/service\",\"versionId\":\"v1\",\"invocationId\":\"async-1\"}");
+  auto channel = worker->getEntrypoint(
+      kj::none, propsWithCaps(kj::mv(caps)), kj::none, kj::mv(identity));
   auto resolutionResult = channel->getResolved();
   auto resolution = KJ_ASSERT_NONNULL(
       kj::mv(resolutionResult).tryGet<kj::Promise<kj::Rc<IoChannelFactory::TokenizableChannel>>>());
@@ -555,6 +561,8 @@ KJ_TEST("resolving channel props keeps promised caps alive") {
       ServiceTriplet("nested", kj::none, Frankenvalue()), Persistent::NO));
 
   auto resolved = resolution.wait(waitScope).downcast<MockSubrequestChannel>();
+  KJ_EXPECT(KJ_ASSERT_NONNULL(worker->boundInvocationIdentity) ==
+      "{\"workerId\":\"tenant/service\",\"versionId\":\"v1\",\"invocationId\":\"async-1\"}"_kj);
   auto capTable = resolved->triplet.props.getCapTable();
   KJ_ASSERT(capTable.size() == 1);
   auto& nested = KJ_ASSERT_NONNULL(kj::tryDowncast<MockSubrequestChannel>(*capTable[0]));

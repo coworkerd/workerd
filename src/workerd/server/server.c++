@@ -4381,9 +4381,11 @@ class Server::WorkerService final: public Service,
     // is the moment it serves: from here on it is non-dumpable and runs under the steady-state system call
     // filter (Coworkerd v49, coworkerd-steady.h).
     coworkerdServing();
+    auto& invocationIdentity = metadata.coworkerdInvocationIdentity != kj::none
+        ? metadata.coworkerdInvocationIdentity : metadata.cfBlobJson;
     auto requestLimits = wrapCpuRequestLimits(
         kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
-        *cpuLimits, metadata.cfBlobJson, [this]() {
+        *cpuLimits, invocationIdentity, [this]() {
           KJ_IF_SOME(cb, abortIsolateCallback) { cb(); }
         }, actor != kj::none);
     auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
@@ -5745,8 +5747,10 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     }
 
     kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
-        kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
-      return kj::rc<SubrequestChannelImpl>(addRefToThis(), kj::mv(name), kj::mv(props));
+        kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits,
+        kj::Maybe<kj::String> invocationIdentity) override {
+      return kj::rc<SubrequestChannelImpl>(
+          addRefToThis(), kj::mv(name), kj::mv(props), kj::mv(invocationIdentity));
     }
 
     kj::Rc<IoChannelFactory::ActorClassChannel> getActorClassResolved(
@@ -5898,10 +5902,12 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     class SubrequestChannelImpl final: public IoChannelFactory::SubrequestChannel {
      public:
       SubrequestChannelImpl(
-          kj::Rc<WorkerStubImpl> isolate, kj::Maybe<kj::String> entrypointName, Frankenvalue props)
+          kj::Rc<WorkerStubImpl> isolate, kj::Maybe<kj::String> entrypointName, Frankenvalue props,
+          kj::Maybe<kj::String> invocationIdentity)
           : isolate(kj::mv(isolate)),
             entrypointName(kj::mv(entrypointName)),
-            props(kj::mv(props)) {}
+            props(kj::mv(props)),
+            invocationIdentity(kj::mv(invocationIdentity)) {}
 
       kj::Own<WorkerInterface> startRequest(
           IoChannelFactory::SubrequestMetadata metadata) override {
@@ -5931,10 +5937,15 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       kj::Rc<WorkerStubImpl> isolate;
       kj::Maybe<kj::String> entrypointName;
       Frankenvalue props;  // moved away when `entrypointService` is initialized
+      const kj::Maybe<kj::String> invocationIdentity;  // owned by this entrypoint, not its isolate
 
       kj::Maybe<kj::Rc<Service>> entrypointService;
 
       kj::Own<WorkerInterface> startRequestImpl(IoChannelFactory::SubrequestMetadata metadata) {
+        KJ_IF_SOME(identity, invocationIdentity) {
+          // Neither a subsequent fetch cf nor props can replace the bound reporting identity.
+          metadata.coworkerdInvocationIdentity = kj::str(identity);
+        }
         auto& service = KJ_ASSERT_NONNULL(isolate->service);
         if (entrypointService == kj::none) {
           entrypointService = service->getEntrypoint(entrypointName, kj::mv(props));

@@ -198,6 +198,10 @@ class IoChannelFactory: public virtual kj::Refcounted {
 
     // Address of the client as IP:port on whose behalf this request is being made.
     kj::Maybe<kj::String> clientAddress;
+
+    // Bound by a Coworkerd platform dynamic entrypoint, never inferred from cf or props.
+    // Reporting identity only; it does not change the request or context lifetime.
+    kj::Maybe<kj::String> coworkerdInvocationIdentity;
   };
 
   // Parameters that can influence the version of a worker that is used to serve a subrequest.
@@ -563,9 +567,11 @@ class WorkerStubChannel: public kj::Refcounted {
   // As with IoChannelFactory::getSubrequestChannel(), the non-virtual method waits for `props` to
   // resolve first, then calls the virtual method.
   kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypoint(
-      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits);
+      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits,
+      kj::Maybe<kj::String> invocationIdentity = kj::none);
   virtual kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
-      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) = 0;
+      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits,
+      kj::Maybe<kj::String> invocationIdentity) = 0;
 
   // As with IoChannelFactory::getActorClass(), the non-virtual method waits for `props` to
   // resolve first, then calls the virtual method.
