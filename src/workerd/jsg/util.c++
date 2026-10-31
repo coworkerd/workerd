@@ -371,6 +371,9 @@ v8::Local<v8::Value> exceptionToJs(
   // TODO(cleanup): decodeTunneledException is currently only used here, consider
   // inlining it back into this function.
   auto tunneledException = decodeTunneledException(isolate, exception, options);
+  // Coworkerd: the platform's detail survives RPC, including getters and returned capabilities.
+  void coworkerdSetRpcErrorCode(v8::Isolate*, v8::Local<v8::Value>, const kj::Exception&);
+  coworkerdSetRpcErrorCode(isolate, tunneledException.handle, exception);
 
   if (tunneledException.isInternal) {
     // Don't log exceptions that have been explicitly marked with worker_do_not_log or are

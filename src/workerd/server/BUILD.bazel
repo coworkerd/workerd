@@ -348,6 +348,7 @@ wd_cc_library(
         "coworkerd-idle-eviction.h",
         "coworkerd-steady.h",
         "coworkerd-wal-shipper.h",
+        "coworkerd-parent-death.h",
     ],
     deps = [
         ":coworkerd-memory-limit",

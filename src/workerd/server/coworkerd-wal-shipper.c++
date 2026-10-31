@@ -1,5 +1,6 @@
 // Coworkerd: see coworkerd-wal-shipper.h.
 #include "coworkerd-wal-shipper.h"
+#include "coworkerd-parent-death.h"
 
 #include <workerd/jsg/exception.h>
 
@@ -409,6 +410,7 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
 
 void setDurableLogProvider(kj::LowLevelAsyncIoProvider& provider) {
   logProvider = &provider;
+  followCoworkerdParent(provider);
 }
 
 bool durableLogEnabled() {

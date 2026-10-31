@@ -1,4 +1,6 @@
 #pragma once
+
+#include <workerd/jsg/coworkerd-rpc-code.h>
 #include "coworkerd-gc.h"
 #include "coworkerd-idle-eviction.h"
 #include <workerd/server/coworkerd-memory-limit.h>
@@ -187,8 +189,10 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   }
   kj::Exception exception() {
     return exceeded->load() == IsolateLimitCause::MEMORY
-        ? KJ_EXCEPTION(OVERLOADED, "jsg.Error: MEMORY_LIMIT_EXCEEDED")
-        : KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED");
+        ? jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, "jsg.Error: MEMORY_LIMIT_EXCEEDED"),
+              "MEMORY_LIMIT_EXCEEDED")
+        : jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED"),
+              "CPU_LIMIT_EXCEEDED");
   }
   void requireNotExceeded() {
     if (exceeded->load() != IsolateLimitCause::NONE) kj::throwFatalException(exception());
