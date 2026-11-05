@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "bootstrap.h"
+#include "coworkerd-parent-death.h"
 #include "coworkerd-channels.h"
 
 #include "worker-factory.h"
@@ -146,8 +147,10 @@ class Bootstrap {
       kj::Maybe<const BenchOptions&> bench)
       : timer(loop.getTimer()),
         monotonicClock(kj::systemPreciseMonotonicClock()),
+        parentProvider(loop.getTimer()),
         provider(loop.getTimer()) {
     initializeCoworkerdChannels();
+    followCoworkerdParent(parentProvider);
     KJ_IF_SOME(path, serveOrTest.perfetto_trace_path) {
 #ifdef WORKERD_USE_PERFETTO
       perfettoSession = PerfettoSession(kj::str(path),
@@ -217,6 +220,7 @@ class Bootstrap {
   kj::Timer& timer;
   // The loop's monotonic clock, consistent with `timer`.
   const kj::MonotonicClock& monotonicClock;
+  kj_rs_io::TokioLowLevelAsyncIoProvider parentProvider;
   // The tokio-backed kj::Network over the Runtime's loop, for the factory.
   kj_rs_io::TokioAsyncIoProvider provider;
 

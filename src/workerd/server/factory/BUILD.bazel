@@ -85,7 +85,7 @@ wd_cc_library(
 # V8 on the Rust-owned event loop and builds the worker factory the Rust server runs.
 wd_cc_library(
     name = "bootstrap",
-    srcs = ["bootstrap.c++"],
+    srcs = ["bootstrap.c++", "coworkerd-parent-death.h"],
     linkstatic = CC_LIBRARY_LINKSTATIC,
     deps = [
         ":bootstrap-hdrs",
