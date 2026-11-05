@@ -7,6 +7,7 @@
 // The private state behind worker-factory.h, shared by the factory's source files.
 
 #include "worker-factory.h"
+#include "coworkerd-cpu-limit.h"
 
 #include <workerd/io/actor-sqlite.h>
 #include <workerd/io/io-thread-context.h>
@@ -191,6 +192,8 @@ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::Er
   kj::Vector<kj::Rc<IoChannelFactory::RpcChannel>> rpcChannels;
   kj::Maybe<kj::String> accessBlobHeader;
   bool isDynamic = false;
+  kj::Maybe<CoworkerdWorkerIdentity> coworkerdIdentity;
+  kj::Own<CpuIsolateLimitEnforcer> cpuLimits;
 
   kj::Maybe<kj::Own<const Worker>> worker;
   // Held from compilation until `worker_set_ctx_exports()` fills the object in; none for a worker

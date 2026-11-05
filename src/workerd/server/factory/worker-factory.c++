@@ -1134,12 +1134,17 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
   }
 
   auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
-  return newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
-      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::refcounted<NullLimitEnforcer>(), {},
+  auto requestLimits = wrapCpuRequestLimits(kj::refcounted<NullLimitEnforcer>(),
+      *worker.cpuLimits, metadata.cfBlobJson, [channel = ioChannelFactory.addRef()]() mutable {
+        channel->abortIsolate("CPU limit exceeded");
+      });
+  auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
+      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},
       kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
       kj::mv(metadata.cfBlobJson), kj::none, kj::mv(triggerContext), IsDynamicDispatch::NO,
       kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
       kj::mv(metadata.clientAddress));
+  return wrapCpuWorkerInterface(kj::mv(entry), *worker.cpuLimits);
 }
 
 }  // namespace
@@ -1521,6 +1526,8 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
   TRACE_EVENT("workerd", "factory_new_worker()", "name", name.cStr());
   auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
   impl->isDynamic = dynamicSource != kj::none;
+  // The creation-identity slot is not inferred from a name, source shape, or request metadata.
+  impl->coworkerdIdentity = kj::none;
   ErrorReporter errorReporter;
   auto& options = *factory.options;
   bool experimental = options.experimental;
@@ -1598,7 +1605,9 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
   // The isolate of the Worker, or of the zygote that snapshots its startup.
   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
-    auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
+    impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
+        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->isDynamic);
+    auto limitEnforcer = kj::addRef(*impl->cpuLimits);
     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
       return Worker::Api::InboundListener{
         .protocol = kj::str(listener.protocol),
