@@ -8,6 +8,7 @@
 #include <kj/function.h>
 #include <kj/mutex.h>
 #include <kj/thread.h>
+#include <kj/time.h>
 #include <kj/vector.h>
 #include <atomic>
 #include <cstdio>
@@ -32,6 +33,51 @@ void writeLimitEvent(kj::StringPtr row);
 kj::String escapeCpuJsonString(kj::StringPtr text);
 void recordPlatformFacts(kj::StringPtr name, bool dynamic);
 
+class LimitWatchdog {
+ public:
+  class Entry {
+   public:
+    // Called on the watchdog thread with the registry locked. Returns when the entry next needs a
+    // call; none if only a wake-up can make it need one.
+    virtual kj::Maybe<kj::TimePoint> watch(kj::TimePoint now) = 0;
+
+   protected:
+    ~Entry() = default;
+  };
+  static LimitWatchdog& start();
+  static kj::TimePoint now() { return kj::systemPreciseMonotonicClock().now(); }
+  void add(Entry& entry, kj::Maybe<kj::TimePoint> due);
+  // `underLock` runs after removal with the registry still locked.
+  template <typename Func>
+  void remove(Entry& entry, Func&& underLock) {
+    auto lock = state.lockExclusive();
+    auto& entries = lock->entries;
+    for (size_t i = 0; i < entries.size(); ++i) {
+      if (entries[i] == &entry) {
+        entries[i] = entries.back();
+        entries.removeLast();
+        break;
+      }
+    }
+    underLock();
+  }
+  // Some limit state left NONE: entries may need a check before their due time.
+  void wake();
+  ~LimitWatchdog() noexcept(false);
+
+ private:
+  struct State {
+    kj::Vector<Entry*> entries;
+    kj::Maybe<kj::TimePoint> sleepUntil;  // none: until woken
+    bool woken = false;
+    bool stopping = false;
+  };
+  kj::MutexGuarded<State> state;
+  kj::Thread thread;
+  LimitWatchdog();
+  void run();
+};
+
 // CPU accounting stays on the isolate thread; only termination and file writes cross threads.
 class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  public:
@@ -39,7 +85,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
       : fallback(kj::mv(fallback)), name(kj::str(name)),
         cpuNs(uint64_t(cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
         state(cpuStateFromEnvironment()) {
-    if (isEnabled()) cpuEventsDescriptor();
+    if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
     recordPlatformFacts(name, dynamic);
     auto paf = kj::newPromiseAndFulfiller<void>();
     failure = paf.promise.fork();
@@ -148,44 +194,56 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
 #endif
   };
 
-  struct Scope {
+  struct Scope final: public LimitWatchdog::Entry {
+    static constexpr uint64_t MIN_RECHECK_NS = 100000;
     CpuIsolateLimitEnforcer& owner;
     uint64_t& used;
     kj::String identity;
     kj::Function<void()> onExit;
     CpuClock clock;
     uint64_t started = clock.now();
-    kj::MutexGuarded<bool> stopped{false};
-    kj::Maybe<kj::Thread> watchdog;
+    bool terminated = false;
+    bool finished = false;
     bool reported = false;
+    kj::TimePoint graceEnd = kj::origin<kj::TimePoint>();
 
     Scope(CpuIsolateLimitEnforcer& owner, uint64_t& used, kj::StringPtr identity,
         kj::Function<void()> onExit)
         : owner(owner), used(used), identity(kj::str(identity)), onExit(kj::mv(onExit)) {
-      watchdog.emplace([this]() {
-        auto lock = stopped.lockExclusive();
-        while (!*lock) {
-          auto consumed = clock.now() - started + this->used;
-          if (consumed >= this->owner.cpuNs) {
-            this->owner.exceeded.store(true);
-            this->owner.isolate->TerminateExecution();
-            // 100 ms exceeds observed interrupt jitter, and leaves ample time before 3 s kill.
-            lock.wait([](bool stopped) { return stopped; }, 100 * kj::MILLISECONDS);
-            if (!*lock) {
-              this->owner.culprit(this->identity, clock.now() - started + this->used);
-              reported = true;
-            }
-            break;
-          }
-          lock.wait([](bool stopped) { return stopped; }, 1 * kj::MILLISECONDS);
+      owner.watchdog->add(*this, firstCheck());
+    }
+    kj::Maybe<kj::TimePoint> firstCheck() const {
+      auto now = LimitWatchdog::now();
+      if (owner.exceeded.load()) return now;
+      return now + static_cast<int64_t>(used < owner.cpuNs ? owner.cpuNs - used : 0) * kj::NANOSECONDS;
+    }
+    kj::Maybe<kj::TimePoint> watch(kj::TimePoint now) override {
+      if (finished) return kj::none;
+      if (terminated) {
+        if (now < graceEnd) return graceEnd;
+        auto consumed = clock.now() - started + used;
+        if (consumed >= owner.cpuNs) {
+          owner.culprit(identity, consumed);
+          reported = true;
+          finished = true;
+          return kj::none;
         }
-      });
+        terminated = false;
+        return now + 1 * kj::MILLISECONDS;
+      }
+      auto consumed = clock.now() - started + used;
+      if (consumed >= owner.cpuNs || owner.exceeded.load()) {
+        owner.exceeded.store(true);
+        owner.isolate->TerminateExecution();
+        terminated = true;
+        graceEnd = now + 100 * kj::MILLISECONDS;
+        return graceEnd;
+      }
+      return now + static_cast<int64_t>(kj::max(owner.cpuNs - consumed, MIN_RECHECK_NS)) * kj::NANOSECONDS;
     }
     ~Scope() noexcept(false) {
-      { auto lock = stopped.lockExclusive(); *lock = true; }
-      watchdog = kj::none;
-      used += clock.now() - started;
-      if (used >= owner.cpuNs) owner.exceeded.store(true);
+      owner.watchdog->remove(*this, [this]() { used += clock.now() - started; });
+      if (used >= owner.cpuNs && !owner.exceeded.exchange(true)) owner.watchdog->wake();
       if (reported && owner.state.size()) unlink(owner.state.cStr());
       if (owner.exceeded.load()) owner.record("terminated", identity, used);
       onExit();
@@ -211,6 +269,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   kj::String state;
   v8::Isolate* isolate = nullptr;
   uint64_t startupUsed = 0;
+  LimitWatchdog* watchdog = nullptr;
   std::atomic<bool> exceeded{false};
   bool published = false;
   kj::ForkedPromise<void> failure = nullptr;
