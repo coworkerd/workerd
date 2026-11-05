@@ -1,3 +1,4 @@
+#include "coworkerd-steady.h"
 // Copyright (c) 2026 Cloudflare, Inc.
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
@@ -1169,6 +1170,7 @@ kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
     ::rust::Box<ChannelFactory> channels,
     kj::Own<RequestMetadata> metadata,
     ::rust::Box<WorkerInterfaceList> tails) {
+  coworkerdServing();
   TRACE_EVENT("workerd", "worker_start_request()");
   auto& impl = worker.getImpl();
   auto entrypointName = toKj(entrypoint);

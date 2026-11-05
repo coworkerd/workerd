@@ -32,6 +32,8 @@ wd_cc_library(
         "coworkerd-cpu-limit.h",
         "coworkerd-memory-limit.c++",
         "coworkerd-memory-limit.h",
+        "coworkerd-steady.c++",
+        "coworkerd-steady.h",
         "worker-factory-actor.c++",
         "worker-factory-impl.h",
         "worker-factory-listen.c++",

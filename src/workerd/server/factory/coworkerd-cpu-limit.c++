@@ -106,6 +106,25 @@ uint32_t cpuLimitFromEnvironment() {
   }
   return static_cast<uint32_t>(value);
 }
+CoworkerdNamedLimits coworkerdNamedLimits(kj::StringPtr isolateName) {
+  // The loader key's last segment, written by the node's runtime bridge only: `limits=<cpuMs>:<memoryMiB>`.
+  // Anything else -- another segment, a number that does not fit, a name of any other shape -- names no limit.
+  const auto text = isolateName.asArray();
+  size_t at = text.size();
+  while (at > 0 && text[at - 1] != '#') --at;
+  const kj::StringPtr marker = "limits="_kj;
+  if (at == 0 || text.size() - at <= marker.size()) return {};
+  for (size_t i = 0; i < marker.size(); ++i) if (text[at + i] != marker[i]) return {};
+  uint64_t values[2] = {0, 0};
+  size_t field = 0;
+  for (size_t p = at + marker.size(); p < text.size(); ++p) {
+    if (text[p] == ':' && field == 0) { ++field; continue; }
+    if (text[p] < '0' || text[p] > '9') return {};
+    values[field] = values[field] * 10 + static_cast<uint64_t>(text[p] - '0');
+    if (values[field] > std::numeric_limits<uint32_t>::max()) return {};
+  }
+  return {static_cast<uint32_t>(values[0]), static_cast<uint32_t>(values[1])};
+}
 int coworkerdPid() {
   static const int pid = getpid();
   return pid;
