@@ -295,7 +295,7 @@ class RequestLimits final: public LimitEnforcer {
           abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
     // The request context ends here, after its waitUntil work, whether or not it ran JavaScript. An actor's context
     // ends with the actor: its row has the CPU of all its events.
-    ~RequestLimits() noexcept(false) { limits->completed(identity, toppedUp + cpuUsed); }
+    ~RequestLimits() noexcept(false) { limits->completed(identity, toppedUp + cpuUsed, gcExcluded); }
     struct IdentityScope {
       jsg::AsyncContextFrame::StorageScope frame;
       MemoryStartupIdentityScope startup;
@@ -305,13 +305,13 @@ class RequestLimits final: public LimitEnforcer {
                 lock.v8Ref<v8::Value>(jsg::v8Str(lock.v8Isolate, owner.identity))),
             startup(owner.identity),
             limit(owner.limits->enterRequestJs(owner.cpuUsed, owner.identity,
-                [&owner]() { if (owner.limits->publish()) owner.abortIsolate(); })) {}
+                [&owner]() { if (owner.limits->publish()) owner.abortIsolate(); }, &owner.gcExcluded)) {}
     };
     kj::Own<void> enterJs(jsg::Lock& lock, IoContext&) override {
       if (limits->publish()) abortIsolate();
       limits->requireNotExceeded();
       if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
-      return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
+      return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); }, &gcExcluded);
     }
     // Each new event a request receives starts with its CPU topped up: a message of a WebSocket it accepted, a call on
     // an RPC target it handed out, and -- upstream's contract, which tops up actors only -- an actor's request (an
@@ -323,10 +323,10 @@ class RequestLimits final: public LimitEnforcer {
       toppedUp += cpuUsed;
       cpuUsed = 0;
       const auto now = LimitWatchdog::now();
-      if (toppedUp > reported && now - lastProgress >= PROGRESS_INTERVAL) {
+      if (toppedUp + gcExcluded > reported && now - lastProgress >= PROGRESS_INTERVAL) {
         lastProgress = now;
-        reported = toppedUp;
-        limits->progress(identity, toppedUp);
+        reported = toppedUp + gcExcluded;
+        limits->progress(identity, toppedUp, gcExcluded);
       }
     }
     void newSubrequest(bool inHouse) override { fallback->newSubrequest(inHouse); }
@@ -353,7 +353,7 @@ class RequestLimits final: public LimitEnforcer {
     kj::Function<void()> abortIsolate;
     kj::String identity;
     // What the limit charged since the last top-up, before it, and the GC CPU it did not charge.
-    uint64_t cpuUsed = 0, toppedUp = 0;
+    uint64_t cpuUsed = 0, toppedUp = 0, gcExcluded = 0;
     // The last progress row: when, and the CPU it reported.
     static constexpr kj::Duration PROGRESS_INTERVAL = 1 * kj::SECONDS;
     kj::TimePoint lastProgress = kj::origin<kj::TimePoint>();
