@@ -255,11 +255,20 @@ class RequestLimits final: public LimitEnforcer {
         kj::String identity, kj::Function<void()> abortIsolate)
         : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
           abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
-    ~RequestLimits() noexcept(false) { limits->completed(identity, cpuUsed); }
+    ~RequestLimits() noexcept(false) { limits->completed(identity, toppedUp + cpuUsed); }
     kj::Own<void> enterJs(jsg::Lock&, IoContext&) override {
       return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
     }
-    void topUpActor() override {}
+    void topUpActor() override {
+      toppedUp += cpuUsed;
+      cpuUsed = 0;
+      auto now = LimitWatchdog::now();
+      if (toppedUp > reported && now - lastProgress >= 1 * kj::SECONDS) {
+        lastProgress = now;
+        reported = toppedUp;
+        limits->progress(identity, toppedUp);
+      }
+    }
     void newSubrequest(bool inHouse) override { fallback->newSubrequest(inHouse); }
     void newKvRequest(KvOpType type) override { fallback->newKvRequest(type); }
     void newAnalyticsEngineRequest() override { fallback->newAnalyticsEngineRequest(); }
@@ -280,7 +289,8 @@ class RequestLimits final: public LimitEnforcer {
     kj::Own<CpuIsolateLimitEnforcer> limits;
     kj::Function<void()> abortIsolate;
     kj::String identity;
-    uint64_t cpuUsed = 0;
+    uint64_t cpuUsed = 0, toppedUp = 0, reported = 0;
+    kj::TimePoint lastProgress = kj::origin<kj::TimePoint>();
   };
 
 
