@@ -221,11 +221,13 @@ impl crate::channels::WorkerStub {
         &self,
         name: KjMaybe<&str>,
         props: KjOwn<Frankenvalue>,
+        invocation_identity: KjMaybe<&str>,
     ) -> Box<SubrequestChannel> {
         SubrequestChannel::new(Rc::new(DynamicEntrypoint {
             stub: Rc::clone(&self.0),
             name: Option::<&str>::from(name).map(str::to_owned),
             props,
+            invocation_identity: Option::<&str>::from(invocation_identity).map(str::to_owned),
         }))
     }
 
@@ -257,10 +259,14 @@ struct DynamicEntrypoint {
     /// `None` is the default entrypoint.
     name: Option<String>,
     props: KjOwn<Frankenvalue>,
+    invocation_identity: Option<String>,
 }
 
 impl Channel for DynamicEntrypoint {
-    fn start_request(&self, metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
+    fn start_request(&self, mut metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
+        if let Some(identity) = &self.invocation_identity {
+            ffi::request_metadata_set_coworkerd_invocation_identity(metadata.as_mut(), identity);
+        }
         let (stub, name) = (Rc::clone(&self.stub), self.name.clone());
         let props = ffi::frankenvalue_clone(&self.props);
         // Starts the request on the started worker. The request keeps the stub alive until it

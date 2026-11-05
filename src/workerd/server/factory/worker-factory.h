@@ -339,6 +339,8 @@ bool request_metadata_from_handoff(const RequestMetadata& metadata);
 ::rust::Vec<::rust::String> request_metadata_caused_by(const RequestMetadata& metadata);
 void request_metadata_set_cause(
     RequestMetadata& metadata, bool fromHandoff, ::rust::Vec<::rust::String> causedBy);
+void request_metadata_set_coworkerd_invocation_identity(
+    RequestMetadata& metadata, ::rust::Str identity);
 void request_metadata_set_actor_self_token(const WorkerFactory& factory,
     RequestMetadata& metadata,
     ::rust::Str uniqueKey,

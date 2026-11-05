@@ -574,6 +574,11 @@ pub mod ffi {
             from_handoff: bool,
             caused_by: Vec<String>,
         );
+        /// Copies the reporting identity bound to a Coworkerd dynamic entrypoint.
+        fn request_metadata_set_coworkerd_invocation_identity(
+            metadata: Pin<&mut RequestMetadata>,
+            identity: &str,
+        );
         /// Makes stubs the request creates for the actor itself restorable: they encode the
         /// actor's namespace and id.
         fn request_metadata_set_actor_self_token(
@@ -902,6 +907,7 @@ pub mod ffi {
             self: &WorkerStub,
             name: KjMaybe<&str>,
             props: KjOwn<Frankenvalue>,
+            invocation_identity: KjMaybe<&str>,
         ) -> Box<SubrequestChannel>;
         fn actor_class(
             self: &WorkerStub,

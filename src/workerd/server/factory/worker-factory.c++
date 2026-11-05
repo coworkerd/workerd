@@ -631,8 +631,10 @@ class WorkerStubChannelHandle final: public WorkerStubChannel {
   explicit WorkerStubChannelHandle(::rust::Box<WorkerStub> stub): stub(kj::mv(stub)) {}
 
   kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
-      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
-    return subrequest_channel_into_kj(stub->entrypoint(toRust(name), toOwn(kj::mv(props))));
+      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits,
+      kj::Maybe<kj::String> invocationIdentity) override {
+    return subrequest_channel_into_kj(
+        stub->entrypoint(toRust(name), toOwn(kj::mv(props)), toRust(invocationIdentity)));
   }
   kj::Rc<IoChannelFactory::ActorClassChannel> getActorClassResolved(
       kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
@@ -1148,8 +1150,10 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
   }
 
   auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
+  auto& invocationIdentity = metadata.coworkerdInvocationIdentity != kj::none
+      ? metadata.coworkerdInvocationIdentity : metadata.cfBlobJson;
   auto requestLimits = wrapCpuRequestLimits(kj::refcounted<NullLimitEnforcer>(),
-      *worker.cpuLimits, metadata.cfBlobJson, [channel = ioChannelFactory.addRef()]() mutable {
+      *worker.cpuLimits, invocationIdentity, [channel = ioChannelFactory.addRef()]() mutable {
         channel->abortIsolate("CPU limit exceeded");
       });
   auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
@@ -1290,6 +1294,11 @@ void request_metadata_set_cause(
     RequestMetadata& metadata, bool fromHandoff, ::rust::Vec<::rust::String> causedBy) {
   metadata.fromHandoff = FromHandoff(fromHandoff);
   metadata.causedBy = KJ_MAP(object, causedBy) { return kj::str(object); };
+}
+
+void request_metadata_set_coworkerd_invocation_identity(
+    RequestMetadata& metadata, ::rust::Str identity) {
+  metadata.coworkerdInvocationIdentity = kj::str(identity);
 }
 
 namespace {
