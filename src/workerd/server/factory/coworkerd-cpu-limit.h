@@ -1,4 +1,5 @@
 #pragma once
+#include <workerd/jsg/coworkerd-rpc-code.h>
 #include "coworkerd-channels.h"
 
 #include <workerd/io/actor-cache.h>
@@ -113,7 +114,8 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     return exceeded.load() ? kj::Maybe<EventOutcome>(EventOutcome::EXCEEDED_CPU) : kj::none;
   }
   kj::Exception exception() {
-    return KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED");
+    return jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED"),
+        "CPU_LIMIT_EXCEEDED");
   }
   void requireNotExceeded() {
     if (exceeded.load()) kj::throwFatalException(exception());
