@@ -26,24 +26,19 @@
 #endif
 
 namespace workerd::server {
-// Creation identity is distinct from per-request origin. The factory slot is empty
-// until the trusted loader transports this record across the existing bridge.
+// Explicit creation identity supplied by the platform loader, distinct from request origin.
 struct CoworkerdWorkerIdentity {
   kj::String tenant;
-  kj::String version;
+  kj::String workerId;
+  kj::String versionId;
   uint64_t generation = 0;
+  uint32_t cpuLimitMs = 0;
+  uint32_t memoryLimitMiB = 0;
 };
-uint32_t cpuLimitFromEnvironment();
-// The limits one Worker names (Coworkerd v49), as the loader key the node's runtime bridge chose carries them:
-// the isolate name's last segment `limits=<cpuMs>:<memoryMiB>` (either may be 0: the process's value, which
-// COWORKERD_CPU_LIMIT_MS and COWORKERD_MEMORY_LIMIT_MIB give, applies to it instead). Both are zero for any
-// other name, so an isolate whose Worker names no limit behaves as before. An isolate's heap constraint is
-// fixed when it is created, and a Worker's limits are part of the key it is loaded under, so a Worker whose
-// limits change is loaded as another isolate rather than kept at the old ones.
-struct CoworkerdNamedLimits {
+struct CoworkerdAppliedLimits {
   uint32_t cpuMs = 0, memoryMiB = 0;
 };
-CoworkerdNamedLimits coworkerdNamedLimits(kj::StringPtr isolateName);
+uint32_t cpuLimitFromEnvironment();
 kj::String escapeCpuJsonString(kj::StringPtr text);
 void recordPlatformFacts(kj::StringPtr name, bool dynamic);
 kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey();
@@ -110,22 +105,21 @@ class LimitWatchdog {
 // CPU accounting stays on the isolate thread; only termination and event writes cross threads.
 class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  public:
-  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic,
-      kj::StringPtr startupIdentity = "")
-      : fallback(kj::mv(fallback)), name(kj::str(name)), named(coworkerdNamedLimits(name)),
-        cpuNs(uint64_t(named.cpuMs ? named.cpuMs : cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
-        dynamic(dynamic),
-        startupIdentity(kj::str(startupIdentity)) {
-    if (dynamic) {
-      auto limit = named.memoryMiB ? named.memoryMiB : memoryLimitFromEnvironment();
+  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name,
+      const kj::Maybe<CoworkerdWorkerIdentity>& identity, kj::StringPtr startupIdentity = "")
+      : fallback(kj::mv(fallback)), name(kj::str(name)),
+        cpuNs(0), tenantWorker(identity != kj::none), startupIdentity(kj::str(startupIdentity)) {
+    KJ_IF_SOME(record, identity) {
+      cpuNs = uint64_t(record.cpuLimitMs ? record.cpuLimitMs : cpuLimitFromEnvironment()) * 1000000;
+      auto limit = record.memoryLimitMiB ? record.memoryLimitMiB : memoryLimitFromEnvironment();
       if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
     }
     // The isolate's GC callbacks account for excluded CPU and long pauses.
     if (gcSettings().observes()) {
-      gc = std::make_shared<IsolateGc>(name, dynamic, cpuNs);
+      gc = std::make_shared<IsolateGc>(name, identity, cpuNs);
     }
     if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
-    recordPlatformFacts(name, dynamic);
+    recordPlatformFacts(name, tenantWorker);
     auto paf = kj::newPromiseAndFulfiller<void>();
     failure = paf.promise.fork();
     fulfiller = kj::mv(paf.fulfiller);
@@ -138,7 +132,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     if (memory) {
       params.constraints.ConfigureDefaultsFromHeapSize(0, memory->limitBytes);
       params.array_buffer_allocator_shared = memory;
-    } else if (!dynamic && gcSettings().staticHeapBytes) {
+    } else if (!tenantWorker && gcSettings().staticHeapBytes) {
       // The runtime: a heap sized for its working set rather than from the machine, so its collections stay small
       // (its young generation follows from the maximum).
       params.constraints.ConfigureDefaultsFromHeapSize(0, gcSettings().staticHeapBytes);
@@ -175,7 +169,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     isolate = value;
     if (memory) memory->customize(value);
     if (gc) gc->install(value);
-    if (!dynamic && gcSettings().staticHeapBytes) recordStaticHeapLimit(value, name);
+    if (!tenantWorker && gcSettings().staticHeapBytes) recordStaticHeapLimit(value, name);
   }
   bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
   // Whether a request of this isolate carries the memory execution identity (v33's attribution of a fatal
@@ -184,11 +178,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   // keeps reporting who was executing.
   bool memoryIdentityWanted() const { return memory != nullptr || memoryLimitFromEnvironment() != 0; }
   // The limits in force here, whichever named them: what the state endpoint shows as applied.
-  CoworkerdNamedLimits applied() const {
+  CoworkerdAppliedLimits applied() const {
     return {static_cast<uint32_t>(cpuNs / 1000000), memory ? static_cast<uint32_t>(memory->limitBytes >> 20) : 0};
   }
-  // A dynamic Worker's request contexts report their end on the event pipe, limits or not.
-  bool reportsCompletion() const { return dynamic && cpuEventsDescriptor() >= 0; }
+  // A tenant Worker's request contexts report their end on the event pipe, limits or not.
+  bool reportsCompletion() const { return tenantWorker && cpuEventsDescriptor() >= 0; }
   kj::Maybe<EventOutcome> outcome() {
     if (exceeded->load() == IsolateLimitCause::NONE) return kj::none;
     return exceeded->load() == IsolateLimitCause::MEMORY ? EventOutcome::EXCEEDED_MEMORY : EventOutcome::EXCEEDED_CPU;
@@ -247,16 +241,16 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     }
     writeLimitEvent(row);
   }
-  // The end of a dynamic Worker's request context (after its waitUntil work), whether or not it
+  // The end of a tenant Worker's request context (after its waitUntil work), whether or not it
   // ever ran JavaScript; without limits only the event pipe gets the row. `used` is what the limit charged, and
   // `gcExcluded` the GC CPU it did not: the request's CPU is their sum.
   void completed(kj::StringPtr identity, uint64_t used, uint64_t gcExcluded) {
-    if (dynamic) record("completed", identity, used, gcExcluded);
+    if (tenantWorker) record("completed", identity, used, gcExcluded);
   }
   // A request's CPU so far while it lasts -- a WebSocket's events top it up, and its context ends only with the
   // connection --, in the completed row's terms: on the event pipe only, where the node meters it, never in the log.
   void progress(kj::StringPtr identity, uint64_t used, uint64_t gcExcluded) {
-    if (dynamic) writeLimitEvent(report("cpu-progress", identity, used, gcExcluded));
+    if (tenantWorker) writeLimitEvent(report("cpu-progress", identity, used, gcExcluded));
   }
   // Written while a termination has not taken effect; a later terminated row for the same
   // invocation withdraws it.
@@ -407,9 +401,8 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  private:
   kj::Own<IsolateLimitEnforcer> fallback;
   kj::String name;
-  CoworkerdNamedLimits named;
   uint64_t cpuNs;
-  bool dynamic;
+  const bool tenantWorker;
   kj::String startupIdentity;
   v8::Isolate* isolate = nullptr;
   uint64_t startupUsed = 0;
