@@ -274,15 +274,19 @@ kj::Rc<IoChannelFactory::RpcChannel> IoChannelFactory::makeRestoredRpcChannel(
 }
 
 kj::Rc<IoChannelFactory::SubrequestChannel> WorkerStubChannel::getEntrypoint(
-    kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) {
+    kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits,
+    kj::Maybe<kj::String> invocationIdentity) {
   KJ_IF_SOME(promise, props.resolveCaps(resolveCap)) {
     return kj::rc<PromisedSubrequestChannel>(
-        promise.then([self = addRefToThis(), name = kj::mv(name), limits = kj::mv(limits)](
+        promise.then([self = addRefToThis(), name = kj::mv(name), limits = kj::mv(limits),
+                         invocationIdentity = kj::mv(invocationIdentity)](
                          Frankenvalue props) mutable {
-      return self->getEntrypointResolved(kj::mv(name), kj::mv(props), kj::mv(limits));
+      return self->getEntrypointResolved(
+          kj::mv(name), kj::mv(props), kj::mv(limits), kj::mv(invocationIdentity));
     }));
   } else {
-    return getEntrypointResolved(kj::mv(name), kj::mv(props), kj::mv(limits));
+    return getEntrypointResolved(
+          kj::mv(name), kj::mv(props), kj::mv(limits), kj::mv(invocationIdentity));
   }
 }
 

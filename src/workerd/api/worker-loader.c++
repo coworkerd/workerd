@@ -28,11 +28,13 @@ jsg::Ref<Fetcher> WorkerStub::getEntrypoint(jsg::Lock& js,
     jsg::Optional<EntrypointOptions> options) {
   Frankenvalue props;
   kj::Maybe<ResourceLimits> limits;
+  kj::Maybe<kj::String> invocationIdentity;
   KJ_IF_SOME(o, options) {
     KJ_IF_SOME(p, o.props) {
       props = Frankenvalue::fromJs(js, p.getHandle(js));
     }
     limits = o.limits;
+    invocationIdentity = kj::mv(o.coworkerdInvocationIdentity);
   }
 
   kj::Maybe<kj::String> entrypointName;
@@ -44,7 +46,8 @@ jsg::Ref<Fetcher> WorkerStub::getEntrypoint(jsg::Lock& js,
     }
   }
 
-  auto subreqChannel = channel->getEntrypoint(kj::mv(entrypointName), kj::mv(props), limits);
+  auto subreqChannel = channel->getEntrypoint(
+      kj::mv(entrypointName), kj::mv(props), limits, kj::mv(invocationIdentity));
   return js.alloc<Fetcher>(IoContext::current().addObject(kj::mv(subreqChannel)));
 }
 
