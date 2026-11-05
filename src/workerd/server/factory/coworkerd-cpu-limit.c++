@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <csignal>
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <limits>
 #include <v8-isolate.h>
 
@@ -85,11 +87,9 @@ uint32_t cpuLimitFromEnvironment() {
   }
   return static_cast<uint32_t>(value);
 }
-kj::String cpuStateFromEnvironment() {
-  const char* value = std::getenv("COWORKERD_CPU_STATE");
-  if (value == nullptr) return kj::str("");
-  KJ_REQUIRE(*value != '\0', "COWORKERD_CPU_STATE must be a non-empty path");
-  return kj::str(value);
+int coworkerdPid() {
+  static const int pid = getpid();
+  return pid;
 }
 int cpuEventsDescriptor() {
   static const int descriptor = []() {
@@ -117,6 +117,53 @@ void writeLimitEvent(kj::StringPtr row) {
   ssize_t written;
   do { written = write(fd, row.cStr(), row.size()); } while (written < 0 && errno == EINTR);
 }
+namespace {
+class InheritedMapping {
+ public:
+  InheritedMapping(const char* variable, size_t expectedSize, int protection, bool exactSize = false) {
+    const char* text = std::getenv(variable);
+    if (!text) return;
+    KJ_REQUIRE(*text, "descriptor setting must be a number", variable);
+    int fd = 0;
+    for (auto* p = text; *p; ++p) {
+      KJ_REQUIRE(*p >= '0' && *p <= '9' && fd < 1000000,
+          "descriptor setting must be a number", variable);
+      fd = fd * 10 + (*p - '0');
+    }
+    KJ_REQUIRE(fd > STDERR_FILENO, "invalid inherited descriptor", variable);
+    int flags = fcntl(fd, F_GETFD);
+    KJ_REQUIRE(flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0,
+        "invalid inherited descriptor", variable);
+    auto closeFd = kj::defer([fd]() { close(fd); });
+    struct stat info;
+    // POSIX shared memory may be rounded up to the host page size.
+    KJ_REQUIRE(fstat(fd, &info) == 0 &&
+        (exactSize ? info.st_size == expectedSize : info.st_size >= expectedSize),
+        "invalid inherited shared memory", variable);
+    auto mapping = mmap(nullptr, expectedSize, protection, MAP_SHARED, fd, 0);
+    KJ_REQUIRE(mapping != MAP_FAILED, "cannot map inherited shared memory", variable);
+    base = mapping;
+    size = expectedSize;
+  }
+  ~InheritedMapping() { if (base) munmap(base, size); }
+  void* base = nullptr;
+ private:
+  size_t size = 0;
+};
+}  // namespace
+
+void initializeCoworkerdChannels() {
+  coworkerdPid();
+  cpuEventsDescriptor();
+  static InheritedMapping lifecycle("COWORKERD_LIFECYCLE_FD",
+      64 + 2 * (16 + size_t(8 << 20)), PROT_READ | PROT_WRITE);
+  if (lifecycle.base) {
+    auto* header = static_cast<const uint32_t*>(lifecycle.base);
+    KJ_REQUIRE(header[2] == 0x434c5743 && header[3] == (8 << 20), "invalid lifecycle channel");
+  }
+  static InheritedMapping band("COWORKERD_MEMORY_BAND_FD", 4096, PROT_READ, true);
+}
+
 void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
   auto line = kj::str("[coworkerd-platform] {\"isolate\":", escapeCpuJsonString(name),
       ",\"dynamic\":", dynamic ? "true" : "false", ",\"canCreateNewIsolateGroups\":",
@@ -208,9 +255,7 @@ class RequestLimits final: public LimitEnforcer {
         kj::String identity, kj::Function<void()> abortIsolate)
         : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
           abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
-    ~RequestLimits() noexcept(false) {
-      if (cpuUsed) limits->record("completed", identity, cpuUsed);
-    }
+    ~RequestLimits() noexcept(false) { limits->completed(identity, cpuUsed); }
     kj::Own<void> enterJs(jsg::Lock&, IoContext&) override {
       return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
     }
@@ -244,7 +289,7 @@ class RequestLimits final: public LimitEnforcer {
 kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
     kj::Function<void()> abortIsolate) {
-  if (!limits.isEnabled()) return fallback;
+  if (!limits.isEnabled() && !limits.reportsCompletion()) return fallback;
   return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
 }
 kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
