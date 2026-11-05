@@ -27,6 +27,8 @@ struct CoworkerdWorkerIdentity {
 };
 uint32_t cpuLimitFromEnvironment();
 kj::String cpuStateFromEnvironment();
+int cpuEventsDescriptor();
+void writeLimitEvent(kj::StringPtr row);
 kj::String escapeCpuJsonString(kj::StringPtr text);
 void recordPlatformFacts(kj::StringPtr name, bool dynamic);
 
@@ -37,6 +39,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
       : fallback(kj::mv(fallback)), name(kj::str(name)),
         cpuNs(uint64_t(cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
         state(cpuStateFromEnvironment()) {
+    if (isEnabled()) cpuEventsDescriptor();
     recordPlatformFacts(name, dynamic);
     auto paf = kj::newPromiseAndFulfiller<void>();
     failure = paf.promise.fork();
@@ -108,12 +111,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     auto log = kj::str("[cpu-limit] ", row);
     ssize_t written;
     do { written = write(STDERR_FILENO, log.cStr(), log.size()); } while (written < 0 && errno == EINTR);
-    if (state.size() == 0) return;
-    auto path = kj::str(state, ".events");
-    if (auto* file = fopen(path.cStr(), "a")) {
-      fwrite(row.cStr(), 1, row.size(), file);
-      fclose(file);
-    }
+    writeLimitEvent(row);
   }
   void culprit(kj::StringPtr identity, uint64_t used) {
     if (state.size() == 0) return;
