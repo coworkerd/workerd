@@ -22,8 +22,11 @@ class WorkerStub: public jsg::Object {
   struct EntrypointOptions {
     jsg::Optional<jsg::JsRef<jsg::JsObject>> props;
     jsg::Optional<ResourceLimits> limits;
+    // Coworkerd platform runtime only: its LOADER capability is never given to tenant code.
+    // An owned JSON identity of this entrypoint, independent of request cf and mutable props.
+    jsg::Optional<kj::String> coworkerdInvocationIdentity;
 
-    JSG_STRUCT(props, limits);
+    JSG_STRUCT(props, limits, coworkerdInvocationIdentity);
   };
 
   jsg::Ref<Fetcher> getEntrypoint(jsg::Lock& js,
