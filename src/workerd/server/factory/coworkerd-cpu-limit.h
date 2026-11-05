@@ -33,6 +33,16 @@ struct CoworkerdWorkerIdentity {
   uint64_t generation = 0;
 };
 uint32_t cpuLimitFromEnvironment();
+// The limits one Worker names (Coworkerd v49), as the loader key the node's runtime bridge chose carries them:
+// the isolate name's last segment `limits=<cpuMs>:<memoryMiB>` (either may be 0: the process's value, which
+// COWORKERD_CPU_LIMIT_MS and COWORKERD_MEMORY_LIMIT_MIB give, applies to it instead). Both are zero for any
+// other name, so an isolate whose Worker names no limit behaves as before. An isolate's heap constraint is
+// fixed when it is created, and a Worker's limits are part of the key it is loaded under, so a Worker whose
+// limits change is loaded as another isolate rather than kept at the old ones.
+struct CoworkerdNamedLimits {
+  uint32_t cpuMs = 0, memoryMiB = 0;
+};
+CoworkerdNamedLimits coworkerdNamedLimits(kj::StringPtr isolateName);
 kj::String escapeCpuJsonString(kj::StringPtr text);
 void recordPlatformFacts(kj::StringPtr name, bool dynamic);
 kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey();
@@ -101,12 +111,12 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  public:
   CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic,
       kj::StringPtr startupIdentity = "")
-      : fallback(kj::mv(fallback)), name(kj::str(name)),
-        cpuNs(uint64_t(cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
+      : fallback(kj::mv(fallback)), name(kj::str(name)), named(coworkerdNamedLimits(name)),
+        cpuNs(uint64_t(named.cpuMs ? named.cpuMs : cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
         dynamic(dynamic),
         startupIdentity(kj::str(startupIdentity)) {
     if (dynamic) {
-      auto limit = memoryLimitFromEnvironment();
+      auto limit = named.memoryMiB ? named.memoryMiB : memoryLimitFromEnvironment();
       if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
     }
     if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
@@ -161,7 +171,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   // OOM): this isolate has a memory limit -- its Worker's own (v49) or the process's -- or the process has
   // one while this isolate has none, as before v49, so that every isolate of a process with a memory limit
   // keeps reporting who was executing.
-  bool memoryIdentityWanted() const { return memoryLimitFromEnvironment() != 0; }
+  bool memoryIdentityWanted() const { return memory != nullptr || memoryLimitFromEnvironment() != 0; }
+  // The limits in force here, whichever named them: what the state endpoint shows as applied.
+  CoworkerdNamedLimits applied() const {
+    return {static_cast<uint32_t>(cpuNs / 1000000), memory ? static_cast<uint32_t>(memory->limitBytes >> 20) : 0};
+  }
   // A dynamic Worker's request contexts report their end on the event pipe, limits or not.
   bool reportsCompletion() const { return dynamic && cpuEventsDescriptor() >= 0; }
   kj::Maybe<EventOutcome> outcome() {
@@ -392,6 +406,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  private:
   kj::Own<IsolateLimitEnforcer> fallback;
   kj::String name;
+  CoworkerdNamedLimits named;
   uint64_t cpuNs;
   bool dynamic;
   kj::String startupIdentity;
