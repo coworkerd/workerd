@@ -1,6 +1,7 @@
 #pragma once
 
 #include <workerd/jsg/coworkerd-rpc-code.h>
+#include "coworkerd-gc.h"
 #include "coworkerd-channels.h"
 #include "coworkerd-memory-limit.h"
 
@@ -119,6 +120,10 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
       auto limit = named.memoryMiB ? named.memoryMiB : memoryLimitFromEnvironment();
       if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
     }
+    // The isolate's GC callbacks account for excluded CPU and long pauses.
+    if (gcSettings().observes()) {
+      gc = std::make_shared<IsolateGc>(name, dynamic, cpuNs);
+    }
     if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
     recordPlatformFacts(name, dynamic);
     auto paf = kj::newPromiseAndFulfiller<void>();
@@ -133,6 +138,10 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     if (memory) {
       params.constraints.ConfigureDefaultsFromHeapSize(0, memory->limitBytes);
       params.array_buffer_allocator_shared = memory;
+    } else if (!dynamic && gcSettings().staticHeapBytes) {
+      // The runtime: a heap sized for its working set rather than from the machine, so its collections stay small
+      // (its young generation follows from the maximum).
+      params.constraints.ConfigureDefaultsFromHeapSize(0, gcSettings().staticHeapBytes);
     }
     return params;
   }
@@ -165,6 +174,8 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   void customizeIsolate(v8::Isolate* value) override {
     isolate = value;
     if (memory) memory->customize(value);
+    if (gc) gc->install(value);
+    if (!dynamic && gcSettings().staticHeapBytes) recordStaticHeapLimit(value, name);
   }
   bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
   // Whether a request of this isolate carries the memory execution identity (v33's attribution of a fatal
@@ -219,14 +230,15 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
         escapeCpuJsonString(version), ",\"invocationId\":", escapeCpuJsonString(invocation), ',');
   }
 
-  kj::String report(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
+  // `gcExcluded`: the GC CPU the limit did not charge (coworkerd-gc.h), in the row only when there was some.
+  kj::String report(kj::StringPtr event, kj::StringPtr identity, uint64_t used, uint64_t gcExcluded = 0) {
     return kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":", escapeCpuJsonString(name),
         ',', identity, "\"cpuUsedNs\":", used, ",\"cpuLimitMs\":", cpuNs / 1000000,
         ",\"pid\":", coworkerdPid(), memory ? memory->metrics() : kj::str(""),
-        "}\n");
+        gcExcluded ? kj::str(",\"gcExcludedNs\":", gcExcluded) : kj::str(""), "}\n");
   }
-  void record(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
-    auto row = report(event, identity, used);
+  void record(kj::StringPtr event, kj::StringPtr identity, uint64_t used, uint64_t gcExcluded = 0) {
+    auto row = report(event, identity, used, gcExcluded);
     if (isEnabled()) {
       // All workerd processes append to one log: emit the prefix and JSON in one syscall.
       auto log = kj::str("[cpu-limit] ", row);
@@ -237,41 +249,20 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   }
   // The end of a dynamic Worker's request context (after its waitUntil work), whether or not it
   // ever ran JavaScript; without limits only the event pipe gets the row. `used` is what the limit charged, and
-  void completed(kj::StringPtr identity, uint64_t used) {
-    if (dynamic) record("completed", identity, used);
+  // `gcExcluded` the GC CPU it did not: the request's CPU is their sum.
+  void completed(kj::StringPtr identity, uint64_t used, uint64_t gcExcluded) {
+    if (dynamic) record("completed", identity, used, gcExcluded);
   }
   // A request's CPU so far while it lasts -- a WebSocket's events top it up, and its context ends only with the
   // connection --, in the completed row's terms: on the event pipe only, where the node meters it, never in the log.
-  void progress(kj::StringPtr identity, uint64_t used) {
-    if (dynamic) writeLimitEvent(report("cpu-progress", identity, used));
+  void progress(kj::StringPtr identity, uint64_t used, uint64_t gcExcluded) {
+    if (dynamic) writeLimitEvent(report("cpu-progress", identity, used, gcExcluded));
   }
   // Written while a termination has not taken effect; a later terminated row for the same
   // invocation withdraws it.
   void culprit(kj::StringPtr identity, uint64_t used) { writeLimitEvent(report("culprit", identity, used)); }
 
-  struct CpuClock {
-#if __APPLE__
-    mach_port_t thread = mach_thread_self();
-    ~CpuClock() { mach_port_deallocate(mach_task_self(), thread); }
-    uint64_t now() const {
-      thread_basic_info_data_t info;
-      mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
-      KJ_REQUIRE(thread_info(thread, THREAD_BASIC_INFO,
-          reinterpret_cast<thread_info_t>(&info), &count) == KERN_SUCCESS);
-      return (uint64_t(info.user_time.seconds) + info.system_time.seconds) * 1000000000
-          + (uint64_t(info.user_time.microseconds) + info.system_time.microseconds) * 1000;
-    }
-#else
-    clockid_t clock;
-    CpuClock() { KJ_REQUIRE(pthread_getcpuclockid(pthread_self(), &clock) == 0); }
-    uint64_t now() const {
-      timespec time;
-      KJ_REQUIRE(clock_gettime(clock, &time) == 0);
-      return uint64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
-    }
-#endif
-  };
-
+  using CpuClock = ThreadCpuClock;
 
   // One JS entry, registered with the watchdog while it runs. Its watch state is touched only by
   // the watchdog thread with the registry locked, and read here after unregistering.
@@ -282,6 +273,10 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     uint64_t& used;
     kj::String identity;
     kj::Function<void()> onExit;
+    // The request's excluded GC CPU (the gcExcludedNs of its rows), or null; and this entry inside the isolate's
+    // collections, which tells it what to exclude.
+    uint64_t* gcExcluded;
+    IsolateGc::Entry gcEntry;
     CpuClock clock;
     uint64_t started = clock.now();
     bool terminated = false;
@@ -292,8 +287,9 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     MemoryExecution previousMemory;
 
     Scope(CpuIsolateLimitEnforcer& owner, uint64_t& used, kj::StringPtr identity,
-        kj::Function<void()> onExit)
-        : owner(owner), used(used), identity(kj::str(identity)), onExit(kj::mv(onExit)) {
+        kj::Function<void()> onExit, uint64_t* gcExcluded = nullptr)
+        : owner(owner), used(used), identity(kj::str(identity)), onExit(kj::mv(onExit)), gcExcluded(gcExcluded),
+          gcEntry(owner.gc.get(), this->identity) {
       if (owner.memory) {
         oomReport = owner.report("memory-culprit", this->identity, 0);
         previousMemory = owner.memory->enter(oomReport);
@@ -314,7 +310,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
       if (terminated) {
         if (now < graceEnd) return graceEnd;
         auto finalCpu = clock.now();
-        auto finalConsumed = finalCpu - started + used;
+        auto finalConsumed = finalCpu - started - gcEntry.excluded(started, finalCpu) + used;
         if (owner.cpuNs && finalConsumed >= owner.cpuNs) {
           owner.culprit(identity, finalConsumed);
           reported = true;
@@ -326,8 +322,9 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
         terminated = false;
         return now + 1 * kj::MILLISECONDS;
       }
+      // The CPU of a major GC that ran inside this entry is not charged, as far as its Worker's budget goes.
       auto cpuNow = clock.now();
-      auto consumed = cpuNow - started + used;
+      auto consumed = cpuNow - started - gcEntry.excluded(started, cpuNow) + used;
       if ((owner.cpuNs && consumed >= owner.cpuNs) ||
           owner.exceeded->load() != IsolateLimitCause::NONE) {
         if (owner.cpuNs && consumed >= owner.cpuNs) {
@@ -346,8 +343,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     ~Scope() noexcept(false) {
       owner.watchdog->remove(*this, [this]() {
         auto cpuNow = clock.now();
-        used += cpuNow - started;
+        auto excluded = gcEntry.excluded(started, cpuNow);
+        used += cpuNow - started - excluded;
+        if (gcExcluded) *gcExcluded += excluded;
       });
+      if (owner.gc) owner.gc->measureOld();
       if (owner.cpuNs && used >= owner.cpuNs) {
         auto expected = IsolateLimitCause::NONE;
         if (owner.exceeded->compare_exchange_strong(expected, IsolateLimitCause::CPU)) {
@@ -376,10 +376,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     auto& self = const_cast<CpuIsolateLimitEnforcer&>(*this);
     return kj::heap<AuxiliaryScope>(self, memoryExecutionIdentity(lock), result);
   }
-  kj::Own<void> enterRequestJs(uint64_t& used, kj::StringPtr identity, kj::Function<void()> onExit) {
+  kj::Own<void> enterRequestJs(uint64_t& used, kj::StringPtr identity, kj::Function<void()> onExit,
+      uint64_t* gcExcluded = nullptr) {
     requireNotExceeded();
     if (!isEnabled()) return {};
-    return kj::heap<Scope>(*this, used, identity, kj::mv(onExit));
+    return kj::heap<Scope>(*this, used, identity, kj::mv(onExit), gcExcluded);
   }
   struct StartupScope {
     jsg::AsyncContextFrame::StorageScope frame;
@@ -415,6 +416,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   LimitWatchdog* watchdog = nullptr;
   IsolateLimitState exceeded = std::make_shared<std::atomic<IsolateLimitCause>>(IsolateLimitCause::NONE);
   std::shared_ptr<IsolateMemoryLimit> memory;
+  std::shared_ptr<IsolateGc> gc;
   bool published = false;
   kj::ForkedPromise<void> failure = nullptr;
   kj::Own<kj::PromiseFulfiller<void>> fulfiller;
