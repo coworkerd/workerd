@@ -1,4 +1,5 @@
 #pragma once
+#include "coworkerd-channels.h"
 
 #include <workerd/io/actor-cache.h>
 #include <workerd/io/limit-enforcer.h>
@@ -27,9 +28,6 @@ struct CoworkerdWorkerIdentity {
   uint64_t generation = 0;
 };
 uint32_t cpuLimitFromEnvironment();
-kj::String cpuStateFromEnvironment();
-int cpuEventsDescriptor();
-void writeLimitEvent(kj::StringPtr row);
 kj::String escapeCpuJsonString(kj::StringPtr text);
 void recordPlatformFacts(kj::StringPtr name, bool dynamic);
 
@@ -84,7 +82,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic)
       : fallback(kj::mv(fallback)), name(kj::str(name)),
         cpuNs(uint64_t(cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
-        state(cpuStateFromEnvironment()) {
+        dynamic(dynamic) {
     if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
     recordPlatformFacts(name, dynamic);
     auto paf = kj::newPromiseAndFulfiller<void>();
@@ -110,6 +108,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   void markPerfEvent(kj::LiteralStringConst name) const override { fallback->markPerfEvent(name); }
   void customizeIsolate(v8::Isolate* value) override { isolate = value; }
   bool isEnabled() const { return cpuNs != 0; }
+  bool reportsCompletion() const { return dynamic && cpuEventsDescriptor() >= 0; }
   kj::Maybe<EventOutcome> outcome() {
     return exceeded.load() ? kj::Maybe<EventOutcome>(EventOutcome::EXCEEDED_CPU) : kj::none;
   }
@@ -149,26 +148,22 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   kj::String report(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
     return kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":", escapeCpuJsonString(name),
         ',', identity, "\"cpuUsedNs\":", used, ",\"cpuLimitMs\":", cpuNs / 1000000,
-        ",\"pid\":", getpid(), "}\n");
+        ",\"pid\":", coworkerdPid(), "}\n");
   }
   void record(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
     auto row = report(event, identity, used);
-    // All workerd processes append to one log: emit the prefix and JSON in one syscall.
-    auto log = kj::str("[cpu-limit] ", row);
-    ssize_t written;
-    do { written = write(STDERR_FILENO, log.cStr(), log.size()); } while (written < 0 && errno == EINTR);
+    if (isEnabled()) {
+      auto log = kj::str("[cpu-limit] ", row);
+      ssize_t written;
+      do { written = write(STDERR_FILENO, log.cStr(), log.size()); } while (written < 0 && errno == EINTR);
+    }
     writeLimitEvent(row);
   }
+  void completed(kj::StringPtr identity, uint64_t used) {
+    if (dynamic) record("completed", identity, used);
+  }
   void culprit(kj::StringPtr identity, uint64_t used) {
-    if (state.size() == 0) return;
-    auto row = report("culprit", identity, used);
-    auto path = kj::str(state, ".tmp");
-    if (auto* file = fopen(path.cStr(), "w")) {
-      auto written = fwrite(row.cStr(), 1, row.size(), file);
-      auto closed = fclose(file);
-      if (written == row.size() && closed == 0) rename(path.cStr(), state.cStr());
-      else unlink(path.cStr());
-    }
+    writeLimitEvent(report("culprit", identity, used));
   }
 
   struct CpuClock {
@@ -244,7 +239,6 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     ~Scope() noexcept(false) {
       owner.watchdog->remove(*this, [this]() { used += clock.now() - started; });
       if (used >= owner.cpuNs && !owner.exceeded.exchange(true)) owner.watchdog->wake();
-      if (reported && owner.state.size()) unlink(owner.state.cStr());
       if (owner.exceeded.load()) owner.record("terminated", identity, used);
       onExit();
     }
@@ -266,7 +260,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   kj::Own<IsolateLimitEnforcer> fallback;
   kj::String name;
   uint64_t cpuNs;
-  kj::String state;
+  bool dynamic;
   v8::Isolate* isolate = nullptr;
   uint64_t startupUsed = 0;
   LimitWatchdog* watchdog = nullptr;

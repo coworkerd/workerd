@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "bootstrap.h"
+#include "coworkerd-channels.h"
 
 #include "worker-factory.h"
 
@@ -147,6 +148,7 @@ class Bootstrap {
       : timer(loop.getTimer()),
         monotonicClock(kj::systemPreciseMonotonicClock()),
         provider(loop.getTimer()) {
+    initializeCoworkerdChannels();
     KJ_IF_SOME(path, serveOrTest.perfetto_trace_path) {
 #ifdef WORKERD_USE_PERFETTO
       perfettoSession = PerfettoSession(kj::str(path),

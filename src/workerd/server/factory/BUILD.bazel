@@ -35,6 +35,7 @@ wd_cc_library(
         "worker-factory-listen.c++",
         "worker-factory-rpc.c++",
     ],
+    hdrs = ["coworkerd-channels.h"],
     linkstatic = CC_LIBRARY_LINKSTATIC,
     deps = [
         ":worker-factory-hdrs",
