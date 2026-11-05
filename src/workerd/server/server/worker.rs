@@ -177,6 +177,7 @@ impl WorkerService {
 
         let spec = ffi::WorkerSpec {
             name: name.to_owned(),
+            startup_identity: String::new(),
             inbound_listeners,
             globals: std::mem::take(&mut bindings.globals),
             access_blob_header: access_blob_header.into(),
@@ -268,11 +269,13 @@ impl WorkerService {
         factory: Rc<Factory>,
         name: String,
         source: KjOwn<DynamicSource>,
+        startup_identity: String,
         server: Weak<Server>,
         abort_isolate: Box<dyn Fn()>,
     ) -> Result<Rc<Self>> {
         let spec = ffi::WorkerSpec {
             name,
+            startup_identity,
             inbound_listeners: Vec::new(),
             globals: Vec::new(),
             access_blob_header: KjMaybe::None,
@@ -1086,13 +1089,18 @@ impl ChannelFactory {
         loader_channel: u32,
         name: KjMaybe<&str>,
         source: KjOwn<DynamicSource>,
+        startup_identity: String,
     ) -> Result<Box<WorkerStub>> {
         let loader = self
             .0
             .worker_loaders
             .get(loader_channel as usize)
             .ok_or_else(|| kj::failed!("invalid worker loader channel number"))?;
-        Ok(Box::new(WorkerStub(loader.load(name.into(), source)?)))
+        Ok(Box::new(WorkerStub(loader.load(
+            name.into(),
+            source,
+            startup_identity,
+        )?)))
     }
 
     pub(crate) fn has_debug_port(&self) -> bool {

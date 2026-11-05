@@ -71,6 +71,8 @@ using ActorIdHandle = Worker::Actor::Id;
 // The source of a dynamic worker, as `IoChannelFactory::loadIsolate()` receives it: the function
 // that fetches it. `factory_new_worker()` fetches the source and compiles the worker from it; the
 // capabilities in its `env` become the worker's own channel tables (`CompiledWorker::Impl`).
+// The loading request's creation identity travels separately in WorkerSpec, captured before this
+// callback runs and owned until the factory copies it into the isolate's limit enforcer.
 using DynamicSource = kj::Function<kj::Promise<DynamicWorkerSource>()>;
 // One request's metadata.
 using RequestMetadata = IoChannelFactory::SubrequestMetadata;
