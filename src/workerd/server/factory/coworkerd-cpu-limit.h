@@ -162,6 +162,9 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   void completed(kj::StringPtr identity, uint64_t used) {
     if (dynamic) record("completed", identity, used);
   }
+  void progress(kj::StringPtr identity, uint64_t used) {
+    if (dynamic) writeLimitEvent(report("cpu-progress", identity, used));
+  }
   void culprit(kj::StringPtr identity, uint64_t used) {
     writeLimitEvent(report("culprit", identity, used));
   }
