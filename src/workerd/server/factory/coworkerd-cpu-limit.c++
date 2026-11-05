@@ -1,6 +1,7 @@
 #include "coworkerd-cpu-limit.h"
 #include <workerd/util/autogate.h>
 #include <cstdlib>
+#include <fcntl.h>
 #include <limits>
 #include <v8-isolate.h>
 
@@ -22,6 +23,32 @@ kj::String cpuStateFromEnvironment() {
   if (value == nullptr) return kj::str("");
   KJ_REQUIRE(*value != '\0', "COWORKERD_CPU_STATE must be a non-empty path");
   return kj::str(value);
+}
+int cpuEventsDescriptor() {
+  static const int descriptor = []() {
+    const char* text = std::getenv("COWORKERD_EVENT_FD");
+    if (text == nullptr) return -1;
+    KJ_REQUIRE(*text, "COWORKERD_EVENT_FD must be a descriptor number");
+    int value = 0;
+    for (const char* p = text; *p; ++p) {
+      KJ_REQUIRE(*p >= '0' && *p <= '9' && value < 1000000,
+          "COWORKERD_EVENT_FD must be a descriptor number");
+      value = value * 10 + (*p - '0');
+    }
+    KJ_REQUIRE(value > STDERR_FILENO, "invalid event descriptor");
+    int flags = fcntl(value, F_GETFD);
+    KJ_REQUIRE(flags >= 0, "COWORKERD_EVENT_FD is not an open descriptor");
+    KJ_REQUIRE(fcntl(value, F_SETFD, flags | FD_CLOEXEC) == 0, "cannot protect event descriptor");
+    return value;
+  }();
+  return descriptor;
+}
+void writeLimitEvent(kj::StringPtr row) {
+  auto fd = cpuEventsDescriptor();
+  if (fd < 0) return;
+  // One unbuffered write per complete row; EINTR before any bytes is retried.
+  ssize_t written;
+  do { written = write(fd, row.cStr(), row.size()); } while (written < 0 && errno == EINTR);
 }
 void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
   auto line = kj::str("[coworkerd-platform] {\"isolate\":", escapeCpuJsonString(name),
