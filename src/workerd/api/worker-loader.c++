@@ -93,8 +93,8 @@ jsg::Ref<WorkerStub> WorkerLoader::get(
     }));
   });
 
-  auto isolateChannel =
-      ioctx.getIoChannelFactory().loadIsolate(channel, kj::mv(name), kj::mv(reenterAndGetCode));
+  auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::mv(name),
+      kj::mv(reenterAndGetCode), server::captureMemoryStartupIdentity());
 
   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
 }
@@ -118,7 +118,7 @@ jsg::Ref<WorkerStub> WorkerLoader::load(jsg::Lock& js, WorkerCode code) {
   auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::none,
       [source = kj::mv(source), ownContentWrapper = kj::mv(ownContentWrapper)]() mutable {
     return source.clone(kj::atomicAddRef(*ownContentWrapper));
-  });
+  }, kj::str(""));
 
   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
 }
