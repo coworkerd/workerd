@@ -1,11 +1,78 @@
 #include "coworkerd-cpu-limit.h"
 #include <workerd/util/autogate.h>
 #include <cstdlib>
+#include <csignal>
 #include <fcntl.h>
 #include <limits>
 #include <v8-isolate.h>
 
 namespace workerd::server {
+LimitWatchdog& LimitWatchdog::start() {
+  // Destroyed at exit, which stops and joins the thread.
+  static LimitWatchdog watchdog;
+  return watchdog;
+}
+LimitWatchdog::LimitWatchdog(): thread([this]() { run(); }) {
+
+}
+LimitWatchdog::~LimitWatchdog() noexcept(false) {
+
+  state.lockExclusive()->stopping = true;
+}
+void LimitWatchdog::add(Entry& entry, kj::Maybe<kj::TimePoint> due) {
+  auto lock = state.lockExclusive();
+  lock->entries.add(&entry);
+  KJ_IF_SOME(time, due) {
+    KJ_IF_SOME(planned, lock->sleepUntil) {
+      if (time < planned) lock->woken = true;
+    } else {
+      lock->woken = true;
+    }
+  }
+}
+void LimitWatchdog::wake() { state.lockExclusive()->woken = true; }
+void LimitWatchdog::run() {
+  // Process-directed signals go to other threads.
+  sigset_t signals;
+  sigfillset(&signals);
+  pthread_sigmask(SIG_BLOCK, &signals, nullptr);
+#if __APPLE__
+  pthread_setname_np("limit-watchdog");
+#else
+  pthread_setname_np(pthread_self(), "limit-watchdog");
+#endif
+  auto lock = state.lockExclusive();
+  while (!lock->stopping) {
+    lock->woken = false;
+    auto now = LimitWatchdog::now();
+    kj::Maybe<kj::TimePoint> next;
+    for (auto* entry: lock->entries) {
+      KJ_IF_SOME(due, entry->watch(now)) {
+        KJ_IF_SOME(earliest, next) {
+          if (due < earliest) next = due;
+        } else {
+          next = due;
+        }
+      }
+    }
+    auto ready = [](const State& s) { return s.stopping || s.woken; };
+    KJ_IF_SOME(due, next) {
+      // A long sleep can end late by an amount that grows with its length (timer coalescing, as
+      // on macOS hosts and their virtual machines), so a due time is approached in halving steps
+      // and only the last one, at most 1 ms, sleeps until it.
+      auto from = LimitWatchdog::now();
+      auto remaining = due - from;
+      if (remaining > 1 * kj::MILLISECONDS) remaining = remaining / 2;
+      if (remaining < 0 * kj::NANOSECONDS) remaining = 0 * kj::NANOSECONDS;
+      lock->sleepUntil = from + remaining;
+      lock.wait(ready, remaining);
+    } else {
+      lock->sleepUntil = kj::none;
+      lock.wait(ready);
+    }
+  }
+}
+
 uint32_t cpuLimitFromEnvironment() {
   const char* text = std::getenv("COWORKERD_CPU_LIMIT_MS");
   if (text == nullptr) return 0;
