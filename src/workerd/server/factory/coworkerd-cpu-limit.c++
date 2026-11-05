@@ -1,7 +1,7 @@
 #include "coworkerd-cpu-limit.h"
 #include <workerd/util/autogate.h>
-#include <cstdlib>
 #include <csignal>
+#include <cstdlib>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -9,16 +9,20 @@
 #include <v8-isolate.h>
 
 namespace workerd::server {
+namespace {
+void wakeLimitWatchdog() { LimitWatchdog::start().wake(); }
+}
+
 LimitWatchdog& LimitWatchdog::start() {
   // Destroyed at exit, which stops and joins the thread.
   static LimitWatchdog watchdog;
   return watchdog;
 }
 LimitWatchdog::LimitWatchdog(): thread([this]() { run(); }) {
-
+  setLimitStateObserver(&wakeLimitWatchdog);
 }
 LimitWatchdog::~LimitWatchdog() noexcept(false) {
-
+  setLimitStateObserver(nullptr);
   state.lockExclusive()->stopping = true;
 }
 void LimitWatchdog::add(Entry& entry, kj::Maybe<kj::TimePoint> due) {
@@ -74,7 +78,22 @@ void LimitWatchdog::run() {
     }
   }
 }
+MemoryStartupIdentityScope::MemoryStartupIdentityScope(kj::StringPtr identity)
+    : previous(memoryStartupIdentitySlot()) { memoryStartupIdentitySlot() = identity; }
+MemoryStartupIdentityScope::~MemoryStartupIdentityScope() { memoryStartupIdentitySlot() = previous; }
 
+kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey() {
+  static const auto key = kj::arc<jsg::AsyncContextFrame::StorageKey>();
+  return key.addRef();
+}
+kj::String memoryExecutionIdentity(jsg::Lock& lock) {
+  KJ_IF_SOME(frame, jsg::AsyncContextFrame::current(lock)) {
+    KJ_IF_SOME(value, frame.get(*memoryExecutionKey())) {
+      return lock.toString(value.getHandle(lock));
+    }
+  }
+  return kj::str("");
+}
 uint32_t cpuLimitFromEnvironment() {
   const char* text = std::getenv("COWORKERD_CPU_LIMIT_MS");
   if (text == nullptr) return 0;
@@ -255,15 +274,37 @@ class RequestLimits final: public LimitEnforcer {
         kj::String identity, kj::Function<void()> abortIsolate)
         : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
           abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
+    // The request context ends here, after its waitUntil work, whether or not it ran JavaScript. An actor's context
+    // ends with the actor: its row has the CPU of all its events.
     ~RequestLimits() noexcept(false) { limits->completed(identity, toppedUp + cpuUsed); }
-    kj::Own<void> enterJs(jsg::Lock&, IoContext&) override {
+    struct IdentityScope {
+      jsg::AsyncContextFrame::StorageScope frame;
+      MemoryStartupIdentityScope startup;
+      kj::Own<void> limit;
+      IdentityScope(jsg::Lock& lock, RequestLimits& owner)
+          : frame(lock, memoryExecutionKey(),
+                lock.v8Ref<v8::Value>(jsg::v8Str(lock.v8Isolate, owner.identity))),
+            startup(owner.identity),
+            limit(owner.limits->enterRequestJs(owner.cpuUsed, owner.identity,
+                [&owner]() { if (owner.limits->publish()) owner.abortIsolate(); })) {}
+    };
+    kj::Own<void> enterJs(jsg::Lock& lock, IoContext&) override {
+      if (limits->publish()) abortIsolate();
+      limits->requireNotExceeded();
+      if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
       return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
     }
+    // Each new event a request receives starts with its CPU topped up: a message of a WebSocket it accepted, a call on
+    // an RPC target it handed out, and -- upstream's contract, which tops up actors only -- an actor's request (an
+    // actor's requests share one IoContext, and this enforcer, for the actor's whole life). A connection's messages are
+    // thus limited one by one, as requests are, instead of together; what each charged stays in the completed row, and
+    // while the request lasts its total so far goes on the event pipe at most once per PROGRESS_INTERVAL, so that the
+    // node meters a long connection as it runs.
     void topUpActor() override {
       toppedUp += cpuUsed;
       cpuUsed = 0;
-      auto now = LimitWatchdog::now();
-      if (toppedUp > reported && now - lastProgress >= 1 * kj::SECONDS) {
+      const auto now = LimitWatchdog::now();
+      if (toppedUp > reported && now - lastProgress >= PROGRESS_INTERVAL) {
         lastProgress = now;
         reported = toppedUp;
         limits->progress(identity, toppedUp);
@@ -280,7 +321,10 @@ class RequestLimits final: public LimitEnforcer {
     kj::Maybe<EventOutcome> getLimitsExceeded() override { return limits->outcome(); }
     kj::Promise<void> onLimitsExceeded() override { return limits->onExceeded(); }
     void setCpuLimitNearlyExceededCallback(kj::Function<void()>) override {}
-    void requireLimitsNotExceeded() override { limits->requireNotExceeded(); }
+    void requireLimitsNotExceeded() override {
+      if (limits->publish()) abortIsolate();
+      limits->requireNotExceeded();
+    }
     void reportMetrics(RequestObserver&) override {}
     kj::Duration consumeTimeElapsedForPeriodicLogging() override { return 0 * kj::SECONDS; }
     size_t getSqliteMemoryUsage() const override { return 0; }
@@ -289,8 +333,12 @@ class RequestLimits final: public LimitEnforcer {
     kj::Own<CpuIsolateLimitEnforcer> limits;
     kj::Function<void()> abortIsolate;
     kj::String identity;
-    uint64_t cpuUsed = 0, toppedUp = 0, reported = 0;
+    // What the limit charged since the last top-up, before it, and the GC CPU it did not charge.
+    uint64_t cpuUsed = 0, toppedUp = 0;
+    // The last progress row: when, and the CPU it reported.
+    static constexpr kj::Duration PROGRESS_INTERVAL = 1 * kj::SECONDS;
     kj::TimePoint lastProgress = kj::origin<kj::TimePoint>();
+    uint64_t reported = 0;
   };
 
 
@@ -299,7 +347,7 @@ class RequestLimits final: public LimitEnforcer {
 kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
     kj::Function<void()> abortIsolate) {
-  if (!limits.isEnabled() && !limits.reportsCompletion()) return fallback;
+  if (!limits.isEnabled() && !limits.memoryIdentityWanted() && !limits.reportsCompletion()) return fallback;
   return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
 }
 kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,

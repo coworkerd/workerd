@@ -899,10 +899,12 @@ class RustIoChannelFactory final: public IoChannelFactory {
 
   kj::Own<WorkerStubChannel> loadIsolate(uint loaderChannel,
       kj::Maybe<kj::String> name,
-      kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) override {
+      kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource,
+      kj::String startupIdentity) override {
     auto nameStr = name.map([](kj::String& n) { return toRust(n); });
     return kj::refcounted<WorkerStubChannelHandle>(channels->load_isolate(
-        loaderChannel, nameStr, kj::heap<DynamicSource>(kj::mv(fetchSource))));
+        loaderChannel, nameStr, kj::heap<DynamicSource>(kj::mv(fetchSource)),
+        toRustString(startupIdentity)));
   }
 
   kj::Network& getWorkerdDebugPortNetwork() override {
@@ -1671,7 +1673,8 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
     impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
-        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->isDynamic);
+        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->isDynamic,
+        kj::str(spec.startup_identity));
     auto limitEnforcer = kj::addRef(*impl->cpuLimits);
     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
       return Worker::Api::InboundListener{

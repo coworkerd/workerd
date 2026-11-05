@@ -24,6 +24,18 @@ class Network;
 
 namespace workerd {
 
+namespace server {
+// Request entry installs a borrowed identity only for its synchronous JS scope. The loader copies
+// it before asynchronous source retrieval; the inline accessor shares one TLS slot across users.
+inline kj::StringPtr& memoryStartupIdentitySlot() {
+  static thread_local kj::StringPtr identity;
+  return identity;
+}
+inline kj::String captureMemoryStartupIdentity() {
+  return kj::str(memoryStartupIdentitySlot());
+}
+}  // namespace server
+
 class WorkerInterface;
 
 // Indicates whether the target worker of a stub had the `allow_irrevocable_stub_storage` compat
@@ -497,7 +509,8 @@ class IoChannelFactory: public virtual kj::Refcounted {
   // Use a dynamic Worker loader binding to obtain an Worker by name. If name is null, or if the named Worker doesn't already exist, the callback will be called to fetch the source code from which the Worker should be created.
   virtual kj::Own<WorkerStubChannel> loadIsolate(uint loaderChannel,
       kj::Maybe<kj::String> name,
-      kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
+      kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource,
+      kj::String startupIdentity) {
     JSG_FAIL_REQUIRE(Error, "Dynamic worker loading is not supported by this runtime.");
   }
 

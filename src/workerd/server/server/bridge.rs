@@ -109,6 +109,9 @@ pub mod ffi {
 
     struct WorkerSpec {
         name: String,
+        /// Opaque creation identity captured synchronously by the loading request. Owned across
+        /// asynchronous source retrieval and compilation; interpreted only by the factory.
+        startup_identity: String,
         /// The worker's inbound TCP listeners, for `Worker::Api::getInboundListeners()`.
         inbound_listeners: Vec<InboundListener>,
         /// The `env` object: an encoded `Globals` message (compiled-bindings.capnp), in words.
@@ -888,6 +891,7 @@ pub mod ffi {
             loader_channel: u32,
             name: KjMaybe<&str>,
             source: KjOwn<DynamicSource>,
+            startup_identity: String,
         ) -> Result<Box<WorkerStub>>;
         /// Whether this worker has the workerd debug port binding.
         fn has_debug_port(self: &ChannelFactory) -> bool;
