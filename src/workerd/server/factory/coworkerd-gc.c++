@@ -67,18 +67,6 @@ const char* typeName(v8::GCType type) {
   return "scavenge";
 }
 
-// The Worker an isolate belongs to: its name before the version. A dynamic isolate is named
-// "<namespace>:<workerId>@<versionId>#<content>#<definition>[#limits=...]" (the node's runtime bridge); any other
-// name is its own Worker.
-std::string workerKey(kj::StringPtr name) {
-  std::string text(name.cStr());
-  auto hash = text.find('#');
-  if (hash != std::string::npos) text.resize(hash);
-  auto at = text.rfind('@');
-  if (at != std::string::npos) text.resize(at);
-  return text;
-}
-
 // What a static isolate (the runtime) holds once a mark-compact is done: its working set.
 struct StaticHeap {
   uint64_t majors = 0, liveAfterMajorBytes = 0, peakLiveAfterMajorBytes = 0, heapLimitBytes = 0;
@@ -179,12 +167,12 @@ class GcBudget {
 namespace {
 // Every Worker's budget in this process, kept while an isolate of the Worker holds it and until it is full again (from
 // then on it is the same as a new one), so that a new isolate of the Worker goes on with the old one's.
-std::shared_ptr<GcBudget> budgetFor(kj::StringPtr isolateName) {
+std::shared_ptr<GcBudget> budgetFor(kj::StringPtr workerId) {
   static kj::MutexGuarded<std::map<std::string, std::shared_ptr<GcBudget>>> budgets;
   auto now = monotonicNs();
   auto lock = budgets.lockExclusive();
   std::erase_if(*lock, [now](auto& entry) { return entry.second.use_count() == 1 && entry.second->full(now); });
-  auto key = workerKey(isolateName);
+  auto key = std::string(workerId.begin(), workerId.size());
   auto found = lock->find(key);
   if (found != lock->end()) return found->second;
   auto made = std::make_shared<GcBudget>(now);
@@ -193,9 +181,12 @@ std::shared_ptr<GcBudget> budgetFor(kj::StringPtr isolateName) {
 }
 }  // namespace
 
-IsolateGc::IsolateGc(kj::StringPtr name, bool dynamic, uint64_t cpuLimitNs)
-    : name(kj::str(name)), dynamic(dynamic), cpuLimitNs(cpuLimitNs) {
-  if (dynamic && cpuLimitNs && gcSettings().excludes()) budget = budgetFor(name);
+IsolateGc::IsolateGc(kj::StringPtr name, const kj::Maybe<CoworkerdWorkerIdentity>& identity,
+    uint64_t cpuLimitNs)
+    : name(kj::str(name)), tenantWorker(identity != kj::none), cpuLimitNs(cpuLimitNs) {
+  KJ_IF_SOME(record, identity) {
+    if (cpuLimitNs && gcSettings().excludes()) budget = budgetFor(record.workerId);
+  }
 }
 IsolateGc::~IsolateGc() noexcept(false) {}
 
@@ -204,7 +195,7 @@ void IsolateGc::install(v8::Isolate* value) {
   clock = kj::heap<ThreadCpuClock>();
   value->AddGCPrologueCallback(&IsolateGc::prologue, this, v8::kGCTypeAll);
   value->AddGCEpilogueCallback(&IsolateGc::epilogue, this, v8::kGCTypeAll);
-  if (dynamic && gcSettings().idleCollectMs) oldUsed = oldAfterMajor = oldGenerationBytes();
+  if (tenantWorker && gcSettings().idleCollectMs) oldUsed = oldAfterMajor = oldGenerationBytes();
 }
 
 void IsolateGc::prologue(v8::Isolate*, v8::GCType type, v8::GCCallbackFlags, void* data) {
@@ -244,12 +235,12 @@ void IsolateGc::ended(v8::GCType) {
   const bool major = (type & MAJOR) != 0;
   if (major) ++majors;
   const auto& settings = gcSettings();
-  if (dynamic && settings.idleCollectMs) {
+  if (tenantWorker && settings.idleCollectMs) {
     oldUsed = oldGenerationBytes();
     if (major) oldAfterMajor = oldUsed;
   }
   uint64_t live = 0, limit = 0;
-  if (!dynamic && major) {
+  if (!tenantWorker && major) {
     v8::HeapStatistics stats;
     isolate->GetHeapStatistics(&stats);
     live = stats.used_heap_size();
@@ -278,7 +269,7 @@ void IsolateGc::ended(v8::GCType) {
       p.firstMajorLongestNs = pause;
       p.firstMajorLongestIsolate = name.cStr();
     }
-    if (!dynamic && major) {
+    if (!tenantWorker && major) {
       auto& heap = p.statics[name.cStr()];
       ++heap.majors;
       heap.liveAfterMajorBytes = live;
@@ -316,7 +307,7 @@ size_t IsolateGc::oldGenerationBytes() const {
 
 void IsolateGc::measureOld() {
   // At most every few milliseconds: a request's entries come in bursts, and the collections measure it anyway.
-  if (!dynamic || !isolate || !gcSettings().idleCollectMs) return;
+  if (!tenantWorker || !isolate || !gcSettings().idleCollectMs) return;
   auto now = monotonicNs();
   if (now - lastMeasured < 5000000) return;
   lastMeasured = now;

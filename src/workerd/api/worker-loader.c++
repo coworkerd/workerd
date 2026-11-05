@@ -8,6 +8,8 @@
 
 #include <capnp/message.h>
 #include <kj/vector.h>
+#include <cmath>
+#include <limits>
 
 namespace workerd::api {
 
@@ -77,8 +79,40 @@ jsg::Ref<DurableObjectClass> WorkerStub::getDurableObjectClass(jsg::Lock& js,
 }
 
 jsg::Ref<WorkerStub> WorkerLoader::get(
-    jsg::Lock& js, kj::Maybe<kj::String> name, jsg::Function<jsg::Promise<WorkerCode>()> getCode) {
+    jsg::Lock& js, kj::Maybe<kj::String> name, jsg::Function<jsg::Promise<WorkerCode>()> getCode,
+    jsg::Optional<GetOptions> options) {
   auto& ioctx = IoContext::current();
+  CoworkerdLoadIdentity identity{.startupIdentity = server::captureMemoryStartupIdentity()};
+  KJ_IF_SOME(o, options) {
+    KJ_IF_SOME(record, o.coworkerdWorker) {
+      JSG_REQUIRE(record.workerId.value.size() > 0 && record.versionId.value.size() > 0,
+          TypeError, "coworkerdWorker.workerId and versionId must be nonempty strings");
+      auto number = [](const jsg::Optional<jsg::NonCoercible<double>>& input,
+                        kj::StringPtr field) {
+        double value = input.map([](const auto& v) { return v.value; }).orDefault(0);
+        JSG_REQUIRE(std::isfinite(value) && value >= 0 && std::trunc(value) == value,
+            TypeError, "coworkerdWorker.", field, " must be a nonnegative integer");
+        return value;
+      };
+      auto limit = [&](const auto& input, kj::StringPtr field) {
+        auto value = number(input, field);
+        JSG_REQUIRE(value <= std::numeric_limits<uint32_t>::max(), TypeError,
+            "coworkerdWorker.", field, " exceeds uint32");
+        return static_cast<uint32_t>(value);
+      };
+      // Generation is reserved for lifecycle handoff; no generation is assigned here.
+      number(record.generation, "generation");
+      identity.cpuLimitMs = limit(record.cpuLimitMs, "cpuLimitMs");
+      identity.memoryLimitMiB = limit(record.memoryLimitMiB, "memoryLimitMiB");
+      identity.present = true;
+      identity.workerId = kj::mv(record.workerId.value);
+      identity.versionId = kj::mv(record.versionId.value);
+      identity.tenant = kj::str("");
+      KJ_IF_SOME(slash, identity.workerId.findFirst('/')) {
+        identity.tenant = kj::str(identity.workerId.slice(0, slash));
+      }
+    }
+  }
 
   // It's important that we use a *weak* reentry callback because this callback will held by the
   // WorkerStub and any entrypoint stubs in vends until they are GC'd. We don't want to create
@@ -97,7 +131,7 @@ jsg::Ref<WorkerStub> WorkerLoader::get(
   });
 
   auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::mv(name),
-      kj::mv(reenterAndGetCode), server::captureMemoryStartupIdentity());
+      kj::mv(reenterAndGetCode), kj::mv(identity));
 
   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
 }
@@ -121,7 +155,7 @@ jsg::Ref<WorkerStub> WorkerLoader::load(jsg::Lock& js, WorkerCode code) {
   auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::none,
       [source = kj::mv(source), ownContentWrapper = kj::mv(ownContentWrapper)]() mutable {
     return source.clone(kj::atomicAddRef(*ownContentWrapper));
-  }, kj::str(""));
+  }, CoworkerdLoadIdentity{});
 
   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
 }

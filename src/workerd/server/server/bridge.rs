@@ -105,11 +105,22 @@ pub mod ffi {
         env_actor_classes: u32,
     }
 
+    /// Owned load-time input. Rust transports it without interpreting its identity or limits.
+    #[derive(Default)]
+    struct CoworkerdLoadIdentity {
+        startup_identity: String,
+        present: bool,
+        tenant: String,
+        worker_id: String,
+        version_id: String,
+        generation: u64,
+        cpu_limit_ms: u32,
+        memory_limit_mib: u32,
+    }
+
     struct WorkerSpec {
         name: String,
-        /// Opaque creation identity captured synchronously by the loading request. Owned across
-        /// asynchronous source retrieval and compilation; interpreted only by the factory.
-        startup_identity: String,
+        load_identity: CoworkerdLoadIdentity,
         /// The worker's inbound TCP listeners, for `Worker::Api::getInboundListeners()`.
         inbound_listeners: Vec<InboundListener>,
         /// The `env` object: an encoded `Globals` message (compiled-bindings.capnp), in words.
@@ -822,7 +833,7 @@ pub mod ffi {
             loader_channel: u32,
             name: KjMaybe<&str>,
             source: KjOwn<DynamicSource>,
-            startup_identity: String,
+            load_identity: CoworkerdLoadIdentity,
         ) -> Result<Box<WorkerStub>>;
         /// Whether this worker has the workerd debug port binding.
         fn has_debug_port(self: &ChannelFactory) -> bool;

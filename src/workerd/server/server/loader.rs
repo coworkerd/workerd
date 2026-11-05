@@ -67,7 +67,7 @@ impl WorkerLoaderNamespace {
         self: &Rc<Self>,
         name: Option<&str>,
         source: KjOwn<DynamicSource>,
-        startup_identity: String,
+        load_identity: ffi::CoworkerdLoadIdentity,
     ) -> Result<Rc<WorkerStub>> {
         let server = self
             .server
@@ -92,7 +92,7 @@ impl WorkerLoaderNamespace {
                     Weak::clone(&self.server),
                     format!("{}:{name}", self.name),
                     source,
-                    startup_identity,
+                    load_identity,
                     Some(on_abort),
                 );
                 self.isolates
@@ -105,7 +105,7 @@ impl WorkerLoaderNamespace {
                 Weak::clone(&self.server),
                 format!("{}:dynamic:{:032x}", self.name, rand::random::<u128>()),
                 source,
-                startup_identity,
+                load_identity,
                 None,
             ),
         };
@@ -148,7 +148,7 @@ impl WorkerStub {
         server: Weak<Server>,
         isolate_name: String,
         source: KjOwn<DynamicSource>,
-        startup_identity: String,
+        load_identity: ffi::CoworkerdLoadIdentity,
         on_abort: Option<Box<dyn Fn()>>,
     ) -> Rc<Self> {
         let fired = Cell::new(false);
@@ -164,7 +164,7 @@ impl WorkerStub {
             factory,
             isolate_name,
             source,
-            startup_identity,
+            load_identity,
             server,
             abort_isolate,
         )

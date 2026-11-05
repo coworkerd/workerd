@@ -36,6 +36,19 @@ inline kj::String captureMemoryStartupIdentity() {
 }
 }  // namespace server
 
+// Owned load-time input from the platform's WorkerLoader capability. The factory copies this
+// into the single cxx CoworkerdLoadIdentity value before asynchronous source retrieval.
+struct CoworkerdLoadIdentity {
+  kj::String startupIdentity;
+  bool present = false;
+  kj::String tenant;
+  kj::String workerId;
+  kj::String versionId;
+  uint64_t generation = 0;
+  uint32_t cpuLimitMs = 0;
+  uint32_t memoryLimitMiB = 0;
+};
+
 class WorkerInterface;
 
 // Indicates whether the target worker of a stub had the `allow_irrevocable_stub_storage` compat
@@ -495,7 +508,7 @@ class IoChannelFactory: public virtual kj::Refcounted {
   virtual kj::Own<WorkerStubChannel> loadIsolate(uint loaderChannel,
       kj::Maybe<kj::String> name,
       kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource,
-      kj::String startupIdentity) {
+      CoworkerdLoadIdentity identity) {
     JSG_FAIL_REQUIRE(Error, "Dynamic worker loading is not supported by this runtime.");
   }
 
