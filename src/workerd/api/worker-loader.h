@@ -138,8 +138,24 @@ class WorkerLoader: public jsg::Object {
     });
   };
 
-  jsg::Ref<WorkerStub> get(
-      jsg::Lock& js, kj::Maybe<kj::String> name, jsg::Function<jsg::Promise<WorkerCode>()> getCode);
+  // Only the platform runtime holds the loader capability that supplies this record.
+  struct CoworkerdWorker {
+    jsg::NonCoercible<kj::String> workerId;
+    jsg::NonCoercible<kj::String> versionId;
+    jsg::Optional<jsg::NonCoercible<double>> generation;
+    jsg::Optional<jsg::NonCoercible<double>> cpuLimitMs;
+    jsg::Optional<jsg::NonCoercible<double>> memoryLimitMiB;
+
+    JSG_STRUCT(workerId, versionId, generation, cpuLimitMs, memoryLimitMiB);
+  };
+
+  struct GetOptions {
+    jsg::Optional<CoworkerdWorker> coworkerdWorker;
+    JSG_STRUCT(coworkerdWorker);
+  };
+
+  jsg::Ref<WorkerStub> get(jsg::Lock& js, kj::Maybe<kj::String> name,
+      jsg::Function<jsg::Promise<WorkerCode>()> getCode, jsg::Optional<GetOptions> options);
 
   // Shortcut for `get(null, () => code)`.
   jsg::Ref<WorkerStub> load(jsg::Lock& js, WorkerCode code);
@@ -170,6 +186,7 @@ class WorkerLoader: public jsg::Object {
 
 #define EW_WORKER_LOADER_ISOLATE_TYPES                                                             \
   api::WorkerStub, api::WorkerStub::EntrypointOptions, api::WorkerLoader,                          \
-      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, workerd::ResourceLimits
+      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, api::WorkerLoader::CoworkerdWorker, \
+      api::WorkerLoader::GetOptions, workerd::ResourceLimits
 
 }  // namespace workerd::api

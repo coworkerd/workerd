@@ -186,7 +186,7 @@ impl WorkerService {
 
         let spec = ffi::WorkerSpec {
             name: name.to_owned(),
-            startup_identity: String::new(),
+            load_identity: ffi::CoworkerdLoadIdentity::default(),
             inbound_listeners,
             globals: std::mem::take(&mut bindings.globals),
             access_blob_header: access_blob_header.into(),
@@ -279,13 +279,13 @@ impl WorkerService {
         factory: Rc<Factory>,
         name: String,
         source: KjOwn<DynamicSource>,
-        startup_identity: String,
+        load_identity: ffi::CoworkerdLoadIdentity,
         server: Weak<Server>,
         abort_isolate: Box<dyn Fn()>,
     ) -> Result<Rc<Self>> {
         let spec = ffi::WorkerSpec {
             name,
-            startup_identity,
+            load_identity,
             inbound_listeners: Vec::new(),
             globals: Vec::new(),
             access_blob_header: KjMaybe::None,
@@ -1144,7 +1144,7 @@ impl ChannelFactory {
         loader_channel: u32,
         name: KjMaybe<&str>,
         source: KjOwn<DynamicSource>,
-        startup_identity: String,
+        load_identity: ffi::CoworkerdLoadIdentity,
     ) -> Result<Box<WorkerStub>> {
         let loader = self
             .0
@@ -1154,7 +1154,7 @@ impl ChannelFactory {
         Ok(Box::new(WorkerStub(loader.load(
             name.into(),
             source,
-            startup_identity,
+            load_identity,
         )?)))
     }
 

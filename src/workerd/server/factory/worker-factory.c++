@@ -903,11 +903,14 @@ class RustIoChannelFactory final: public IoChannelFactory {
   kj::Own<WorkerStubChannel> loadIsolate(uint loaderChannel,
       kj::Maybe<kj::String> name,
       kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource,
-      kj::String startupIdentity) override {
+      workerd::CoworkerdLoadIdentity identity) override {
     auto nameStr = name.map([](kj::String& n) { return toRust(n); });
     return kj::refcounted<WorkerStubChannelHandle>(channels->load_isolate(
         loaderChannel, nameStr, kj::heap<DynamicSource>(kj::mv(fetchSource)),
-        toRustString(startupIdentity)));
+        CoworkerdLoadIdentity{toRustString(identity.startupIdentity), identity.present,
+            toRustString(identity.tenant), toRustString(identity.workerId),
+            toRustString(identity.versionId), identity.generation,
+            identity.cpuLimitMs, identity.memoryLimitMiB}));
   }
 
   kj::Network& getWorkerdDebugPortNetwork() override {
@@ -1603,8 +1606,12 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
   TRACE_EVENT("workerd", "factory_new_worker()", "name", name.cStr());
   auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
   impl->isDynamic = dynamicSource != kj::none;
-  // The creation-identity slot is not inferred from a name, source shape, or request metadata.
-  impl->coworkerdIdentity = kj::none;
+  if (spec.load_identity.present) {
+    const auto& identity = spec.load_identity;
+    impl->coworkerdIdentity = CoworkerdWorkerIdentity{kj::str(identity.tenant),
+      kj::str(identity.worker_id), kj::str(identity.version_id), identity.generation,
+      identity.cpu_limit_ms, identity.memory_limit_mib};
+  }
   ErrorReporter errorReporter;
   auto& options = *factory.options;
   bool experimental = options.experimental;
@@ -1684,8 +1691,8 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
     impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
-        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->isDynamic,
-        kj::str(spec.startup_identity));
+        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->coworkerdIdentity,
+        kj::str(spec.load_identity.startup_identity));
     auto limitEnforcer = kj::addRef(*impl->cpuLimits);
     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
       return Worker::Api::InboundListener{

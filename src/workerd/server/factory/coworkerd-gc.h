@@ -38,6 +38,8 @@ class Worker;
 
 namespace workerd::server {
 
+struct CoworkerdWorkerIdentity;
+
 struct GcSettings {
   uint64_t budgetNs = 0, refillNsPerSecond = 0;
   uint64_t longPauseNs = 0;
@@ -80,7 +82,8 @@ enum class IdleCollection { COLLECTED, BUSY, GONE };
 // callbacks are never removed: they end with the isolate.
 class IsolateGc {
  public:
-  IsolateGc(kj::StringPtr name, bool dynamic, uint64_t cpuLimitNs);
+  IsolateGc(kj::StringPtr name, const kj::Maybe<CoworkerdWorkerIdentity>& identity,
+      uint64_t cpuLimitNs);
   ~IsolateGc() noexcept(false);
   IsolateGc(const IsolateGc&) = delete;
 
@@ -118,7 +121,7 @@ class IsolateGc {
   void measureOld();
 
   kj::StringPtr getName() const { return name; }
-  bool isDynamic() const { return dynamic; }
+  bool isTenantWorker() const { return tenantWorker; }
 
  private:
   static void prologue(v8::Isolate* isolate, v8::GCType type, v8::GCCallbackFlags flags, void* data);
@@ -128,9 +131,9 @@ class IsolateGc {
   size_t oldGenerationBytes() const;
 
   const kj::String name;
-  const bool dynamic;
+  const bool tenantWorker;
   const uint64_t cpuLimitNs;
-  std::shared_ptr<GcBudget> budget;  // dynamic isolates while the exclusion is on
+  std::shared_ptr<GcBudget> budget;  // tenant isolates while the exclusion is on
   v8::Isolate* isolate = nullptr;
   kj::Maybe<kj::Own<ThreadCpuClock>> clock;
 
