@@ -215,12 +215,18 @@ fn fixed_pool(dialer: Dialer, style: Style) -> ClientPool {
 /// A capnp connection to the external server, over an HTTP CONNECT tunnel.
 struct RpcConnection(KjOwn<ffi::RpcClient>);
 
+enum Transport {
+    Http,
+    Capnp,
+}
+
 struct ExternalHttp {
     factory: Rc<Factory>,
     /// The connections of every event, the RPC tunnel's included.
     pool: ClientPool,
     rewriter: HttpRewriter,
-    /// The capnp connection custom events go over, made when the first one needs it and dropped
+    transport: Transport,
+    /// The capnp connection events go over, made when the first one needs it and dropped
     /// when it is lost.
     rpc: RefCell<Option<Rc<RpcConnection>>>,
 }
@@ -260,11 +266,19 @@ impl ExternalHttp {
     }
 }
 
-/// An `external` service speaking HTTP or HTTPS.
+/// An `external` service speaking HTTP, HTTPS, or Cap'n Proto over HTTP CONNECT.
 pub struct ExternalHttpService(Rc<ExternalHttp>);
 
 impl Channel for ExternalHttpService {
     fn start_request(&self, metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
+        if let Transport::Capnp = self.0.transport {
+            let service = Rc::clone(&self.0);
+            return Ok(worker::PromisedInterface::new(async move {
+                let connection = service.rpc().await?;
+                Ok(ffi::rpc_client_start_request(&connection.0, metadata))
+            })
+            .into_kj());
+        }
         Ok(ExternalHttpRequest {
             service: Rc::clone(&self.0),
             metadata,
@@ -553,11 +567,12 @@ pub fn make_external_service(
             ));
         }
     };
-    let http = |rewriter: HttpRewriter, dialer: Dialer| -> Rc<dyn Channel> {
+    let http = |rewriter: HttpRewriter, dialer: Dialer, transport: Transport| -> Rc<dyn Channel> {
         Rc::new(ExternalHttpService(Rc::new(ExternalHttp {
             factory: Rc::clone(factory),
             pool: fixed_pool(dialer, rewriter.style()),
             rewriter,
+            transport,
             rpc: RefCell::new(None),
         })))
     };
@@ -567,6 +582,20 @@ pub fn make_external_service(
             Ok(http(
                 rewriter,
                 Dialer::new(&address, 80, None, factory.loopback()),
+                Transport::Http,
+            ))
+        }
+        Ok(external_server::Which::Capnp(options)) => {
+            let rewriter = HttpRewriter::new(options.map_err(capnp_error)?)?;
+            if rewriter.capnp_connect_host().is_none() {
+                return Err(kj::failed!(
+                    "Cap'n Proto external service requires capnpConnectHost"
+                ));
+            }
+            Ok(http(
+                rewriter,
+                Dialer::new(&address, 80, None, factory.loopback()),
+                Transport::Capnp,
             ))
         }
         Ok(external_server::Which::Https(https)) => {
@@ -576,6 +605,7 @@ pub fn make_external_service(
             Ok(http(
                 rewriter,
                 Dialer::new(&address, 443, Some((tls, host)), factory.loopback()),
+                Transport::Http,
             ))
         }
         Ok(external_server::Which::Tcp(tcp)) => {
