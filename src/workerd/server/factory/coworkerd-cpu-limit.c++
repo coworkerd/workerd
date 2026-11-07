@@ -281,9 +281,9 @@ class CpuWorkerInterface final: public WorkerInterface {
 class RequestLimits final: public LimitEnforcer {
    public:
     RequestLimits(kj::Own<LimitEnforcer> fallback, CpuIsolateLimitEnforcer& limits,
-        kj::String identity, kj::Function<void()> abortIsolate)
+        kj::String identity, kj::Function<void()> abortIsolate, bool isActor)
         : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
-          abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
+          abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)), isActor(isActor) {}
     // The request context ends here, after its waitUntil work, whether or not it ran JavaScript. An actor's context
     // ends with the actor: its row has the CPU of all its events.
     ~RequestLimits() noexcept(false) { limits->completed(identity, toppedUp + cpuUsed, gcExcluded); }
@@ -311,6 +311,7 @@ class RequestLimits final: public LimitEnforcer {
     // while the request lasts its total so far goes on the event pipe at most once per PROGRESS_INTERVAL, so that the
     // node meters a long connection as it runs.
     void topUpActor() override {
+      if (isActor) idleWorkerActorEvent(limits->activity());
       toppedUp += cpuUsed;
       cpuUsed = 0;
       const auto now = LimitWatchdog::now();
@@ -343,6 +344,7 @@ class RequestLimits final: public LimitEnforcer {
     kj::Own<CpuIsolateLimitEnforcer> limits;
     kj::Function<void()> abortIsolate;
     kj::String identity;
+    const bool isActor;
     // What the limit charged since the last top-up, before it, and the GC CPU it did not charge.
     uint64_t cpuUsed = 0, toppedUp = 0, gcExcluded = 0;
     // The last progress row: when, and the CPU it reported.
@@ -356,9 +358,11 @@ class RequestLimits final: public LimitEnforcer {
 
 kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
-    kj::Function<void()> abortIsolate) {
-  if (!limits.isEnabled() && !limits.memoryIdentityWanted() && !limits.reportsCompletion()) return fallback;
-  return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
+    kj::Function<void()> abortIsolate, bool isActor) {
+  if (!limits.isEnabled() && !limits.memoryIdentityWanted() && !limits.reportsCompletion() &&
+      !limits.activity()) return fallback;
+  return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata),
+      kj::mv(abortIsolate), isActor);
 }
 kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
     CpuIsolateLimitEnforcer& limits) {

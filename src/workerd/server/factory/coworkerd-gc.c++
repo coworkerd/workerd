@@ -342,4 +342,48 @@ uint64_t IsolateGc::Entry::excluded(uint64_t entryStartCpu, uint64_t cpuNow) con
   return std::min(total, cpuNow > entryStartCpu ? cpuNow - entryStartCpu : uint64_t(0));
 }
 
+kj::Promise<IdleCollection> collectIdleIsolate(
+    kj::Own<const Worker> worker, std::shared_ptr<IsolateGc> gc, kj::Function<bool()> stillIdle) {
+  auto asyncLock = co_await worker->takeAsyncLockWithoutRequest(nullptr);
+  if (!stillIdle()) co_return IdleCollection::BUSY;
+  worker->runInLockScope(asyncLock, [&](Worker::Lock& lock) { gc->collectIdle(lock.getIsolate()); });
+  co_return IdleCollection::COLLECTED;
+}
+
+void countIdleCollection(IdleCollection outcome, bool skippedQueued) {
+  auto lock = processGc().lockExclusive();
+  ++lock->version;
+  if (skippedQueued) ++lock->idleSkippedQueued;
+  else if (outcome == IdleCollection::COLLECTED) ++lock->idleCollections;
+  else if (outcome == IdleCollection::BUSY) ++lock->idleSkippedBusy;
+  else ++lock->idleSkippedGone;
+}
+
+uint64_t processGcVersion() { return processGc().lockShared()->version; }
+
+kj::String processGcJson() {
+  const auto& s = gcSettings();
+  auto lock = processGc().lockShared();
+  const auto& p = *lock;
+  kj::Vector<kj::String> statics;
+  for (const auto& [isolateName, heap]: p.statics) {
+    statics.add(kj::str("{\"isolate\":", escapeCpuJsonString(isolateName.c_str()), ",\"majors\":", heap.majors,
+        ",\"liveAfterMajorBytes\":", heap.liveAfterMajorBytes, ",\"peakLiveAfterMajorBytes\":",
+        heap.peakLiveAfterMajorBytes, ",\"heapLimitBytes\":", heap.heapLimitBytes, "}"));
+  }
+  return kj::str(",\"gc\":{\"majorCollections\":", p.majors, ",\"minorCollections\":", p.minors,
+      ",\"weakCallbacks\":", p.weakCallbacks, ",\"idleCollections\":", p.idleCollections,
+      ",\"idleSkippedBusy\":", p.idleSkippedBusy, ",\"idleSkippedQueued\":", p.idleSkippedQueued,
+      ",\"idleSkippedGone\":", p.idleSkippedGone, ",\"longPauses\":", p.longPauses,
+      ",\"longPauseMs\":", s.longPauseNs / 1000000, ",\"longestPauseNs\":", p.longestPauseNs,
+      ",\"longestPauseIsolate\":", escapeCpuJsonString(p.longestPauseIsolate.c_str()),
+      ",\"longestPauseType\":", escapeCpuJsonString(p.longestPauseType.c_str()),
+      ",\"firstMajorLongestNs\":", p.firstMajorLongestNs,
+      ",\"firstMajorLongestIsolate\":", escapeCpuJsonString(p.firstMajorLongestIsolate.c_str()),
+      ",\"excludedNs\":", p.excludedNs, ",\"chargedMajorNs\":", p.chargedMajorNs,
+      ",\"budgetMs\":", s.budgetNs / 1000000, ",\"refillMsPerSecond\":", s.refillNsPerSecond / 1000000,
+      ",\"idleCollectMs\":", s.idleCollectMs, ",\"idleCollectMinBytes\":", s.idleCollectMinBytes,
+      ",\"staticHeapBytes\":", s.staticHeapBytes, ",\"static\":[", kj::strArray(statics, ","), "]}");
+}
+
 }  // namespace workerd::server
