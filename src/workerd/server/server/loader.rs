@@ -116,9 +116,21 @@ impl WorkerLoaderNamespace {
         // an aborted named stub has left the map. A stub dropped before its service exists would
         // leave that service never unlinked.
         let keep = Rc::clone(&stub);
+        let namespace = Rc::downgrade(self);
+        let name = name.map(str::to_owned);
         factory.spawn_detached(async move {
-            // A startup failure reaches the callers that await the stub.
-            let _ = keep.startup().await;
+            // Callers retain the failed result, but a later named load may try fresh source.
+            if keep.startup().await.is_err()
+                && let (Some(namespace), Some(name)) = (namespace.upgrade(), name)
+            {
+                let mut isolates = namespace.isolates.borrow_mut();
+                if isolates
+                    .get(&name)
+                    .is_some_and(|current| Rc::ptr_eq(current, &keep))
+                {
+                    isolates.remove(&name);
+                }
+            }
         });
         Ok(stub)
     }

@@ -212,6 +212,7 @@ class CompiledWorker final {
 
 WorkerInfo worker_info(const CompiledWorker& worker);
 void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const uint64_t> globals);
+void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory> channels);
 void worker_unlink(const CompiledWorker& worker);
 kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
     kj::Maybe<::rust::Str> entrypoint,

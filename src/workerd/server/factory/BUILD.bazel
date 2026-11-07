@@ -36,6 +36,8 @@ wd_cc_library(
         "coworkerd-steady.h",
         "coworkerd-gc.c++",
         "coworkerd-gc.h",
+        "coworkerd-idle-eviction.c++",
+        "coworkerd-idle-eviction.h",
         "worker-factory-actor.c++",
         "worker-factory-impl.h",
         "worker-factory-listen.c++",

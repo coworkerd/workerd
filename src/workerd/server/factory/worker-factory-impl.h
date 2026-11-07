@@ -8,6 +8,7 @@
 
 #include "worker-factory.h"
 #include "coworkerd-cpu-limit.h"
+#include "coworkerd-idle-eviction.h"
 
 #include <workerd/io/actor-sqlite.h>
 #include <workerd/io/io-thread-context.h>
@@ -129,6 +130,7 @@ class WorkerFactory::Impl final: private kj::TaskSet::ErrorHandler {
   // Background work no request owns: container cleanup, trace delivery, and the Rust server's
   // tasks (factory_spawn). Declared last, so that it is destroyed first: a task may hold anything
   // else here.
+  std::shared_ptr<IdleReaper> idleReaper;
   kj::TaskSet tasks;
   // How many tasks factory_spawn has added; factory_settle_tasks waits for it to stop growing.
   uint64_t spawnCount = 0;
@@ -171,6 +173,7 @@ class WorkerTimerChannel final: public TimerChannel {
 class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::ErrorHandler {
  public:
   Impl(const WorkerFactory& factory, kj::String name);
+  ~Impl() noexcept(false);
 
   const WorkerFactory& factory;
   kj::String name;
@@ -193,6 +196,10 @@ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::Er
   kj::Maybe<kj::String> accessBlobHeader;
   bool isDynamic = false;
   kj::Maybe<CoworkerdWorkerIdentity> coworkerdIdentity;
+  IdleWorkerRef idleWorker;
+  bool idleReady = false;
+  // LinkedChannels owns loopback references; worker_unlink releases this copy first.
+  kj::Maybe<::rust::Box<ChannelFactory>> idleChannels;
   kj::Own<CpuIsolateLimitEnforcer> cpuLimits;
 
   kj::Maybe<kj::Own<const Worker>> worker;

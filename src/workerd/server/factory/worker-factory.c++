@@ -88,6 +88,7 @@ WorkerFactory::Impl::Impl(WorkerFactory& factory,
       channelTokenHandler(factory,
           this->config.hasCluster() ? kj::Maybe<kj::StringPtr>(this->config.getCluster().getKey())
                                     : kj::none),
+      idleReaper(server::idleReaper(timer)),
       tasks(*this) {
   // The config's logging settings go on top of the caller's.
   auto& logging = this->options->loggingOptions;
@@ -897,6 +898,7 @@ class RustIoChannelFactory final: public IoChannelFactory {
         .attach(kj::addRef(*this));
   }
   void abortIsolate(kj::StringPtr reason) noexcept override {
+    idleWorkerRemoved(worker->idleWorker, "cpu");
     channels->abort_isolate(toRustString(reason));
   }
 
@@ -1160,12 +1162,14 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
         channel->abortIsolate("CPU limit exceeded");
       });
   auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
-      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},
+      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(requestLimits),
+      idleActivity(worker.idleWorker),
       kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
       kj::mv(metadata.cfBlobJson), kj::none, kj::mv(triggerContext), IsDynamicDispatch::NO,
       kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
       kj::mv(metadata.clientAddress));
-  return wrapCpuWorkerInterface(kj::mv(entry), *worker.cpuLimits);
+  return wrapIdleWorkerInterface(
+      wrapCpuWorkerInterface(kj::mv(entry), *worker.cpuLimits), worker.idleWorker);
 }
 
 }  // namespace
@@ -1411,6 +1415,22 @@ CompiledWorker::Impl::Impl(const WorkerFactory& factory, kj::String name)
       timerChannel(factory.getImpl().timer, factory.getImpl().monotonicClock),
       waitUntilTasks(*this) {}
 
+CompiledWorker::Impl::~Impl() noexcept(false) {
+  idleChannels = kj::none;
+  if (idleWorker && !idleReady) {
+    // A failed startup destroys its compiled isolate before reporting load-failed,
+    // as the 0.5.3 startup promise did when unwinding its failed service.
+    KJ_IF_SOME(w, worker) {
+      w->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock&) {
+        ctxExportsHandle = kj::none;
+      });
+    }
+    worker = kj::none;
+    idleWorkerFailed(idleWorker);
+  }
+  detachIdleWorker(idleWorker);
+}
+
 void CompiledWorker::Impl::taskFailed(kj::Exception&& exception) {
   KJ_LOG(ERROR, exception);
 }
@@ -1607,6 +1627,10 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
   auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
   impl->isDynamic = dynamicSource != kj::none;
   if (spec.load_identity.present) {
+    impl->idleWorker = registerIdleWorker(factory.idleReaper, impl->name,
+        [target = impl.get()]() {
+      KJ_IF_SOME(channels, target->idleChannels) channels->abort_isolate("idle");
+    }, spec.load_identity.present);
     const auto& identity = spec.load_identity;
     impl->coworkerdIdentity = CoworkerdWorkerIdentity{kj::str(identity.tenant),
       kj::str(identity.worker_id), kj::str(identity.version_id), identity.generation,
@@ -1710,7 +1734,9 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
         workerSource.variant.is<WorkerSource::ScriptSource>() && !usingNewModuleRegistry
         ? Worker::ConsoleMode::INSPECTOR_ONLY
         : options.loggingOptions.consoleMode;
-    return kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), newIsolateObserver(options),
+    return kj::atomicRefcounted<Worker::Isolate>(kj::mv(api),
+        idleIsolateObserver(isolateName, impl->isDynamic, impl->idleWorker,
+            newIsolateObserver(options)),
         isolateName, kj::mv(limitEnforcer), policy, kj::mv(isolateLoggingOptions));
   };
 
@@ -1856,8 +1882,16 @@ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const ui
   });
 }
 
+void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory> channels) {
+  auto& impl = worker.getImpl();
+  impl.idleChannels = kj::mv(channels);
+  impl.idleReady = true;
+  idleWorkerReady(impl.idleWorker);
+}
+
 void worker_unlink(const CompiledWorker& worker) {
   auto& impl = worker.getImpl();
+  impl.idleChannels = kj::none;
   impl.waitUntilTasks.clear();
   impl.subrequestChannels.clear();
   impl.actorClassChannels.clear();

@@ -171,15 +171,20 @@ class InheritedMapping {
 };
 }  // namespace
 
-void initializeCoworkerdChannels() {
-  coworkerdPid();
-  cpuEventsDescriptor();
+void* coworkerdLifecycleMapping() {
   static InheritedMapping lifecycle("COWORKERD_LIFECYCLE_FD",
       64 + 2 * (16 + size_t(8 << 20)), PROT_READ | PROT_WRITE);
   if (lifecycle.base) {
     auto* header = static_cast<const uint32_t*>(lifecycle.base);
     KJ_REQUIRE(header[2] == 0x434c5743 && header[3] == (8 << 20), "invalid lifecycle channel");
   }
+  return lifecycle.base;
+}
+
+void initializeCoworkerdChannels() {
+  coworkerdPid();
+  cpuEventsDescriptor();
+  coworkerdLifecycleMapping();
   static InheritedMapping band("COWORKERD_MEMORY_BAND_FD", 4096, PROT_READ, true);
 }
 
