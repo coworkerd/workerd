@@ -2,6 +2,7 @@
 
 #include <workerd/jsg/coworkerd-rpc-code.h>
 #include "coworkerd-gc.h"
+#include "coworkerd-idle-eviction.h"
 #include "coworkerd-channels.h"
 #include "coworkerd-memory-limit.h"
 
@@ -106,9 +107,10 @@ class LimitWatchdog {
 class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  public:
   CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name,
-      const kj::Maybe<CoworkerdWorkerIdentity>& identity, kj::StringPtr startupIdentity = "")
+      const kj::Maybe<CoworkerdWorkerIdentity>& identity, kj::StringPtr startupIdentity = "",
+      IdleWorkerRef idleWorker = {})
       : fallback(kj::mv(fallback)), name(kj::str(name)),
-        cpuNs(0), tenantWorker(identity != kj::none), startupIdentity(kj::str(startupIdentity)) {
+        cpuNs(0), tenantWorker(identity != kj::none), startupIdentity(kj::str(startupIdentity)), idleWorker(kj::mv(idleWorker)) {
     KJ_IF_SOME(record, identity) {
       cpuNs = uint64_t(record.cpuLimitMs ? record.cpuLimitMs : cpuLimitFromEnvironment()) * 1000000;
       auto limit = record.memoryLimitMiB ? record.memoryLimitMiB : memoryLimitFromEnvironment();
@@ -117,6 +119,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     // The isolate's GC callbacks account for excluded CPU and long pauses.
     if (gcSettings().observes()) {
       gc = std::make_shared<IsolateGc>(name, identity, cpuNs);
+      idleWorkerSetGc(this->idleWorker, gc);
     }
     if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
     recordPlatformFacts(name, tenantWorker);
@@ -126,6 +129,8 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     if (cpuNs) record("created", "", 0);
     if (memory) record("memory-created", "", 0);
   }
+
+  const IdleWorkerRef& activity() const { return idleWorker; }
 
   v8::Isolate::CreateParams getCreateParams() override {
     auto params = fallback->getCreateParams();
@@ -404,6 +409,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   uint64_t cpuNs;
   const bool tenantWorker;
   kj::String startupIdentity;
+  IdleWorkerRef idleWorker;
   v8::Isolate* isolate = nullptr;
   uint64_t startupUsed = 0;
   LimitWatchdog* watchdog = nullptr;
@@ -417,7 +423,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
 
 kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
-    kj::Function<void()> abortIsolate);
+    kj::Function<void()> abortIsolate, bool isActor = false);
 kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
     CpuIsolateLimitEnforcer& limits);
 }  // namespace workerd::server

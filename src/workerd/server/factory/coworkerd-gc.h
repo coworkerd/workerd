@@ -155,4 +155,16 @@ class IsolateGc {
   std::atomic<uint64_t> excludedNs{0};          // excluded GC CPU since this isolate began
 };
 
+// Fix B's collection, from the idle reaper: the Worker's async lock, then -- unless `stillIdle` says a request came
+// meanwhile -- one collectIdle() under it.
+kj::Promise<IdleCollection> collectIdleIsolate(
+    kj::Own<const Worker> worker, std::shared_ptr<IsolateGc> gc, kj::Function<bool()> stillIdle);
+
+// This process's collections as one JSON object member, ,"gc":{...}, for the lifecycle snapshot (the node's state
+// endpoint shows it per process); and a number that changes whenever it does.
+kj::String processGcJson();
+uint64_t processGcVersion();
+// The idle reaper's outcomes, counted with the rest.
+void countIdleCollection(IdleCollection outcome, bool skippedQueued);
+
 }  // namespace workerd::server
