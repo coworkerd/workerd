@@ -377,6 +377,7 @@ impl WorkerService {
             },
             None,
         )?;
+        ffi::worker_idle_ready(&this.worker, Box::new(ChannelFactory(this.channels()?)))?;
         Ok(this)
     }
 }
