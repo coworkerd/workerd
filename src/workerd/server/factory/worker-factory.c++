@@ -1149,7 +1149,7 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
   auto requestLimits = wrapCpuRequestLimits(kj::refcounted<NullLimitEnforcer>(),
       *worker.cpuLimits, invocationIdentity, [channel = ioChannelFactory.addRef()]() mutable {
         channel->abortIsolate("CPU limit exceeded");
-      });
+      }, actor != kj::none);
   auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
       entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(requestLimits),
       idleActivity(worker.idleWorker),
@@ -1651,7 +1651,7 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
     impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
         kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->coworkerdIdentity,
-        kj::str(spec.load_identity.startup_identity));
+        kj::str(spec.load_identity.startup_identity), impl->idleWorker);
     auto limitEnforcer = kj::addRef(*impl->cpuLimits);
     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
       return Worker::Api::InboundListener{
@@ -1825,6 +1825,16 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
   impl.idleChannels = kj::mv(channels);
   impl.idleReady = true;
   idleWorkerReady(impl.idleWorker);
+  if (impl.idleWorker && gcSettings().idleCollectMs) {
+    // The collector holds the Worker, not the Impl. Its observer holds idleWorker;
+    // ~Impl detaches the collector to break that cycle. An in-flight collection
+    // keeps its own Worker reference until its async lock and collection finish.
+    idleWorkerSetCollector(impl.idleWorker,
+        [ref = kj::atomicAddRef(impl.getWorker())](std::shared_ptr<IsolateGc> gc,
+            kj::Function<bool()> stillIdle) -> kj::Maybe<kj::Promise<IdleCollection>> {
+      return collectIdleIsolate(kj::atomicAddRef(*ref), kj::mv(gc), kj::mv(stillIdle));
+    });
+  }
 }
 
 void worker_unlink(const CompiledWorker& worker) {
