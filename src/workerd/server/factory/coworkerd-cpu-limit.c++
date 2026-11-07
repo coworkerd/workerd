@@ -181,11 +181,16 @@ void* coworkerdLifecycleMapping() {
   return lifecycle.base;
 }
 
+const uint32_t* coworkerdMemoryBandMapping() {
+  static InheritedMapping band("COWORKERD_MEMORY_BAND_FD", 4096, PROT_READ, true);
+  return static_cast<const uint32_t*>(band.base);
+}
+
 void initializeCoworkerdChannels() {
   coworkerdPid();
   cpuEventsDescriptor();
   coworkerdLifecycleMapping();
-  static InheritedMapping band("COWORKERD_MEMORY_BAND_FD", 4096, PROT_READ, true);
+  coworkerdMemoryBandMapping();
 }
 
 void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
