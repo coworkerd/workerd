@@ -9,6 +9,8 @@
 #include <mutex>
 #include <unistd.h>
 #if __linux__
+#include <kj/debug.h>
+
 #include <fcntl.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
@@ -82,6 +84,16 @@ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
   if (digits && count < MAX_CALLS) numbers[count++] = value;
   close(fd);
   return count;
+}
+
+size_t programLength(size_t count) {
+#if defined(__x86_64__)
+  return count + 9;
+#elif defined(__aarch64__)
+  return count + 6;
+#else
+#error "the steady-state system call filter needs this architecture's audit arch"
+#endif
 }
 
 // The launcher's filter layout (launcher/launcher.c, spike 21 PROTOCOL 4.4), so that both tables are
@@ -210,9 +222,11 @@ void narrow() {
     failure = ENOENT;
   }
   if (count > 0) {
-    std::vector<struct sock_filter> program(count + 8);
-    instructions = buildFilter(numbers, count, observe ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_KILL_PROCESS,
+    std::vector<struct sock_filter> program(programLength(count));
+    const auto at = buildFilter(numbers, count, observe ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_KILL_PROCESS,
         program.data());
+    KJ_REQUIRE(at == program.size(), count, at, program.size());
+    instructions = at;
     struct sock_fprog filter = {static_cast<unsigned short>(instructions), program.data()};
     // no_new_privs is seccomp(2)'s precondition for an unprivileged process. The launcher set it and it
     // survives the execve; setting it again keeps this independent of how the process was started.
