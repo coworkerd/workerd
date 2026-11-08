@@ -95,6 +95,7 @@ const STOPS_AT_ONCE: usize = 64;
 
 const EVICT_TIMEOUT_MESSAGE: &str =
     "jsg.Error: Timed out waiting to evict Durable Object: it still has active references.";
+const RESIDENT_LIMIT_REASON: &str = "broken.dropped; Actor evicted for the resident object limit";
 
 /// The namespace of one Durable Object class: its actors and their shared storage. The runtime's
 /// `ActorNamespace`.
@@ -118,6 +119,11 @@ pub struct ActorNamespace {
     actors: RefCell<LinkedHashMap<String, Rc<ActorContainer>>>,
     /// The cleanup loop, started by the first request; dropped with the namespace.
     cleanup_task: RefCell<Option<TaskHandle>>,
+    /// One resident-limit pass, started by a successful root start, never a periodic loop.
+    resident_task: RefCell<Option<TaskHandle>>,
+    enforcing: Cell<bool>,
+    residency: Cell<ffi::DurableResidencyReport>,
+    reported_residency: Cell<ffi::DurableResidencyReport>,
     /// Set in cluster mode for a namespace on disk: its actors are owned by one instance of
     /// the cluster at a time, and replicated.
     cluster: OnceCell<Rc<ClusterNode>>,
@@ -172,6 +178,10 @@ impl ActorNamespace {
             storage: OnceCell::new(),
             actors: RefCell::new(LinkedHashMap::new()),
             cleanup_task: RefCell::new(None),
+            resident_task: RefCell::new(None),
+            enforcing: Cell::new(false),
+            residency: Cell::new(ffi::DurableResidencyReport::default()),
+            reported_residency: Cell::new(ffi::DurableResidencyReport::default()),
             cluster: OnceCell::new(),
             directory: OnceCell::new(),
             shipped: Cell::new(false),
@@ -409,6 +419,134 @@ impl ActorNamespace {
             .collect();
         keys.iter().filter_map(|key| actors.remove(key)).collect()
     }
+
+    /// Counts root trees, not actors: a live facet keeps its root tree resident.
+    fn count_resident(&self) {
+        if !self.shipped.get() {
+            return;
+        }
+        let mut report = self.residency.get();
+        report.resident = self
+            .actors
+            .borrow()
+            .values()
+            .filter(|container| container.is_resident())
+            .count() as u64;
+        self.residency.set(report);
+        let reported = self.reported_residency.get();
+        if report.resident == reported.resident
+            && report.limit == reported.limit
+            && report.evicted == reported.evicted
+            && report.woken == reported.woken
+            && report.wake_us_total == reported.wake_us_total
+        {
+            return;
+        }
+        let handle = ActorNamespaceHandle(Weak::clone(&self.this));
+        match handle.durable_log_residency(&report) {
+            Ok(()) => {
+                self.reported_residency.set(report);
+            }
+            Err(error) => tracing::error!(
+                "reporting Durable Object residency: {}",
+                error.description()
+            ),
+        }
+    }
+
+    fn object_resident(&self, container: &ActorContainer) {
+        if !self.shipped.get() || !container.is_root() {
+            return;
+        }
+        self.count_resident();
+        let report = self.residency.get();
+        if report.limit == 0
+            || report.resident <= report.limit
+            || !self.is_evictable()
+            || self.enforcing.replace(true)
+        {
+            return;
+        }
+        // Replacing a completed handle is safe; the pass never clears its own handle.
+        let task = self
+            .factory
+            .spawn(enforce_resident_limit(Weak::clone(&self.this)));
+        *self.resident_task.borrow_mut() = Some(task);
+    }
+
+    fn object_evicted(&self) {
+        if !self.shipped.get() {
+            return;
+        }
+        let mut report = self.residency.get();
+        report.evicted += 1;
+        self.residency.set(report);
+        self.count_resident();
+    }
+
+    fn object_woken(&self, took: Duration) {
+        if !self.shipped.get() {
+            return;
+        }
+        let mut report = self.residency.get();
+        report.woken += 1;
+        report.wakes += 1;
+        // Preserve the existing wire's microsecond precision for sub-millisecond wakes.
+        let us = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        report.wake_us_total = report.wake_us_total.saturating_add(us);
+        report.wake_us_max = report.wake_us_max.max(us);
+        self.residency.set(report);
+        self.count_resident();
+    }
+}
+
+/// Clears the pass flag on completion, error or cancellation without owning its namespace.
+struct ResidentPass(Weak<ActorNamespace>);
+
+impl Drop for ResidentPass {
+    fn drop(&mut self) {
+        if let Some(ns) = self.0.upgrade() {
+            ns.enforcing.set(false);
+        }
+    }
+}
+
+async fn enforce_resident_limit(namespace: Weak<ActorNamespace>) {
+    let _release = ResidentPass(Weak::clone(&namespace));
+    let Some(ns) = namespace.upgrade() else {
+        return;
+    };
+    let mut order: Vec<_> = ns
+        .actors
+        .borrow()
+        .values()
+        .filter(|container| container.is_resident())
+        .cloned()
+        .collect();
+    order.sort_by_key(|container| container.last_access.get());
+    // Pinned roots have weak namespace links. No namespace/TaskHandle ownership cycle spans await.
+    drop(ns);
+    for root in order {
+        let Some(ns) = namespace.upgrade() else {
+            return;
+        };
+        ns.count_resident();
+        let report = ns.residency.get();
+        if report.limit == 0 || report.resident <= report.limit || !ns.is_evictable() {
+            break;
+        }
+        drop(ns);
+        if let Err(error) = root.evict_for_resident_limit().await {
+            tracing::error!(
+                "the resident object limit could not be enforced: {}",
+                error.description()
+            );
+            break;
+        }
+    }
+    if let Some(ns) = namespace.upgrade() {
+        ns.count_resident();
+    }
 }
 
 /// Drops containers the namespace has not touched in `CONTAINER_EXPIRATION`, that often.
@@ -588,6 +726,11 @@ impl ActorNamespace {
             ));
         }
         self.shipped.set(shipped);
+        if shipped {
+            let mut report = self.residency.get();
+            report.limit = ffi::factory_durable_log_resident_objects()?;
+            self.residency.set(report);
+        }
         if !path.is_empty() {
             let directory = format!("{path}/{unique_key}");
             if self.cluster.get().is_some() {
@@ -696,6 +839,10 @@ fn claim_directory(directory: &str) -> Result<()> {
 }
 
 impl ActorNamespaceHandle {
+    fn durable_log_residency(&self, report: &ffi::DurableResidencyReport) -> Result<()> {
+        Ok(ffi::actor_namespace_durable_log_residency(self, report)?)
+    }
+
     pub(crate) fn actor_for_alarm(
         &self,
         id: KjOwn<ActorIdHandle>,
@@ -1074,6 +1221,8 @@ pub struct ActorContainer {
     /// is for the on-broken monitor and a request being started, which borrow the handle; it
     /// counts no request, so it does not block the actor's shutdown.
     actor: RefCell<Option<Rc<KjOwn<ffi::ActorHandle>>>>,
+    /// Only a real actor-to-empty eviction makes the next successful start a wake.
+    was_evicted: Cell<bool>,
     /// The hibernation manager of the evicted actor, for the actor that replaces it.
     manager: RefCell<Option<KjRc<ffi::HibernationManager>>>,
     /// Set once the actor broke or was aborted; every later use of the container fails with it.
@@ -1159,6 +1308,7 @@ impl ActorContainer {
             last_access,
             class_and_id: RefCell::new(class_and_id),
             actor: RefCell::new(None),
+            was_evicted: Cell::new(false),
             manager: RefCell::new(None),
             broken_reason: RefCell::new(None),
             facets: RefCell::new(LinkedHashMap::new()),
@@ -1196,6 +1346,53 @@ impl ActorContainer {
 
     fn is_root(&self) -> bool {
         self.parent.is_none()
+    }
+
+    fn is_resident(&self) -> bool {
+        self.is_running()
+            || self
+                .facets
+                .borrow()
+                .values()
+                .any(|child| child.is_resident())
+    }
+
+    fn tree_has_requests(&self) -> bool {
+        self.active.get()
+            || self
+                .actor
+                .borrow()
+                .as_ref()
+                .is_some_and(|actor| ffi::actor_is_shared(actor))
+            || self
+                .facets
+                .borrow()
+                .values()
+                .any(|child| child.tree_has_requests())
+    }
+
+    fn pin_facets_first(self: &Rc<Self>, order: &mut Vec<Rc<Self>>) {
+        for child in self.facets.borrow().values() {
+            child.pin_facets_first(order);
+        }
+        order.push(Rc::clone(self));
+    }
+
+    async fn evict_for_resident_limit(self: &Rc<Self>) -> Result<()> {
+        let root = Rc::downgrade(self);
+        let mut order = Vec::new();
+        self.pin_facets_first(&mut order);
+        for container in order {
+            if !resident_tree_idle(Some(&root)) {
+                break;
+            }
+            if container.is_running() {
+                container
+                    .try_evict_guarded(RESIDENT_LIMIT_REASON, true, Some(Weak::clone(&root)))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// The root of the facet tree; a facet whose parent is gone stands for it.
@@ -1343,6 +1540,8 @@ impl ActorContainer {
             if let Some(actor) = self.actor.borrow().clone() {
                 return Ok(actor);
             }
+            let ns = self.namespace()?;
+            let woke_from = self.was_evicted.get().then(|| ns.factory.now());
             if let Some(pending) = self.pending_class() {
                 pending.await?;
                 self.require_not_broken()?;
@@ -1358,6 +1557,11 @@ impl ActorContainer {
             // A concurrent request may have started the actor meanwhile.
             if !self.is_running() {
                 self.start(&class)?;
+                if let Some(from) = woke_from {
+                    self.was_evicted.set(false);
+                    ns.object_woken(ns.factory.now().saturating_sub(from));
+                }
+                ns.object_resident(self);
             }
             return self
                 .actor
@@ -1814,10 +2018,23 @@ impl ActorContainer {
     /// Starts a root's hook only once it has no requests. Once committed, retirement belongs to
     /// the container, so canceling a test eviction or the idle timer cannot interrupt it.
     async fn try_evict(&self, reason: &str, hibernate: bool) -> Result<bool> {
+        self.try_evict_guarded(reason, hibernate, None).await
+    }
+
+    async fn try_evict_guarded(
+        &self,
+        reason: &str,
+        hibernate: bool,
+        resident_root: Option<Weak<Self>>,
+    ) -> Result<bool> {
+        let resident_pass = resident_root.is_some();
         let retirement = self.retirement.borrow().clone();
         if let Some(retirement) = retirement {
             retirement.await?;
-            return Ok(true);
+            return Ok(!resident_pass || !self.is_running());
+        }
+        if !resident_tree_idle(resident_root.as_ref()) {
+            return Ok(false);
         }
         let current = self.actor.borrow().clone();
         // The handler may be read only while the actor is idle.
@@ -1842,15 +2059,25 @@ impl ActorContainer {
             let retirement = ns
                 .factory
                 .spawn(async move {
-                    retire_actor(container, actor, class, metadata, reason, hibernate).await
+                    retire_actor(
+                        container,
+                        actor,
+                        class,
+                        metadata,
+                        reason,
+                        hibernate,
+                        resident_root,
+                    )
+                    .await
                 })
                 .shared();
             *self.retirement.borrow_mut() = Some(retirement.clone());
             self.cancel_shutdown();
             retirement.await?;
-            return Ok(true);
+            return Ok(!resident_pass || !self.is_running());
         }
-        self.finish_eviction(reason, hibernate).await
+        self.finish_eviction(reason, hibernate, resident_root.as_ref())
+            .await
     }
 
     /// Shuts the actor down, keeping its storage. Returns false without evicting if the actor
@@ -1860,7 +2087,12 @@ impl ActorContainer {
     /// the shutdown and the clearing of the slot after it are one step, so no request finds a
     /// shut-down actor in the slot. The on-broken monitor is cancelled only once the shutdown
     /// is committed, so that an early `false` leaves the actor watched.
-    async fn finish_eviction(&self, reason: &str, hibernate: bool) -> Result<bool> {
+    async fn finish_eviction(
+        &self,
+        reason: &str,
+        hibernate: bool,
+        resident_root: Option<&Weak<Self>>,
+    ) -> Result<bool> {
         let current = self.actor.borrow().clone();
         if let Some(actor) = &current {
             if hibernate {
@@ -1877,6 +2109,11 @@ impl ActorContainer {
                 Some(_) => return Ok(false),
                 None => return Ok(true),
             }
+            // A different actor in the same root tree may have acquired a request while
+            // this actor awaited its isolate lock. Leave the rest of that tree alone.
+            if !resident_tree_idle(resident_root) {
+                return Ok(false);
+            }
             if !ffi::actor_shutdown(actor, reason, lock.into())? {
                 return Ok(false);
             }
@@ -1884,11 +2121,27 @@ impl ActorContainer {
         self.cancel_on_broken();
         self.cancel_shutdown();
         *self.actor.borrow_mut() = None;
+        if current.is_some() {
+            self.was_evicted.set(true);
+            if let Some(ns) = self.namespace.upgrade() {
+                ns.object_evicted();
+            }
+        }
         if !hibernate {
             *self.manager.borrow_mut() = None;
         }
         Ok(true)
     }
+}
+
+/// No guard for upstream idle/test evictions; a resident pass checks the whole root tree.
+fn resident_tree_idle(root: Option<&Weak<ActorContainer>>) -> bool {
+    root.is_none_or(|root| {
+        root.upgrade().is_some_and(|root| {
+            root.namespace.upgrade().is_some_and(|ns| ns.is_evictable())
+                && !root.tree_has_requests()
+        })
+    })
 }
 
 async fn retire_actor(
@@ -1898,6 +2151,7 @@ async fn retire_actor(
     metadata: KjOwn<RequestMetadata>,
     reason: String,
     hibernate: bool,
+    resident_root: Option<Weak<ActorContainer>>,
 ) -> Result<()> {
     let hook = class.run_on_hibernate(metadata, &actor).await;
     let container = container
@@ -1906,7 +2160,16 @@ async fn retire_actor(
     let result = async {
         hook?;
         container.require_not_broken()?;
-        if !container.finish_eviction(&reason, hibernate).await? {
+        if !resident_tree_idle(resident_root.as_ref()) {
+            return Ok(());
+        }
+        if !container
+            .finish_eviction(&reason, hibernate, resident_root.as_ref())
+            .await?
+        {
+            if resident_root.is_some() {
+                return Ok(());
+            }
             return Err(kj::failed!("a retiring actor acquired a strong reference"));
         }
         Ok(())
