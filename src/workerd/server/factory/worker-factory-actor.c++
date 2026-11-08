@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "worker-factory-impl.h"
+#include "coworkerd-wal-shipper.h"
 
 #include <workerd/api/actor-state.h>
 #include <workerd/io/actor-cache.h>
@@ -176,6 +177,7 @@ ActorStorage::Impl::Impl(const WorkerFactory& factory,
               : vfsDirectory->clone()),
       vfs(*sqliteDirectory),
       uniqueKey(kj::mv(uniqueKey)),
+      timer(factory.getImpl().timer),
       alarmScheduler(kj::heap<AlarmScheduler>(kj::systemPreciseCalendarClock(),
           factory.getImpl().timer,
           vfs,
@@ -206,6 +208,9 @@ void ActorStorage::Impl::deleteFacet(
     const kj::Directory& dir, kj::StringPtr rootKey, FacetTreeIndex& index, uint facetId) {
   index.forEachChild(
       facetId, [&](uint childId, kj::StringPtr) { deleteFacet(dir, rootKey, index, childId); });
+  KJ_IF_SOME(name, actors->durable_log_name(toRust(rootKey))) {
+    durableLogFacetDeleted(kj::str(name), facetId);
+  }
   // The database may not exist at all if the facet never ran.
   dir.tryRemove(getSqlitePath(rootKey, facetId));
   dir.tryRemove(getSqlitePath(rootKey, facetId, "-wal"));
@@ -257,6 +262,19 @@ void ActorStorage::Impl::cloneFacet(const kj::Directory& dir,
         .run("PRAGMA wal_checkpoint(TRUNCATE);");
     dir.tryRemove(getSqlitePath(rootKey, dstId, "-wal"));
   }
+}
+
+bool factory_durable_log_enabled() {
+  return durableLogEnabled();
+}
+
+::rust::String actor_id_name(const ActorIdHandle& id) {
+  KJ_IF_SOME(obj, id.tryGet<kj::Own<ActorIdFactory::ActorId>>()) {
+    KJ_IF_SOME(name, obj->getName()) {
+      return toRustString(name);
+    }
+  }
+  return ::rust::String();
 }
 
 ActorStorage::ActorStorage(kj::Own<Impl> impl): impl(kj::mv(impl)) {}
@@ -524,7 +542,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
     kj::String rootKey,
     kj::Maybe<kj::String> actorName,
     kj::Maybe<::rust::Box<Committer>> committer) {
+  KJ_REQUIRE(!(spec.shipped && spec.replicated),
+      "cluster mode and the node's Durable Object log are mutually exclusive");
   return [storage = kj::mv(storage), durable = spec.durable, facetId = spec.facet_id,
+             shipped = spec.shipped, rootName = kj::str(spec.root_name),
+             facetName = kj::str(spec.facet_name), parentFacetId = spec.parent_facet_id,
              rootKey = kj::mv(rootKey), actorName = kj::mv(actorName),
              committer = kj::mv(committer)](const ActorCache::SharedLru& sharedLru,
              OutputGate& outputGate, ActorCache::Hooks& hooks,
@@ -553,10 +575,30 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
     // also deletes the child facets' storage; that is not transactional with the reset, as it is
     // in production).
     db->run("PRAGMA journal_mode=WAL;");
-    db->afterReset([storage = kj::addRef(*storage), rootKey = kj::str(rootKey), selfId](
-                       SqliteDatabase& db) mutable {
+    kj::Maybe<kj::Own<DurableLogShipper>> shipper;
+    if (shipped) {
+      DurableObjectName name{
+        .objectName = kj::str(rootName.size() == 0 ? rootKey.asPtr() : rootName.asPtr()),
+        .storageId = kj::str(rootKey),
+        .facetId = selfId,
+        .parentFacetId = parentFacetId.orDefault(0),
+        .facetName = kj::str(facetName),
+      };
+      shipper = kj::heap<DurableLogShipper>(*KJ_ASSERT_NONNULL(storage->directory),
+          storage->getSqlitePath(rootKey, selfId, "-wal"_kj),
+          storage->getSqlitePath(rootKey, selfId), kj::mv(name), *db, storage->timer);
+    }
+    DurableLogShipper* shipperPtr = nullptr;
+    KJ_IF_SOME(s, shipper) {
+      shipperPtr = s.get();
+    }
+    db->afterReset([storage = kj::addRef(*storage), rootKey = kj::str(rootKey), selfId,
+                      shipperPtr](SqliteDatabase& db) mutable {
+      // Close descendant actors before deleting their files; preserve cluster reset handling.
       storage->actors->database_reset(toRust(storage->getSqlitePath(rootKey, selfId).toString()));
       db.run("PRAGMA journal_mode=WAL;");
+      // Configure the replacement connection and order RESET before descendant DELETE records.
+      if (shipperPtr != nullptr) shipperPtr->afterReset(db);
       storage->deleteDescendantStorage(*KJ_ASSERT_NONNULL(storage->directory), rootKey, selfId);
     });
     kj::Function<kj::Promise<void>(SpanParent)> commit = [](SpanParent) -> kj::Promise<void> {
@@ -566,6 +608,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
       commit = [c = kj::mv(c)](
                    SpanParent) -> kj::Promise<void> { return result_task_run(c->commit()); };
       committer = kj::none;
+    }
+    KJ_IF_SOME(s, shipper) {
+      commit = [s = kj::mv(s)](SpanParent) mutable -> kj::Promise<void> {
+        return s->onCommit();
+      };
     }
     auto sqlite = kj::heap<ActorSqlite>(kj::mv(db), outputGate, kj::mv(commit), *sqliteHooks);
     KJ_IF_SOME(root, rootHooks) {

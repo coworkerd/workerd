@@ -234,6 +234,7 @@ class ActorStorage::Impl final: public kj::Refcounted {
   kj::Own<const kj::Directory> sqliteDirectory;
   SqliteDatabase::Vfs vfs;
   kj::String uniqueKey;
+  kj::Timer& timer;
   kj::Own<AlarmScheduler> alarmScheduler;
 
   // The facet index of the root actor `rootKey`, read from disk for one operation; none when it

@@ -280,6 +280,8 @@ kj::Promise<FacetStartInfo> facet_start_resolve(kj::Own<FacetStart> start);
 
 kj::Own<ActorIdHandle> actor_id_clone(const ActorIdHandle& id);
 ::rust::String actor_id_key(const ActorIdHandle& id);
+::rust::String actor_id_name(const ActorIdHandle& id);
+bool factory_durable_log_enabled();
 kj::Own<ActorIdHandle> actor_id_from_name(::rust::Str name);
 kj::Own<ActorIdHandle> actor_id_from_hex(::rust::Str hex);
 

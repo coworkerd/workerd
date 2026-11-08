@@ -185,6 +185,14 @@ pub mod ffi {
         facet_id: KjMaybe<u32>,
         /// The cluster replicates the actor's commits: each waits for `Committer::commit`.
         replicated: bool,
+        /// The node confirms WAL commits over its inherited log channel; excludes replicated.
+        shipped: bool,
+        /// The root's idFromName name, or empty when its id carries no name.
+        root_name: String,
+        /// Empty for the root, otherwise the facet's name in its parent's tree.
+        facet_name: String,
+        /// None for a root; a direct child of the root has parent id zero.
+        parent_facet_id: KjMaybe<u32>,
     }
 
     /// What an alarm does when another instance owns its object: runs again later, a retry
@@ -485,6 +493,10 @@ pub mod ffi {
         fn actor_id_clone(id: &ActorIdHandle) -> KjOwn<ActorIdHandle>;
         /// The key the server files the actor under: the hex id, or the name.
         fn actor_id_key(id: &ActorIdHandle) -> String;
+        /// The durable id's original name, or empty when no name was retained.
+        fn actor_id_name(id: &ActorIdHandle) -> String;
+        /// C++ owns the first read and validation of the inherited log descriptor.
+        fn factory_durable_log_enabled() -> Result<bool>;
         fn actor_id_from_name(name: &str) -> KjOwn<ActorIdHandle>;
         /// The id of a durable namespace, from its hex text (a debug-port request).
         fn actor_id_from_hex(hex: &str) -> Result<KjOwn<ActorIdHandle>>;
@@ -960,6 +972,9 @@ pub mod ffi {
         ) -> Result<KjOwn<WorkerInterface>>;
         /// Whether the cluster replicates the namespace's actors.
         fn replicated(self: &ActorNamespaceHandle) -> bool;
+        /// The node's object name for a shipped root, including while deleting unopened facets.
+        fn durable_log_name(self: &ActorNamespaceHandle, root_key: &str)
+        -> Result<KjMaybe<String>>;
         /// Called as SQLite opens one of the namespace's files: fails once this instance's
         /// cluster lease has lapsed.
         fn check_open(self: &ActorNamespaceHandle) -> Result<()>;
