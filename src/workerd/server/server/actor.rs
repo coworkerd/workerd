@@ -123,6 +123,8 @@ pub struct ActorNamespace {
     cluster: OnceCell<Rc<ClusterNode>>,
     /// The namespace's directory, once linked on disk.
     directory: OnceCell<String>,
+    /// Durable disk storage whose commits are confirmed by the node, rather than a cluster.
+    shipped: Cell<bool>,
     /// Actors being resolved in the cluster, each woken when its first resolution ends.
     resolving: RefCell<HashMap<String, Rc<Notify>>>,
     /// Set for the namespace of a worker that cannot handle requests (`set_broken`).
@@ -172,6 +174,7 @@ impl ActorNamespace {
             cleanup_task: RefCell::new(None),
             cluster: OnceCell::new(),
             directory: OnceCell::new(),
+            shipped: Cell::new(false),
             resolving: RefCell::new(HashMap::new()),
             broken: Cell::new(false),
             left_behind: RefCell::new(Vec::new()),
@@ -578,6 +581,13 @@ impl ActorNamespace {
             }
             ActorConfig::Ephemeral { .. } => ("", ""),
         };
+        let shipped = !path.is_empty() && ffi::factory_durable_log_enabled()?;
+        if shipped && self.cluster.get().is_some() {
+            return Err(kj::failed!(
+                "cluster mode and the node's Durable Object log are mutually exclusive"
+            ));
+        }
+        self.shipped.set(shipped);
         if !path.is_empty() {
             let directory = format!("{path}/{unique_key}");
             if self.cluster.get().is_some() {
@@ -771,6 +781,25 @@ impl ActorNamespaceHandle {
 
     pub(crate) fn replicated(&self) -> bool {
         self.namespace().is_some_and(|ns| ns.cluster().is_some())
+    }
+
+    pub(crate) fn durable_log_name(&self, root_key: &str) -> Result<KjMaybe<String>> {
+        let ns = self
+            .namespace()
+            .ok_or_else(|| kj::disconnected!("the namespace is gone"))?;
+        if !ns.shipped.get() {
+            return Ok(None.into());
+        }
+        let actors = ns.actors.borrow();
+        let root = actors
+            .get(root_key)
+            .ok_or_else(|| kj::failed!("the shipped root is gone"))?;
+        let name = if root.root_name.is_empty() {
+            &root.root_key
+        } else {
+            &root.root_name
+        };
+        Ok(Some(name.clone()).into())
     }
 
     pub(crate) fn check_open(&self) -> Result<()> {
@@ -1036,6 +1065,8 @@ pub struct ActorContainer {
     parent: Option<Weak<Self>>,
     /// The key of the root actor whose storage this one shares: its own for a root.
     root_key: String,
+    /// The root's idFromName name, shared by every database sent to the node's log.
+    root_name: String,
     /// Shared by the whole facet tree: the namespace expires the tree as one.
     last_access: Rc<Cell<Duration>>,
     class_and_id: RefCell<ClassState>,
@@ -1074,6 +1105,7 @@ pub struct ActorContainer {
 impl ActorContainer {
     fn new_root(key: String, ns: &ActorNamespace, id: KjOwn<ActorIdHandle>) -> Rc<Self> {
         let class = Rc::clone(&ns.actor_class);
+        let root_name = ffi::actor_id_name(&id);
         Rc::new_cyclic(|this| {
             Self::init(
                 Weak::clone(this),
@@ -1081,6 +1113,7 @@ impl ActorContainer {
                 Weak::clone(&ns.this),
                 None,
                 key,
+                root_name,
                 Rc::new(Cell::new(ns.factory.now())),
                 ClassState::Ready { class, id },
             )
@@ -1099,6 +1132,7 @@ impl ActorContainer {
                 Weak::clone(&parent.namespace),
                 Some(Weak::clone(&parent.this)),
                 parent.root_key.clone(),
+                parent.root_name.clone(),
                 Rc::clone(&parent.last_access),
                 ClassState::Pending(pending),
             )
@@ -1111,6 +1145,7 @@ impl ActorContainer {
         namespace: Weak<ActorNamespace>,
         parent: Option<Weak<Self>>,
         root_key: String,
+        root_name: String,
         last_access: Rc<Cell<Duration>>,
         class_and_id: ClassState,
     ) -> Self {
@@ -1120,6 +1155,7 @@ impl ActorContainer {
             namespace,
             parent,
             root_key,
+            root_name,
             last_access,
             class_and_id: RefCell::new(class_and_id),
             actor: RefCell::new(None),
@@ -1394,6 +1430,18 @@ impl ActorContainer {
             root_key: self.root_key.clone(),
             facet_id: self.facet_id()?.into(),
             replicated: ns.cluster().is_some(),
+            shipped: ns.shipped.get(),
+            root_name: self.root_name.clone(),
+            facet_name: if self.is_root() {
+                String::new()
+            } else {
+                self.key.clone()
+            },
+            parent_facet_id: match self.parent()? {
+                Some(parent) => Some(parent.facet_id()?.unwrap_or(0)),
+                None => None,
+            }
+            .into(),
         };
         let actor = Rc::new(class.new_actor(NewActor {
             id,
@@ -2116,6 +2164,11 @@ impl ActorContainer {
     }
 
     fn clone_facet(&self, src: &str, dst: &str) -> Result<()> {
+        if self.namespace()?.shipped.get() {
+            return Err(kj::failed!(
+                "jsg.Error: cloneFacet() is not supported for Durable Objects on this platform."
+            ));
+        }
         let ns = self.namespace()?;
         // Replacing a facet implies aborting it.
         self.abort_facet(dst, kj::failed!("jsg.Error: Facet was cloned-over."));

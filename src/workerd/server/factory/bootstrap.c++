@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "bootstrap.h"
+#include "coworkerd-wal-shipper.h"
 #include "coworkerd-parent-death.h"
 #include "coworkerd-channels.h"
 
@@ -152,6 +153,7 @@ class Bootstrap {
         provider(loop.getTimer()) {
     initializeCoworkerdChannels();
     followCoworkerdParent(parentProvider);
+    setDurableLogProvider(parentProvider);
     KJ_IF_SOME(path, serveOrTest.perfetto_trace_path) {
 #ifdef WORKERD_USE_PERFETTO
       perfettoSession = PerfettoSession(kj::str(path),
@@ -190,6 +192,7 @@ class Bootstrap {
   // Ends the --async-trace file. The factory is destroyed first, ending every context, so the exit
   // line follows their ends.
   ~Bootstrap() noexcept(false) {
+    shutdownDurableLog();
     KJ_IF_SOME(writer, asyncTraceWriter) {
       writer->finish();
     }
