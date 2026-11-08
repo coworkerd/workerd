@@ -173,6 +173,18 @@ pub mod ffi {
         report: Vec<u64>,
     }
 
+    /// The node's residency message, per namespace (one namespace per shipped process).
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    struct DurableResidencyReport {
+        resident: u64,
+        limit: u64,
+        evicted: u64,
+        woken: u64,
+        wakes: u64,
+        wake_us_total: u64,
+        wake_us_max: u64,
+    }
+
     /// Where an actor keeps its data.
     struct ActorStorageSpec {
         /// Durable: keep state across requests. Ephemeral: no storage at all.
@@ -497,6 +509,12 @@ pub mod ffi {
         fn actor_id_name(id: &ActorIdHandle) -> String;
         /// C++ owns the first read and validation of the inherited log descriptor.
         fn factory_durable_log_enabled() -> Result<bool>;
+        /// C++ owns the first environment read: 4096 by default, zero means unlimited.
+        fn factory_durable_log_resident_objects() -> Result<u64>;
+        fn actor_namespace_durable_log_residency(
+            actors: &ActorNamespaceHandle,
+            report: &DurableResidencyReport,
+        ) -> Result<()>;
         fn actor_id_from_name(name: &str) -> KjOwn<ActorIdHandle>;
         /// The id of a durable namespace, from its hex text (a debug-port request).
         fn actor_id_from_hex(hex: &str) -> Result<KjOwn<ActorIdHandle>>;

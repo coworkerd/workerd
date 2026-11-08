@@ -282,6 +282,10 @@ kj::Own<ActorIdHandle> actor_id_clone(const ActorIdHandle& id);
 ::rust::String actor_id_key(const ActorIdHandle& id);
 ::rust::String actor_id_name(const ActorIdHandle& id);
 bool factory_durable_log_enabled();
+uint64_t factory_durable_log_resident_objects();
+struct DurableResidencyReport;
+void actor_namespace_durable_log_residency(
+    const ActorNamespaceHandle& actors, const DurableResidencyReport& report);
 kj::Own<ActorIdHandle> actor_id_from_name(::rust::Str name);
 kj::Own<ActorIdHandle> actor_id_from_hex(::rust::Str hex);
 

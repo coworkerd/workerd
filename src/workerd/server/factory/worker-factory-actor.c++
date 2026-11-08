@@ -2,8 +2,8 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-#include "worker-factory-impl.h"
 #include "coworkerd-wal-shipper.h"
+#include "worker-factory-impl.h"
 
 #include <workerd/api/actor-state.h>
 #include <workerd/io/actor-cache.h>
@@ -169,9 +169,8 @@ ActorStorage::Impl::Impl(const WorkerFactory& factory,
     : actors(kj::mv(actorsParam)),
       directory(kj::mv(directoryParam)),
       vfsDirectory(directory.map([](kj::Own<const kj::Directory>& d) { return d->clone(); })
-                       .orDefault([&]() {
-                         return kj::newInMemoryDirectory(kj::systemPreciseCalendarClock());
-                       })),
+              .orDefault(
+                  [&]() { return kj::newInMemoryDirectory(kj::systemPreciseCalendarClock()); })),
       sqliteDirectory(actors->replicated()
               ? kj::heap<ClusterDirectory>(vfsDirectory->clone(), *actors)
               : vfsDirectory->clone()),
@@ -266,6 +265,21 @@ void ActorStorage::Impl::cloneFacet(const kj::Directory& dir,
 
 bool factory_durable_log_enabled() {
   return durableLogEnabled();
+}
+
+uint64_t factory_durable_log_resident_objects() {
+  return durableResidentLimit();
+}
+
+void actor_namespace_durable_log_residency(
+    const ActorNamespaceHandle&, const DurableResidencyReport& report) {
+  durableLogResidency({.resident = report.resident,
+    .limit = report.limit,
+    .evicted = report.evicted,
+    .woken = report.woken,
+    .wakes = report.wakes,
+    .wakeUsTotal = report.wake_us_total,
+    .wakeUsMax = report.wake_us_max});
 }
 
 ::rust::String actor_id_name(const ActorIdHandle& id) {
@@ -417,6 +431,18 @@ kj::Maybe<uint32_t> actor_storage_facet_id(const ActorStorage& storage,
 
 namespace {
 
+// Read the alarm held by this database without creating a missing metadata table.
+kj::Maybe<kj::Date> alarmOf(SqliteDatabase& db) {
+  {
+    auto exists =
+        db.run("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_cf_METADATA'");
+    if (exists.isDone()) return kj::none;
+  }
+  auto query = db.run("SELECT value FROM _cf_METADATA WHERE key = 1");
+  if (query.isDone() || query.isNull(0)) return kj::none;
+  return kj::UNIX_EPOCH + query.getInt64(0) * kj::NANOSECONDS;
+}
+
 // The actor's hooks into the server: the requests it raises for itself (alarms, hibernated
 // WebSocket events, which restart the actor if needed), its facets, and its transitions between
 // idle and active. The actor owns a reference as its loopback, so the hooks it borrows as its
@@ -525,14 +551,29 @@ class ActorSqliteHooks final: public ActorSqlite::Hooks {
   ActorKey actor;
 };
 
-// Facets have their own storage but no alarms: the scheduler delivers only to root actors.
+// The node schedules shipped facets; the local scheduler delivers only to root actors.
 class FacetAlarmHooks final: public ActorSqlite::Hooks {
  public:
+  FacetAlarmHooks() = default;
+  FacetAlarmHooks(kj::String objectName, uint facetId)
+      : shipped(ShippedFacet{kj::mv(objectName), facetId}) {}
+
   kj::Promise<void> scheduleRun(
       kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) override {
+    KJ_IF_SOME(facet, shipped) {
+      durableLogAlarm(facet.objectName, facet.facetId, newAlarmTime);
+      return kj::READY_NOW;
+    }
     // The same message as the production storage factory's.
     JSG_FAIL_REQUIRE(Error, "Facets currently cannot set alarms.");
   }
+
+ private:
+  struct ShippedFacet {
+    kj::String objectName;
+    uint facetId;
+  };
+  kj::Maybe<ShippedFacet> shipped;
 };
 
 // The actor's storage: SQLite in the namespace's directory, or an in-memory cache over empty
@@ -560,11 +601,14 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
     kj::Own<ActorSqlite::Hooks> sqliteHooks;
     kj::Maybe<ActorSqliteHooks&> rootHooks;
     uint selfId = facetId.orDefault(0);
+    auto shippedName = kj::str(rootName.size() == 0 ? rootKey.asPtr() : rootName.asPtr());
     if (facetId == kj::none) {
       auto root =
           kj::heap<ActorSqliteHooks>(kj::addRef(*storage), ActorKey(rootKey.asPtr(), actorName));
       rootHooks = *root;
       sqliteHooks = kj::mv(root);
+    } else if (shipped) {
+      sqliteHooks = kj::heap<FacetAlarmHooks>(kj::str(shippedName), selfId);
     } else {
       sqliteHooks = kj::heap<FacetAlarmHooks>();
     }
@@ -578,7 +622,7 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
     kj::Maybe<kj::Own<DurableLogShipper>> shipper;
     if (shipped) {
       DurableObjectName name{
-        .objectName = kj::str(rootName.size() == 0 ? rootKey.asPtr() : rootName.asPtr()),
+        .objectName = kj::str(shippedName),
         .storageId = kj::str(rootKey),
         .facetId = selfId,
         .parentFacetId = parentFacetId.orDefault(0),
@@ -592,8 +636,8 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
     KJ_IF_SOME(s, shipper) {
       shipperPtr = s.get();
     }
-    db->afterReset([storage = kj::addRef(*storage), rootKey = kj::str(rootKey), selfId,
-                      shipperPtr](SqliteDatabase& db) mutable {
+    db->afterReset([storage = kj::addRef(*storage), rootKey = kj::str(rootKey), selfId, shipperPtr](
+                       SqliteDatabase& db) mutable {
       // Close descendant actors before deleting their files; preserve cluster reset handling.
       storage->actors->database_reset(toRust(storage->getSqlitePath(rootKey, selfId).toString()));
       db.run("PRAGMA journal_mode=WAL;");
@@ -610,9 +654,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
       committer = kj::none;
     }
     KJ_IF_SOME(s, shipper) {
-      commit = [s = kj::mv(s)](SpanParent) mutable -> kj::Promise<void> {
-        return s->onCommit();
-      };
+      commit = [s = kj::mv(s)](SpanParent) mutable -> kj::Promise<void> { return s->onCommit(); };
+    }
+    // Every open reports the persisted value, including none, before ActorSqlite owns the database.
+    if (shipped && facetId != kj::none) {
+      durableLogAlarm(shippedName, selfId, alarmOf(*db));
     }
     auto sqlite = kj::heap<ActorSqlite>(kj::mv(db), outputGate, kj::mv(commit), *sqliteHooks);
     KJ_IF_SOME(root, rootHooks) {
