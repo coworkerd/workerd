@@ -51,7 +51,7 @@ jsg::Promise<jsg::Ref<api::Fetcher>> CoworkerdRootLoader::getRoot(
   auto request = context.getIoChannelFactory().getWorkerdDebugPort().getEntrypointRequest();
   request.setService(service);
   Frankenvalue::fromJson(kj::mv(selectionJson)).toCapnp(request.initProps());
-  // Resolve the selection before exposing a Fetcher, so refreshing a reclaimed plan never replays an event.
+  // Pin a validated plan before exposing a Fetcher; the object is selected when its event starts.
   return context.awaitIo(js, request.send(),
       [](jsg::Lock& js, capnp::Response<rpc::WorkerdDebugPort::GetEntrypointResults> response)
           -> jsg::Ref<api::Fetcher> {

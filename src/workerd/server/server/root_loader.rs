@@ -6,7 +6,7 @@
 //! Compiled instances and stable namespace/class providers have separate lifetimes.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, SystemTime};
@@ -82,7 +82,7 @@ struct RootSelection {
     #[serde(default)]
     alarm_facet_id: Option<u32>,
     #[serde(default)]
-    prepared_ticket: Option<String>,
+    preparation_nonce: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
@@ -315,23 +315,22 @@ struct Plan {
     selection_pins: Cell<usize>,
 }
 
-struct PlanPin(Rc<Plan>);
+struct PlanPin(Rc<Plan>, Weak<RootRegistry>);
 impl PlanPin {
-    fn new(plan: Rc<Plan>) -> Self {
+    fn new(plan: Rc<Plan>, registry: Weak<RootRegistry>) -> Self {
         plan.selection_pins.set(plan.selection_pins.get() + 1);
-        Self(plan)
+        Self(plan, registry)
     }
 }
 impl Drop for PlanPin {
     fn drop(&mut self) {
         self.0.selection_pins.set(self.0.selection_pins.get() - 1);
+        if self.0.selection_pins.get() == 0 {
+            if let Some(registry) = self.1.upgrade() {
+                registry.schedule_prune();
+            }
+        }
     }
-}
-
-struct PreparedRoot {
-    selection: RootSelection,
-    channel: Rc<dyn Channel>,
-    pin: PlanPin,
 }
 
 #[derive(Clone)]
@@ -344,11 +343,35 @@ struct NamespaceEntry {
     removing: Rc<Cell<bool>>,
 }
 
+struct InstallFlight {
+    deployment: RefCell<Option<Rc<Deployment>>>,
+    namespaces: Vec<String>,
+    cancelled: Cell<bool>,
+    result: RefCell<Option<Result<String>>>,
+    completed: tokio::sync::Notify,
+}
+
+impl InstallFlight {
+    async fn wait(&self) -> Result<String> {
+        loop {
+            let notified = self.completed.notified();
+            if let Some(result) = self.result.borrow().clone() {
+                return result;
+            }
+            notified.await;
+        }
+    }
+}
+
 pub struct RootRegistry {
     this: Weak<Self>,
     factory: Rc<Factory>,
     storage: String,
     install_lock: tokio::sync::Mutex<()>,
+    installing: RefCell<HashMap<String, Rc<InstallFlight>>>,
+    tenant_compilations: Cell<u64>,
+    removed_namespaces: RefCell<HashSet<String>>,
+    collect_queued: Cell<bool>,
     plans: RefCell<HashMap<String, Rc<Plan>>>,
     namespaces: RefCell<HashMap<String, NamespaceEntry>>,
     closing_roots: Rc<RootCloseFences>,
@@ -357,8 +380,6 @@ pub struct RootRegistry {
     compiled: RefCell<HashMap<WorkerKey, Rc<WorkerService>>>,
     retiring: RefCell<HashMap<WorkerKey, Rc<WorkerService>>>,
     ignored_retirements: Cell<u64>,
-    next_prepared: Cell<u64>,
-    prepared: RefCell<BTreeMap<u64, PreparedRoot>>,
     server: RefCell<Weak<crate::config::Server>>,
 }
 
@@ -374,6 +395,10 @@ impl RootRegistry {
             factory,
             storage,
             install_lock: tokio::sync::Mutex::new(()),
+            installing: RefCell::new(HashMap::new()),
+            tenant_compilations: Cell::new(0),
+            removed_namespaces: RefCell::new(HashSet::new()),
+            collect_queued: Cell::new(false),
             plans: RefCell::new(HashMap::new()),
             namespaces: RefCell::new(HashMap::new()),
             closing_roots: Rc::default(),
@@ -382,8 +407,6 @@ impl RootRegistry {
             compiled: RefCell::new(HashMap::new()),
             retiring: RefCell::new(HashMap::new()),
             ignored_retirements: Cell::new(0),
-            next_prepared: Cell::new(0),
-            prepared: RefCell::new(BTreeMap::new()),
             server: RefCell::new(Weak::new()),
         }))
     }
@@ -460,8 +483,20 @@ impl RootRegistry {
             .is_some_and(|object| Rc::ptr_eq(&object.registration, registration));
         if matches {
             self.objects.borrow_mut().remove(index);
-            self.prune_plans();
+            self.schedule_prune();
         }
+    }
+
+    fn schedule_prune(&self) {
+        if self.collect_queued.replace(true) { return; }
+        let Some(registry) = self.this.upgrade() else { return; };
+        let factory = Rc::clone(&self.factory);
+        let timer = Rc::clone(&factory);
+        factory.spawn_detached(async move {
+            timer.sleep(Duration::ZERO).await;
+            registry.collect_queued.set(false);
+            registry.prune_plans();
+        });
     }
 
     fn prune_plans(&self) {
@@ -471,6 +506,13 @@ impl RootRegistry {
             .values()
             .map(|entry| entry.source.borrow().clone())
             .collect();
+        // The common case has no obsolete plan. Do not scan every remembered object
+        // when the last Fetcher of an ordinary request releases its pin.
+        if self.plans.borrow().iter().all(|(key, plan)| {
+            needed.contains(key) || plan.selection_pins.get() != 0
+        }) {
+            return;
+        }
         needed.extend(
             self.objects
                 .borrow()
@@ -527,6 +569,7 @@ impl RootRegistry {
         for namespace in namespaces {
             namespace.prune_idle_roots();
         }
+        if self.objects.borrow().is_empty() { self.objects.borrow_mut().shrink_to_fit(); }
         self.prune_plans();
     }
 
@@ -619,6 +662,7 @@ impl RootRegistry {
                 );
         }
         // A binding invocation must yield its calling isolate before compiling another isolate.
+        self.tenant_compilations.set(self.tenant_compilations.get() + 1);
         self.factory.sleep(Duration::ZERO).await;
         let errors = Rc::new(RefCell::new(Vec::new()));
         let found = Rc::clone(&errors);
@@ -719,7 +763,7 @@ impl RootRegistry {
             identity,
             &report,
         )
-        .await.map_err(|error| kj::failed!("ROOT_TENANT_CODE: {}", error.description()))?;
+        .await?;
         if report.refuses()
             || deployment
                 .namespaces
@@ -883,15 +927,67 @@ impl RootRegistry {
 
     async fn install(self: &Rc<Self>, deployment: Deployment) -> Result<String> {
         deployment.validate()?;
+        self.validate_install(&deployment)?;
         let plan_key = deployment.plan_key()?;
-        let _guard = wait_for_root(
+        if let Some(existing) = self.plans.borrow().get(&plan_key).cloned() {
+            if existing.deployment != deployment {
+                return Err(kj::failed!("a root plan cannot be replaced under its existing key"));
+            }
+            for namespace in &deployment.namespaces {
+                if let Some(entry) = self.namespaces.borrow().get(&namespace.id) {
+                    if entry.removing.get() {
+                        return Err(kj::disconnected!("root namespace removal is still in progress; retry"));
+                    }
+                    *entry.source.borrow_mut() = plan_key.clone();
+                }
+            }
+            return Ok(plan_key);
+        }
+        let existing = self.installing.borrow().get(&plan_key).cloned();
+        let flight = if let Some(flight) = existing {
+            if flight.deployment.borrow().as_ref().is_none_or(|value| **value != deployment) {
+                return Err(kj::failed!("a root plan cannot be replaced under its existing key"));
+            }
+            flight
+        } else {
+            let flight = Rc::new(InstallFlight {
+                namespaces: deployment.namespaces.iter().map(|space| space.id.clone()).collect(),
+                deployment: RefCell::new(Some(Rc::new(deployment))),
+                cancelled: Cell::new(false),
+                result: RefCell::new(None),
+                completed: tokio::sync::Notify::new(),
+            });
+            self.installing.borrow_mut().insert(plan_key.clone(), Rc::clone(&flight));
+            let registry = Rc::clone(self);
+            let task = Rc::clone(&flight);
+            let key = plan_key.clone();
+            // Compilation belongs to the registry; cancellation of a waiting caller cannot
+            // strand its source or cause a second concurrent compilation of the same key.
+            self.factory.spawn_detached(async move {
+                let deployment = task.deployment.borrow().as_ref().cloned().expect("install deployment");
+                let result = registry.install_compiled((*deployment).clone(), &task).await;
+                drop(deployment);
+                task.deployment.borrow_mut().take();
+                *task.result.borrow_mut() = Some(result);
+                registry.installing.borrow_mut().remove(&key);
+                task.completed.notify_waiters();
+            });
+            flight
+        };
+        wait_for_root(
             &self.factory,
-            &deployment.namespaces[0].id,
+            &flight.namespaces[0],
             "",
-            "plan install lock",
-            self.install_lock.lock(),
+            "plan installation",
+            flight.wait(),
         )
-        .await?;
+        .await?
+    }
+
+    fn validate_install(&self, deployment: &Deployment) -> Result<()> {
+        if deployment.namespaces.iter().any(|space| self.removed_namespaces.borrow().contains(&space.id)) {
+            return Err(kj::disconnected!("the root namespace was deleted by its node"));
+        }
         if self.namespaces.borrow().iter().any(|(id, entry)| {
             entry.removing.get()
                 && deployment
@@ -916,21 +1012,6 @@ impl RootRegistry {
             return Err(kj::failed!(
                 "a root storage key is already used by a configured namespace"
             ));
-        }
-        let existing = self.plans.borrow().get(&plan_key).cloned();
-        if let Some(existing) = existing {
-            if existing.deployment != deployment {
-                return Err(kj::failed!(
-                    "a root plan cannot be replaced under its existing key"
-                ));
-            }
-            for namespace in &deployment.namespaces {
-                if let Some(entry) = self.namespaces.borrow().get(&namespace.id) {
-                    *entry.source.borrow_mut() = plan_key.clone();
-                }
-            }
-            self.prune_plans();
-            return Ok(plan_key);
         }
         {
             let spaces = self.namespaces.borrow();
@@ -959,6 +1040,12 @@ impl RootRegistry {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn install_compiled(self: &Rc<Self>, deployment: Deployment, flight: &InstallFlight) -> Result<String> {
+        self.validate_install(&deployment)?;
+        let plan_key = deployment.plan_key()?;
         let key = deployment.key(deployment.initial_generation()?)?;
         let plan = Rc::new(Plan {
             deployment,
@@ -969,6 +1056,12 @@ impl RootRegistry {
             selection_pins: Cell::new(0),
         });
         let worker = self.compile(&plan.deployment, &key).await?;
+        let _guard = wait_for_root(&self.factory, &plan.deployment.namespaces[0].id, "",
+            "registry publication", self.install_lock.lock()).await?;
+        if flight.cancelled.get() || self.validate_install(&plan.deployment).is_err() {
+            if !plan.deployment.is_platform() { worker.unlink(); }
+            return Err(kj::disconnected!("root namespace removed while its plan compiled"));
+        }
         let spaces = match self.make_spaces(&plan.deployment, &plan_key) {
             Ok(spaces) => spaces,
             Err(error) => {
@@ -1054,27 +1147,6 @@ impl RootRegistry {
         );
         *plan.loaded.borrow_mut() = Some(key);
         Ok(worker)
-    }
-
-    async fn prepare(self: &Rc<Self>, selection: RootSelection) -> Result<u64> {
-        if selection.prepared_ticket.is_some() {
-            return Err(kj::failed!("a prepared root cannot be prepared again"));
-        }
-        let plan = self.plans.borrow().get(&selection.plan).cloned()
-            .ok_or_else(|| kj::failed!("unknown root plan"))?;
-        let pin = PlanPin::new(plan);
-        // All asynchronous selection and retirement waits finish before the runtime receives a Fetcher.
-        let channel = self.root(selection.clone()).await?;
-        let ticket = self.next_prepared.get().checked_add(1)
-            .ok_or_else(|| kj::failed!("prepared root ticket space exhausted"))?;
-        self.next_prepared.set(ticket);
-        let mut prepared = self.prepared.borrow_mut();
-        // A cancelled management call must not leave an unbounded capability table.
-        if prepared.len() >= 1024 {
-            prepared.pop_first();
-        }
-        prepared.insert(ticket, PreparedRoot { selection, channel, pin });
-        Ok(ticket)
     }
 
     async fn root(self: &Rc<Self>, selection: RootSelection) -> Result<Rc<dyn Channel>> {
@@ -1235,8 +1307,8 @@ impl RootRegistry {
             },
         );
         let result = match selection.alarm_facet_id {
-            Some(facet) => namespace.root_alarm_channel(id, facet),
-            None => namespace.root_channel(id),
+            Some(facet) => namespace.root_alarm_channel(id, facet, selection.preparation_nonce),
+            None => namespace.root_channel(id, selection.preparation_nonce),
         };
         if result.is_err() && !namespace.has_root_container(&key) {
             self.remove_object(&index, &registration);
@@ -1361,6 +1433,10 @@ impl RootRegistry {
                     completed = false;
                 }
             }
+            if !completed && roots.iter().all(|(namespace, key)| !namespace.has_resident_root(key)) {
+                futures::future::join_all(roots.iter().map(|(namespace, key)| namespace.root_closed(key))).await;
+                completed = true;
+            }
             if completed {
                 worker.unlink();
             } else {
@@ -1421,6 +1497,10 @@ impl RootRegistry {
         })).collect();
         namespaces.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         json!({"plans": plans, "namespaces": namespaces, "compiledWorkers": self.compiled.borrow().len(),
+            "installingNamespaces": self.installing.borrow().values().flat_map(|flight| flight.namespaces.iter().cloned()).collect::<Vec<_>>(),
+            "installingPlans": self.installing.borrow().len(), "tenantCompilations": self.tenant_compilations.get(),
+            "closingFences": self.closing_roots.pending(),
+            "retiredNamespaceCount": self.removed_namespaces.borrow().len(),
             "objectEntries": self.objects.borrow().len(),
             "objectContainers": self.namespaces.borrow().values().map(|entry| entry.namespace.container_count()).sum::<usize>(),
             "selectionLocks": self.selection_locks.borrow().len(),
@@ -1773,33 +1853,16 @@ impl Channel for RootRegistry {
         props: KjOwn<ffi::Frankenvalue>,
         _persistent: bool,
     ) -> Result<Rc<dyn Channel>> {
-        let mut selection: RootSelection = serde_json::from_str(&ffi::frankenvalue_plain_json(&props)?)
+        let selection: RootSelection = serde_json::from_str(&ffi::frankenvalue_plain_json(&props)?)
             .map_err(|error| kj::failed!("invalid root selection: {error}"))?;
         if !selection.dispatch_checked {
             return Err(kj::failed!("jsg.Error: node dispatch checks are required"));
         }
-        if let Some(ticket) = selection.prepared_ticket.take() {
-            let ticket = ticket.parse::<u64>()
-                .map_err(|_| kj::failed!("jsg.Error: invalid prepared root ticket"))?;
-            let prepared = self.prepared.borrow_mut().remove(&ticket)
-                .ok_or_else(|| kj::failed!("jsg.Error: ROOT_PLAN_MISSING: prepared selection expired"))?;
-            if prepared.selection != selection {
-                return Err(kj::failed!("jsg.Error: prepared selection does not match"));
-            }
-            return Ok(Rc::new(RootReadyChannel {
-                registry: self.this.upgrade().ok_or_else(|| kj::disconnected!("root registry gone"))?,
-                selection,
-                channel: prepared.channel,
-                _pin: prepared.pin,
-            }));
-        }
         // Let the trusted runtime refresh a cached key before starting an object event.
         if !self.plans.borrow().contains_key(&selection.plan) {
-            return Err(kj::failed!(
-                "jsg.Error: ROOT_PLAN_MISSING: the root plan was reclaimed"
-            ));
+            return Err(preparation_error(&selection.preparation_nonce, kj::failed!("unknown root plan")));
         }
-        let pin = PlanPin::new(Rc::clone(self.plans.borrow().get(&selection.plan).unwrap()));
+        let pin = PlanPin::new(Rc::clone(self.plans.borrow().get(&selection.plan).unwrap()), self.this.clone());
         Ok(Rc::new(RootSelectedChannel {
             registry: self
                 .this
@@ -1835,24 +1898,6 @@ struct RootSelectedChannel {
     _pin: PlanPin,
 }
 
-struct RootReadyChannel {
-    registry: Rc<RootRegistry>,
-    selection: RootSelection,
-    channel: Rc<dyn Channel>,
-    _pin: PlanPin,
-}
-impl Channel for RootReadyChannel {
-    fn start_request(&self, mut metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
-        self.registry.stamp_metadata(&self.selection, &mut metadata)?;
-        self.channel.start_request(metadata)
-    }
-    fn require_allows_transfer(&self) -> Result<()> {
-        Err(not_transferable("Private prepared root"))
-    }
-    fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
-        Err(not_transferable("Private prepared root"))
-    }
-}
 impl Channel for RootSelectedChannel {
     fn start_request(
         &self,
@@ -1860,10 +1905,16 @@ impl Channel for RootSelectedChannel {
     ) -> Result<KjOwn<WorkerInterface>> {
         let registry = Rc::clone(&self.registry);
         let selection = self.selection.clone();
-        registry.stamp_metadata(&selection, &mut metadata)?;
+        let nonce = selection.preparation_nonce.clone();
+        registry.stamp_metadata(&selection, &mut metadata)
+            .map_err(|error| preparation_error(&nonce, error))?;
+        let pin = PlanPin::new(Rc::clone(&self._pin.0), self.registry.this.clone());
         Ok(worker::PromisedInterface::new(async move {
-            let channel = registry.root(selection).await?;
+            let _pin = pin;
+            let channel = registry.root(selection).await
+                .map_err(|error| preparation_error(&nonce, error))?;
             channel.start_request(metadata)
+                .map_err(|error| preparation_error(&nonce, error))
         })
         .into_kj())
     }
@@ -1918,6 +1969,17 @@ async fn read_json(mut body: Pin<&mut AsyncInputStream>) -> Result<Value> {
     serde_json::from_slice(&bytes).map_err(|error| kj::failed!("invalid root description: {error}"))
 }
 
+/// Only private selection and actor setup call this, before a tenant event exists.
+/// The nonce belongs to this runtime dispatch and is never included in tenant metadata.
+pub(crate) fn preparation_error(nonce: &str, error: crate::Error) -> crate::Error {
+    if nonce.is_empty() { return error; }
+    let message = error.description();
+    let kind = if message.contains("ROOT_TENANT_CODE: ") { "tenant-code" }
+        else if message.contains("unknown root plan") || message.contains("root selection plan removed") { "plan-missing" }
+        else { "platform" };
+    kj::failed!("jsg.Error: COWORKERD_ROOT_PREPARATION:{nonce}:{kind}: {message}")
+}
+
 fn preparation_failure(message: &str) -> (u32, Value) {
     let code = "ROOT_TENANT_CODE: ";
     let (status, kind, reason) = if let Some(index) = message.find(code) {
@@ -1957,18 +2019,7 @@ impl Service for RootRequest {
                 match self.registry.install(deployment).await {
                     Ok(plan) => json!({"plan": plan, "state": self.registry.snapshot()}),
                     Err(error) => {
-                        let (code, value) = preparation_failure(error.description());
-                        status = code;
-                        value
-                    }
-                }
-            }
-            (Method::POST, "/prepare") => {
-                let selection = serde_json::from_value(read_json(body).await?)
-                    .map_err(|error| kj::failed!("root selection: {error}"))?;
-                match self.registry.prepare(selection).await {
-                    Ok(ticket) => json!({"ticket": ticket.to_string()}),
-                    Err(error) => {
+                        tracing::error!("root installation: {error:?}");
                         let (code, value) = preparation_failure(error.description());
                         status = code;
                         value
@@ -1985,6 +2036,13 @@ impl Service for RootRequest {
                 let id = value["namespaceId"]
                     .as_str()
                     .ok_or_else(|| kj::failed!("remove-namespace needs a namespaceId"))?;
+                if value["permanent"].as_bool() == Some(true) {
+                    self.registry.removed_namespaces.borrow_mut().insert(id.to_owned());
+                }
+                let compiling: Vec<_> = self.registry.installing.borrow().values()
+                    .filter(|flight| flight.namespaces.iter().any(|namespace| namespace == id))
+                    .cloned().collect();
+                for flight in &compiling { flight.cancelled.set(true); }
                 let entry = self.registry.namespaces.borrow().get(id).cloned();
                 let removed = entry.is_some();
                 if let Some(entry) = entry {
@@ -2007,16 +2065,29 @@ impl Service for RootRequest {
                             registry.prune_plans();
                         });
                     }
-                    wait_for_root(
+                    if let Err(error) = wait_for_root(
                         &self.registry.factory,
                         id,
                         "",
                         "namespace removal",
                         entry.namespace.roots_closed(),
                     )
-                    .await?;
+                    .await {
+                        let bytes = serde_json::to_vec(&json!({"error":{"kind":"namespace-closing","message":error.description()}}))
+                            .map_err(|error| kj::failed!("root reply: {error}"))?;
+                        let headers = Headers::new(header_table(&self.registry.factory));
+                        return response.send(503, "Namespace still closing", &headers, Some(bytes.len() as u64))?.write(&bytes).await;
+                    }
                     // Let the cancellation-independent removal task publish its completion.
                     self.registry.factory.sleep(Duration::ZERO).await;
+                }
+                for flight in compiling {
+                    if let Err(error) = wait_for_root(&self.registry.factory, id, "", "cancelled namespace compilation", flight.wait()).await {
+                        let bytes = serde_json::to_vec(&json!({"error":{"kind":"namespace-closing","message":error.description()}}))
+                            .map_err(|error| kj::failed!("root reply: {error}"))?;
+                        let headers = Headers::new(header_table(&self.registry.factory));
+                        return response.send(503, "Namespace still closing", &headers, Some(bytes.len() as u64))?.write(&bytes).await;
+                    }
                 }
                 self.registry.prune_plans();
                 json!({"removed": removed, "state": self.registry.snapshot()})

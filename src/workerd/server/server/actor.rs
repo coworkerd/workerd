@@ -105,6 +105,12 @@ pub(crate) struct RootCloseFences {
     closing: RefCell<HashMap<(String, String), Shared<LocalBoxFuture<'static, ()>>>>,
 }
 
+impl RootCloseFences {
+    pub(crate) fn pending(&self) -> usize {
+        self.closing.borrow().len()
+    }
+}
+
 /// Bound a caller's wait without cancelling the teardown that owns the storage fence.
 pub(crate) async fn wait_for_root<T>(
     factory: &Factory,
@@ -602,7 +608,11 @@ impl ActorNamespace {
             .actors
             .borrow()
             .values()
-            .filter(|container| container.is_resident())
+            .filter(|container| {
+                let resident = container.is_resident();
+                container.resident_counted.set(resident);
+                resident
+            })
             .count() as u64;
         self.residency.set(report);
         if let Some(id) = self.residency_id.get() {
@@ -610,22 +620,37 @@ impl ActorNamespace {
         }
     }
 
+    /// Update only the root whose actor changed, rather than scanning all dormant containers.
+    fn refresh_resident_root(&self, container: &ActorContainer) {
+        if !self.actor_class.runtime_root() { self.count_resident(); return; }
+        let Some(root) = container.this.upgrade().map(|container| container.root()) else { return; };
+        let present = self.actors.borrow().get(&root.key).is_some_and(|current| Rc::ptr_eq(current, &root));
+        if !present { root.resident_counted.set(false); return; }
+        let resident = root.is_resident();
+        let previous = root.resident_counted.replace(resident);
+        let mut report = self.residency.get();
+        if resident && !previous { report.resident += 1; }
+        if !resident && previous { report.resident = report.resident.saturating_sub(1); }
+        self.residency.set(report);
+        if let Some(id) = self.residency_id.get() { self.factory.residency().update(id, report); }
+    }
+
     fn object_resident(&self, container: &ActorContainer) {
         if !self.shipped.get() || (!container.is_root() && !self.actor_class.runtime_root()) {
             return;
         }
-        self.count_resident();
+        self.refresh_resident_root(container);
         self.factory.residency().enforce(&self.factory);
     }
 
-    fn object_evicted(&self) {
+    fn object_evicted(&self, container: &ActorContainer) {
         if !self.shipped.get() {
             return;
         }
         let mut report = self.residency.get();
         report.evicted += 1;
         self.residency.set(report);
-        self.count_resident();
+        self.refresh_resident_root(container);
     }
 
     fn object_woken(&self, took: Duration) {
@@ -722,11 +747,11 @@ impl ActorNamespace {
     }
 
     /// A selected runtime root must report constructor rejection before publishing its record.
-    pub(crate) fn root_channel(&self, id: KjOwn<ActorIdHandle>) -> Result<Rc<dyn Channel>> {
+    pub(crate) fn root_channel(&self, id: KjOwn<ActorIdHandle>, nonce: String) -> Result<Rc<dyn Channel>> {
         assert!(self.actor_class.runtime_root() && self.cluster().is_none());
-        Ok(Rc::new(ActorChannel {
+        Ok(Rc::new(RootActorChannel {
             container: Client(self.container_for(id)?),
-            persistent: false,
+            nonce,
         }))
     }
 
@@ -734,11 +759,16 @@ impl ActorNamespace {
         self.actors.borrow().contains_key(key)
     }
 
+    pub(crate) fn has_resident_root(&self, key: &str) -> bool {
+        self.actors.borrow().get(key).is_some_and(|container| container.is_resident())
+    }
+
     /// A node-selected alarm of a root or an already registered facet of that root.
     pub(crate) fn root_alarm_channel(
         &self,
         id: KjOwn<ActorIdHandle>,
         facet: u32,
+        nonce: String,
     ) -> Result<Rc<dyn Channel>> {
         assert!(self.actor_class.runtime_root() && self.cluster().is_none());
         let root = self.container_for(id)?;
@@ -759,9 +789,9 @@ impl ActorNamespace {
         .ok_or_else(|| {
             kj::disconnected!("the root alarm facet is not registered in this process")
         })?;
-        Ok(Rc::new(ActorChannel {
+        Ok(Rc::new(RootActorChannel {
             container: Client(target),
-            persistent: false,
+            nonce,
         }))
     }
 
@@ -981,6 +1011,7 @@ impl ActorNamespace {
             .map(|(key, _)| key.clone())
             .collect();
         let removed: Vec<_> = keys.iter().filter_map(|key| actors.remove(key)).collect();
+        if actors.is_empty() { actors.shrink_to_fit(); }
         drop(actors);
         for root in &removed {
             root.namespace_removed();
@@ -1617,6 +1648,7 @@ pub struct ActorContainer {
     actor: RefCell<Option<Rc<KjOwn<ffi::ActorHandle>>>>,
     /// Only a real actor-to-empty eviction makes the next successful start a wake.
     was_evicted: Cell<bool>,
+    resident_counted: Cell<bool>,
     /// The hibernation manager of the evicted actor, for the actor that replaces it.
     manager: RefCell<Option<KjRc<ffi::HibernationManager>>>,
     /// Set once the actor broke or was aborted; every later use of the container fails with it.
@@ -1738,6 +1770,7 @@ impl ActorContainer {
             class_and_id: RefCell::new(class_and_id),
             actor: RefCell::new(None),
             was_evicted: Cell::new(false),
+            resident_counted: Cell::new(false),
             manager: RefCell::new(None),
             broken_reason: RefCell::new(None),
             facets: RefCell::new(LinkedHashMap::new()),
@@ -1960,10 +1993,24 @@ impl ActorContainer {
         drop(self.shutdown_task.borrow_mut().take());
     }
 
+    fn require_root_not_retiring(&self) -> Result<()> {
+        if self.namespace()?.actor_class.runtime_root() {
+            let mut parent = self.parent.as_ref().and_then(Weak::upgrade);
+            while let Some(container) = parent {
+                if container.retirement.borrow().is_some() {
+                    return Err(kj::failed!("jsg.Error: Child facets cannot be called while their root is running onHibernate"));
+                }
+                parent = container.parent.as_ref().and_then(Weak::upgrade);
+            }
+        }
+        Ok(())
+    }
+
     /// The running actor, started first if it is not running.
     async fn get_actor(&self) -> Result<Rc<KjOwn<ffi::ActorHandle>>> {
         loop {
             let ns = self.namespace()?;
+            self.require_root_not_retiring()?;
             let retirement = self.retirement.borrow().clone();
             if let Some(retirement) = retirement {
                 // A request that the onHibernate handler makes to its own object waits here too,
@@ -2126,6 +2173,7 @@ impl ActorContainer {
         self: &Rc<Self>,
         metadata: KjOwn<RequestMetadata>,
     ) -> Result<KjOwn<WorkerInterface>> {
+        self.require_root_not_retiring()?;
         self.require_not_broken()?;
         if let Some(ns) = self.namespace.upgrade() {
             ns.ensure_cleanup_loop();
@@ -2646,7 +2694,7 @@ impl ActorContainer {
         if current.is_some() {
             self.was_evicted.set(true);
             if let Some(ns) = self.namespace.upgrade() {
-                ns.object_evicted();
+                ns.object_evicted(self);
             }
         }
         Ok(true)
@@ -3153,6 +3201,27 @@ impl Channel for RejectedActorChannel {
     fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
         Err(self.0.clone())
     }
+}
+
+/// Private runtime-root setup. Errors are marked before an actor event is handed off.
+struct RootActorChannel {
+    container: Client,
+    nonce: String,
+}
+impl Channel for RootActorChannel {
+    fn start_request(&self, metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
+        let client = Client(Rc::clone(&self.container.0));
+        let nonce = self.nonce.clone();
+        client.require_not_broken().map_err(|error| crate::root_loader::preparation_error(&nonce, error))?;
+        Ok(PromisedInterface::new(async move {
+            let actor = client.get_actor().await
+                .map_err(|error| crate::root_loader::preparation_error(&nonce, error))?;
+            client.request_on(metadata, &actor)
+                .map_err(|error| crate::root_loader::preparation_error(&nonce, error))
+        }).into_kj())
+    }
+    fn require_allows_transfer(&self) -> Result<()> { self.container.require_transferable() }
+    fn token(&self, usage: TokenUsage) -> Result<KjOwn<PendingToken>> { self.container.token(usage, false) }
 }
 
 struct ActorChannel {
