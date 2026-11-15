@@ -65,6 +65,7 @@ use crate::worker::WorkerService;
 pub struct Factory {
     inner: KjOwn<ffi::WorkerFactory>,
     loopback: Loopback,
+    residency: Rc<crate::actor::ResidencyCoordinator>,
 }
 
 impl Factory {
@@ -73,6 +74,7 @@ impl Factory {
         Self {
             inner,
             loopback: Loopback::default(),
+            residency: crate::actor::ResidencyCoordinator::new(),
         }
     }
 
@@ -80,6 +82,11 @@ impl Factory {
     #[must_use]
     pub fn loopback(&self) -> &Loopback {
         &self.loopback
+    }
+
+    /// The one residency budget and report stream shared by this run's namespaces.
+    pub(crate) fn residency(&self) -> &Rc<crate::actor::ResidencyCoordinator> {
+        &self.residency
     }
 
     /// The factory, for the bridge functions.
@@ -1545,6 +1552,10 @@ impl Server {
                 false,
             )
             .ok_or_else(|| kj::failed!("root bridge entrypoint missing"))
+    }
+
+    pub(crate) fn has_configured_namespace_key(&self, key: &str) -> bool {
+        self.namespaces_by_unique_key.contains_key(key)
     }
 
     /// Resolves everything `worker`'s config names into its channel table.

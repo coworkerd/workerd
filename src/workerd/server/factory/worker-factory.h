@@ -284,6 +284,7 @@ bool actor_shutdown(
     const ActorHandle& actor, ::rust::Str reason, kj::Maybe<kj::Own<ActorLock>> lock);
 void actor_reset_storage(const ActorHandle& actor);
 kj::Maybe<kj::Rc<HibernationManager>> actor_hibernation_manager(const ActorHandle& actor);
+bool hibernation_manager_has_connections(const HibernationManager& manager);
 kj::Promise<FacetStartInfo> facet_start_resolve(kj::Own<FacetStart> start);
 
 kj::Own<ActorIdHandle> actor_id_clone(const ActorIdHandle& id);

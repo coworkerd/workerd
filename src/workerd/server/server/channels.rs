@@ -95,6 +95,21 @@ pub struct WorkerEntrypoint<'a> {
 /// A Durable Object class, from which actors are made. The runtime's
 /// `IoChannelFactory::ActorClassChannel`.
 pub trait ActorClass {
+    /// A runtime root's immutable plan, used to bind its own saved facet classes on restoration.
+    fn root_plan(&self) -> Option<&str> {
+        None
+    }
+    fn for_root_plan(&self, _plan: &str) -> Result<Option<Rc<dyn ActorClass>>> {
+        Ok(None)
+    }
+    /// The namespace has removed this container. A specialized root removes its exact record.
+    fn container_removed(&self) {}
+
+    /// Private root namespaces serialize reuse of their storage after a retired tree closes.
+    fn runtime_root(&self) -> bool {
+        false
+    }
+
     /// Specializes a runtime-managed root's class before the container is created.
     fn for_root(&self, _id: &ffi::ActorIdHandle) -> Option<Rc<dyn ActorClass>> {
         None

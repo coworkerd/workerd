@@ -893,6 +893,10 @@ kj::Maybe<kj::Rc<HibernationManager>> actor_hibernation_manager(const ActorHandl
       [](HibernationManager& m) { return kj::Rc<HibernationManager>(m.addRef()); });
 }
 
+bool hibernation_manager_has_connections(const HibernationManager& manager) {
+  return manager.getWebSocketCount() != 0;
+}
+
 kj::Promise<FacetStartInfo> facet_start_resolve(kj::Own<FacetStart> start) {
   auto info = co_await (*start)();
   co_await info.ensureAllResolved();

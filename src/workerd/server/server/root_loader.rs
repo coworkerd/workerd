@@ -93,10 +93,34 @@ struct RootBinding {
 }
 
 #[derive(Clone)]
-struct RootObject {
-    selection: RootSelection,
-    class_name: String,
+struct RootOrigin {
+    namespace_id: String,
+    object_id: String,
+    plan: String,
 }
+impl From<&RootSelection> for RootOrigin {
+    fn from(value: &RootSelection) -> Self {
+        Self {
+            namespace_id: value.namespace_id.clone(),
+            object_id: value.object_id.clone(),
+            plan: value.plan.clone(),
+        }
+    }
+}
+#[derive(Clone)]
+struct RootObject {
+    origin: RootOrigin,
+    class_name: String,
+    registration: Rc<()>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RootClassReference {
+    worker_id: String,
+    plan: String,
+}
+const ROOT_CLASS_REFERENCE: &str = "coworkerd:root-class:";
 
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -227,6 +251,7 @@ pub struct RootRegistry {
     plans: RefCell<HashMap<String, Rc<Plan>>>,
     namespaces: RefCell<HashMap<String, NamespaceEntry>>,
     objects: RefCell<HashMap<(String, String), RootObject>>,
+    selection_locks: RefCell<HashMap<(String, String), Weak<tokio::sync::Mutex<()>>>>,
     compiled: RefCell<HashMap<WorkerKey, Rc<WorkerService>>>,
     retiring: RefCell<HashMap<WorkerKey, Rc<WorkerService>>>,
     ignored_retirements: Cell<u64>,
@@ -248,6 +273,7 @@ impl RootRegistry {
             plans: RefCell::new(HashMap::new()),
             namespaces: RefCell::new(HashMap::new()),
             objects: RefCell::new(HashMap::new()),
+            selection_locks: RefCell::new(HashMap::new()),
             compiled: RefCell::new(HashMap::new()),
             retiring: RefCell::new(HashMap::new()),
             ignored_retirements: Cell::new(0),
@@ -273,16 +299,29 @@ impl RootRegistry {
         props: Option<KjOwn<ffi::Frankenvalue>>,
         persistent: bool,
     ) -> Option<Rc<dyn ActorClass>> {
-        if !self.plans.borrow().contains_key(plan_key) {
+        let reference: RootClassReference =
+            serde_json::from_str(plan_key.strip_prefix(ROOT_CLASS_REFERENCE)?).ok()?;
+        let plan_key = reference.plan.as_str();
+        let worker_id = reference.worker_id;
+        // A saved class can outlive its obsolete source plan. Restore only a dormant proxy for
+        // a worker this registry still owns; the parent root binds it before construction.
+        if !self
+            .plans
+            .borrow()
+            .values()
+            .any(|plan| plan.deployment.worker_id == worker_id)
+        {
             return None;
         }
         Some(Rc::new(RootExportedClass {
             registry: self.this.clone(),
             plan_key: plan_key.to_owned(),
+            worker_id,
             class_name: class_name.to_owned(),
             props,
             persistent,
             generation: Cell::new(None),
+            running_worker: RefCell::new(Weak::new()),
         }))
     }
 
@@ -294,6 +333,78 @@ impl RootRegistry {
             .map(|entry| Rc::clone(&entry.namespace))
     }
 
+    fn remove_object(&self, index: &(String, String), registration: &Rc<()>) {
+        let matches = self
+            .objects
+            .borrow()
+            .get(index)
+            .is_some_and(|object| Rc::ptr_eq(&object.registration, registration));
+        if matches {
+            self.objects.borrow_mut().remove(index);
+            self.prune_plans();
+        }
+    }
+
+    fn prune_plans(&self) {
+        let mut needed: HashSet<String> = self
+            .namespaces
+            .borrow()
+            .values()
+            .map(|entry| entry.source.borrow().clone())
+            .collect();
+        needed.extend(
+            self.objects
+                .borrow()
+                .values()
+                .map(|object| object.origin.plan.clone()),
+        );
+        needed.extend(
+            self.retiring
+                .borrow()
+                .keys()
+                .map(|key| key.plan_key.clone()),
+        );
+        let unused: Vec<_> = self
+            .plans
+            .borrow()
+            .keys()
+            .filter(|key| !needed.contains(*key))
+            .cloned()
+            .collect();
+        let mut workers = Vec::new();
+        for key in unused {
+            self.plans.borrow_mut().remove(&key);
+            let instances: Vec<_> = self
+                .compiled
+                .borrow()
+                .keys()
+                .filter(|instance| instance.plan_key == key)
+                .cloned()
+                .collect();
+            for instance in instances {
+                if let Some(worker) = self.compiled.borrow_mut().remove(&instance) {
+                    workers.push(worker);
+                }
+            }
+        }
+        for worker in workers {
+            worker.unlink();
+        }
+    }
+
+    fn collect_inactive(&self) {
+        let namespaces: Vec<_> = self
+            .namespaces
+            .borrow()
+            .values()
+            .map(|entry| Rc::clone(&entry.namespace))
+            .collect();
+        for namespace in namespaces {
+            namespace.prune_idle_roots();
+        }
+        self.prune_plans();
+    }
+
     fn target(&self, target: &RootTarget, props: &Value) -> Result<Rc<dyn Channel>> {
         self.server
             .borrow()
@@ -302,7 +413,7 @@ impl RootRegistry {
             .root_binding(&target.service, target.entrypoint.as_deref(), props)
     }
 
-    fn root_props(&self, selection: &RootSelection) -> Result<KjOwn<ffi::Frankenvalue>> {
+    fn root_props(&self, selection: &RootOrigin) -> Result<KjOwn<ffi::Frankenvalue>> {
         let plan = self
             .plans
             .borrow()
@@ -521,10 +632,12 @@ impl RootRegistry {
                 Rc::new(RootExportedClass {
                     registry: self.this.clone(),
                     plan_key: plan_key.to_owned(),
+                    worker_id: plan.deployment.worker_id.clone(),
                     class_name: name.clone(),
                     props: None,
                     persistent: false,
                     generation: Cell::new(Some(key.generation)),
+                    running_worker: RefCell::new(Weak::new()),
                 }) as Rc<dyn ActorClass>
             })
             .collect();
@@ -610,12 +723,33 @@ impl RootRegistry {
         deployment.validate()?;
         let plan_key = deployment.plan_key()?;
         let _guard = self.install_lock.lock().await;
-        if let Some(existing) = self.plans.borrow().get(&plan_key) {
+        let server = self
+            .server
+            .borrow()
+            .upgrade()
+            .ok_or_else(|| kj::disconnected!("root server gone"))?;
+        if deployment
+            .namespaces
+            .iter()
+            .any(|namespace| server.has_configured_namespace_key(&namespace.unique_key))
+        {
+            return Err(kj::failed!(
+                "a root storage key is already used by a configured namespace"
+            ));
+        }
+        let existing = self.plans.borrow().get(&plan_key).cloned();
+        if let Some(existing) = existing {
             if existing.deployment != deployment {
                 return Err(kj::failed!(
                     "a root plan cannot be replaced under its existing key"
                 ));
             }
+            for namespace in &deployment.namespaces {
+                if let Some(entry) = self.namespaces.borrow().get(&namespace.id) {
+                    *entry.source.borrow_mut() = plan_key.clone();
+                }
+            }
+            self.prune_plans();
             return Ok(plan_key);
         }
         {
@@ -678,6 +812,7 @@ impl RootRegistry {
         );
         *plan.loaded.borrow_mut() = Some(key);
         self.plans.borrow_mut().insert(plan_key.clone(), plan);
+        self.prune_plans();
         Ok(plan_key)
     }
 
@@ -756,10 +891,46 @@ impl RootRegistry {
         let id = ffi::actor_id_for_root(&descriptor.unique_key, &name);
         let key = ffi::actor_id_key(&id);
         let index = (selection.namespace_id.clone(), key.clone());
+        let lock = {
+            let mut locks = self.selection_locks.borrow_mut();
+            match locks.get(&index).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Rc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(index.clone(), Rc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _cleanup = SelectionLock {
+            registry: self.this.clone(),
+            index: index.clone(),
+            lock: Rc::downgrade(&lock),
+        };
+        let _guard = lock.lock().await;
+        let namespace = self
+            .namespaces
+            .borrow()
+            .get(&selection.namespace_id)
+            .map(|entry| Rc::clone(&entry.namespace))
+            .ok_or_else(|| kj::failed!("root namespace missing"))?;
+        namespace.wait_root_closed(&key).await;
         let previous = self.objects.borrow().get(&index).cloned();
+        let old_retirement = previous.as_ref().and_then(|old| {
+            self.plans
+                .borrow()
+                .get(&old.origin.plan)
+                .and_then(|plan| plan.retiring.borrow().clone())
+        });
+        if let Some(old_retirement) = old_retirement {
+            old_retirement.await;
+        }
+        if !self.plans.borrow().contains_key(&selection.plan) {
+            return Err(kj::disconnected!("root selection plan removed"));
+        }
         if previous
             .as_ref()
-            .is_some_and(|previous| previous.selection.plan != selection.plan)
+            .is_some_and(|previous| previous.origin.plan != selection.plan)
         {
             let namespace = self
                 .namespaces
@@ -771,12 +942,25 @@ impl RootRegistry {
                 &key,
                 &kj::failed!("jsg.Error: the Worker's active version changed"),
             );
+            namespace.wait_root_closed(&key).await;
+        }
+        if !self
+            .namespaces
+            .borrow()
+            .contains_key(&selection.namespace_id)
+        {
+            return Err(kj::disconnected!("root namespace removed"));
         }
         self.objects.borrow_mut().insert(
             index,
             RootObject {
-                selection: selection.clone(),
+                origin: RootOrigin::from(&selection),
                 class_name: descriptor.class_name.clone(),
+                registration: previous
+                    .as_ref()
+                    .filter(|old| old.origin.plan == selection.plan)
+                    .map(|old| Rc::clone(&old.registration))
+                    .unwrap_or_else(|| Rc::new(())),
             },
         );
         let spaces = self.namespaces.borrow();
@@ -832,7 +1016,7 @@ impl RootRegistry {
             .objects
             .borrow()
             .iter()
-            .filter(|(_, object)| object.selection.plan == plan_key)
+            .filter(|(_, object)| object.origin.plan == plan_key)
             .filter_map(|((namespace, storage_key), _)| {
                 self.namespaces
                     .borrow()
@@ -857,6 +1041,7 @@ impl RootRegistry {
                         &storage_key,
                         &kj::disconnected!("root worker limit exceeded"),
                     );
+                    namespace.wait_root_closed(&storage_key).await;
                 }
             }
             if completed {
@@ -875,6 +1060,7 @@ impl RootRegistry {
             }
             registry.retiring.borrow_mut().remove(&key);
             plan.retiring.borrow_mut().take();
+            registry.collect_inactive();
             let _ = done.send(());
         });
         true
@@ -906,11 +1092,15 @@ impl RootRegistry {
         })).collect();
         namespaces.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         json!({"plans": plans, "namespaces": namespaces, "compiledWorkers": self.compiled.borrow().len(),
+            "objectEntries": self.objects.borrow().len(),
+            "objectContainers": self.namespaces.borrow().values().map(|entry| entry.namespace.container_count()).sum::<usize>(),
+            "selectionLocks": self.selection_locks.borrow().len(),
             "ignoredRetirements": self.ignored_retirements.get(), "pid": std::process::id()})
     }
 
     pub fn shutdown(&self) {
-        for entry in self.namespaces.borrow().values() {
+        let namespaces = std::mem::take(&mut *self.namespaces.borrow_mut());
+        for entry in namespaces.values() {
             entry
                 .namespace
                 .abort_all(Some(&kj::disconnected!("root registry shutdown")));
@@ -922,7 +1112,7 @@ impl RootRegistry {
         for worker in std::mem::take(&mut *self.retiring.borrow_mut()).values() {
             worker.unlink();
         }
-        self.namespaces.borrow_mut().clear();
+        drop(namespaces);
         self.objects.borrow_mut().clear();
         self.plans.borrow_mut().clear();
     }
@@ -939,24 +1129,58 @@ struct RootClass {
     namespace_id: String,
 }
 
+struct SelectionLock {
+    registry: Weak<RootRegistry>,
+    index: (String, String),
+    lock: Weak<tokio::sync::Mutex<()>>,
+}
+impl Drop for SelectionLock {
+    fn drop(&mut self) {
+        if self.lock.strong_count() == 1 {
+            if let Some(registry) = self.registry.upgrade() {
+                let mut locks = registry.selection_locks.borrow_mut();
+                if locks
+                    .get(&self.index)
+                    .is_some_and(|lock| Weak::ptr_eq(lock, &self.lock))
+                {
+                    locks.remove(&self.index);
+                }
+            }
+        }
+    }
+}
+
 impl ActorClass for RootClass {
+    fn runtime_root(&self) -> bool {
+        true
+    }
     fn for_root(&self, id: &ffi::ActorIdHandle) -> Option<Rc<dyn ActorClass>> {
         let registry = self.registry.upgrade()?;
-        let object = registry
-            .objects
-            .borrow()
-            .get(&(self.namespace_id.clone(), ffi::actor_id_key(id)))
-            .cloned()?;
-        let props = registry.root_props(&object.selection).ok()?;
+        let index = (self.namespace_id.clone(), ffi::actor_id_key(id));
+        let object = registry.objects.borrow().get(&index).cloned()?;
+        if !registry.plans.borrow().contains_key(&object.origin.plan) {
+            return None;
+        }
+        let props = registry.root_props(&object.origin).ok()?;
         Some(Rc::new(RootObjectClass {
-            public_id: object.selection.object_id,
+            index,
+            registration: Rc::clone(&object.registration),
+            public_id: object.origin.object_id,
             class: RootExportedClass {
                 registry: self.registry.clone(),
-                plan_key: object.selection.plan,
+                worker_id: registry
+                    .plans
+                    .borrow()
+                    .get(&object.origin.plan)?
+                    .deployment
+                    .worker_id
+                    .clone(),
+                plan_key: object.origin.plan,
                 class_name: object.class_name,
                 props: Some(props),
                 persistent: false,
                 generation: Cell::new(None),
+                running_worker: RefCell::new(Weak::new()),
             },
         }))
     }
@@ -986,6 +1210,8 @@ impl ActorClass for RootClass {
 
 /// One container's immutable load plan. Namespace promotion never retargets an existing actor.
 struct RootObjectClass {
+    index: (String, String),
+    registration: Rc<()>,
     public_id: String,
     class: RootExportedClass,
 }
@@ -995,10 +1221,12 @@ struct RootObjectClass {
 struct RootExportedClass {
     registry: Weak<RootRegistry>,
     plan_key: String,
+    worker_id: String,
     class_name: String,
     props: Option<KjOwn<ffi::Frankenvalue>>,
     persistent: bool,
     generation: Cell<Option<u64>>,
+    running_worker: RefCell<Weak<WorkerService>>,
 }
 impl RootExportedClass {
     fn registry(&self) -> Result<Rc<RootRegistry>> {
@@ -1015,12 +1243,7 @@ impl RootExportedClass {
                 .get()
                 .ok_or_else(|| kj::failed!("root class is not ready"))?,
         };
-        let worker = registry
-            .compiled
-            .borrow()
-            .get(&key)
-            .cloned()
-            .or_else(|| registry.retiring.borrow().get(&key).cloned());
+        let worker = registry.compiled.borrow().get(&key).cloned();
         worker
             .ok_or_else(|| kj::disconnected!("root worker unloaded"))?
             .actor_class(
@@ -1032,10 +1255,33 @@ impl RootExportedClass {
     }
 }
 impl ActorClass for RootExportedClass {
+    fn for_root_plan(&self, root_plan: &str) -> Result<Option<Rc<dyn ActorClass>>> {
+        let registry = self.registry()?;
+        let owner = registry
+            .plans
+            .borrow()
+            .get(root_plan)
+            .map(|plan| plan.deployment.worker_id.clone())
+            .ok_or_else(|| kj::disconnected!("the root class plan was removed"))?;
+        if owner != self.worker_id {
+            return Ok(None);
+        }
+        Ok(Some(Rc::new(Self {
+            registry: self.registry.clone(),
+            plan_key: root_plan.to_owned(),
+            worker_id: self.worker_id.clone(),
+            class_name: self.class_name.clone(),
+            props: self.props.as_deref().map(ffi::frankenvalue_clone),
+            persistent: self.persistent,
+            generation: Cell::new(None),
+            running_worker: RefCell::new(Weak::new()),
+        })))
+    }
     fn when_ready(&self) -> LocalBoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let registry = self.registry()?;
-            registry.worker(&self.plan_key).await?;
+            let worker = registry.worker(&self.plan_key).await?;
+            *self.running_worker.borrow_mut() = Rc::downgrade(&worker);
             self.generation.set(
                 registry
                     .plans
@@ -1061,7 +1307,23 @@ impl ActorClass for RootExportedClass {
         metadata: KjOwn<RequestMetadata>,
         actor: &'a ffi::ActorHandle,
     ) -> LocalBoxFuture<'a, Result<()>> {
-        Box::pin(async move { self.class()?.run_on_hibernate(metadata, actor).await })
+        Box::pin(async move {
+            // This hook belongs to an existing actor. It never constructs a replacement from
+            // a retiring isolate; class() above resolves only published compiled instances.
+            let worker = self
+                .running_worker
+                .borrow()
+                .upgrade()
+                .ok_or_else(|| kj::disconnected!("root hook worker gone"))?;
+            let class = worker
+                .actor_class(
+                    Some(&self.class_name),
+                    self.props.as_deref().map(ffi::frankenvalue_clone),
+                    self.persistent,
+                )
+                .ok_or_else(|| kj::failed!("root hook class missing"))?;
+            class.run_on_hibernate(metadata, actor).await
+        })
     }
     fn token(&self, usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
         let registry = self.registry()?;
@@ -1069,9 +1331,15 @@ impl ActorClass for RootExportedClass {
             .props
             .as_deref()
             .ok_or_else(|| kj::failed!("an unspecialized root class has no token"))?;
+        let reference = serde_json::to_string(&RootClassReference {
+            worker_id: self.worker_id.clone(),
+            plan: self.plan_key.clone(),
+        })
+        .map_err(|error| kj::failed!("root class reference: {error}"))?;
+        let service = format!("{ROOT_CLASS_REFERENCE}{reference}");
         Ok(ffi::factory_encode_actor_class_token(
             registry.factory.raw(),
-            &self.plan_key,
+            &service,
             &self.class_name,
             Some(props).into(),
             self.persistent,
@@ -1089,15 +1357,25 @@ impl ActorClass for RootExportedClass {
         Ok(Rc::new(Self {
             registry: self.registry.clone(),
             plan_key: self.plan_key.clone(),
+            worker_id: self.worker_id.clone(),
             class_name: self.class_name.clone(),
             props: Some(props),
             persistent,
             generation: Cell::new(self.generation.get()),
+            running_worker: RefCell::new(self.running_worker.borrow().clone()),
         }))
     }
 }
 
 impl ActorClass for RootObjectClass {
+    fn root_plan(&self) -> Option<&str> {
+        Some(&self.class.plan_key)
+    }
+    fn container_removed(&self) {
+        if let Some(registry) = self.class.registry.upgrade() {
+            registry.remove_object(&self.index, &self.registration);
+        }
+    }
     fn when_ready(&self) -> LocalBoxFuture<'_, Result<()>> {
         self.class.when_ready()
     }
@@ -1264,6 +1542,27 @@ impl Service for RootRequest {
                 json!({"plan": plan, "state": self.registry.snapshot()})
             }
             (Method::GET, "/state") => self.registry.snapshot(),
+            (Method::POST, "/collect") => {
+                self.registry.collect_inactive();
+                self.registry.snapshot()
+            }
+            (Method::POST, "/remove-namespace") => {
+                let value = read_json(body).await?;
+                let id = value["namespaceId"]
+                    .as_str()
+                    .ok_or_else(|| kj::failed!("remove-namespace needs a namespaceId"))?;
+                let entry = self.registry.namespaces.borrow_mut().remove(id);
+                let removed = entry.is_some();
+                if let Some(entry) = entry {
+                    entry
+                        .namespace
+                        .abort_all(Some(&kj::disconnected!("root namespace removed")));
+                    entry.namespace.wait_roots_closed().await;
+                    drop(entry);
+                }
+                self.registry.prune_plans();
+                json!({"removed": removed, "state": self.registry.snapshot()})
+            }
             (Method::POST, "/hibernate") => {
                 let namespaces: Vec<_> = self
                     .registry

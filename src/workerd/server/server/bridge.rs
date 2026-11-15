@@ -175,7 +175,7 @@ pub mod ffi {
         report: Vec<u64>,
     }
 
-    /// The node's residency message, per namespace (one namespace per shipped process).
+    /// The node's unchanged residency message, aggregated for the whole process.
     #[derive(Clone, Copy, Default, PartialEq, Eq)]
     struct DurableResidencyReport {
         resident: u64,
@@ -516,6 +516,7 @@ pub mod ffi {
         /// The actor's hibernation manager, to hand to the actor that replaces it after eviction.
         fn actor_hibernation_manager(actor: &ActorHandle) -> KjMaybe<KjRc<HibernationManager>>;
         type HibernationManager;
+        fn hibernation_manager_has_connections(manager: &HibernationManager) -> bool;
 
         /// A facet's start info, as the actor that owns the facet supplies it; resolving it
         /// yields the facet's id and class.

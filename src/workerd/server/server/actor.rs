@@ -21,6 +21,7 @@
 use std::cell::Cell;
 use std::cell::OnceCell;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::pin::Pin;
@@ -97,6 +98,131 @@ const EVICT_TIMEOUT_MESSAGE: &str =
     "jsg.Error: Timed out waiting to evict Durable Object: it still has active references.";
 const RESIDENT_LIMIT_REASON: &str = "broken.dropped; Actor evicted for the resident object limit";
 
+struct ResidencyEntry {
+    namespace: Weak<ActorNamespace>,
+    report: ffi::DurableResidencyReport,
+}
+
+/// One budget and cumulative report for the factory's shipped namespaces. Slots identify a
+/// namespace incarnation, so destroying and recreating a namespace never re-adds old counters.
+pub(crate) struct ResidencyCoordinator {
+    this: Weak<Self>,
+    next_id: Cell<u64>,
+    namespaces: RefCell<BTreeMap<u64, ResidencyEntry>>,
+    total: Cell<ffi::DurableResidencyReport>,
+    reported: Cell<ffi::DurableResidencyReport>,
+    enforcing: Cell<bool>,
+    task: RefCell<Option<TaskHandle>>,
+}
+
+impl ResidencyCoordinator {
+    pub(crate) fn new() -> Rc<Self> {
+        Rc::new_cyclic(|this| Self {
+            this: this.clone(),
+            next_id: Cell::new(0),
+            namespaces: RefCell::new(BTreeMap::new()),
+            total: Cell::new(ffi::DurableResidencyReport::default()),
+            reported: Cell::new(ffi::DurableResidencyReport::default()),
+            enforcing: Cell::new(false),
+            task: RefCell::new(None),
+        })
+    }
+
+    fn register(&self, namespace: Weak<ActorNamespace>, limit: u64) -> u64 {
+        let id = self.next_id.get();
+        self.next_id
+            .set(id.checked_add(1).expect("namespace incarnation overflow"));
+        let mut total = self.total.get();
+        total.limit = limit;
+        self.total.set(total);
+        self.namespaces.borrow_mut().insert(
+            id,
+            ResidencyEntry {
+                namespace,
+                report: ffi::DurableResidencyReport::default(),
+            },
+        );
+        id
+    }
+
+    fn update(&self, id: u64, report: ffi::DurableResidencyReport) {
+        let mut namespaces = self.namespaces.borrow_mut();
+        let Some(entry) = namespaces.get_mut(&id) else {
+            return;
+        };
+        let old = entry.report;
+        entry.report = report;
+        drop(namespaces);
+        let mut total = self.total.get();
+        total.resident = total
+            .resident
+            .saturating_sub(old.resident)
+            .saturating_add(report.resident);
+        total.evicted = total
+            .evicted
+            .saturating_add(report.evicted.saturating_sub(old.evicted));
+        total.woken = total
+            .woken
+            .saturating_add(report.woken.saturating_sub(old.woken));
+        total.wakes = total
+            .wakes
+            .saturating_add(report.wakes.saturating_sub(old.wakes));
+        total.wake_us_total = total
+            .wake_us_total
+            .saturating_add(report.wake_us_total.saturating_sub(old.wake_us_total));
+        total.wake_us_max = total.wake_us_max.max(report.wake_us_max);
+        self.total.set(total);
+        self.emit();
+    }
+
+    fn unregister(&self, id: u64) {
+        let removed = self.namespaces.borrow_mut().remove(&id);
+        if let Some(removed) = removed {
+            let mut total = self.total.get();
+            total.resident = total.resident.saturating_sub(removed.report.resident);
+            self.total.set(total);
+            self.emit();
+        }
+    }
+
+    fn emit(&self) {
+        let report = self.total.get();
+        if report == self.reported.get() {
+            return;
+        }
+        // The legacy bridge's namespace argument is unused in C++; it has no routing role.
+        let handle = ActorNamespaceHandle(Weak::new());
+        match ffi::actor_namespace_durable_log_residency(&handle, &report) {
+            Ok(()) => self.reported.set(report),
+            Err(error) => tracing::error!("reporting Durable Object residency: {}", error),
+        }
+    }
+
+    fn namespaces(&self) -> Vec<Rc<ActorNamespace>> {
+        self.namespaces
+            .borrow()
+            .values()
+            .filter_map(|entry| entry.namespace.upgrade())
+            .collect()
+    }
+
+    fn refresh(&self) {
+        for namespace in self.namespaces() {
+            namespace.count_resident();
+        }
+    }
+
+    fn enforce(&self, factory: &Factory) {
+        let total = self.total.get();
+        if total.limit == 0 || total.resident <= total.limit || self.enforcing.replace(true) {
+            return;
+        }
+        // A start triggers one bounded pass. Busy roots cause no timer or retry loop.
+        let task = factory.spawn(enforce_resident_limit(Weak::clone(&self.this)));
+        *self.task.borrow_mut() = Some(task);
+    }
+}
+
 /// The namespace of one Durable Object class: its actors and their shared storage. The runtime's
 /// `ActorNamespace`.
 pub struct ActorNamespace {
@@ -119,11 +245,9 @@ pub struct ActorNamespace {
     actors: RefCell<LinkedHashMap<String, Rc<ActorContainer>>>,
     /// The cleanup loop, started by the first request; dropped with the namespace.
     cleanup_task: RefCell<Option<TaskHandle>>,
-    /// One resident-limit pass, started by a successful root start, never a periodic loop.
-    resident_task: RefCell<Option<TaskHandle>>,
-    enforcing: Cell<bool>,
+    /// This incarnation's slot in the factory's process-wide coordinator, if shipped.
+    residency_id: Cell<Option<u64>>,
     residency: Cell<ffi::DurableResidencyReport>,
-    reported_residency: Cell<ffi::DurableResidencyReport>,
     /// Set in cluster mode for a namespace on disk: its actors are owned by one instance of
     /// the cluster at a time, and replicated.
     cluster: OnceCell<Rc<ClusterNode>>,
@@ -137,6 +261,8 @@ pub struct ActorNamespace {
     broken: Cell<bool>,
     /// Actors a stop left as they were at its deadline: they end as the process exits.
     left_behind: RefCell<Vec<Rc<ActorContainer>>>,
+    /// A retired runtime root owns these fences until every old native handle is released.
+    closing_roots: RefCell<HashMap<String, Shared<LocalBoxFuture<'static, ()>>>>,
 }
 
 /// The first resolution of an actor: its end, however it ends, wakes the requests that waited.
@@ -178,16 +304,15 @@ impl ActorNamespace {
             storage: OnceCell::new(),
             actors: RefCell::new(LinkedHashMap::new()),
             cleanup_task: RefCell::new(None),
-            resident_task: RefCell::new(None),
-            enforcing: Cell::new(false),
+            residency_id: Cell::new(None),
             residency: Cell::new(ffi::DurableResidencyReport::default()),
-            reported_residency: Cell::new(ffi::DurableResidencyReport::default()),
             cluster: OnceCell::new(),
             directory: OnceCell::new(),
             shipped: Cell::new(false),
             resolving: RefCell::new(HashMap::new()),
             broken: Cell::new(false),
             left_behind: RefCell::new(Vec::new()),
+            closing_roots: RefCell::new(HashMap::new()),
         })
     }
 
@@ -308,6 +433,9 @@ impl ActorNamespace {
                 let owned = Owned::new(Rc::clone(cluster), &unique_key, &key, epoch);
                 *container.owned.borrow_mut() = Some(owned);
                 let replaced = self.actors.borrow_mut().insert(key, Rc::clone(&container));
+                if let Some(replaced) = &replaced {
+                    replaced.namespace_removed();
+                }
                 drop(replaced);
                 Ok(Resolved::Here(Client(container)))
             }
@@ -338,6 +466,9 @@ impl ActorNamespace {
             .is_some_and(|c| std::ptr::eq(Rc::as_ptr(c), container))
         {
             actors.remove(&container.key);
+            drop(actors);
+            container.namespace_removed();
+            self.count_resident();
         }
     }
 
@@ -417,7 +548,13 @@ impl ActorNamespace {
             })
             .map(|(key, _)| key.clone())
             .collect();
-        keys.iter().filter_map(|key| actors.remove(key)).collect()
+        let removed: Vec<_> = keys.iter().filter_map(|key| actors.remove(key)).collect();
+        drop(actors);
+        for container in &removed {
+            container.namespace_removed();
+        }
+        self.count_resident();
+        removed
     }
 
     /// Counts root trees, not actors: a live facet keeps its root tree resident.
@@ -433,45 +570,17 @@ impl ActorNamespace {
             .filter(|container| container.is_resident())
             .count() as u64;
         self.residency.set(report);
-        let reported = self.reported_residency.get();
-        if report.resident == reported.resident
-            && report.limit == reported.limit
-            && report.evicted == reported.evicted
-            && report.woken == reported.woken
-            && report.wake_us_total == reported.wake_us_total
-        {
-            return;
-        }
-        let handle = ActorNamespaceHandle(Weak::clone(&self.this));
-        match handle.durable_log_residency(&report) {
-            Ok(()) => {
-                self.reported_residency.set(report);
-            }
-            Err(error) => tracing::error!(
-                "reporting Durable Object residency: {}",
-                error.description()
-            ),
+        if let Some(id) = self.residency_id.get() {
+            self.factory.residency().update(id, report);
         }
     }
 
     fn object_resident(&self, container: &ActorContainer) {
-        if !self.shipped.get() || !container.is_root() {
+        if !self.shipped.get() || (!container.is_root() && !self.actor_class.runtime_root()) {
             return;
         }
         self.count_resident();
-        let report = self.residency.get();
-        if report.limit == 0
-            || report.resident <= report.limit
-            || !self.is_evictable()
-            || self.enforcing.replace(true)
-        {
-            return;
-        }
-        // Replacing a completed handle is safe; the pass never clears its own handle.
-        let task = self
-            .factory
-            .spawn(enforce_resident_limit(Weak::clone(&self.this)));
-        *self.resident_task.borrow_mut() = Some(task);
+        self.factory.residency().enforce(&self.factory);
     }
 
     fn object_evicted(&self) {
@@ -501,41 +610,47 @@ impl ActorNamespace {
 }
 
 /// Clears the pass flag on completion, error or cancellation without owning its namespace.
-struct ResidentPass(Weak<ActorNamespace>);
+struct ResidentPass(Weak<ResidencyCoordinator>);
 
 impl Drop for ResidentPass {
     fn drop(&mut self) {
-        if let Some(ns) = self.0.upgrade() {
-            ns.enforcing.set(false);
+        if let Some(coordinator) = self.0.upgrade() {
+            coordinator.enforcing.set(false);
         }
     }
 }
 
-async fn enforce_resident_limit(namespace: Weak<ActorNamespace>) {
-    let _release = ResidentPass(Weak::clone(&namespace));
-    let Some(ns) = namespace.upgrade() else {
+async fn enforce_resident_limit(coordinator: Weak<ResidencyCoordinator>) {
+    let _release = ResidentPass(Weak::clone(&coordinator));
+    let Some(process) = coordinator.upgrade() else {
         return;
     };
-    let mut order: Vec<_> = ns
-        .actors
-        .borrow()
-        .values()
-        .filter(|container| container.is_resident())
-        .cloned()
-        .collect();
-    order.sort_by_key(|container| container.last_access.get());
-    // Pinned roots have weak namespace links. No namespace/TaskHandle ownership cycle spans await.
-    drop(ns);
+    let mut order = Vec::new();
+    for namespace in process.namespaces() {
+        if namespace.is_evictable() {
+            order.extend(
+                namespace
+                    .actors
+                    .borrow()
+                    .values()
+                    .filter(|root| root.is_resident())
+                    .cloned(),
+            );
+        }
+    }
+    order.sort_by_key(|root| root.last_access.get());
+    // Roots and the task only have weak namespace/coordinator links across awaits.
+    drop(process);
     for root in order {
-        let Some(ns) = namespace.upgrade() else {
+        let Some(process) = coordinator.upgrade() else {
             return;
         };
-        ns.count_resident();
-        let report = ns.residency.get();
-        if report.limit == 0 || report.resident <= report.limit || !ns.is_evictable() {
+        process.refresh();
+        let report = process.total.get();
+        if report.limit == 0 || report.resident <= report.limit {
             break;
         }
-        drop(ns);
+        drop(process);
         if let Err(error) = root.evict_for_resident_limit().await {
             tracing::error!(
                 "the resident object limit could not be enforced: {}",
@@ -544,8 +659,8 @@ async fn enforce_resident_limit(namespace: Weak<ActorNamespace>) {
             break;
         }
     }
-    if let Some(ns) = namespace.upgrade() {
-        ns.count_resident();
+    if let Some(process) = coordinator.upgrade() {
+        process.refresh();
     }
 }
 
@@ -617,7 +732,9 @@ impl ActorNamespace {
         let actors = std::mem::take(&mut *self.actors.borrow_mut());
         for container in actors.values() {
             container.abort(reason.cloned());
+            container.namespace_removed();
         }
+        self.count_resident();
     }
 
     /// Retires one runtime-selected root while retaining the namespace and its storage.
@@ -625,7 +742,59 @@ impl ActorNamespace {
         let actor = self.actors.borrow_mut().remove(key);
         if let Some(actor) = actor {
             actor.abort(Some(reason.clone()));
+            actor.namespace_removed();
         }
+        self.count_resident();
+    }
+
+    /// No replacement may open this root's files before its old ActorSqlites and shippers die.
+    pub async fn wait_root_closed(&self, key: &str) {
+        let closing = self.closing_roots.borrow().get(key).cloned();
+        if let Some(closing) = closing {
+            closing.await;
+        }
+    }
+
+    pub async fn wait_roots_closed(&self) {
+        let closing: Vec<_> = self.closing_roots.borrow().values().cloned().collect();
+        futures::future::join_all(closing).await;
+    }
+
+    fn close_root_handles(&self, key: &str, handles: Vec<Rc<KjOwn<ffi::ActorHandle>>>) {
+        if handles.is_empty() || !self.actor_class.runtime_root() {
+            return;
+        }
+        assert!(
+            !self.closing_roots.borrow().contains_key(key),
+            "root storage already closing"
+        );
+        let (done, wait) = futures::channel::oneshot::channel::<()>();
+        self.closing_roots.borrow_mut().insert(
+            key.to_owned(),
+            async move {
+                let _ = wait.await;
+            }
+            .boxed_local()
+            .shared(),
+        );
+        let namespace = self.this.clone();
+        let factory = Rc::clone(&self.factory);
+        let key = key.to_owned();
+        self.factory.spawn_detached(async move {
+            // Rust handles and native request references both count. The last handle's drop
+            // destroys ActorSqlite and its shipper synchronously, queueing CLOSED before OPEN.
+            while handles
+                .iter()
+                .any(|actor| Rc::strong_count(actor) != 1 || ffi::actor_is_shared(actor))
+            {
+                factory.sleep(EVICT_RETRY_DELAY).await;
+            }
+            drop(handles);
+            if let Some(namespace) = namespace.upgrade() {
+                namespace.closing_roots.borrow_mut().remove(&key);
+            }
+            let _ = done.send(());
+        });
     }
 
     /// Releases one idle root's actor tree, retaining its storage and hibernation managers.
@@ -644,6 +813,32 @@ impl ActorNamespace {
             .values()
             .filter(|actor| actor.is_resident())
             .count()
+    }
+
+    pub fn container_count(&self) -> usize {
+        self.actors.borrow().len()
+    }
+
+    /// Runtime-only sweep after idle unload; containers with connections or clients stay.
+    pub fn prune_idle_roots(&self) {
+        if !self.actor_class.runtime_root() {
+            return;
+        }
+        let mut actors = self.actors.borrow_mut();
+        let keys: Vec<_> = actors
+            .iter()
+            .filter(|(_, root)| {
+                !root.is_resident() && !root.tree_has_managers() && !root.has_clients()
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let removed: Vec<_> = keys.iter().filter_map(|key| actors.remove(key)).collect();
+        drop(actors);
+        for root in &removed {
+            root.namespace_removed();
+        }
+        drop(removed);
+        self.count_resident();
     }
 
     /// Stops every actor that is left as this instance's handoff ends; peers take them over
@@ -665,6 +860,10 @@ impl ActorNamespace {
     /// are left as they are, for the process's exit to end.
     async fn stop_all(&self, until: Option<Instant>, stop: impl Fn(&str, &ActorContainer)) {
         let actors = std::mem::take(&mut *self.actors.borrow_mut());
+        for container in actors.values() {
+            container.namespace_removed();
+        }
+        self.count_resident();
         let mut actors = actors.into_iter().collect::<Vec<_>>().into_iter();
         while actors.len() > 0 {
             if until.is_some_and(|until| Instant::now() >= until) {
@@ -785,6 +984,13 @@ impl ActorNamespace {
         }
         // Checked above; nothing else sets it.
         let _ = self.storage.set(storage);
+        if shipped {
+            self.residency_id.set(Some(
+                self.factory
+                    .residency()
+                    .register(Weak::clone(&self.this), self.residency.get().limit),
+            ));
+        }
         Ok(())
     }
 
@@ -838,6 +1044,17 @@ impl ActorNamespace {
     }
 }
 
+impl Drop for ActorNamespace {
+    fn drop(&mut self) {
+        for root in self.actors.get_mut().values() {
+            root.namespace_removed();
+        }
+        if let Some(id) = self.residency_id.get() {
+            self.factory.residency().unregister(id);
+        }
+    }
+}
+
 /// Marks a namespace's `directory` as the cluster's. The cluster replaces an
 /// object's database with the bucket's copy, so a directory holding Durable
 /// Objects from before cluster mode is refused rather than deleted.
@@ -865,10 +1082,6 @@ fn claim_directory(directory: &str) -> Result<()> {
 }
 
 impl ActorNamespaceHandle {
-    fn durable_log_residency(&self, report: &ffi::DurableResidencyReport) -> Result<()> {
-        Ok(ffi::actor_namespace_durable_log_residency(self, report)?)
-    }
-
     pub(crate) fn actor_for_alarm(
         &self,
         id: KjOwn<ActorIdHandle>,
@@ -1278,6 +1491,28 @@ pub struct ActorContainer {
 }
 
 impl ActorContainer {
+    fn namespace_removed(&self) {
+        if let ClassState::Ready { class, .. } = &*self.class_and_id.borrow() {
+            class.container_removed();
+        }
+    }
+
+    fn tree_has_managers(&self) -> bool {
+        self.has_hibernating_connections()
+            || self
+                .facets
+                .borrow()
+                .values()
+                .any(|child| child.tree_has_managers())
+    }
+
+    fn has_hibernating_connections(&self) -> bool {
+        self.manager
+            .borrow()
+            .as_ref()
+            .is_some_and(|manager| ffi::hibernation_manager_has_connections(manager))
+    }
+
     fn new_root(key: String, ns: &ActorNamespace, id: KjOwn<ActorIdHandle>) -> Rc<Self> {
         let class = ns
             .actor_class
@@ -1379,11 +1614,18 @@ impl ActorContainer {
 
     fn is_resident(&self) -> bool {
         self.is_running()
+            || (self.class_root_is_runtime() && self.has_hibernating_connections())
             || self
                 .facets
                 .borrow()
                 .values()
                 .any(|child| child.is_resident())
+    }
+
+    fn class_root_is_runtime(&self) -> bool {
+        self.namespace
+            .upgrade()
+            .is_some_and(|ns| ns.actor_class.runtime_root())
     }
 
     fn tree_has_requests(&self) -> bool {
@@ -1570,6 +1812,8 @@ impl ActorContainer {
                 return Ok(actor);
             }
             let ns = self.namespace()?;
+            ns.wait_root_closed(&self.root_key).await;
+            self.require_not_broken()?;
             let woke_from = self.was_evicted.get().then(|| ns.factory.now());
             if let Some(pending) = self.pending_class() {
                 pending.await?;
@@ -1811,6 +2055,18 @@ impl ActorContainer {
     /// the container leaves its map, dropping the hibernation manager (which disconnects the
     /// hibernated WebSockets).
     fn broken(self: &Rc<Self>, reason: &crate::Error) {
+        if self.is_root()
+            && self
+                .namespace
+                .upgrade()
+                .is_some_and(|ns| ns.actor_class.runtime_root())
+        {
+            self.abort(Some(reason.clone()));
+            if let Some(ns) = self.namespace.upgrade() {
+                ns.remove_container(self);
+            }
+            return;
+        }
         *self.broken_reason.borrow_mut() = Some(reason.clone());
         let facets = std::mem::take(&mut *self.facets.borrow_mut());
         for facet in facets.values() {
@@ -1874,6 +2130,15 @@ impl ActorContainer {
         if self.broken_reason.borrow().is_some() {
             return None;
         }
+        let mut closing = Vec::new();
+        if self.is_root()
+            && self
+                .namespace
+                .upgrade()
+                .is_some_and(|ns| ns.actor_class.runtime_root())
+        {
+            self.pin_actor_handles(&mut closing);
+        }
         let actor = self.actor.borrow_mut().take();
         if let Some(actor) = &actor {
             // Only an error cancels a committed hook, which must stop before ownership is released.
@@ -1899,7 +2164,20 @@ impl ActorContainer {
         );
         let owned = self.release(actor.as_deref());
         drop(actor);
+        if let Some(ns) = self.namespace.upgrade() {
+            ns.close_root_handles(&self.root_key, closing);
+            ns.count_resident();
+        }
         owned
+    }
+
+    fn pin_actor_handles(&self, handles: &mut Vec<Rc<KjOwn<ffi::ActorHandle>>>) {
+        for facet in self.facets.borrow().values() {
+            facet.pin_actor_handles(handles);
+        }
+        if let Some(actor) = self.actor.borrow().as_ref() {
+            handles.push(Rc::clone(actor));
+        }
     }
 
     /// Whether this actor or a facet of it has a request in flight.
@@ -2126,6 +2404,9 @@ impl ActorContainer {
         if let Some(actor) = &current {
             if hibernate {
                 self.save_manager();
+                if self.class_root_is_runtime() && !self.has_hibernating_connections() {
+                    *self.manager.borrow_mut() = None;
+                }
             }
             let lock = if hibernate && self.manager.borrow().is_some() {
                 Some(ffi::actor_lock(actor).await?)
@@ -2150,14 +2431,14 @@ impl ActorContainer {
         self.cancel_on_broken();
         self.cancel_shutdown();
         *self.actor.borrow_mut() = None;
+        if !hibernate {
+            *self.manager.borrow_mut() = None;
+        }
         if current.is_some() {
             self.was_evicted.set(true);
             if let Some(ns) = self.namespace.upgrade() {
                 ns.object_evicted();
             }
-        }
-        if !hibernate {
-            *self.manager.borrow_mut() = None;
         }
         Ok(true)
     }
@@ -2327,7 +2608,13 @@ async fn resolve_facet_start(
 ) -> Result<()> {
     let ffi::FacetStartInfo { id, actor_class } = ffi::facet_start_resolve(start).await?;
     if let Some(container) = container.upgrade() {
-        let class = actor_class.0;
+        let mut class = actor_class.0;
+        let root_class = container.root().class()?;
+        if let Some(plan) = root_class.root_plan() {
+            if let Some(bound) = class.for_root_plan(plan)? {
+                class = bound;
+            }
+        }
         *container.class_and_id.borrow_mut() = ClassState::Ready { class, id };
     }
     Ok(())
@@ -2335,6 +2622,10 @@ async fn resolve_facet_start(
 
 impl Drop for ActorContainer {
     fn drop(&mut self) {
+        let mut closing = Vec::new();
+        if self.is_root() && self.class_root_is_runtime() {
+            self.pin_actor_handles(&mut closing);
+        }
         for facet in self.facets.get_mut().values() {
             facet.abort(None);
         }
@@ -2343,6 +2634,10 @@ impl Drop for ActorContainer {
             ffi::actor_abort(actor, &AbortReason(None));
         }
         drop(self.release(actor.as_deref()));
+        drop(actor);
+        if let Some(namespace) = self.namespace.upgrade() {
+            namespace.close_root_handles(&self.root_key, closing);
+        }
     }
 }
 
