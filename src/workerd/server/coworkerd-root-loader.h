@@ -14,7 +14,7 @@ class CoworkerdRootLoader final: public api::Fetcher {
   CoworkerdRootLoader(uint channel, kj::String service)
       : Fetcher(channel, RequiresHostAndProtocol::YES), service(kj::mv(service)) {}
 
-  jsg::Ref<api::Fetcher> getRoot(jsg::Lock& js, kj::String selectionJson);
+  jsg::Promise<jsg::Ref<api::Fetcher>> getRoot(jsg::Lock& js, kj::String selectionJson);
 
   JSG_RESOURCE_TYPE(CoworkerdRootLoader) {
     JSG_INHERIT(api::Fetcher);

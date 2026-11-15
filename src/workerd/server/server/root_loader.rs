@@ -1730,6 +1730,12 @@ impl Channel for RootRegistry {
         if !selection.dispatch_checked {
             return Err(kj::failed!("jsg.Error: node dispatch checks are required"));
         }
+        // Let the trusted runtime refresh a cached key before starting an object event.
+        if !self.plans.borrow().contains_key(&selection.plan) {
+            return Err(kj::failed!(
+                "jsg.Error: ROOT_PLAN_MISSING: the root plan was reclaimed"
+            ));
+        }
         Ok(Rc::new(RootSelectedChannel {
             registry: self
                 .this
@@ -1771,7 +1777,10 @@ impl Channel for RootSelectedChannel {
         let selection = self.selection.clone();
         registry.stamp_metadata(&selection, &mut metadata)?;
         Ok(worker::PromisedInterface::new(async move {
-            registry.root(selection).await?.start_request(metadata)
+            let channel = registry.root(selection).await.map_err(|error| {
+                kj::failed!("jsg.Error: ROOT_PREPARATION_FAILED: {}", error.description())
+            })?;
+            channel.start_request(metadata)
         })
         .into_kj())
     }

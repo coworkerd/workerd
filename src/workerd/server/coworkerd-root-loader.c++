@@ -45,15 +45,22 @@ class RootBootstrapChannel final: public IoChannelFactory::SubrequestChannel {
 
 }  // namespace
 
-jsg::Ref<api::Fetcher> CoworkerdRootLoader::getRoot(jsg::Lock& js, kj::String selectionJson) {
+jsg::Promise<jsg::Ref<api::Fetcher>> CoworkerdRootLoader::getRoot(
+    jsg::Lock& js, kj::String selectionJson) {
   auto& context = IoContext::current();
   auto request = context.getIoChannelFactory().getWorkerdDebugPort().getEntrypointRequest();
   request.setService(service);
   Frankenvalue::fromJson(kj::mv(selectionJson)).toCapnp(request.initProps());
-  kj::Rc<IoChannelFactory::SubrequestChannel> channel = kj::rc<RootBootstrapChannel>(
-      request.send().getEntrypoint(), context.getHttpOverCapnpFactory(), context.getByteStreamFactory());
-  return js.alloc<api::Fetcher>(
-      context.addObject(kj::mv(channel)), api::Fetcher::RequiresHostAndProtocol::NO);
+  // Resolve the selection before exposing a Fetcher, so refreshing a reclaimed plan never replays an event.
+  return context.awaitIo(js, request.send(),
+      [](jsg::Lock& js, capnp::Response<rpc::WorkerdDebugPort::GetEntrypointResults> response)
+          -> jsg::Ref<api::Fetcher> {
+    auto& context = IoContext::current();
+    kj::Rc<IoChannelFactory::SubrequestChannel> channel = kj::rc<RootBootstrapChannel>(
+        response.getEntrypoint(), context.getHttpOverCapnpFactory(), context.getByteStreamFactory());
+    return js.alloc<api::Fetcher>(
+        context.addObject(kj::mv(channel)), api::Fetcher::RequiresHostAndProtocol::NO);
+  });
 }
 
 }  // namespace workerd::server
