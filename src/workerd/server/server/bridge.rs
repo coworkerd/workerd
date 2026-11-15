@@ -122,6 +122,8 @@ pub mod ffi {
 
     struct WorkerSpec {
         name: String,
+        /// Owned configuration supplied by the private root loader; empty on existing paths.
+        runtime_config: Vec<u64>,
         load_identity: CoworkerdLoadIdentity,
         /// The worker's inbound TCP listeners, for `Worker::Api::getInboundListeners()`.
         inbound_listeners: Vec<InboundListener>,

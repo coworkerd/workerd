@@ -160,6 +160,56 @@ impl WorkerService {
         inbound_listeners: Vec<ffi::InboundListener>,
         report: &Reporter,
     ) -> Result<Rc<Self>> {
+        Self::new_config(
+            factory,
+            name,
+            Some(service_index),
+            conf,
+            actor_configs,
+            inbound_listeners,
+            ffi::CoworkerdLoadIdentity::default(),
+            report,
+        )
+        .await
+    }
+
+    /// Compiles an owned config with an explicit creation record and registry-owned namespaces.
+    pub async fn new_root(
+        factory: Rc<Factory>,
+        name: &str,
+        conf: worker::Reader<'_>,
+        actor_configs: &ActorConfigs,
+        identity: ffi::CoworkerdLoadIdentity,
+        report: &Reporter,
+    ) -> Result<Rc<Self>> {
+        if !identity.present {
+            return Err(kj::failed!(
+                "ROOT_CREATION_REQUIRED: a tenant root needs a creation record"
+            ));
+        }
+        Self::new_config(
+            factory,
+            name,
+            None,
+            conf,
+            actor_configs,
+            Vec::new(),
+            identity,
+            report,
+        )
+        .await
+    }
+
+    async fn new_config(
+        factory: Rc<Factory>,
+        name: &str,
+        service_index: Option<u32>,
+        conf: worker::Reader<'_>,
+        actor_configs: &ActorConfigs,
+        inbound_listeners: Vec<ffi::InboundListener>,
+        load_identity: ffi::CoworkerdLoadIdentity,
+        report: &Reporter,
+    ) -> Result<Rc<Self>> {
         let experimental = factory.experimental();
         let empty = ActorConfigMap::new();
         let local_actor_configs = actor_configs.get(name).unwrap_or(&empty);
@@ -189,20 +239,27 @@ impl WorkerService {
             None
         };
 
+        let runtime_config = if service_index.is_none() {
+            let mut message = capnp::message::Builder::new_default();
+            message.set_root(conf).map_err(capnp_error)?;
+            capnp::serialize::write_message_to_words(&message)
+                .chunks_exact(8)
+                .map(|word| u64::from_ne_bytes(word.try_into().expect("aligned Capnp word")))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let spec = ffi::WorkerSpec {
             name: name.to_owned(),
-            load_identity: ffi::CoworkerdLoadIdentity::default(),
+            runtime_config,
+            load_identity,
             inbound_listeners,
             globals: std::mem::take(&mut bindings.globals),
             access_blob_header: access_blob_header.into(),
         };
-        let compiled = ffi::factory_new_worker(
-            factory.raw(),
-            &spec,
-            KjMaybe::Some(service_index),
-            KjMaybe::None,
-        )
-        .await?;
+        let compiled =
+            ffi::factory_new_worker(factory.raw(), &spec, service_index.into(), KjMaybe::None)
+                .await?;
 
         let info = ffi::worker_info(&compiled);
         for error in info.errors {
@@ -232,7 +289,11 @@ impl WorkerService {
         ffi::worker_set_ctx_exports(&compiled, &loopback.globals)?;
 
         let pending = pending_link(name, conf, bindings, loopback, report).map_err(capnp_error)?;
-        let config_spec = ffi::is_bench_mode().then_some((service_index, spec));
+        let config_spec = if ffi::is_bench_mode() {
+            service_index.map(|index| (index, spec))
+        } else {
+            None
+        };
 
         let this = Rc::new(Self {
             factory,
@@ -250,7 +311,9 @@ impl WorkerService {
             namespaces: RefCell::new(LinkedHashMap::new()),
             broken: Cell::new(false),
         });
-        this.init_namespaces(local_actor_configs);
+        if service_index.is_some() {
+            this.init_namespaces(local_actor_configs);
+        }
         Ok(this)
     }
 }
@@ -292,6 +355,7 @@ impl WorkerService {
     ) -> Result<Rc<Self>> {
         let spec = ffi::WorkerSpec {
             name,
+            runtime_config: Vec::new(),
             load_identity,
             inbound_listeners: Vec::new(),
             globals: Vec::new(),
@@ -727,6 +791,19 @@ impl WorkerService {
 }
 
 impl WorkerService {
+    /// Installs a namespace whose class provider and storage outlive this compiled worker.
+    pub fn set_root_namespace(&self, class: &str, namespace: Rc<ActorNamespace>) {
+        self.namespaces
+            .borrow_mut()
+            .insert(class.to_owned(), namespace);
+    }
+
+    /// Marks a registry worker ready only after all channels have been linked.
+    pub fn root_ready(&self) -> Result<()> {
+        ffi::worker_idle_ready(&self.worker, Box::new(ChannelFactory(self.channels()?)))?;
+        Ok(())
+    }
+
     /// The designators awaiting the link stage. Taken once, by the server's third pass.
     pub fn take_pending_link(&self) -> Option<PendingLink> {
         self.pending.borrow_mut().take()

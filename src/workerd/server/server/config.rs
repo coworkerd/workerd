@@ -417,6 +417,7 @@ pub enum Service {
     /// the rest of the config can be checked.
     Leaf(Rc<dyn Channel>),
     Disk(Rc<DiskDirectoryService>),
+    RootLoader(Rc<crate::root_loader::RootRegistry>),
 }
 
 impl Service {
@@ -427,6 +428,7 @@ impl Service {
             Self::Worker(worker) => worker.default_entrypoint(),
             Self::Leaf(channel) => Rc::clone(channel),
             Self::Disk(disk) => Rc::clone(disk) as Rc<dyn Channel>,
+            Self::RootLoader(loader) => Rc::clone(loader) as Rc<dyn Channel>,
         }
     }
 
@@ -611,6 +613,11 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        for service in self.services.0.values() {
+            if let Service::RootLoader(loader) = service {
+                loader.shutdown();
+            }
+        }
         // Actors may have background work, which aborting them cancels. The run's background
         // tasks (tasks.rs) go too: one may hold an actor, and so its class's worker.
         self.abort_all_actors(Some(&kj::disconnected!("Server shutting down.")));
@@ -1795,6 +1802,17 @@ async fn make_service(
                 crate::services::make_disk_directory_service(name, disk, path, factory)
                     .map(Service::Disk),
             ))
+        }
+        Ok(service::Which::CoworkerdRootLoader(conf)) => {
+            let conf = conf.map_err(capnp_error)?;
+            if !factory.experimental() {
+                return Err(kj::failed!(
+                    "the private root loader requires --experimental"
+                ));
+            }
+            let storage = text(conf.get_storage_path())?;
+            crate::root_loader::RootRegistry::new(Rc::clone(factory), storage)
+                .map(Service::RootLoader)
         }
         // Made once the cluster is joined (`make_bucket_services`).
         Ok(service::Which::Bucket(_)) => Ok(Service::Leaf(Rc::new(InvalidConfigChannel))),

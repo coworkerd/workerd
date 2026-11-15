@@ -449,12 +449,20 @@ struct Service {
 
     bucket @6 :ClusterBucket;
     # A directory in the cluster's bucket, served over HTTP. Requires `Config.cluster`.
+
+    coworkerdRootLoader @7 :CoworkerdRootLoader;
+    # Private platform capability, bound only into the trusted durable runtime.
   }
 
   # TODO(someday): Allow defining a list of middlewares to stack on top of the service. This would
   #   be a list of Worker names, where each Worker must have a binding called `next`. This
   #   implicitly creates an inherited worker that wraps this service, with the `next` binding
   #   pointing to the service itself (or to the next middleware in the stack).
+}
+
+struct CoworkerdRootLoader {
+  storagePath @0 :Text;
+  # The trusted process configuration's writable root storage directory.
 }
 
 struct ClusterBucket {

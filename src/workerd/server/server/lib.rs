@@ -24,6 +24,7 @@ pub mod listen;
 pub mod loader;
 pub mod log;
 pub mod pyodide;
+pub mod root_loader;
 pub mod run;
 pub mod services;
 pub mod tasks;

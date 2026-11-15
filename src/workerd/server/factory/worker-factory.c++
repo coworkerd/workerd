@@ -1671,6 +1671,17 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
       kj::str(identity.worker_id), kj::str(identity.version_id), identity.generation,
       identity.cpu_limit_ms, identity.memory_limit_mib};
   }
+  kj::Own<capnp::MallocMessageBuilder> runtimeConfig;
+  kj::Maybe<config::Worker::Reader> configWorker;
+  KJ_IF_SOME(index, configService) {
+    configWorker = factory.config.getServices()[index].getWorker();
+  } else if (!spec.runtime_config.empty()) {
+    capnp::FlatArrayMessageReader reader(
+        asWords(kj::from<Rust>(spec.runtime_config)), CONFIG_READER_OPTIONS);
+    runtimeConfig = kj::heap<capnp::MallocMessageBuilder>();
+    runtimeConfig->setRoot(reader.getRoot<config::Worker>());
+    configWorker = runtimeConfig->getRoot<config::Worker>();
+  }
   ErrorReporter errorReporter;
   auto& options = *factory.options;
   bool experimental = options.experimental;
@@ -1681,8 +1692,7 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
   kj::Maybe<kj::StringPtr> moduleFallback;
   capnp::List<config::Extension>::Reader extensions;
   kj::Function<void(jsg::Lock&, const Worker::Api&, v8::Local<v8::Object>)> compileBindings;
-  KJ_IF_SOME(index, configService) {
-    auto conf = factory.config.getServices()[index].getWorker();
+  KJ_IF_SOME(conf, configWorker) {
     extensions = factory.config.getExtensions();
     impl->flagsArena = kj::heap<capnp::MallocMessageBuilder>();
     featureFlags = compileFlags(options, conf, *impl->flagsArena, errorReporter);
@@ -1891,6 +1901,9 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
   }
 
   kj::Maybe<kj::Own<void>> ownContent;
+  if (runtimeConfig.get() != nullptr) {
+    ownContent = kj::mv(runtimeConfig);
+  }
   KJ_IF_SOME(dynamic, impl->dynamicSource) ownContent = kj::mv(dynamic.ownContent);
   auto scriptStart = api::BenchTiming::now();
   auto script = isolate->newScript(impl->name, workerSource, IsolateObserver::StartType::COLD,
