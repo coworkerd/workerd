@@ -555,29 +555,28 @@ class ActorSqliteHooks final: public ActorSqlite::Hooks {
   ActorKey actor;
 };
 
-// The node schedules every shipped database; only non-shipped roots use the local scheduler.
+// Facets have their own storage but no alarms: the scheduler delivers only to root actors.
 class FacetAlarmHooks final: public ActorSqlite::Hooks {
  public:
-  FacetAlarmHooks() = default;
-  FacetAlarmHooks(kj::String objectName, uint facetId)
-      : shipped(ShippedFacet{kj::mv(objectName), facetId}) {}
-
   kj::Promise<void> scheduleRun(
       kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) override {
-    KJ_IF_SOME(facet, shipped) {
-      durableLogAlarm(facet.objectName, facet.facetId, newAlarmTime);
-      return kj::READY_NOW;
-    }
     // The same message as the production storage factory's.
     JSG_FAIL_REQUIRE(Error, "Facets currently cannot set alarms.");
   }
+};
+
+// Shipped roots report only to the node; they never arm the local scheduler.
+class ShippedRootAlarmHooks final: public ActorSqlite::Hooks {
+ public:
+  explicit ShippedRootAlarmHooks(kj::String objectName): objectName(kj::mv(objectName)) {}
+  kj::Promise<void> scheduleRun(
+      kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) override {
+    durableLogAlarm(objectName, 0, newAlarmTime);
+    return kj::READY_NOW;
+  }
 
  private:
-  struct ShippedFacet {
-    kj::String objectName;
-    uint facetId;
-  };
-  kj::Maybe<ShippedFacet> shipped;
+  kj::String objectName;
 };
 
 // The actor's storage: SQLite in the namespace's directory, or an in-memory cache over empty
@@ -606,13 +605,10 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
     kj::Maybe<ActorSqliteHooks&> rootHooks;
     uint selfId = facetId.orDefault(0);
     auto shippedName = kj::str(rootName.size() == 0 ? rootKey.asPtr() : rootName.asPtr());
-    if (shipped) {
-      if (facetId == kj::none) {
-        // An older build may have persisted a local schedule. The database's value is now
-        // reported to the node, so remove that obsolete second scheduler's entry on open.
-        storage->alarmScheduler->deleteAlarm(ActorKey(rootKey.asPtr(), actorName));
-      }
-      sqliteHooks = kj::heap<FacetAlarmHooks>(kj::str(shippedName), selfId);
+    if (shipped && facetId == kj::none) {
+      // A shipped root's database is authoritative; remove any local scheduler entry.
+      storage->alarmScheduler->deleteAlarm(ActorKey(rootKey.asPtr(), actorName));
+      sqliteHooks = kj::heap<ShippedRootAlarmHooks>(kj::str(shippedName));
     } else if (facetId == kj::none) {
       auto root =
           kj::heap<ActorSqliteHooks>(kj::addRef(*storage), ActorKey(rootKey.asPtr(), actorName));
@@ -666,8 +662,8 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
       commit = [s = kj::mv(s)](SpanParent) mutable -> kj::Promise<void> { return s->onCommit(); };
     }
     // Every open reports the persisted value, including none, before ActorSqlite owns the database.
-    if (shipped) {
-      durableLogAlarm(shippedName, selfId, alarmOf(*db));
+    if (shipped && facetId == kj::none) {
+      durableLogAlarm(shippedName, 0, alarmOf(*db));
     }
     auto sqlite = kj::heap<ActorSqlite>(kj::mv(db), outputGate, kj::mv(commit), *sqliteHooks);
     KJ_IF_SOME(root, rootHooks) {
