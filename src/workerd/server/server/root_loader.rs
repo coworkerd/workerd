@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, SystemTime};
 
+use base64::Engine as _;
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use futures::future::Shared;
@@ -42,6 +43,7 @@ struct CreationRecord {
     tenant: String,
     worker_id: String,
     version_id: String,
+    #[serde(default)]
     generation: u64,
     cpu_limit_ms: u32,
     memory_limit_mib: u32,
@@ -54,6 +56,8 @@ struct CreationRecord {
 struct Module {
     name: String,
     source: String,
+    #[serde(rename = "type", default)]
+    module_type: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
@@ -128,8 +132,14 @@ const ROOT_CLASS_REFERENCE: &str = "coworkerd:root-class:";
 #[serde(rename_all = "camelCase")]
 struct Deployment {
     kind: String,
+    #[serde(default)]
+    tenant: String,
+    #[serde(default)]
+    platform_class: Option<RootTarget>,
     worker_id: String,
     version_id: String,
+    #[serde(default)]
+    version_fingerprint: String,
     compatibility_date: String,
     #[serde(default)]
     compatibility_flags: Vec<String>,
@@ -152,6 +162,26 @@ struct WorkerKey {
 }
 
 impl Deployment {
+    fn is_platform(&self) -> bool {
+        self.kind == "platform"
+    }
+
+    fn owner_tenant(&self) -> Result<&str> {
+        if self.is_platform() {
+            Ok(&self.tenant)
+        } else {
+            Ok(&self.record()?.tenant)
+        }
+    }
+
+    fn initial_generation(&self) -> Result<u64> {
+        if self.is_platform() {
+            Ok(0)
+        } else {
+            Ok(self.record()?.generation)
+        }
+    }
+
     fn record(&self) -> Result<&CreationRecord> {
         let record = self
             .creation_record
@@ -184,18 +214,55 @@ impl Deployment {
     }
 
     fn plan_key(&self) -> Result<String> {
+        if self.is_platform() {
+            return serde_json::to_string(&json!({
+                "kind": "platform", "tenant": self.tenant, "workerId": self.worker_id,
+                "versionId": self.version_id, "platformClass": self.platform_class,
+                "namespaces": self.namespaces,
+            }))
+            .map_err(|error| kj::failed!("root key: {error}"));
+        }
         let record = self.record()?;
         serde_json::to_string(&json!({
             "workerId": self.worker_id, "versionId": self.version_id,
             "cpuLimitMs": record.cpu_limit_ms, "memoryLimitMib": record.memory_limit_mib,
             "generation": record.generation,
+            "versionFingerprint": self.version_fingerprint,
         }))
         .map_err(|error| kj::failed!("root key: {error}"))
     }
 
     fn validate(&self) -> Result<()> {
-        self.record()?;
-        if self.modules.is_empty() || self.namespaces.is_empty() {
+        if self.is_platform() {
+            let class = self
+                .platform_class
+                .as_ref()
+                .ok_or_else(|| kj::failed!("platform root class missing"))?;
+            if self.tenant.is_empty()
+                || self.worker_id.is_empty()
+                || self.version_id.is_empty()
+                || class.service.is_empty()
+                || class.entrypoint.is_none()
+                || self.creation_record.is_some()
+                || !self.modules.is_empty()
+                || !self.environment.is_empty()
+                || !self.durable_objects.is_empty()
+                || self.global_outbound.is_some()
+                || self.streaming_tail.is_some()
+            {
+                return Err(kj::failed!(
+                    "platform root plans cannot load tenant code or records"
+                ));
+            }
+        } else {
+            self.record()?;
+            if self.platform_class.is_some() {
+                return Err(kj::failed!(
+                    "tenant root plans cannot select a platform class"
+                ));
+            }
+        }
+        if (!self.is_platform() && self.modules.is_empty()) || self.namespaces.is_empty() {
             return Err(kj::failed!(
                 "a root deployment needs modules and namespaces"
             ));
@@ -210,6 +277,15 @@ impl Deployment {
         }
         let (mut ids, mut bindings, mut keys) = (HashSet::new(), HashSet::new(), HashSet::new());
         for namespace in &self.namespaces {
+            if self.is_platform()
+                && self
+                    .platform_class
+                    .as_ref()
+                    .and_then(|class| class.entrypoint.as_ref())
+                    != Some(&namespace.class_name)
+            {
+                return Err(kj::failed!("platform root namespace class mismatch"));
+            }
             if !::cluster::compose::is_path_component(&namespace.unique_key)
                 || namespace.id.is_empty()
                 || namespace.class_name.is_empty()
@@ -390,7 +466,11 @@ impl RootRegistry {
             .collect();
         let mut workers = Vec::new();
         for key in unused {
-            self.plans.borrow_mut().remove(&key);
+            let platform = self
+                .plans
+                .borrow_mut()
+                .remove(&key)
+                .is_some_and(|plan| plan.deployment.is_platform());
             let instances: Vec<_> = self
                 .compiled
                 .borrow()
@@ -400,7 +480,9 @@ impl RootRegistry {
                 .collect();
             for instance in instances {
                 if let Some(worker) = self.compiled.borrow_mut().remove(&instance) {
-                    workers.push(worker);
+                    if !platform {
+                        workers.push(worker);
+                    }
                 }
             }
         }
@@ -499,6 +581,17 @@ impl RootRegistry {
     }
 
     async fn compile(&self, deployment: &Deployment, key: &WorkerKey) -> Result<Rc<WorkerService>> {
+        if let Some(class) = &deployment.platform_class {
+            return self
+                .server
+                .borrow()
+                .upgrade()
+                .ok_or_else(|| kj::disconnected!("root server gone"))?
+                .root_platform_worker(
+                    &class.service,
+                    class.entrypoint.as_deref().unwrap_or("default"),
+                );
+        }
         // A binding invocation must yield its calling isolate before compiling another isolate.
         self.factory.sleep(Duration::ZERO).await;
         let errors = Rc::new(RefCell::new(Vec::new()));
@@ -530,7 +623,23 @@ impl RootRegistry {
             for (index, source) in deployment.modules.iter().enumerate() {
                 let mut module = modules.reborrow().get(index as u32);
                 module.set_name(source.name.as_str());
-                module.set_es_module(source.source.as_str());
+                match source.module_type.as_str() {
+                    "" | "js" => module.set_es_module(source.source.as_str()),
+                    "cjs" => module.set_common_js_module(source.source.as_str()),
+                    "text" => module.set_text(source.source.as_str()),
+                    "json" => module.set_json(source.source.as_str()),
+                    "data" | "wasm" => {
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(&source.source)
+                            .map_err(|error| kj::failed!("root module base64: {error}"))?;
+                        if source.module_type == "data" {
+                            module.set_data(&bytes);
+                        } else {
+                            module.set_wasm(&bytes);
+                        }
+                    }
+                    _ => return Err(kj::failed!("unsupported root module type")),
+                }
             }
             conf.reborrow()
                 .init_durable_object_storage()
@@ -608,6 +717,9 @@ impl RootRegistry {
         worker: &Rc<WorkerService>,
         spaces: &HashMap<String, NamespaceEntry>,
     ) -> Result<()> {
+        if plan.deployment.is_platform() {
+            return Ok(());
+        }
         let _ = spaces;
         let pending = worker
             .take_pending_link()
@@ -805,7 +917,7 @@ impl RootRegistry {
                         .ok_or_else(|| kj::failed!("namespace source missing"))?;
                     if existing.unique_key != namespace.unique_key
                         || owner.deployment.worker_id != deployment.worker_id
-                        || owner.deployment.record()?.tenant != deployment.record()?.tenant
+                        || owner.deployment.owner_tenant()? != deployment.owner_tenant()?
                     {
                         return Err(kj::failed!(
                             "a root namespace cannot change its owner or storage"
@@ -821,7 +933,7 @@ impl RootRegistry {
                 }
             }
         }
-        let key = deployment.key(deployment.record()?.generation)?;
+        let key = deployment.key(deployment.initial_generation()?)?;
         let plan = Rc::new(Plan {
             deployment,
             lock: tokio::sync::Mutex::new(()),
@@ -833,12 +945,16 @@ impl RootRegistry {
         let spaces = match self.make_spaces(&plan.deployment, &plan_key) {
             Ok(spaces) => spaces,
             Err(error) => {
-                worker.unlink();
+                if !plan.deployment.is_platform() {
+                    worker.unlink();
+                }
                 return Err(error);
             }
         };
         if let Err(error) = self.link(&plan_key, &plan, &key, &worker, &spaces) {
-            worker.unlink();
+            if !plan.deployment.is_platform() {
+                worker.unlink();
+            }
             return Err(error);
         }
         for entry in spaces.values() {
@@ -897,7 +1013,9 @@ impl RootRegistry {
         let worker = self.compile(&plan.deployment, &key).await?;
         let linked = self.link(plan_key, &plan, &key, &worker, &self.namespaces.borrow());
         if let Err(error) = linked {
-            worker.unlink();
+            if !plan.deployment.is_platform() {
+                worker.unlink();
+            }
             return Err(error);
         }
         assert!(
@@ -1088,6 +1206,9 @@ impl RootRegistry {
         let Some(plan) = self.plans.borrow().get(plan_key).cloned() else {
             return false;
         };
+        if plan.deployment.is_platform() {
+            return false;
+        }
         let current = self.compiled.borrow().get(key).cloned();
         let matches = plan.loaded.borrow().as_ref() == Some(key)
             && current.as_ref().is_some_and(|current| {
@@ -1239,6 +1360,11 @@ impl RootRegistry {
             "plan": id, "workerId": plan.deployment.worker_id, "versionId": plan.deployment.version_id,
             "loaded": plan.loaded.borrow().is_some(), "generation": plan.generation.get(),
             "key": *plan.loaded.borrow(), "namespaces": plan.deployment.namespaces,
+            "kind": plan.deployment.kind, "tenant": plan.deployment.owner_tenant().ok(),
+            "platformClass": plan.deployment.platform_class,
+            "configuredWorker": if plan.deployment.is_platform() {
+                self.loaded(plan).map(|worker| format!("{:p}", Rc::as_ptr(&worker)))
+            } else { None },
         })).collect();
         plans.sort_by(|a, b| a["plan"].as_str().cmp(&b["plan"].as_str()));
         let mut namespaces: Vec<_> = self.namespaces.borrow().iter().map(|(id, entry)| json!({
@@ -1261,8 +1387,15 @@ impl RootRegistry {
                 .abort_all(Some(&kj::disconnected!("root registry shutdown")));
         }
         let workers = std::mem::take(&mut *self.compiled.borrow_mut());
-        for worker in workers.values() {
-            worker.unlink();
+        for (key, worker) in &workers {
+            if !self
+                .plans
+                .borrow()
+                .get(&key.plan_key)
+                .is_some_and(|plan| plan.deployment.is_platform())
+            {
+                worker.unlink();
+            }
         }
         for worker in std::mem::take(&mut *self.retiring.borrow_mut()).values() {
             worker.unlink();
@@ -1706,6 +1839,13 @@ impl Service for RootRequest {
         let text = std::str::from_utf8(url).map_err(|error| kj::failed!("root URL: {error}"))?;
         let url = url::Url::parse(text).map_err(|error| kj::failed!("root URL: {error}"))?;
         let value = match (method, url.path()) {
+            (Method::POST, "/lookup") => {
+                let deployment: Deployment = serde_json::from_value(read_json(body).await?)
+                    .map_err(|error| kj::failed!("root lookup: {error}"))?;
+                let key = deployment.plan_key()?;
+                let present = self.registry.plans.borrow().contains_key(&key);
+                json!({"plan": if present { Some(key) } else { None }})
+            }
             (Method::POST, "/install") => {
                 let deployment = serde_json::from_value(read_json(body).await?)
                     .map_err(|error| kj::failed!("root deployment: {error}"))?;

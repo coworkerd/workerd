@@ -1554,6 +1554,20 @@ impl Server {
             .ok_or_else(|| kj::failed!("root bridge entrypoint missing"))
     }
 
+    pub(crate) fn root_platform_worker(
+        &self,
+        service: &str,
+        class: &str,
+    ) -> Result<Rc<WorkerService>> {
+        self.services
+            .0
+            .get(service)
+            .and_then(Service::as_worker)
+            .filter(|worker| worker.has_actor_class(class))
+            .cloned()
+            .ok_or_else(|| kj::failed!("root platform class must belong to a configured worker"))
+    }
+
     pub(crate) fn has_configured_namespace_key(&self, key: &str) -> bool {
         self.namespaces_by_unique_key.contains_key(key)
     }
