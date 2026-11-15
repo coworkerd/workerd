@@ -1381,11 +1381,14 @@ impl RootRegistry {
                 // currently executing KJ promise would otherwise destroy its own callback.
                 // Stop every old container before releasing the plan, then wait on storage
                 // keys independently, without keeping healthy objects behind one old handle.
-                for (namespace, storage_key) in &roots {
+                for (index, (namespace, storage_key)) in roots.iter().enumerate() {
                     namespace.abort_root(
                         storage_key,
                         &kj::disconnected!("root worker limit exceeded"),
                     );
+                    if (index + 1) % 64 == 0 {
+                        registry.factory.sleep(Duration::ZERO).await;
+                    }
                 }
                 plan.retiring.borrow_mut().take();
                 let _ = done.send(());

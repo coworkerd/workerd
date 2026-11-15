@@ -508,8 +508,8 @@ impl ActorNamespace {
         {
             actors.remove(&container.key);
             drop(actors);
+            self.forget_resident_root(container);
             container.namespace_removed();
-            self.count_resident();
         }
     }
 
@@ -631,6 +631,16 @@ impl ActorNamespace {
         let mut report = self.residency.get();
         if resident && !previous { report.resident += 1; }
         if !resident && previous { report.resident = report.resident.saturating_sub(1); }
+        self.residency.set(report);
+        if let Some(id) = self.residency_id.get() { self.factory.residency().update(id, report); }
+    }
+
+    /// A removed runtime root no longer contributes, even while old references retain it.
+    fn forget_resident_root(&self, container: &ActorContainer) {
+        if !self.actor_class.runtime_root() { self.count_resident(); return; }
+        if !container.resident_counted.replace(false) { return; }
+        let mut report = self.residency.get();
+        report.resident = report.resident.saturating_sub(1);
         self.residency.set(report);
         if let Some(id) = self.residency_id.get() { self.factory.residency().update(id, report); }
     }
@@ -842,6 +852,7 @@ impl ActorNamespace {
     /// `reason` becomes the error of the actors' in-flight requests.
     pub fn abort_all(&self, reason: Option<&crate::Error>) {
         let actors = std::mem::take(&mut *self.actors.borrow_mut());
+        self.count_resident();
         for container in actors.values() {
             container.abort(reason.cloned());
             container.namespace_removed();
@@ -853,10 +864,10 @@ impl ActorNamespace {
     pub fn abort_root(&self, key: &str, reason: &crate::Error) {
         let actor = self.actors.borrow_mut().remove(key);
         if let Some(actor) = actor {
+            self.forget_resident_root(&actor);
             actor.abort(Some(reason.clone()));
             actor.namespace_removed();
         }
-        self.count_resident();
     }
 
     /// No replacement may open this root's files before its old ActorSqlites and shippers die.
@@ -2400,7 +2411,7 @@ impl ActorContainer {
         drop(actor);
         if let Some(ns) = self.namespace.upgrade() {
             ns.close_root_handles(&self.root_key, closing);
-            ns.count_resident();
+            ns.refresh_resident_root(self);
         }
         owned
     }
