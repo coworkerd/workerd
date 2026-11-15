@@ -1387,7 +1387,7 @@ impl RootRegistry {
                         &kj::disconnected!("root worker limit exceeded"),
                     );
                     if (index + 1) % 64 == 0 {
-                        registry.factory.sleep(Duration::ZERO).await;
+                        registry.factory.sleep(Duration::from_millis(1)).await;
                     }
                 }
                 plan.retiring.borrow_mut().take();
@@ -2050,13 +2050,14 @@ impl Service for RootRequest {
                 let removed = entry.is_some();
                 if let Some(entry) = entry {
                     if !entry.removing.replace(true) {
-                        entry
-                            .namespace
-                            .abort_all(Some(&kj::disconnected!("root namespace removed")));
+                        let closing = entry.namespace.abort_runtime_roots(
+                            kj::disconnected!("root namespace removed"),
+                        );
                         let registry = Rc::clone(&self.registry);
                         let old = entry.clone();
                         let id = id.to_owned();
                         self.registry.factory.spawn_detached(async move {
+                            closing.await;
                             old.namespace.roots_closed().await;
                             let matches =
                                 registry.namespaces.borrow().get(&id).is_some_and(|entry| {
@@ -2073,7 +2074,17 @@ impl Service for RootRequest {
                         id,
                         "",
                         "namespace removal",
-                        entry.namespace.roots_closed(),
+                        async {
+                            // Wait for the independent task to close every batch and its fences,
+                            // including batches that have not started when this request arrives.
+                            loop {
+                                let present = self.registry.namespaces.borrow().get(id).is_some_and(|current| {
+                                    Rc::ptr_eq(&current.namespace, &entry.namespace)
+                                });
+                                if !present { break; }
+                                self.registry.factory.sleep(Duration::from_millis(1)).await;
+                            }
+                        },
                     )
                     .await {
                         let bytes = serde_json::to_vec(&json!({"error":{"kind":"namespace-closing","message":error.description()}}))

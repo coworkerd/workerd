@@ -860,6 +860,23 @@ impl ActorNamespace {
         self.count_resident();
     }
 
+    /// Namespace deletion detaches all runtime roots before closing them in bounded batches.
+    pub(crate) fn abort_runtime_roots(self: &Rc<Self>, reason: crate::Error) -> LocalBoxFuture<'static, ()> {
+        assert!(self.actor_class.runtime_root());
+        let actors = std::mem::take(&mut *self.actors.borrow_mut());
+        self.count_resident();
+        let namespace = Rc::clone(self);
+        async move {
+            for (index, (_, container)) in actors.into_iter().enumerate() {
+                container.abort(Some(reason.clone()));
+                container.namespace_removed();
+                if (index + 1) % 64 == 0 {
+                    namespace.factory.sleep(Duration::from_millis(1)).await;
+                }
+            }
+        }.boxed_local()
+    }
+
     /// Retires one runtime-selected root while retaining the namespace and its storage.
     pub fn abort_root(&self, key: &str, reason: &crate::Error) {
         let actor = self.actors.borrow_mut().remove(key);
