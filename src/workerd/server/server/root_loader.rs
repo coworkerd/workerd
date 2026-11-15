@@ -25,7 +25,7 @@ use worker::Interface;
 use workerd_capnp::config;
 
 use crate::Result;
-use crate::actor::ActorNamespace;
+use crate::actor::{ActorNamespace, RootCloseFences, wait_for_root};
 use crate::bindings::{ActorConfig, SPECIAL_SUBREQUEST_CHANNEL_COUNT};
 use crate::bridge::ffi;
 use crate::channels::{
@@ -75,6 +75,8 @@ struct RootSelection {
     dispatch_checked: bool,
     #[serde(default)]
     tenant_cf: Value,
+    #[serde(default)]
+    alarm_facet_id: Option<u32>,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
@@ -241,6 +243,7 @@ struct NamespaceEntry {
     source: Rc<RefCell<String>>,
     class_name: String,
     unique_key: String,
+    removing: Rc<Cell<bool>>,
 }
 
 pub struct RootRegistry {
@@ -250,6 +253,7 @@ pub struct RootRegistry {
     install_lock: tokio::sync::Mutex<()>,
     plans: RefCell<HashMap<String, Rc<Plan>>>,
     namespaces: RefCell<HashMap<String, NamespaceEntry>>,
+    closing_roots: Rc<RootCloseFences>,
     objects: RefCell<HashMap<(String, String), RootObject>>,
     selection_locks: RefCell<HashMap<(String, String), Weak<tokio::sync::Mutex<()>>>>,
     compiled: RefCell<HashMap<WorkerKey, Rc<WorkerService>>>,
@@ -272,6 +276,7 @@ impl RootRegistry {
             install_lock: tokio::sync::Mutex::new(()),
             plans: RefCell::new(HashMap::new()),
             namespaces: RefCell::new(HashMap::new()),
+            closing_roots: Rc::default(),
             objects: RefCell::new(HashMap::new()),
             selection_locks: RefCell::new(HashMap::new()),
             compiled: RefCell::new(HashMap::new()),
@@ -303,6 +308,18 @@ impl RootRegistry {
             serde_json::from_str(plan_key.strip_prefix(ROOT_CLASS_REFERENCE)?).ok()?;
         let plan_key = reference.plan.as_str();
         let worker_id = reference.worker_id;
+        // Even an obsolete plan's canonical key names its owner. Do not accept a reference
+        // merely because some unrelated plan of the claimed Worker happens to remain loaded.
+        let referenced_key: Value = serde_json::from_str(plan_key).ok()?;
+        if referenced_key.get("workerId")?.as_str()? != worker_id
+            || self
+                .plans
+                .borrow()
+                .get(plan_key)
+                .is_some_and(|plan| plan.deployment.worker_id != worker_id)
+        {
+            return None;
+        }
         // A saved class can outlive its obsolete source plan. Restore only a dormant proxy for
         // a worker this registry still owns; the parent root binds it before construction.
         if !self
@@ -683,6 +700,11 @@ impl RootRegistry {
         let mut result = HashMap::new();
         for space in &deployment.namespaces {
             if let Some(existing) = self.namespaces.borrow().get(&space.id).cloned() {
+                if existing.removing.get() {
+                    return Err(kj::disconnected!(
+                        "root namespace removal is still in progress; retry"
+                    ));
+                }
                 result.insert(space.id.clone(), existing);
                 continue;
             }
@@ -705,6 +727,7 @@ impl RootRegistry {
                 class,
                 false,
             );
+            namespace.set_root_close_fences(Rc::clone(&self.closing_roots));
             namespace.link(Some(&self.storage))?;
             result.insert(
                 space.id.clone(),
@@ -713,6 +736,7 @@ impl RootRegistry {
                     source,
                     class_name: space.class_name.clone(),
                     unique_key: space.unique_key.clone(),
+                    removing: Rc::new(Cell::new(false)),
                 },
             );
         }
@@ -722,7 +746,25 @@ impl RootRegistry {
     async fn install(self: &Rc<Self>, deployment: Deployment) -> Result<String> {
         deployment.validate()?;
         let plan_key = deployment.plan_key()?;
-        let _guard = self.install_lock.lock().await;
+        let _guard = wait_for_root(
+            &self.factory,
+            &deployment.namespaces[0].id,
+            "",
+            "plan install lock",
+            self.install_lock.lock(),
+        )
+        .await?;
+        if self.namespaces.borrow().iter().any(|(id, entry)| {
+            entry.removing.get()
+                && deployment
+                    .namespaces
+                    .iter()
+                    .any(|space| space.id == *id || space.unique_key == entry.unique_key)
+        }) {
+            return Err(kj::disconnected!(
+                "root namespace removal is still in progress; retry"
+            ));
+        }
         let server = self
             .server
             .borrow()
@@ -823,10 +865,24 @@ impl RootRegistry {
             .get(plan_key)
             .cloned()
             .ok_or_else(|| kj::failed!("unknown root plan"))?;
-        let _guard = plan.lock.lock().await;
+        let _guard = wait_for_root(
+            &self.factory,
+            &plan.deployment.worker_id,
+            "",
+            "plan load lock",
+            plan.lock.lock(),
+        )
+        .await?;
         let retiring = plan.retiring.borrow().clone();
         if let Some(retiring) = retiring {
-            retiring.await;
+            wait_for_root(
+                &self.factory,
+                &plan.deployment.worker_id,
+                "",
+                "plan retirement",
+                retiring,
+            )
+            .await?;
         }
         if let Some(worker) = self.loaded(&plan) {
             return Ok(worker);
@@ -907,14 +963,49 @@ impl RootRegistry {
             index: index.clone(),
             lock: Rc::downgrade(&lock),
         };
-        let _guard = lock.lock().await;
-        let namespace = self
+        let _guard = wait_for_root(
+            &self.factory,
+            &selection.namespace_id,
+            &key,
+            "root selection lock",
+            lock.lock(),
+        )
+        .await?;
+        let entry = self
             .namespaces
             .borrow()
             .get(&selection.namespace_id)
-            .map(|entry| Rc::clone(&entry.namespace))
+            .cloned()
             .ok_or_else(|| kj::failed!("root namespace missing"))?;
-        namespace.wait_root_closed(&key).await;
+        if entry.removing.get() || entry.unique_key != descriptor.unique_key {
+            return Err(kj::disconnected!(
+                "root namespace changed or is being removed; retry"
+            ));
+        }
+        let same_owner = self
+            .plans
+            .borrow()
+            .get(entry.source.borrow().as_str())
+            .is_some_and(|owner| {
+                owner.deployment.worker_id == plan.deployment.worker_id
+                    && owner
+                        .deployment
+                        .creation_record
+                        .as_ref()
+                        .map(|record| &record.tenant)
+                        == plan
+                            .deployment
+                            .creation_record
+                            .as_ref()
+                            .map(|record| &record.tenant)
+            });
+        if !same_owner {
+            return Err(kj::failed!(
+                "the selected plan does not own the current root namespace"
+            ));
+        }
+        let namespace = Rc::clone(&entry.namespace);
+        namespace.wait_root_closed(&key).await?;
         let previous = self.objects.borrow().get(&index).cloned();
         let old_retirement = previous.as_ref().and_then(|old| {
             self.plans
@@ -923,7 +1014,14 @@ impl RootRegistry {
                 .and_then(|plan| plan.retiring.borrow().clone())
         });
         if let Some(old_retirement) = old_retirement {
-            old_retirement.await;
+            wait_for_root(
+                &self.factory,
+                &selection.namespace_id,
+                &key,
+                "previous plan retirement",
+                old_retirement,
+            )
+            .await?;
         }
         if !self.plans.borrow().contains_key(&selection.plan) {
             return Err(kj::disconnected!("root selection plan removed"));
@@ -932,42 +1030,52 @@ impl RootRegistry {
             .as_ref()
             .is_some_and(|previous| previous.origin.plan != selection.plan)
         {
-            let namespace = self
-                .namespaces
-                .borrow()
-                .get(&selection.namespace_id)
-                .map(|entry| Rc::clone(&entry.namespace))
-                .ok_or_else(|| kj::failed!("root namespace missing"))?;
+            if entry.removing.get()
+                || !self
+                    .namespaces
+                    .borrow()
+                    .get(&selection.namespace_id)
+                    .is_some_and(|current| Rc::ptr_eq(&current.namespace, &entry.namespace))
+            {
+                return Err(kj::disconnected!("root namespace removed"));
+            }
             namespace.abort_root(
                 &key,
                 &kj::failed!("jsg.Error: the Worker's active version changed"),
             );
-            namespace.wait_root_closed(&key).await;
+            namespace.wait_root_closed(&key).await?;
         }
         if !self
             .namespaces
             .borrow()
-            .contains_key(&selection.namespace_id)
+            .get(&selection.namespace_id)
+            .is_some_and(|current| {
+                !current.removing.get() && Rc::ptr_eq(&current.namespace, &entry.namespace)
+            })
         {
             return Err(kj::disconnected!("root namespace removed"));
         }
+        let registration = previous
+            .as_ref()
+            .filter(|old| old.origin.plan == selection.plan)
+            .map(|old| Rc::clone(&old.registration))
+            .unwrap_or_else(|| Rc::new(()));
         self.objects.borrow_mut().insert(
-            index,
+            index.clone(),
             RootObject {
                 origin: RootOrigin::from(&selection),
                 class_name: descriptor.class_name.clone(),
-                registration: previous
-                    .as_ref()
-                    .filter(|old| old.origin.plan == selection.plan)
-                    .map(|old| Rc::clone(&old.registration))
-                    .unwrap_or_else(|| Rc::new(())),
+                registration: Rc::clone(&registration),
             },
         );
-        let spaces = self.namespaces.borrow();
-        let namespace = spaces
-            .get(&selection.namespace_id)
-            .ok_or_else(|| kj::failed!("root namespace missing"))?;
-        Ok(namespace.namespace.channel(id, false))
+        let result = match selection.alarm_facet_id {
+            Some(facet) => namespace.root_alarm_channel(id, facet),
+            None => namespace.root_channel(id),
+        };
+        if result.is_err() && !namespace.has_root_container(&key) {
+            self.remove_object(&index, &registration);
+        }
+        result
     }
 
     fn begin_retire(
@@ -1026,22 +1134,60 @@ impl RootRegistry {
             .collect();
         let registry = Rc::clone(self);
         let key = key.clone();
-        // The plan is detached synchronously above. Requests cannot acquire the retiring isolate;
-        // they wait for actor teardown before compiling a new generation on the same storage.
+        if !idle {
+            // Stop all old containers before yielding. Each storage key now has its own fence;
+            // a retained native handle must not hold up unrelated objects' next generation.
+            for (namespace, storage_key) in &roots {
+                namespace.abort_root(
+                    storage_key,
+                    &kj::disconnected!("root worker limit exceeded"),
+                );
+            }
+            plan.retiring.borrow_mut().take();
+            let _ = done.send(());
+            self.factory.spawn_detached(async move {
+                futures::future::join_all(
+                    roots
+                        .iter()
+                        .map(|(namespace, key)| namespace.root_closed(key)),
+                )
+                .await;
+                worker.unlink();
+                registry.retiring.borrow_mut().remove(&key);
+                registry.collect_inactive();
+            });
+            return true;
+        }
+        // Graceful evictions run concurrently. Caller deadlines do not cancel this task.
         self.factory.spawn_detached(async move {
             let mut completed = true;
-            for (namespace, storage_key) in roots {
-                if idle {
-                    if let Err(error) = namespace.evict_root_for_unload(&storage_key).await {
-                        tracing::error!("retiring idle root: {error:?}");
-                        completed = false;
+            let results =
+                futures::future::join_all(roots.iter().map(|(namespace, storage_key)| {
+                    let factory = Rc::clone(&registry.factory);
+                    async move {
+                        let result = wait_for_root(
+                            &factory,
+                            namespace.unique_key().unwrap_or_default(),
+                            storage_key,
+                            "idle tree retirement",
+                            namespace.evict_root_for_unload(storage_key),
+                        )
+                        .await?;
+                        if let Err(error) = &result {
+                            tracing::error!(
+                                namespace = namespace.unique_key().unwrap_or_default(),
+                                storage_key,
+                                "retiring idle root: {error:?}"
+                            );
+                        }
+                        result
                     }
-                } else {
-                    namespace.abort_root(
-                        &storage_key,
-                        &kj::disconnected!("root worker limit exceeded"),
-                    );
-                    namespace.wait_root_closed(&storage_key).await;
+                }))
+                .await;
+            for result in results {
+                if let Err(error) = result {
+                    tracing::error!("retiring idle root: {error:?}");
+                    completed = false;
                 }
             }
             if completed {
@@ -1066,7 +1212,7 @@ impl RootRegistry {
         true
     }
 
-    async fn retire(self: &Rc<Self>, plan_key: &str, key: &WorkerKey) -> bool {
+    async fn retire(self: &Rc<Self>, plan_key: &str, key: &WorkerKey) -> Result<bool> {
         let retired = self.begin_retire(plan_key, key, None, true);
         let wait = self
             .plans
@@ -1074,9 +1220,16 @@ impl RootRegistry {
             .get(plan_key)
             .and_then(|plan| plan.retiring.borrow().clone());
         if let Some(wait) = wait {
-            wait.await;
+            wait_for_root(
+                &self.factory,
+                plan_key,
+                "",
+                "explicit plan retirement",
+                wait,
+            )
+            .await?;
         }
-        retired
+        Ok(retired)
     }
 
     fn snapshot(&self) -> Value {
@@ -1255,6 +1408,17 @@ impl RootExportedClass {
     }
 }
 impl ActorClass for RootExportedClass {
+    fn request_ready(&self) -> bool {
+        let Ok(registry) = self.registry() else {
+            return false;
+        };
+        self.generation.get().is_some_and(|generation| {
+            registry.compiled.borrow().contains_key(&WorkerKey {
+                plan_key: self.plan_key.clone(),
+                generation,
+            })
+        })
+    }
     fn for_root_plan(&self, root_plan: &str) -> Result<Option<Rc<dyn ActorClass>>> {
         let registry = self.registry()?;
         let owner = registry
@@ -1264,7 +1428,9 @@ impl ActorClass for RootExportedClass {
             .map(|plan| plan.deployment.worker_id.clone())
             .ok_or_else(|| kj::disconnected!("the root class plan was removed"))?;
         if owner != self.worker_id {
-            return Ok(None);
+            return Err(kj::failed!(
+                "jsg.Error: the child facet class belongs to a different Worker"
+            ));
         }
         Ok(Some(Rc::new(Self {
             registry: self.registry.clone(),
@@ -1368,6 +1534,9 @@ impl ActorClass for RootExportedClass {
 }
 
 impl ActorClass for RootObjectClass {
+    fn request_ready(&self) -> bool {
+        self.class.request_ready()
+    }
     fn root_plan(&self) -> Option<&str> {
         Some(&self.class.plan_key)
     }
@@ -1551,14 +1720,38 @@ impl Service for RootRequest {
                 let id = value["namespaceId"]
                     .as_str()
                     .ok_or_else(|| kj::failed!("remove-namespace needs a namespaceId"))?;
-                let entry = self.registry.namespaces.borrow_mut().remove(id);
+                let entry = self.registry.namespaces.borrow().get(id).cloned();
                 let removed = entry.is_some();
                 if let Some(entry) = entry {
-                    entry
-                        .namespace
-                        .abort_all(Some(&kj::disconnected!("root namespace removed")));
-                    entry.namespace.wait_roots_closed().await;
-                    drop(entry);
+                    if !entry.removing.replace(true) {
+                        entry
+                            .namespace
+                            .abort_all(Some(&kj::disconnected!("root namespace removed")));
+                        let registry = Rc::clone(&self.registry);
+                        let old = entry.clone();
+                        let id = id.to_owned();
+                        self.registry.factory.spawn_detached(async move {
+                            old.namespace.roots_closed().await;
+                            let matches =
+                                registry.namespaces.borrow().get(&id).is_some_and(|entry| {
+                                    Rc::ptr_eq(&entry.namespace, &old.namespace)
+                                });
+                            if matches {
+                                registry.namespaces.borrow_mut().remove(&id);
+                            }
+                            registry.prune_plans();
+                        });
+                    }
+                    wait_for_root(
+                        &self.registry.factory,
+                        id,
+                        "",
+                        "namespace removal",
+                        entry.namespace.roots_closed(),
+                    )
+                    .await?;
+                    // Let the cancellation-independent removal task publish its completion.
+                    self.registry.factory.sleep(Duration::ZERO).await;
                 }
                 self.registry.prune_plans();
                 json!({"removed": removed, "state": self.registry.snapshot()})
@@ -1604,7 +1797,7 @@ impl Service for RootRequest {
                     .cloned()
                     .ok_or_else(|| kj::failed!("unknown root plan"))?;
                 let key = plan.deployment.key(generation)?;
-                let retired = self.registry.retire(plan_key, &key).await;
+                let retired = self.registry.retire(plan_key, &key).await?;
                 json!({"retired": retired, "state": self.registry.snapshot()})
             }
             (_, "/invoke") => {

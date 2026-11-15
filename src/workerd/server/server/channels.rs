@@ -95,6 +95,11 @@ pub struct WorkerEntrypoint<'a> {
 /// A Durable Object class, from which actors are made. The runtime's
 /// `IoChannelFactory::ActorClassChannel`.
 pub trait ActorClass {
+    /// Whether a running actor can accept an event without waiting for its loader.
+    fn request_ready(&self) -> bool {
+        true
+    }
+
     /// A runtime root's immutable plan, used to bind its own saved facet classes on restoration.
     fn root_plan(&self) -> Option<&str> {
         None

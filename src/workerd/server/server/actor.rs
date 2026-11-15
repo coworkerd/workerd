@@ -98,6 +98,41 @@ const EVICT_TIMEOUT_MESSAGE: &str =
     "jsg.Error: Timed out waiting to evict Durable Object: it still has active references.";
 const RESIDENT_LIMIT_REASON: &str = "broken.dropped; Actor evicted for the resident object limit";
 
+/// Storage fences belong to a loader, rather than a namespace incarnation. An old namespace's
+/// detached closer keeps this table alive until dropping the last SQLite handle queues CLOSED.
+#[derive(Default)]
+pub(crate) struct RootCloseFences {
+    closing: RefCell<HashMap<(String, String), Shared<LocalBoxFuture<'static, ()>>>>,
+}
+
+/// Bound a caller's wait without cancelling the teardown that owns the storage fence.
+pub(crate) async fn wait_for_root<T>(
+    factory: &Factory,
+    namespace: &str,
+    key: &str,
+    stage: &str,
+    future: impl Future<Output = T>,
+) -> Result<T> {
+    let started = factory.now();
+    let future = std::pin::pin!(future);
+    let timeout = std::pin::pin!(factory.sleep(EVICT_TIMEOUT));
+    match futures::future::select(future, timeout).await {
+        Either::Left((value, _)) => Ok(value),
+        Either::Right(_) => {
+            tracing::warn!(
+                namespace,
+                storage_key = key,
+                stage,
+                waited_ms = factory.now().saturating_sub(started).as_millis() as u64,
+                "root storage wait timed out; replacement remains fenced"
+            );
+            Err(not_delivered(kj::disconnected!(
+                "jsg.Error: Durable Object storage is still closing; retry the request."
+            )))
+        }
+    }
+}
+
 struct ResidencyEntry {
     namespace: Weak<ActorNamespace>,
     report: ffi::DurableResidencyReport,
@@ -262,7 +297,7 @@ pub struct ActorNamespace {
     /// Actors a stop left as they were at its deadline: they end as the process exits.
     left_behind: RefCell<Vec<Rc<ActorContainer>>>,
     /// A retired runtime root owns these fences until every old native handle is released.
-    closing_roots: RefCell<HashMap<String, Shared<LocalBoxFuture<'static, ()>>>>,
+    closing_roots: OnceCell<Rc<RootCloseFences>>,
 }
 
 /// The first resolution of an actor: its end, however it ends, wakes the requests that waited.
@@ -312,7 +347,7 @@ impl ActorNamespace {
             resolving: RefCell::new(HashMap::new()),
             broken: Cell::new(false),
             left_behind: RefCell::new(Vec::new()),
-            closing_roots: RefCell::new(HashMap::new()),
+            closing_roots: OnceCell::new(),
         })
     }
 
@@ -429,7 +464,7 @@ impl ActorNamespace {
                 if cluster.cluster.is_draining() {
                     return Err(moved(&format!("{key}: this node is draining")));
                 }
-                let container = ActorContainer::new_root(key.clone(), self, id);
+                let container = ActorContainer::new_root(key.clone(), self, id)?;
                 let owned = Owned::new(Rc::clone(cluster), &unique_key, &key, epoch);
                 *container.owned.borrow_mut() = Some(owned);
                 let replaced = self.actors.borrow_mut().insert(key, Rc::clone(&container));
@@ -514,15 +549,15 @@ impl ActorNamespace {
     }
 
     /// The container of the actor with `id`, created if the namespace has none.
-    fn container_for(&self, id: KjOwn<ActorIdHandle>) -> Rc<ActorContainer> {
+    fn container_for(&self, id: KjOwn<ActorIdHandle>) -> Result<Rc<ActorContainer>> {
         let key = ffi::actor_id_key(&id);
         let mut actors = self.actors.borrow_mut();
         if let Some(container) = actors.get(&key) {
-            return Rc::clone(container);
+            return Ok(Rc::clone(container));
         }
-        let container = ActorContainer::new_root(key.clone(), self, id);
+        let container = ActorContainer::new_root(key.clone(), self, id)?;
         actors.insert(key, Rc::clone(&container));
-        container
+        Ok(container)
     }
 
     /// Starts the cleanup loop if it is not running. A namespace with `preventEviction` never
@@ -686,6 +721,50 @@ impl ActorNamespace {
         self.channel_for(id, persistent, false)
     }
 
+    /// A selected runtime root must report constructor rejection before publishing its record.
+    pub(crate) fn root_channel(&self, id: KjOwn<ActorIdHandle>) -> Result<Rc<dyn Channel>> {
+        assert!(self.actor_class.runtime_root() && self.cluster().is_none());
+        Ok(Rc::new(ActorChannel {
+            container: Client(self.container_for(id)?),
+            persistent: false,
+        }))
+    }
+
+    pub(crate) fn has_root_container(&self, key: &str) -> bool {
+        self.actors.borrow().contains_key(key)
+    }
+
+    /// A node-selected alarm of a root or an already registered facet of that root.
+    pub(crate) fn root_alarm_channel(
+        &self,
+        id: KjOwn<ActorIdHandle>,
+        facet: u32,
+    ) -> Result<Rc<dyn Channel>> {
+        assert!(self.actor_class.runtime_root() && self.cluster().is_none());
+        let root = self.container_for(id)?;
+        fn find(root: &Rc<ActorContainer>, facet: u32) -> Option<Rc<ActorContainer>> {
+            if root.facet_id.get() == Some(facet) {
+                return Some(Rc::clone(root));
+            }
+            root.facets
+                .borrow()
+                .values()
+                .find_map(|child| find(child, facet))
+        }
+        let target = if facet == 0 {
+            Some(root)
+        } else {
+            find(&root, facet)
+        }
+        .ok_or_else(|| {
+            kj::disconnected!("the root alarm facet is not registered in this process")
+        })?;
+        Ok(Rc::new(ActorChannel {
+            container: Client(target),
+            persistent: false,
+        }))
+    }
+
     /// The channel of the actor with `id` for a peer's or the debug port's request.
     pub fn peer_channel(&self, id: KjOwn<ActorIdHandle>) -> Rc<dyn Channel> {
         self.channel_for(id, false, true)
@@ -706,10 +785,13 @@ impl ActorNamespace {
                 bound: Rc::default(),
             });
         }
-        Rc::new(ActorChannel {
-            container: Client(self.container_for(id)),
-            persistent,
-        })
+        match self.container_for(id) {
+            Ok(container) => Rc::new(ActorChannel {
+                container: Client(container),
+                persistent,
+            }),
+            Err(error) => Rc::new(RejectedActorChannel(error)),
+        }
     }
 
     /// The channel of the ephemeral actor named `name`.
@@ -748,51 +830,117 @@ impl ActorNamespace {
     }
 
     /// No replacement may open this root's files before its old ActorSqlites and shippers die.
-    pub async fn wait_root_closed(&self, key: &str) {
-        let closing = self.closing_roots.borrow().get(key).cloned();
-        if let Some(closing) = closing {
-            closing.await;
-        }
+    pub(crate) fn set_root_close_fences(&self, fences: Rc<RootCloseFences>) {
+        assert!(self.closing_roots.set(fences).is_ok());
     }
 
-    pub async fn wait_roots_closed(&self) {
-        let closing: Vec<_> = self.closing_roots.borrow().values().cloned().collect();
-        futures::future::join_all(closing).await;
+    fn root_closing(&self, key: &str) -> Option<Shared<LocalBoxFuture<'static, ()>>> {
+        self.closing_roots
+            .get()?
+            .closing
+            .borrow()
+            .get(&(self.unique_key()?.to_owned(), key.to_owned()))
+            .cloned()
+    }
+
+    pub async fn wait_root_closed(&self, key: &str) -> Result<()> {
+        let closing = self.root_closing(key);
+        if let Some(closing) = closing {
+            wait_for_root(
+                &self.factory,
+                self.unique_key().unwrap_or_default(),
+                key,
+                "storage close",
+                closing,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn root_closed(&self, key: &str) -> LocalBoxFuture<'static, ()> {
+        let closing = self.root_closing(key);
+        async move {
+            if let Some(closing) = closing {
+                closing.await;
+            }
+        }
+        .boxed_local()
+    }
+
+    pub(crate) fn roots_closed(&self) -> LocalBoxFuture<'static, ()> {
+        let closing: Vec<_> = self
+            .closing_roots
+            .get()
+            .map(|fences| {
+                fences
+                    .closing
+                    .borrow()
+                    .iter()
+                    .filter(|((namespace, _), _)| Some(namespace.as_str()) == self.unique_key())
+                    .map(|(_, wait)| wait.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        async move {
+            futures::future::join_all(closing).await;
+        }
+        .boxed_local()
     }
 
     fn close_root_handles(&self, key: &str, handles: Vec<Rc<KjOwn<ffi::ActorHandle>>>) {
         if handles.is_empty() || !self.actor_class.runtime_root() {
             return;
         }
+        let fences = Rc::clone(self.closing_roots.get().expect("runtime root fences"));
+        let index = (
+            self.unique_key()
+                .expect("runtime root namespace")
+                .to_owned(),
+            key.to_owned(),
+        );
         assert!(
-            !self.closing_roots.borrow().contains_key(key),
+            !fences.closing.borrow().contains_key(&index),
             "root storage already closing"
         );
         let (done, wait) = futures::channel::oneshot::channel::<()>();
-        self.closing_roots.borrow_mut().insert(
-            key.to_owned(),
+        fences.closing.borrow_mut().insert(
+            index.clone(),
             async move {
                 let _ = wait.await;
             }
             .boxed_local()
             .shared(),
         );
-        let namespace = self.this.clone();
         let factory = Rc::clone(&self.factory);
-        let key = key.to_owned();
         self.factory.spawn_detached(async move {
             // Rust handles and native request references both count. The last handle's drop
             // destroys ActorSqlite and its shipper synchronously, queueing CLOSED before OPEN.
+            let started = factory.now();
+            let mut timed_out = false;
             while handles
                 .iter()
                 .any(|actor| Rc::strong_count(actor) != 1 || ffi::actor_is_shared(actor))
             {
-                factory.sleep(EVICT_RETRY_DELAY).await;
+                if !timed_out && factory.now().saturating_sub(started) >= EVICT_TIMEOUT {
+                    timed_out = true;
+                    tracing::warn!(
+                        namespace = index.0,
+                        storage_key = index.1,
+                        waited_ms = factory.now().saturating_sub(started).as_millis() as u64,
+                        "root handles still held; storage fence retained"
+                    );
+                }
+                factory
+                    .sleep(if timed_out {
+                        Duration::from_millis(100)
+                    } else {
+                        EVICT_RETRY_DELAY
+                    })
+                    .await;
             }
             drop(handles);
-            if let Some(namespace) = namespace.upgrade() {
-                namespace.closing_roots.borrow_mut().remove(&key);
-            }
+            fences.closing.borrow_mut().remove(&index);
             let _ = done.send(());
         });
     }
@@ -1090,9 +1238,16 @@ impl ActorNamespaceHandle {
             .0
             .upgrade()
             .ok_or_else(|| kj::disconnected!("the Durable Object namespace is gone"))?;
+        if namespace.shipped.get() {
+            // Persisted entries from an older build can wake before the database is opened
+            // and removes them. They must never execute a second alarm beside the node's.
+            return Err(kj::disconnected!(
+                "the node schedules this shipped database's alarm"
+            ));
+        }
         let metadata = ffi::new_request_metadata(KjMaybe::None, KjMaybe::None);
         let Some(node) = namespace.cluster().map(Rc::clone) else {
-            return namespace.container_for(id).start_request(metadata);
+            return namespace.container_for(id)?.start_request(metadata);
         };
         // A draining instance starts nothing: the alarm runs where the object goes, once peers
         // adopt this instance's alarms as it leaves, or the next owner opens the object.
@@ -1513,13 +1668,23 @@ impl ActorContainer {
             .is_some_and(|manager| ffi::hibernation_manager_has_connections(manager))
     }
 
-    fn new_root(key: String, ns: &ActorNamespace, id: KjOwn<ActorIdHandle>) -> Rc<Self> {
-        let class = ns
-            .actor_class
-            .for_root(&id)
-            .unwrap_or_else(|| Rc::clone(&ns.actor_class));
+    fn new_root(key: String, ns: &ActorNamespace, id: KjOwn<ActorIdHandle>) -> Result<Rc<Self>> {
+        if ns.root_closing(&key).is_some() {
+            return Err(not_delivered(kj::disconnected!(
+                "jsg.Error: Durable Object storage is still closing; retry the request."
+            )));
+        }
+        let class = match ns.actor_class.for_root(&id) {
+            Some(class) => class,
+            None if ns.actor_class.runtime_root() => {
+                return Err(kj::failed!(
+                    "jsg.Error: the root has no explicit node selection"
+                ));
+            }
+            None => Rc::clone(&ns.actor_class),
+        };
         let root_name = ffi::actor_id_name(&id);
-        Rc::new_cyclic(|this| {
+        Ok(Rc::new_cyclic(|this| {
             Self::init(
                 Weak::clone(this),
                 key.clone(),
@@ -1530,7 +1695,7 @@ impl ActorContainer {
                 Rc::new(Cell::new(ns.factory.now())),
                 ClassState::Ready { class, id },
             )
-        })
+        }))
     }
 
     /// A facet of `parent`, whose class and id `start` resolves.
@@ -1614,7 +1779,6 @@ impl ActorContainer {
 
     fn is_resident(&self) -> bool {
         self.is_running()
-            || (self.class_root_is_runtime() && self.has_hibernating_connections())
             || self
                 .facets
                 .borrow()
@@ -1799,20 +1963,38 @@ impl ActorContainer {
     /// The running actor, started first if it is not running.
     async fn get_actor(&self) -> Result<Rc<KjOwn<ffi::ActorHandle>>> {
         loop {
+            let ns = self.namespace()?;
             let retirement = self.retirement.borrow().clone();
             if let Some(retirement) = retirement {
                 // A request that the onHibernate handler makes to its own object waits here too,
                 // until the handler's wall-clock budget cuts it off. A successor may have started
                 // and begun retiring while this waited.
-                retirement.await?;
+                if ns.actor_class.runtime_root() {
+                    wait_for_root(
+                        &ns.factory,
+                        ns.unique_key().unwrap_or_default(),
+                        &self.root_key,
+                        "actor retirement",
+                        retirement,
+                    )
+                    .await??;
+                } else {
+                    retirement.await?;
+                }
                 continue;
             }
             self.require_not_broken()?;
+            if self.pending_class().is_none() {
+                let class = self.class()?;
+                if !class.request_ready() {
+                    class.when_ready().await?;
+                    self.require_not_broken()?;
+                }
+            }
             if let Some(actor) = self.actor.borrow().clone() {
                 return Ok(actor);
             }
-            let ns = self.namespace()?;
-            ns.wait_root_closed(&self.root_key).await;
+            ns.wait_root_closed(&self.root_key).await?;
             self.require_not_broken()?;
             let woke_from = self.was_evicted.get().then(|| ns.factory.now());
             if let Some(pending) = self.pending_class() {
@@ -1948,7 +2130,10 @@ impl ActorContainer {
             ns.ensure_cleanup_loop();
         }
         let client = Client(Rc::clone(self));
-        let running = if self.retirement.borrow().is_none() {
+        let running = if self.retirement.borrow().is_none()
+            && self.pending_class().is_none()
+            && self.class()?.request_ready()
+        {
             self.actor.borrow().clone()
         } else {
             None
@@ -2337,7 +2522,19 @@ impl ActorContainer {
         let resident_pass = resident_root.is_some();
         let retirement = self.retirement.borrow().clone();
         if let Some(retirement) = retirement {
-            retirement.await?;
+            let ns = self.namespace()?;
+            if ns.actor_class.runtime_root() {
+                wait_for_root(
+                    &ns.factory,
+                    ns.unique_key().unwrap_or_default(),
+                    &self.root_key,
+                    "eviction retirement",
+                    retirement,
+                )
+                .await??;
+            } else {
+                retirement.await?;
+            }
             return Ok(!resident_pass || !self.is_running());
         }
         if !resident_tree_idle(resident_root.as_ref()) {
@@ -2380,7 +2577,18 @@ impl ActorContainer {
                 .shared();
             *self.retirement.borrow_mut() = Some(retirement.clone());
             self.cancel_shutdown();
-            retirement.await?;
+            if ns.actor_class.runtime_root() {
+                wait_for_root(
+                    &ns.factory,
+                    ns.unique_key().unwrap_or_default(),
+                    &self.root_key,
+                    "hibernate retirement",
+                    retirement,
+                )
+                .await??;
+            } else {
+                retirement.await?;
+            }
             return Ok(!resident_pass || !self.is_running());
         }
         self.finish_eviction(reason, hibernate, resident_root.as_ref())
@@ -2934,6 +3142,18 @@ impl Drop for Client {
 }
 
 /// A stub's channel to an actor.
+struct RejectedActorChannel(crate::Error);
+
+impl Channel for RejectedActorChannel {
+    fn start_request(&self, _metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
+        Err(self.0.clone())
+    }
+
+    fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
+        Err(self.0.clone())
+    }
+}
+
 struct ActorChannel {
     container: Client,
     /// Whether the channel was restored from a stored stub, or may be stored.
