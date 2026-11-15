@@ -59,6 +59,7 @@
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/server/workerd-debug-port-client.h>
+#include <workerd/server/coworkerd-root-loader.h>
 
 namespace workerd::server {
 
@@ -126,6 +127,7 @@ namespace workerd::server {
   EW_PERFORMANCE_ISOLATE_TYPES,                         \
   EW_TRACING_ISOLATE_TYPES,                             \
   EW_WORKERD_DEBUG_PORT_CLIENT_ISOLATE_TYPES,           \
+  workerd::server::CoworkerdRootLoader,                 \
   EW_WRAPPED_BINDING_ISOLATE_TYPES,                     \
   workerd::api::EnvModule,                              \
   jsg::TypeWrapperExtension<PromiseWrapper>,            \

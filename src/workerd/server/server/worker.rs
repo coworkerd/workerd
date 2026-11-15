@@ -108,7 +108,7 @@ pub struct LinkedChannels {
     pub server: Weak<Server>,
     /// How a dynamic worker unloads itself; a static worker aborting its isolate ends the
     /// process.
-    pub abort_isolate: Option<Box<dyn Fn()>>,
+    pub abort_isolate: Option<Box<dyn Fn(&str)>>,
 }
 
 /// A compiled worker and what the service graph hangs off it.
@@ -351,7 +351,7 @@ impl WorkerService {
         source: KjOwn<DynamicSource>,
         load_identity: ffi::CoworkerdLoadIdentity,
         server: Weak<Server>,
-        abort_isolate: Box<dyn Fn()>,
+        abort_isolate: Box<dyn Fn(&str)>,
     ) -> Result<Rc<Self>> {
         let spec = ffi::WorkerSpec {
             name,
@@ -1229,7 +1229,7 @@ impl ChannelFactory {
     pub(crate) fn abort_isolate(&self, reason: &str) -> Result<()> {
         match &self.0.abort_isolate {
             Some(abort) => {
-                abort();
+                abort(reason);
                 Ok(())
             }
             None => Err(kj::failed!(

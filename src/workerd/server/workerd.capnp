@@ -789,6 +789,10 @@ struct Worker {
       #
       # This is a workerd-only API intended for local development and testing.
 
+      coworkerdRootLoader @29 :ServiceDesignator;
+      # Private platform capability. getRoot() binds an explicit, dispatch-checked root selection;
+      # inherited fetch() manages load plans. Never place this binding in a tenant worker.
+
       # TODO(someday): dispatch, other new features
     }
 

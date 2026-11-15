@@ -620,6 +620,32 @@ impl ActorNamespace {
         }
     }
 
+    /// Retires one runtime-selected root while retaining the namespace and its storage.
+    pub fn abort_root(&self, key: &str, reason: &crate::Error) {
+        let actor = self.actors.borrow_mut().remove(key);
+        if let Some(actor) = actor {
+            actor.abort(Some(reason.clone()));
+        }
+    }
+
+    /// Releases one idle root's actor tree, retaining its storage and hibernation managers.
+    pub async fn evict_root_for_unload(&self, key: &str) -> Result<()> {
+        let actor = self.actors.borrow().get(key).cloned();
+        if let Some(actor) = actor {
+            actor.evict_tree_if_running(true).await?;
+        }
+        Ok(())
+    }
+
+    /// The namespace-local count, for the private loader's diagnostic snapshot.
+    pub fn resident_roots(&self) -> usize {
+        self.actors
+            .borrow()
+            .values()
+            .filter(|actor| actor.is_resident())
+            .count()
+    }
+
     /// Stops every actor that is left as this instance's handoff ends; peers take them over
     /// once it left the cluster. Any request still in flight is cancelled, as it could not
     /// commit once a peer owns the object. A later request that still reaches one here, through
@@ -695,7 +721,7 @@ impl ActorNamespace {
         let containers: Vec<Rc<ActorContainer>> = self.actors.borrow().values().cloned().collect();
         let evictions = containers
             .iter()
-            .map(|container| container.evict_tree_for_test_if_running(hibernate));
+            .map(|container| container.evict_tree_if_running(hibernate));
         futures::future::join_all(evictions)
             .await
             .into_iter()
@@ -1253,7 +1279,10 @@ pub struct ActorContainer {
 
 impl ActorContainer {
     fn new_root(key: String, ns: &ActorNamespace, id: KjOwn<ActorIdHandle>) -> Rc<Self> {
-        let class = Rc::clone(&ns.actor_class);
+        let class = ns
+            .actor_class
+            .for_root(&id)
+            .unwrap_or_else(|| Rc::clone(&ns.actor_class));
         let root_name = ffi::actor_id_name(&id);
         Rc::new_cyclic(|this| {
             Self::init(
@@ -1961,7 +1990,7 @@ impl ActorContainer {
 
     /// Test hook: evicts the actor and its facets, those that are running; the bulk eviction
     /// must not fail on actors that are not.
-    fn evict_tree_for_test_if_running(
+    fn evict_tree_if_running(
         self: &Rc<Self>,
         hibernate: bool,
     ) -> LocalBoxFuture<'static, Result<()>> {
@@ -1971,7 +2000,7 @@ impl ActorContainer {
             let facets: Vec<Rc<Self>> = this.facets.borrow().values().cloned().collect();
             let mut evictions: Vec<LocalBoxFuture<'static, Result<()>>> = facets
                 .iter()
-                .map(|facet| facet.evict_tree_for_test_if_running(hibernate))
+                .map(|facet| facet.evict_tree_if_running(hibernate))
                 .collect();
             if this.is_running() {
                 let this = Rc::clone(&this);
@@ -1994,7 +2023,7 @@ impl ActorContainer {
         let deadline = factory.now() + EVICT_TIMEOUT;
         loop {
             if self
-                .try_evict("broken.dropped; Actor evicted by test", hibernate)
+                .try_evict("broken.dropped; Actor evicted while idle", hibernate)
                 .await?
             {
                 return Ok(());

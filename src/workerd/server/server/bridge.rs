@@ -539,6 +539,8 @@ pub mod ffi {
             report: &DurableResidencyReport,
         ) -> Result<()>;
         fn actor_id_from_name(name: &str) -> KjOwn<ActorIdHandle>;
+        /// The native storage id for an explicitly selected root in its namespace.
+        fn actor_id_for_root(unique_key: &str, name: &str) -> KjOwn<ActorIdHandle>;
         /// The id of a durable namespace, from its hex text (a debug-port request).
         fn actor_id_from_hex(hex: &str) -> Result<KjOwn<ActorIdHandle>>;
 
@@ -621,6 +623,7 @@ pub mod ffi {
         ) -> KjOwn<RequestMetadata>;
         /// The cf blob the request carries, as JSON.
         fn request_metadata_cf_blob_json(metadata: &RequestMetadata) -> KjMaybe<String>;
+        fn request_metadata_set_cf_blob_json(metadata: Pin<&mut RequestMetadata>, json: &str);
         /// Marks the request as coming through a stub that was, or may be, stored durably.
         fn request_metadata_set_from_persistent_stub(
             metadata: Pin<&mut RequestMetadata>,
@@ -671,6 +674,12 @@ pub mod ffi {
         #[namespace = "workerd"]
         type Frankenvalue;
         fn frankenvalue_from_json(json: &str) -> KjOwn<Frankenvalue>;
+        fn frankenvalue_plain_json(value: &Frankenvalue) -> Result<String>;
+        fn frankenvalue_set_value(
+            value: Pin<&mut Frankenvalue>,
+            name: &str,
+            child: KjOwn<Frankenvalue>,
+        );
         fn frankenvalue_clone(value: &Frankenvalue) -> KjOwn<Frankenvalue>;
         fn frankenvalue_is_empty(value: &Frankenvalue) -> bool;
         /// An empty object.

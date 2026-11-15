@@ -484,6 +484,17 @@ impl Compiler<'_> {
                 self.out.has_debug_port = true;
                 global.set_workerd_debug_port(());
             }
+            Which::CoworkerdRootLoader(designator) => {
+                if !self.experimental_feature("coworkerdRootLoader") {
+                    return Ok(false);
+                }
+                let designator = designator?;
+                let channel = self.subrequest_channel(designator, error_context)?;
+                let mut root = global.init_coworkerd_root_loader();
+                root.set_channel(channel);
+                root.set_service(designator.get_name()?);
+                self.out.has_debug_port = true;
+            }
         }
         Ok(true)
     }

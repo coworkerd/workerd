@@ -295,6 +295,7 @@ struct DurableResidencyReport;
 void actor_namespace_durable_log_residency(
     const ActorNamespaceHandle& actors, const DurableResidencyReport& report);
 kj::Own<ActorIdHandle> actor_id_from_name(::rust::Str name);
+kj::Own<ActorIdHandle> actor_id_for_root(::rust::Str uniqueKey, ::rust::Str name);
 kj::Own<ActorIdHandle> actor_id_from_hex(::rust::Str hex);
 
 // The storage of one Durable Object namespace: its directory (or none, for in-memory storage),
@@ -347,6 +348,7 @@ void stamp_current_actor_cause(RequestMetadata& metadata);
 kj::Own<RequestMetadata> new_request_metadata(
     kj::Maybe<::rust::Str> cfBlobJson, kj::Maybe<::rust::Str> clientAddress);
 kj::Maybe<::rust::String> request_metadata_cf_blob_json(const RequestMetadata& metadata);
+void request_metadata_set_cf_blob_json(RequestMetadata& metadata, ::rust::Str json);
 void request_metadata_set_from_persistent_stub(RequestMetadata& metadata, bool persistent);
 kj::Maybe<::rust::String> request_metadata_forwarded_by(const RequestMetadata& metadata);
 void request_metadata_set_forwarded_by(RequestMetadata& metadata, ::rust::Str node);
@@ -366,6 +368,8 @@ void exception_throw(const kj::Exception& exception);
 ::rust::String exception_text(const AbortReason& error);
 
 kj::Own<Frankenvalue> frankenvalue_from_json(::rust::Str json);
+::rust::String frankenvalue_plain_json(const Frankenvalue& value);
+void frankenvalue_set_value(Frankenvalue& value, ::rust::Str name, kj::Own<Frankenvalue> child);
 kj::Own<Frankenvalue> frankenvalue_clone(const Frankenvalue& value);
 bool frankenvalue_is_empty(const Frankenvalue& value);
 kj::Own<Frankenvalue> frankenvalue_new();

@@ -191,6 +191,15 @@ wd_cc_library(
 )
 
 wd_cc_library(
+    name = "coworkerd-root-loader",
+    srcs = ["coworkerd-root-loader.c++"],
+    hdrs = ["coworkerd-root-loader.h"],
+    deps = [
+        "//src/workerd/io",
+    ],
+)
+
+wd_cc_library(
     name = "workerd-api",
     srcs = [
         "workerd-api.c++",
@@ -236,6 +245,7 @@ wd_cc_library(
     deps = [
         ":actor-id-impl",
         ":compiled-bindings_capnp",
+        ":coworkerd-root-loader",
         ":fallback-service",
         ":workerd-debug-port-client",
         ":workerd_capnp",

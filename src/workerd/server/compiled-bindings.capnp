@@ -97,6 +97,10 @@ struct Global {
     }
     workerLoader @42 :UInt32;
     workerdDebugPort @43 :Void;
+    coworkerdRootLoader :group {
+      channel @44 :UInt32;
+      service @45 :Text;
+    }
   }
 }
 

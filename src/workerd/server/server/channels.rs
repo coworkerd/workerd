@@ -95,6 +95,11 @@ pub struct WorkerEntrypoint<'a> {
 /// A Durable Object class, from which actors are made. The runtime's
 /// `IoChannelFactory::ActorClassChannel`.
 pub trait ActorClass {
+    /// Specializes a runtime-managed root's class before the container is created.
+    fn for_root(&self, _id: &ffi::ActorIdHandle) -> Option<Rc<dyn ActorClass>> {
+        None
+    }
+
     /// Resolves once the class can make actors (a dynamic worker's class waits for its worker to
     /// start).
     fn when_ready(&self) -> LocalBoxFuture<'_, Result<()>> {

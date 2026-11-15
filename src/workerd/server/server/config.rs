@@ -1502,6 +1502,12 @@ impl Server {
         let handle = Box::new(ServerHandle(Rc::downgrade(&server)));
         ffi::factory_set_server(server.factory.raw(), handle);
 
+        for service in server.services.0.values() {
+            if let Service::RootLoader(roots) = service {
+                roots.set_server(Rc::downgrade(&server));
+            }
+        }
+
         // Third pass: the links.
         for (name, worker) in server.workers() {
             tolerate_deployment(&server.report, name, server.link_worker(name, worker))?;
@@ -1515,6 +1521,30 @@ impl Server {
         }
         server.report.report_broken();
         Ok(server)
+    }
+
+    /// Resolves a platform-supplied root bridge target. Native root creation stays private.
+    pub(crate) fn root_binding(
+        &self,
+        service: &str,
+        entrypoint: Option<&str>,
+        props: &serde_json::Value,
+    ) -> Result<Rc<dyn Channel>> {
+        let worker = self
+            .services
+            .0
+            .get(service)
+            .and_then(Service::as_worker)
+            .ok_or_else(|| {
+                kj::failed!("root bridge target must be a configured platform worker")
+            })?;
+        worker
+            .entrypoint(
+                entrypoint,
+                Some(ffi::frankenvalue_from_json(&props.to_string())),
+                false,
+            )
+            .ok_or_else(|| kj::failed!("root bridge entrypoint missing"))
     }
 
     /// Resolves everything `worker`'s config names into its channel table.
@@ -1857,6 +1887,19 @@ impl ServerHandle {
         persistent: bool,
     ) -> Result<Box<ActorClassChannel>> {
         let class_name: Option<&str> = class_name.into();
+        let server = self.server()?;
+        for service in server.services.0.values() {
+            if let Service::RootLoader(roots) = service {
+                if let Some(class) = roots.exported_class(
+                    service_name,
+                    class_name.unwrap_or("default"),
+                    Some(ffi::frankenvalue_clone(&props)),
+                    persistent,
+                ) {
+                    return Ok(ActorClassChannel::new(class));
+                }
+            }
+        }
         self.server()?
             .stub_worker(service_name)?
             .actor_class(class_name, Some(props), persistent)
@@ -1877,6 +1920,13 @@ impl ServerHandle {
         persistent: bool,
     ) -> Result<Box<SubrequestChannel>> {
         let server = self.server()?;
+        for service in server.services.0.values() {
+            if let Service::RootLoader(roots) = service {
+                if let Some(namespace) = roots.namespace_by_key(unique_key) {
+                    return Ok(SubrequestChannel::new(namespace.channel(id, persistent)));
+                }
+            }
+        }
         let namespace = server
             .namespaces_by_unique_key
             .get(unique_key)

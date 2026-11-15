@@ -541,6 +541,7 @@ bool WorkerdApi::isBindingTransferableThroughSnapshot(Global::Reader global) {
     case Global::WORKERD_DEBUG_PORT:
       return true;
     case Global::CRYPTO_KEY:
+    case Global::COWORKERD_ROOT_LOADER:
     case Global::MEMORY_CACHE:
     case Global::WRAPPED:
     case Global::LOOPBACK_SERVICE_STUB:
@@ -586,6 +587,12 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
       return lock.wrap(context,
           lock.alloc<api::Fetcher>(global.getFetcher(), api::Fetcher::RequiresHostAndProtocol::YES,
               /*isInHouse=*/false, api::RpcCompatGateBypassed(isInternal.toBool())));
+
+    case Global::COWORKERD_ROOT_LOADER: {
+      auto root = global.getCoworkerdRootLoader();
+      return lock.wrap(context,
+          lock.alloc<CoworkerdRootLoader>(root.getChannel(), kj::str(root.getService())));
+    }
 
     case Global::LOOPBACK_SERVICE_STUB:
       return lock.wrap(

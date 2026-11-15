@@ -164,7 +164,7 @@ impl WorkerStub {
         on_abort: Option<Box<dyn Fn()>>,
     ) -> Rc<Self> {
         let fired = Cell::new(false);
-        let abort_isolate: Box<dyn Fn()> = Box::new(move || {
+        let abort_isolate: Box<dyn Fn(&str)> = Box::new(move |_reason| {
             if fired.replace(true) {
                 return;
             }
@@ -275,7 +275,10 @@ struct DynamicEntrypoint {
 }
 
 impl Channel for DynamicEntrypoint {
-    fn start_request(&self, mut metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
+    fn start_request(
+        &self,
+        mut metadata: KjOwn<RequestMetadata>,
+    ) -> Result<KjOwn<WorkerInterface>> {
         if let Some(identity) = &self.invocation_identity {
             ffi::request_metadata_set_coworkerd_invocation_identity(metadata.as_mut(), identity);
         }

@@ -1276,6 +1276,9 @@ kj::Own<RequestMetadata> new_request_metadata(
 kj::Maybe<::rust::String> request_metadata_cf_blob_json(const RequestMetadata& metadata) {
   return metadata.cfBlobJson.map([](const kj::String& s) { return toRustString(s); });
 }
+void request_metadata_set_cf_blob_json(RequestMetadata& metadata, ::rust::Str json) {
+  metadata.cfBlobJson = kj::str(json);
+}
 
 void request_metadata_set_from_persistent_stub(RequestMetadata& metadata, bool persistent) {
   if (persistent) metadata.fromPersistentStub = Persistent::YES;
@@ -1368,8 +1371,20 @@ void exception_throw(const kj::Exception& exception) {
 kj::Own<Frankenvalue> frankenvalue_from_json(::rust::Str json) {
   return kj::heap<Frankenvalue>(Frankenvalue::fromJson(kj::str(json)));
 }
+::rust::String frankenvalue_plain_json(const Frankenvalue& value) {
+  capnp::MallocMessageBuilder message;
+  const_cast<Frankenvalue&>(value).toCapnp(message.initRoot<rpc::Frankenvalue>());
+  auto root = message.getRoot<rpc::Frankenvalue>();
+  KJ_REQUIRE(root.which() == rpc::Frankenvalue::JSON && root.getProperties().size() == 0 &&
+          root.getCapTableSize() == 0,
+      "a private root selection must be plain JSON");
+  return toRustString(root.getJson());
+}
 kj::Own<Frankenvalue> frankenvalue_clone(const Frankenvalue& value) {
   return kj::heap<Frankenvalue>(const_cast<Frankenvalue&>(value).clone());
+}
+void frankenvalue_set_value(Frankenvalue& value, ::rust::Str name, kj::Own<Frankenvalue> child) {
+  value.setProperty(kj::str(name), kj::mv(*child));
 }
 bool frankenvalue_is_empty(const Frankenvalue& value) {
   return value.empty();
@@ -1400,6 +1415,10 @@ kj::Own<ActorIdHandle> actor_id_clone(const ActorIdHandle& id) {
 }
 kj::Own<ActorIdHandle> actor_id_from_name(::rust::Str name) {
   return kj::heap<ActorIdHandle>(kj::str(name));
+}
+kj::Own<ActorIdHandle> actor_id_for_root(::rust::Str uniqueKey, ::rust::Str name) {
+  ActorIdFactoryImpl factory(kj::str(uniqueKey));
+  return kj::heap<ActorIdHandle>(factory.idFromName(kj::str(name)));
 }
 kj::Own<ActorIdHandle> actor_id_from_hex(::rust::Str hex) {
   auto decoded = kj::decodeHex(kj::str(hex));

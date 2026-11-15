@@ -11,7 +11,9 @@ use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, SystemTime};
 
+use futures::FutureExt;
 use futures::future::LocalBoxFuture;
+use futures::future::Shared;
 use kj::http::{
     ConnectResponse, ConnectSettings, Headers, HeadersRef, Method, Service, ServiceResponse,
 };
@@ -63,6 +65,39 @@ struct Namespace {
     unique_key: String,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RootSelection {
+    namespace_id: String,
+    object_id: String,
+    data_epoch: String,
+    plan: String,
+    dispatch_checked: bool,
+    #[serde(default)]
+    tenant_cf: Value,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct RootTarget {
+    service: String,
+    entrypoint: Option<String>,
+    #[serde(default)]
+    props: Value,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
+struct RootBinding {
+    metadata: Value,
+    target: RootTarget,
+}
+
+#[derive(Clone)]
+struct RootObject {
+    selection: RootSelection,
+    class_name: String,
+}
+
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct Deployment {
@@ -75,15 +110,18 @@ struct Deployment {
     modules: Vec<Module>,
     namespaces: Vec<Namespace>,
     creation_record: Option<CreationRecord>,
+    #[serde(default)]
+    environment: std::collections::BTreeMap<String, Value>,
+    #[serde(default)]
+    durable_objects: Vec<RootBinding>,
+    global_outbound: Option<RootTarget>,
+    streaming_tail: Option<RootTarget>,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkerKey {
-    worker_id: String,
-    version_id: String,
-    cpu_limit_ms: u32,
-    memory_limit_mib: u32,
+    plan_key: String,
     generation: u64,
 }
 
@@ -113,19 +151,20 @@ impl Deployment {
     }
 
     fn key(&self, generation: u64) -> Result<WorkerKey> {
-        let record = self.record()?;
         Ok(WorkerKey {
-            worker_id: self.worker_id.clone(),
-            version_id: self.version_id.clone(),
-            cpu_limit_ms: record.cpu_limit_ms,
-            memory_limit_mib: record.memory_limit_mib,
+            plan_key: self.plan_key()?,
             generation,
         })
     }
 
     fn plan_key(&self) -> Result<String> {
-        serde_json::to_string(&self.key(self.record()?.generation)?)
-            .map_err(|error| kj::failed!("root key: {error}"))
+        let record = self.record()?;
+        serde_json::to_string(&json!({
+            "workerId": self.worker_id, "versionId": self.version_id,
+            "cpuLimitMs": record.cpu_limit_ms, "memoryLimitMib": record.memory_limit_mib,
+            "generation": record.generation,
+        }))
+        .map_err(|error| kj::failed!("root key: {error}"))
     }
 
     fn validate(&self) -> Result<()> {
@@ -143,12 +182,7 @@ impl Deployment {
                 ));
             }
         }
-        let (mut ids, mut classes, mut bindings, mut keys) = (
-            HashSet::new(),
-            HashSet::new(),
-            HashSet::new(),
-            HashSet::new(),
-        );
+        let (mut ids, mut bindings, mut keys) = (HashSet::new(), HashSet::new(), HashSet::new());
         for namespace in &self.namespaces {
             if !::cluster::compose::is_path_component(&namespace.unique_key)
                 || namespace.id.is_empty()
@@ -156,7 +190,6 @@ impl Deployment {
                 || namespace.binding.is_empty()
                 || namespace.binding == "ROOTS"
                 || !ids.insert(&namespace.id)
-                || !classes.insert(&namespace.class_name)
                 || !bindings.insert(&namespace.binding)
                 || !keys.insert(&namespace.unique_key)
             {
@@ -174,8 +207,10 @@ struct Plan {
     lock: tokio::sync::Mutex<()>,
     generation: Cell<Option<u64>>,
     loaded: RefCell<Option<WorkerKey>>,
+    retiring: RefCell<Option<Shared<LocalBoxFuture<'static, ()>>>>,
 }
 
+#[derive(Clone)]
 struct NamespaceEntry {
     namespace: Rc<ActorNamespace>,
     /// A class provider is independent of the compiled instance that currently implements it.
@@ -191,8 +226,11 @@ pub struct RootRegistry {
     install_lock: tokio::sync::Mutex<()>,
     plans: RefCell<HashMap<String, Rc<Plan>>>,
     namespaces: RefCell<HashMap<String, NamespaceEntry>>,
+    objects: RefCell<HashMap<(String, String), RootObject>>,
     compiled: RefCell<HashMap<WorkerKey, Rc<WorkerService>>>,
+    retiring: RefCell<HashMap<WorkerKey, Rc<WorkerService>>>,
     ignored_retirements: Cell<u64>,
+    server: RefCell<Weak<crate::config::Server>>,
 }
 
 impl RootRegistry {
@@ -209,8 +247,11 @@ impl RootRegistry {
             install_lock: tokio::sync::Mutex::new(()),
             plans: RefCell::new(HashMap::new()),
             namespaces: RefCell::new(HashMap::new()),
+            objects: RefCell::new(HashMap::new()),
             compiled: RefCell::new(HashMap::new()),
+            retiring: RefCell::new(HashMap::new()),
             ignored_retirements: Cell::new(0),
+            server: RefCell::new(Weak::new()),
         }))
     }
 
@@ -219,6 +260,114 @@ impl RootRegistry {
             .borrow()
             .as_ref()
             .and_then(|key| self.compiled.borrow().get(key).cloned())
+    }
+
+    pub fn set_server(&self, server: Weak<crate::config::Server>) {
+        *self.server.borrow_mut() = server;
+    }
+
+    pub fn exported_class(
+        &self,
+        plan_key: &str,
+        class_name: &str,
+        props: Option<KjOwn<ffi::Frankenvalue>>,
+        persistent: bool,
+    ) -> Option<Rc<dyn ActorClass>> {
+        if !self.plans.borrow().contains_key(plan_key) {
+            return None;
+        }
+        Some(Rc::new(RootExportedClass {
+            registry: self.this.clone(),
+            plan_key: plan_key.to_owned(),
+            class_name: class_name.to_owned(),
+            props,
+            persistent,
+            generation: Cell::new(None),
+        }))
+    }
+
+    pub fn namespace_by_key(&self, unique_key: &str) -> Option<Rc<ActorNamespace>> {
+        self.namespaces
+            .borrow()
+            .values()
+            .find(|entry| entry.unique_key == unique_key)
+            .map(|entry| Rc::clone(&entry.namespace))
+    }
+
+    fn target(&self, target: &RootTarget, props: &Value) -> Result<Rc<dyn Channel>> {
+        self.server
+            .borrow()
+            .upgrade()
+            .ok_or_else(|| kj::disconnected!("root server gone"))?
+            .root_binding(&target.service, target.entrypoint.as_deref(), props)
+    }
+
+    fn root_props(&self, selection: &RootSelection) -> Result<KjOwn<ffi::Frankenvalue>> {
+        let plan = self
+            .plans
+            .borrow()
+            .get(&selection.plan)
+            .cloned()
+            .ok_or_else(|| kj::failed!("root plan gone"))?;
+        let mut props = ffi::frankenvalue_new();
+        let mut bindings = ffi::frankenvalue_from_json("[]");
+        for (index, binding) in plan.deployment.durable_objects.iter().enumerate() {
+            let mut target_props = binding.target.props.clone();
+            if !target_props.is_object() {
+                target_props = json!({});
+            }
+            target_props["caller"] =
+                json!({"namespaceId": selection.namespace_id, "objectId": selection.object_id});
+            target_props["workerId"] = json!(plan.deployment.worker_id);
+            target_props["versionId"] = json!(plan.deployment.version_id);
+            let channel = self.target(&binding.target, &target_props)?;
+            let mut entry = ffi::frankenvalue_from_json(&binding.metadata.to_string());
+            ffi::frankenvalue_set_service_stub(
+                entry.pin_mut(),
+                "fetcher",
+                crate::channels::SubrequestChannel::new(channel),
+            );
+            ffi::frankenvalue_set_value(bindings.pin_mut(), &index.to_string(), entry);
+        }
+        ffi::frankenvalue_set_value(props.pin_mut(), "durableObjects", bindings);
+        Ok(props)
+    }
+
+    fn stamp_metadata(
+        &self,
+        selection: &RootSelection,
+        metadata: &mut KjOwn<RequestMetadata>,
+    ) -> Result<()> {
+        let plan = self
+            .plans
+            .borrow()
+            .get(&selection.plan)
+            .cloned()
+            .ok_or_else(|| kj::failed!("root plan gone"))?;
+        let mut cf = serde_json::Map::new();
+        for name in [
+            "nodeId",
+            "serverId",
+            "processId",
+            "processGeneration",
+            "contentHash",
+            "invocationId",
+            "treeId",
+            "ingressServerId",
+            "lease",
+            "orderSequence",
+            "depth",
+        ] {
+            if let Some(value) = selection.tenant_cf.get(name) {
+                cf.insert(name.to_owned(), value.clone());
+            }
+        }
+        cf.insert("workerId".to_owned(), json!(plan.deployment.worker_id));
+        cf.insert("versionId".to_owned(), json!(plan.deployment.version_id));
+        let cf = Value::Object(cf).to_string();
+        ffi::request_metadata_set_cf_blob_json(metadata.pin_mut(), &cf);
+        ffi::request_metadata_set_coworkerd_invocation_identity(metadata.pin_mut(), &cf);
+        Ok(())
     }
 
     async fn compile(&self, deployment: &Deployment, key: &WorkerKey) -> Result<Rc<WorkerService>> {
@@ -258,24 +407,20 @@ impl RootRegistry {
             conf.reborrow()
                 .init_durable_object_storage()
                 .set_local_disk("root-storage");
-            let mut spaces = conf
-                .reborrow()
-                .init_durable_object_namespaces(deployment.namespaces.len() as u32);
-            for (index, namespace) in deployment.namespaces.iter().enumerate() {
-                let mut space = spaces.reborrow().get(index as u32);
-                space.set_class_name(namespace.class_name.as_str());
-                space.set_unique_key(namespace.unique_key.as_str());
-                space.set_enable_sql(true);
-            }
+            // Root namespaces belong only to the trusted registry. Declaring them here would
+            // also expose native namespace capabilities through the tenant's ctx.exports.
+            conf.reborrow().init_durable_object_namespaces(0);
             let mut bindings = conf
                 .reborrow()
-                .init_bindings(deployment.namespaces.len() as u32);
-            for (index, namespace) in deployment.namespaces.iter().enumerate() {
+                .init_bindings(deployment.environment.len() as u32);
+            for (index, (name, value)) in deployment.environment.iter().enumerate() {
                 let mut binding = bindings.reborrow().get(index as u32);
-                binding.set_name(namespace.binding.as_str());
-                binding
-                    .init_durable_object_namespace()
-                    .set_class_name(namespace.class_name.as_str());
+                binding.set_name(name.as_str());
+                if let Some(text) = value.as_str() {
+                    binding.set_text(text);
+                } else {
+                    binding.set_json(value.to_string().as_str());
+                }
             }
         }
         let conf = message
@@ -335,12 +480,7 @@ impl RootRegistry {
         worker: &Rc<WorkerService>,
         spaces: &HashMap<String, NamespaceEntry>,
     ) -> Result<()> {
-        for namespace in &plan.deployment.namespaces {
-            let entry = spaces
-                .get(&namespace.id)
-                .ok_or_else(|| kj::failed!("root namespace missing before link"))?;
-            worker.set_root_namespace(&namespace.class_name, Rc::clone(&entry.namespace));
-        }
+        let _ = spaces;
         let pending = worker
             .take_pending_link()
             .ok_or_else(|| kj::failed!("root worker was already linked"))?;
@@ -352,8 +492,16 @@ impl RootRegistry {
         {
             return Err(kj::failed!("root worker binding kind is not implemented"));
         }
+        let global = match &plan.deployment.global_outbound {
+            Some(target) => self.target(target, &target.props)?,
+            None => Rc::new(Denied) as Rc<dyn Channel>,
+        };
+        let streaming_tails = match &plan.deployment.streaming_tail {
+            Some(target) => vec![self.target(target, &target.props)?],
+            None => Vec::new(),
+        };
         let mut subrequest: Vec<Rc<dyn Channel>> = (0..SPECIAL_SUBREQUEST_CHANNEL_COUNT)
-            .map(|_| Rc::new(Denied) as Rc<dyn Channel>)
+            .map(|_| Rc::clone(&global))
             .collect();
         for name in &pending.loopback.subrequest_entrypoints {
             subrequest.push(worker.loopback_entrypoint(name.as_deref())?);
@@ -369,13 +517,21 @@ impl RootRegistry {
             .loopback
             .actor_classes
             .iter()
-            .map(|name| worker.loopback_actor_class(name))
-            .collect::<Result<_>>()?;
+            .map(|name| {
+                Rc::new(RootExportedClass {
+                    registry: self.this.clone(),
+                    plan_key: plan_key.to_owned(),
+                    class_name: name.clone(),
+                    props: None,
+                    persistent: false,
+                    generation: Cell::new(Some(key.generation)),
+                }) as Rc<dyn ActorClass>
+            })
+            .collect();
         let registry = Rc::downgrade(self);
         let expected = Rc::downgrade(worker);
         let plan_key = plan_key.to_owned();
         let key = key.clone();
-        let factory = Rc::clone(&self.factory);
         worker.link(
             LinkedChannels {
                 first_subrequest: 0,
@@ -385,23 +541,20 @@ impl RootRegistry {
                 actor_class,
                 cache: None,
                 tails: Vec::new(),
-                streaming_tails: Vec::new(),
+                streaming_tails,
                 worker_loaders: Vec::new(),
                 access_binding_channel: None,
                 has_debug_port: false,
-                server: Weak::new(),
-                abort_isolate: Some(Box::new(move || {
-                    let (registry, expected, plan_key, key) = (
-                        registry.clone(),
-                        expected.clone(),
-                        plan_key.clone(),
-                        key.clone(),
-                    );
-                    factory.spawn_detached(async move {
-                        if let Some(registry) = registry.upgrade() {
-                            registry.retire(&plan_key, &key, Some(expected)).await;
-                        }
-                    });
+                server: self.server.borrow().clone(),
+                abort_isolate: Some(Box::new(move |reason| {
+                    if let Some(registry) = registry.upgrade() {
+                        registry.begin_retire(
+                            &plan_key,
+                            &key,
+                            Some(expected.clone()),
+                            reason == "idle",
+                        );
+                    }
                 })),
             },
             Some(&self.storage),
@@ -416,11 +569,14 @@ impl RootRegistry {
     ) -> Result<HashMap<String, NamespaceEntry>> {
         let mut result = HashMap::new();
         for space in &deployment.namespaces {
+            if let Some(existing) = self.namespaces.borrow().get(&space.id).cloned() {
+                result.insert(space.id.clone(), existing);
+                continue;
+            }
             let source = Rc::new(RefCell::new(plan_key.to_owned()));
             let class: Rc<dyn ActorClass> = Rc::new(RootClass {
                 registry: self.this.clone(),
-                source: Rc::clone(&source),
-                class_name: space.class_name.clone(),
+                namespace_id: space.id.clone(),
             });
             let namespace = ActorNamespace::new(
                 Rc::clone(&self.factory),
@@ -465,13 +621,26 @@ impl RootRegistry {
         {
             let spaces = self.namespaces.borrow();
             for namespace in &deployment.namespaces {
-                if spaces.contains_key(&namespace.id)
-                    || spaces
-                        .values()
-                        .any(|entry| entry.unique_key == namespace.unique_key)
+                if let Some(existing) = spaces.get(&namespace.id) {
+                    let source = existing.source.borrow();
+                    let plans = self.plans.borrow();
+                    let owner = plans
+                        .get(source.as_str())
+                        .ok_or_else(|| kj::failed!("namespace source missing"))?;
+                    if existing.unique_key != namespace.unique_key
+                        || owner.deployment.worker_id != deployment.worker_id
+                        || owner.deployment.record()?.tenant != deployment.record()?.tenant
+                    {
+                        return Err(kj::failed!(
+                            "a root namespace cannot change its owner or storage"
+                        ));
+                    }
+                } else if spaces
+                    .values()
+                    .any(|entry| entry.unique_key == namespace.unique_key)
                 {
                     return Err(kj::failed!(
-                        "a root namespace is already owned by another plan"
+                        "a storage directory is already owned by another namespace"
                     ));
                 }
             }
@@ -482,6 +651,7 @@ impl RootRegistry {
             lock: tokio::sync::Mutex::new(()),
             generation: Cell::new(Some(key.generation)),
             loaded: RefCell::new(None),
+            retiring: RefCell::new(None),
         });
         let worker = self.compile(&plan.deployment, &key).await?;
         let spaces = match self.make_spaces(&plan.deployment, &plan_key) {
@@ -495,8 +665,17 @@ impl RootRegistry {
             worker.unlink();
             return Err(error);
         }
+        for entry in spaces.values() {
+            *entry.source.borrow_mut() = plan_key.clone();
+        }
         self.namespaces.borrow_mut().extend(spaces);
-        self.compiled.borrow_mut().insert(key.clone(), worker);
+        assert!(
+            self.compiled
+                .borrow_mut()
+                .insert(key.clone(), worker)
+                .is_none(),
+            "root instance key collision"
+        );
         *plan.loaded.borrow_mut() = Some(key);
         self.plans.borrow_mut().insert(plan_key.clone(), plan);
         Ok(plan_key)
@@ -510,6 +689,10 @@ impl RootRegistry {
             .cloned()
             .ok_or_else(|| kj::failed!("unknown root plan"))?;
         let _guard = plan.lock.lock().await;
+        let retiring = plan.retiring.borrow().clone();
+        if let Some(retiring) = retiring {
+            retiring.await;
+        }
         if let Some(worker) = self.loaded(&plan) {
             return Ok(worker);
         }
@@ -526,23 +709,93 @@ impl RootRegistry {
             worker.unlink();
             return Err(error);
         }
-        self.compiled
-            .borrow_mut()
-            .insert(key.clone(), Rc::clone(&worker));
+        assert!(
+            self.compiled
+                .borrow_mut()
+                .insert(key.clone(), Rc::clone(&worker))
+                .is_none(),
+            "root instance key collision"
+        );
         *plan.loaded.borrow_mut() = Some(key);
         Ok(worker)
     }
 
-    async fn retire(
-        &self,
+    async fn root(self: &Rc<Self>, selection: RootSelection) -> Result<Rc<dyn Channel>> {
+        if !selection.dispatch_checked {
+            return Err(kj::failed!(
+                "jsg.Error: the node has not authorized this root dispatch"
+            ));
+        }
+        if selection.object_id.len() != 64
+            || !selection
+                .object_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || selection.data_epoch.is_empty()
+            || selection.data_epoch.parse::<u64>().is_err()
+        {
+            return Err(kj::failed!("jsg.Error: invalid explicit root selection"));
+        }
+        let plan = self
+            .plans
+            .borrow()
+            .get(&selection.plan)
+            .cloned()
+            .ok_or_else(|| kj::failed!("unknown root plan"))?;
+        let descriptor = plan
+            .deployment
+            .namespaces
+            .iter()
+            .find(|space| space.id == selection.namespace_id)
+            .ok_or_else(|| kj::failed!("this plan does not own the root namespace"))?;
+        self.worker(&selection.plan).await?;
+        let name = format!(
+            "{}/{}/{}",
+            selection.namespace_id, selection.object_id, selection.data_epoch
+        );
+        let id = ffi::actor_id_for_root(&descriptor.unique_key, &name);
+        let key = ffi::actor_id_key(&id);
+        let index = (selection.namespace_id.clone(), key.clone());
+        let previous = self.objects.borrow().get(&index).cloned();
+        if previous
+            .as_ref()
+            .is_some_and(|previous| previous.selection.plan != selection.plan)
+        {
+            let namespace = self
+                .namespaces
+                .borrow()
+                .get(&selection.namespace_id)
+                .map(|entry| Rc::clone(&entry.namespace))
+                .ok_or_else(|| kj::failed!("root namespace missing"))?;
+            namespace.abort_root(
+                &key,
+                &kj::failed!("jsg.Error: the Worker's active version changed"),
+            );
+        }
+        self.objects.borrow_mut().insert(
+            index,
+            RootObject {
+                selection: selection.clone(),
+                class_name: descriptor.class_name.clone(),
+            },
+        );
+        let spaces = self.namespaces.borrow();
+        let namespace = spaces
+            .get(&selection.namespace_id)
+            .ok_or_else(|| kj::failed!("root namespace missing"))?;
+        Ok(namespace.namespace.channel(id, false))
+    }
+
+    fn begin_retire(
+        self: &Rc<Self>,
         plan_key: &str,
         key: &WorkerKey,
         expected: Option<Weak<WorkerService>>,
+        idle: bool,
     ) -> bool {
         let Some(plan) = self.plans.borrow().get(plan_key).cloned() else {
             return false;
         };
-        let _guard = plan.lock.lock().await;
         let current = self.compiled.borrow().get(key).cloned();
         let matches = plan.loaded.borrow().as_ref() == Some(key)
             && current.as_ref().is_some_and(|current| {
@@ -555,19 +808,89 @@ impl RootRegistry {
                 .set(self.ignored_retirements.get() + 1);
             return false;
         }
-        self.compiled.borrow_mut().remove(key);
+        let worker = self
+            .compiled
+            .borrow_mut()
+            .remove(key)
+            .expect("matched root instance");
         *plan.loaded.borrow_mut() = None;
-        for entry in self.namespaces.borrow().values() {
-            if entry.source.borrow().as_str() == plan_key {
-                entry
-                    .namespace
-                    .abort_all(Some(&kj::disconnected!("root worker unloaded")));
+        assert!(
+            self.retiring
+                .borrow_mut()
+                .insert(key.clone(), Rc::clone(&worker))
+                .is_none()
+        );
+        let (done, wait) = futures::channel::oneshot::channel::<()>();
+        *plan.retiring.borrow_mut() = Some(
+            async move {
+                let _ = wait.await;
             }
-        }
-        if let Some(worker) = current {
-            worker.unlink();
-        }
+            .boxed_local()
+            .shared(),
+        );
+        let roots: Vec<_> = self
+            .objects
+            .borrow()
+            .iter()
+            .filter(|(_, object)| object.selection.plan == plan_key)
+            .filter_map(|((namespace, storage_key), _)| {
+                self.namespaces
+                    .borrow()
+                    .get(namespace)
+                    .map(|entry| (Rc::clone(&entry.namespace), storage_key.clone()))
+            })
+            .collect();
+        let registry = Rc::clone(self);
+        let key = key.clone();
+        // The plan is detached synchronously above. Requests cannot acquire the retiring isolate;
+        // they wait for actor teardown before compiling a new generation on the same storage.
+        self.factory.spawn_detached(async move {
+            let mut completed = true;
+            for (namespace, storage_key) in roots {
+                if idle {
+                    if let Err(error) = namespace.evict_root_for_unload(&storage_key).await {
+                        tracing::error!("retiring idle root: {error:?}");
+                        completed = false;
+                    }
+                } else {
+                    namespace.abort_root(
+                        &storage_key,
+                        &kj::disconnected!("root worker limit exceeded"),
+                    );
+                }
+            }
+            if completed {
+                worker.unlink();
+            } else {
+                // Do not start a different isolate against a still-running actor on failed
+                // graceful teardown. Keep the original generation available for another event.
+                assert!(
+                    registry
+                        .compiled
+                        .borrow_mut()
+                        .insert(key.clone(), Rc::clone(&worker))
+                        .is_none()
+                );
+                *plan.loaded.borrow_mut() = Some(key.clone());
+            }
+            registry.retiring.borrow_mut().remove(&key);
+            plan.retiring.borrow_mut().take();
+            let _ = done.send(());
+        });
         true
+    }
+
+    async fn retire(self: &Rc<Self>, plan_key: &str, key: &WorkerKey) -> bool {
+        let retired = self.begin_retire(plan_key, key, None, true);
+        let wait = self
+            .plans
+            .borrow()
+            .get(plan_key)
+            .and_then(|plan| plan.retiring.borrow().clone());
+        if let Some(wait) = wait {
+            wait.await;
+        }
+        retired
     }
 
     fn snapshot(&self) -> Value {
@@ -579,6 +902,7 @@ impl RootRegistry {
         plans.sort_by(|a, b| a["plan"].as_str().cmp(&b["plan"].as_str()));
         let mut namespaces: Vec<_> = self.namespaces.borrow().iter().map(|(id, entry)| json!({
             "id": id, "className": entry.class_name, "uniqueKey": entry.unique_key, "source": *entry.source.borrow(),
+            "residentRoots": entry.namespace.resident_roots(),
         })).collect();
         namespaces.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         json!({"plans": plans, "namespaces": namespaces, "compiledWorkers": self.compiled.borrow().len(),
@@ -595,7 +919,11 @@ impl RootRegistry {
         for worker in workers.values() {
             worker.unlink();
         }
+        for worker in std::mem::take(&mut *self.retiring.borrow_mut()).values() {
+            worker.unlink();
+        }
         self.namespaces.borrow_mut().clear();
+        self.objects.borrow_mut().clear();
         self.plans.borrow_mut().clear();
     }
 }
@@ -608,11 +936,71 @@ impl Drop for RootRegistry {
 
 struct RootClass {
     registry: Weak<RootRegistry>,
-    source: Rc<RefCell<String>>,
-    class_name: String,
+    namespace_id: String,
 }
 
-impl RootClass {
+impl ActorClass for RootClass {
+    fn for_root(&self, id: &ffi::ActorIdHandle) -> Option<Rc<dyn ActorClass>> {
+        let registry = self.registry.upgrade()?;
+        let object = registry
+            .objects
+            .borrow()
+            .get(&(self.namespace_id.clone(), ffi::actor_id_key(id)))
+            .cloned()?;
+        let props = registry.root_props(&object.selection).ok()?;
+        Some(Rc::new(RootObjectClass {
+            public_id: object.selection.object_id,
+            class: RootExportedClass {
+                registry: self.registry.clone(),
+                plan_key: object.selection.plan,
+                class_name: object.class_name,
+                props: Some(props),
+                persistent: false,
+                generation: Cell::new(None),
+            },
+        }))
+    }
+    fn new_actor(&self, _request: NewActor<'_>) -> Result<KjOwn<ffi::ActorHandle>> {
+        Err(kj::failed!(
+            "jsg.Error: the root has no explicit node selection"
+        ))
+    }
+    fn start_request(
+        &self,
+        _metadata: KjOwn<RequestMetadata>,
+        _actor: &ffi::ActorHandle,
+    ) -> Result<KjOwn<WorkerInterface>> {
+        Err(kj::failed!("root class was not specialized"))
+    }
+    fn run_on_hibernate<'a>(
+        &'a self,
+        _metadata: KjOwn<RequestMetadata>,
+        _actor: &'a ffi::ActorHandle,
+    ) -> LocalBoxFuture<'a, Result<()>> {
+        Box::pin(async { Err(kj::failed!("root class was not specialized")) })
+    }
+    fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
+        Err(not_transferable("Private root namespace"))
+    }
+}
+
+/// One container's immutable load plan. Namespace promotion never retargets an existing actor.
+struct RootObjectClass {
+    public_id: String,
+    class: RootExportedClass,
+}
+
+// Class credentials carry the immutable plan and props, never a strong isolate reference.
+// A child facet can survive an unload and resolve its own class on the next invocation.
+struct RootExportedClass {
+    registry: Weak<RootRegistry>,
+    plan_key: String,
+    class_name: String,
+    props: Option<KjOwn<ffi::Frankenvalue>>,
+    persistent: bool,
+    generation: Cell<Option<u64>>,
+}
+impl RootExportedClass {
     fn registry(&self) -> Result<Rc<RootRegistry>> {
         self.registry
             .upgrade()
@@ -620,25 +1008,42 @@ impl RootClass {
     }
     fn class(&self) -> Result<Rc<dyn ActorClass>> {
         let registry = self.registry()?;
-        let plan = registry
-            .plans
+        let key = WorkerKey {
+            plan_key: self.plan_key.clone(),
+            generation: self
+                .generation
+                .get()
+                .ok_or_else(|| kj::failed!("root class is not ready"))?,
+        };
+        let worker = registry
+            .compiled
             .borrow()
-            .get(self.source.borrow().as_str())
+            .get(&key)
             .cloned()
-            .ok_or_else(|| kj::failed!("root source gone"))?;
-        registry
-            .loaded(&plan)
+            .or_else(|| registry.retiring.borrow().get(&key).cloned());
+        worker
             .ok_or_else(|| kj::disconnected!("root worker unloaded"))?
-            .actor_class(Some(&self.class_name), None, false)
+            .actor_class(
+                Some(&self.class_name),
+                self.props.as_deref().map(ffi::frankenvalue_clone),
+                self.persistent,
+            )
             .ok_or_else(|| kj::failed!("root class missing"))
     }
 }
-
-impl ActorClass for RootClass {
+impl ActorClass for RootExportedClass {
     fn when_ready(&self) -> LocalBoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            let source = self.source.borrow().clone();
-            self.registry()?.worker(&source).await.map(drop)
+            let registry = self.registry()?;
+            registry.worker(&self.plan_key).await?;
+            self.generation.set(
+                registry
+                    .plans
+                    .borrow()
+                    .get(&self.plan_key)
+                    .and_then(|plan| plan.generation.get()),
+            );
+            Ok(())
         })
     }
     fn new_actor(&self, request: NewActor<'_>) -> Result<KjOwn<ffi::ActorHandle>> {
@@ -658,8 +1063,65 @@ impl ActorClass for RootClass {
     ) -> LocalBoxFuture<'a, Result<()>> {
         Box::pin(async move { self.class()?.run_on_hibernate(metadata, actor).await })
     }
+    fn token(&self, usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
+        let registry = self.registry()?;
+        let props = self
+            .props
+            .as_deref()
+            .ok_or_else(|| kj::failed!("an unspecialized root class has no token"))?;
+        Ok(ffi::factory_encode_actor_class_token(
+            registry.factory.raw(),
+            &self.plan_key,
+            &self.class_name,
+            Some(props).into(),
+            self.persistent,
+            usage,
+        )?)
+    }
+    fn for_props(
+        &self,
+        props: KjOwn<ffi::Frankenvalue>,
+        persistent: bool,
+    ) -> Result<Rc<dyn ActorClass>> {
+        if self.props.is_some() {
+            return Err(kj::failed!("can't override root class props"));
+        }
+        Ok(Rc::new(Self {
+            registry: self.registry.clone(),
+            plan_key: self.plan_key.clone(),
+            class_name: self.class_name.clone(),
+            props: Some(props),
+            persistent,
+            generation: Cell::new(self.generation.get()),
+        }))
+    }
+}
+
+impl ActorClass for RootObjectClass {
+    fn when_ready(&self) -> LocalBoxFuture<'_, Result<()>> {
+        self.class.when_ready()
+    }
+    fn new_actor(&self, mut request: NewActor<'_>) -> Result<KjOwn<ffi::ActorHandle>> {
+        // Host/app presents O as a string. The native container index and storage spec retain S.
+        request.id = ffi::actor_id_from_name(&self.public_id);
+        self.class.new_actor(request)
+    }
+    fn start_request(
+        &self,
+        metadata: KjOwn<RequestMetadata>,
+        actor: &ffi::ActorHandle,
+    ) -> Result<KjOwn<WorkerInterface>> {
+        self.class.start_request(metadata, actor)
+    }
+    fn run_on_hibernate<'a>(
+        &'a self,
+        metadata: KjOwn<RequestMetadata>,
+        actor: &'a ffi::ActorHandle,
+    ) -> LocalBoxFuture<'a, Result<()>> {
+        self.class.run_on_hibernate(metadata, actor)
+    }
     fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
-        Err(not_transferable("Runtime root class"))
+        Err(not_transferable("Private root instance class"))
     }
 }
 
@@ -676,6 +1138,25 @@ impl Channel for Denied {
 }
 
 impl Channel for RootRegistry {
+    fn for_props(
+        &self,
+        props: KjOwn<ffi::Frankenvalue>,
+        _persistent: bool,
+    ) -> Result<Rc<dyn Channel>> {
+        let selection: RootSelection = serde_json::from_str(&ffi::frankenvalue_plain_json(&props)?)
+            .map_err(|error| kj::failed!("invalid root selection: {error}"))?;
+        if !selection.dispatch_checked {
+            return Err(kj::failed!("jsg.Error: node dispatch checks are required"));
+        }
+        Ok(Rc::new(RootSelectedChannel {
+            registry: self
+                .this
+                .upgrade()
+                .ok_or_else(|| kj::disconnected!("root registry gone"))?,
+            selection,
+        }))
+    }
+
     fn start_request(&self, metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
         let registry = self
             .this
@@ -695,9 +1176,56 @@ impl Channel for RootRegistry {
     }
 }
 
+struct RootSelectedChannel {
+    registry: Rc<RootRegistry>,
+    selection: RootSelection,
+}
+impl Channel for RootSelectedChannel {
+    fn start_request(
+        &self,
+        mut metadata: KjOwn<RequestMetadata>,
+    ) -> Result<KjOwn<WorkerInterface>> {
+        let registry = Rc::clone(&self.registry);
+        let selection = self.selection.clone();
+        registry.stamp_metadata(&selection, &mut metadata)?;
+        Ok(worker::PromisedInterface::new(async move {
+            registry.root(selection).await?.start_request(metadata)
+        })
+        .into_kj())
+    }
+    fn require_allows_transfer(&self) -> Result<()> {
+        Err(not_transferable("Private selected root"))
+    }
+    fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
+        Err(not_transferable("Private selected root"))
+    }
+}
+
 struct RootRequest {
     registry: Rc<RootRegistry>,
     metadata: Option<KjOwn<RequestMetadata>>,
+}
+
+impl RootRequest {
+    async fn target(&mut self) -> Result<KjOwn<WorkerInterface>> {
+        let metadata = self
+            .metadata
+            .as_ref()
+            .ok_or_else(|| kj::failed!("root event already used"))?;
+        let cf: Option<String> = ffi::request_metadata_cf_blob_json(metadata).into();
+        let cf: Value = serde_json::from_str(cf.as_deref().unwrap_or("null"))
+            .map_err(|error| kj::failed!("root metadata: {error}"))?;
+        let selection: RootSelection = serde_json::from_value(cf["coworkerdRoot"].clone())
+            .map_err(|error| {
+                kj::failed!("jsg.Error: an explicit node root selection is required: {error}")
+            })?;
+        let mut metadata = self
+            .metadata
+            .take()
+            .ok_or_else(|| kj::failed!("root event already used"))?;
+        self.registry.stamp_metadata(&selection, &mut metadata)?;
+        self.registry.root(selection).await?.start_request(metadata)
+    }
 }
 
 async fn read_json(mut body: Pin<&mut AsyncInputStream>) -> Result<Value> {
@@ -736,6 +1264,31 @@ impl Service for RootRequest {
                 json!({"plan": plan, "state": self.registry.snapshot()})
             }
             (Method::GET, "/state") => self.registry.snapshot(),
+            (Method::POST, "/hibernate") => {
+                let namespaces: Vec<_> = self
+                    .registry
+                    .namespaces
+                    .borrow()
+                    .values()
+                    .map(|entry| Rc::clone(&entry.namespace))
+                    .collect();
+                for namespace in namespaces {
+                    namespace.evict_all_for_test(true).await?;
+                }
+                json!({"hibernated": true, "state": self.registry.snapshot()})
+            }
+            (_, "/object") => {
+                let mut target = worker::CxxWorkerInterface::new(self.target().await?);
+                return Service::request(
+                    &mut target,
+                    method,
+                    text.as_bytes(),
+                    headers,
+                    body,
+                    response,
+                )
+                .await;
+            }
             (Method::POST, "/retire") => {
                 let value = read_json(body).await?;
                 let plan_key = value["plan"]
@@ -752,7 +1305,7 @@ impl Service for RootRequest {
                     .cloned()
                     .ok_or_else(|| kj::failed!("unknown root plan"))?;
                 let key = plan.deployment.key(generation)?;
-                let retired = self.registry.retire(plan_key, &key, None).await;
+                let retired = self.registry.retire(plan_key, &key).await;
                 json!({"retired": retired, "state": self.registry.snapshot()})
             }
             (_, "/invoke") => {
@@ -803,6 +1356,27 @@ impl Service for RootRequest {
 
 #[async_trait::async_trait(?Send)]
 impl Interface for RootRequest {
+    async fn custom_event(
+        &mut self,
+        event: KjOwn<worker::CustomEvent>,
+    ) -> Result<worker::CustomEventResult> {
+        let metadata = self
+            .metadata
+            .take()
+            .ok_or_else(|| kj::failed!("root event already used"))?;
+        let registry = Rc::clone(&self.registry);
+        // The promised interface reports resolution errors to the RPC event before dropping it.
+        let promised = worker::PromisedInterface::new(async move {
+            RootRequest {
+                registry,
+                metadata: Some(metadata),
+            }
+            .target()
+            .await
+        });
+        let mut target = worker::CxxWorkerInterface::new(promised.into_kj());
+        Interface::custom_event(&mut target, event).await
+    }
     async fn run_scheduled(
         &mut self,
         _time: &SystemTime,
