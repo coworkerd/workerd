@@ -1782,7 +1782,9 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
     impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
         kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->coworkerdIdentity,
-        kj::str(spec.load_identity.startup_identity), impl->idleWorker);
+        kj::str(spec.load_identity.startup_identity), impl->idleWorker,
+        spec.runtime_config.size() != 0 ? &factory.timer : nullptr,
+        spec.runtime_config.size() != 0 ? &factory.tasks : nullptr);
     auto limitEnforcer = kj::addRef(*impl->cpuLimits);
     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
       return Worker::Api::InboundListener{

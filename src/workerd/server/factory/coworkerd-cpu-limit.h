@@ -16,11 +16,13 @@
 #include <kj/function.h>
 #include <kj/mutex.h>
 #include <kj/thread.h>
+#include <kj/timer.h>
 #include <kj/time.h>
 #include <kj/vector.h>
 #include <atomic>
 #include <cstdio>
 #include <pthread.h>
+#include <unordered_map>
 #include <unistd.h>
 #if __APPLE__
 #include <mach/mach.h>
@@ -104,11 +106,51 @@ class LimitWatchdog {
 };
 
 // CPU accounting stays on the isolate thread; only termination and event writes cross threads.
+// Root plans can have thousands of live actor contexts. A single fork rejection would
+// put every context's teardown on the event loop at once, ahead of health-probe I/O.
+class RootLimitFailures final: public kj::Refcounted {
+ public:
+  RootLimitFailures(kj::Timer& timer, kj::TaskSet& tasks): timer(timer), tasks(tasks) {}
+  kj::Promise<void> subscribe() {
+    KJ_IF_SOME(error, published) { return kj::Promise<void>(error.clone()); }
+    const auto id = ++nextId;
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    subscribers.emplace(id, kj::mv(paf.fulfiller));
+    return paf.promise.attach(kj::defer([self = kj::addRef(*this), id]() mutable {
+      self->subscribers.erase(id);
+    }));
+  }
+  void publish(kj::Exception error) {
+    if (published != kj::none) return;
+    published = kj::mv(error);
+    tasks.add(kj::evalLater([self = kj::addRef(*this)]() mutable {
+      auto promise = self->drain();
+      return promise.attach(kj::mv(self));
+    }));
+  }
+ private:
+  kj::Promise<void> drain() {
+    for (unsigned i = 0; i < 8 && !subscribers.empty(); ++i) {
+      auto at = subscribers.begin();
+      auto fulfiller = kj::mv(at->second);
+      subscribers.erase(at);
+      KJ_IF_SOME(error, published) { fulfiller->reject(error.clone()); }
+    }
+    if (subscribers.empty()) return kj::READY_NOW;
+    return timer.afterDelay(1 * kj::MILLISECONDS).then([this]() { return drain(); });
+  }
+  kj::Timer& timer;
+  kj::TaskSet& tasks;
+  uint64_t nextId = 0;
+  kj::Maybe<kj::Exception> published;
+  std::unordered_map<uint64_t, kj::Own<kj::PromiseFulfiller<void>>> subscribers;
+};
+
 class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  public:
   CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name,
       const kj::Maybe<CoworkerdWorkerIdentity>& identity, kj::StringPtr startupIdentity = "",
-      IdleWorkerRef idleWorker = {})
+      IdleWorkerRef idleWorker = {}, kj::Timer* rootTimer = nullptr, kj::TaskSet* rootTasks = nullptr)
       : fallback(kj::mv(fallback)), name(kj::str(name)),
         cpuNs(0), tenantWorker(identity != kj::none), startupIdentity(kj::str(startupIdentity)), idleWorker(kj::mv(idleWorker)) {
     KJ_IF_SOME(record, identity) {
@@ -123,9 +165,14 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     }
     if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
     recordPlatformFacts(name, tenantWorker);
-    auto paf = kj::newPromiseAndFulfiller<void>();
-    failure = paf.promise.fork();
-    fulfiller = kj::mv(paf.fulfiller);
+    if (rootTimer != nullptr) {
+      KJ_REQUIRE(rootTasks != nullptr);
+      rootFailures = kj::refcounted<RootLimitFailures>(*rootTimer, *rootTasks);
+    } else {
+      auto paf = kj::newPromiseAndFulfiller<void>();
+      failure = paf.promise.fork();
+      fulfiller = kj::mv(paf.fulfiller);
+    }
     if (cpuNs) record("created", "", 0);
     if (memory) record("memory-created", "", 0);
   }
@@ -202,11 +249,15 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   void requireNotExceeded() {
     if (exceeded->load() != IsolateLimitCause::NONE) kj::throwFatalException(exception());
   }
-  kj::Promise<void> onExceeded() { return failure.addBranch(); }
+  kj::Promise<void> onExceeded() {
+    KJ_IF_SOME(roots, rootFailures) { return roots->subscribe(); }
+    return failure.addBranch();
+  }
   bool publish() {
     if (exceeded->load() == IsolateLimitCause::NONE || published) return false;
     published = true;
-    fulfiller->reject(exception());
+    KJ_IF_SOME(roots, rootFailures) { roots->publish(exception()); }
+    else { fulfiller->reject(exception()); }
     return true;
   }
 
@@ -419,6 +470,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   bool published = false;
   kj::ForkedPromise<void> failure = nullptr;
   kj::Own<kj::PromiseFulfiller<void>> fulfiller;
+  kj::Maybe<kj::Own<RootLimitFailures>> rootFailures;
 };
 
 kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,

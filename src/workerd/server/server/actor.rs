@@ -870,7 +870,7 @@ impl ActorNamespace {
             for (index, (_, container)) in actors.into_iter().enumerate() {
                 container.abort(Some(reason.clone()));
                 container.namespace_removed();
-                if (index + 1) % 64 == 0 {
+                if (index + 1) % 16 == 0 {
                     namespace.factory.sleep(Duration::from_millis(1)).await;
                 }
             }

@@ -1386,7 +1386,7 @@ impl RootRegistry {
                         storage_key,
                         &kj::disconnected!("root worker limit exceeded"),
                     );
-                    if (index + 1) % 64 == 0 {
+                    if (index + 1) % 16 == 0 {
                         registry.factory.sleep(Duration::from_millis(1)).await;
                     }
                 }
