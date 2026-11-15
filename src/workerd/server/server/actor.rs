@@ -1984,6 +1984,7 @@ impl ActorContainer {
                 continue;
             }
             self.require_not_broken()?;
+            let wake_started = ns.factory.now();
             if self.pending_class().is_none() {
                 let class = self.class()?;
                 if !class.request_ready() {
@@ -1996,7 +1997,7 @@ impl ActorContainer {
             }
             ns.wait_root_closed(&self.root_key).await?;
             self.require_not_broken()?;
-            let woke_from = self.was_evicted.get().then(|| ns.factory.now());
+            let woke_from = self.was_evicted.get().then_some(wake_started);
             if let Some(pending) = self.pending_class() {
                 pending.await?;
                 self.require_not_broken()?;
