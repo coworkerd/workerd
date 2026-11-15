@@ -1135,17 +1135,19 @@ impl RootRegistry {
         let registry = Rc::clone(self);
         let key = key.clone();
         if !idle {
-            // Stop all old containers before yielding. Each storage key now has its own fence;
-            // a retained native handle must not hold up unrelated objects' next generation.
-            for (namespace, storage_key) in &roots {
-                namespace.abort_root(
-                    storage_key,
-                    &kj::disconnected!("root worker limit exceeded"),
-                );
-            }
-            plan.retiring.borrow_mut().take();
-            let _ = done.send(());
             self.factory.spawn_detached(async move {
+                // Leave the limit callback's stack before cancelling actors: cancelling the
+                // currently executing KJ promise would otherwise destroy its own callback.
+                // Stop every old container before releasing the plan, then wait on storage
+                // keys independently, without keeping healthy objects behind one old handle.
+                for (namespace, storage_key) in &roots {
+                    namespace.abort_root(
+                        storage_key,
+                        &kj::disconnected!("root worker limit exceeded"),
+                    );
+                }
+                plan.retiring.borrow_mut().take();
+                let _ = done.send(());
                 futures::future::join_all(
                     roots
                         .iter()
