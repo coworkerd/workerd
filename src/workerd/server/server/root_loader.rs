@@ -6,7 +6,7 @@
 //! Compiled instances and stable namespace/class providers have separate lifetimes.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, SystemTime};
@@ -69,7 +69,7 @@ struct Namespace {
     unique_key: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct RootSelection {
     namespace_id: String,
@@ -81,6 +81,8 @@ struct RootSelection {
     tenant_cf: Value,
     #[serde(default)]
     alarm_facet_id: Option<u32>,
+    #[serde(default)]
+    prepared_ticket: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
@@ -310,6 +312,26 @@ struct Plan {
     generation: Cell<Option<u64>>,
     loaded: RefCell<Option<WorkerKey>>,
     retiring: RefCell<Option<Shared<LocalBoxFuture<'static, ()>>>>,
+    selection_pins: Cell<usize>,
+}
+
+struct PlanPin(Rc<Plan>);
+impl PlanPin {
+    fn new(plan: Rc<Plan>) -> Self {
+        plan.selection_pins.set(plan.selection_pins.get() + 1);
+        Self(plan)
+    }
+}
+impl Drop for PlanPin {
+    fn drop(&mut self) {
+        self.0.selection_pins.set(self.0.selection_pins.get() - 1);
+    }
+}
+
+struct PreparedRoot {
+    selection: RootSelection,
+    channel: Rc<dyn Channel>,
+    pin: PlanPin,
 }
 
 #[derive(Clone)]
@@ -335,6 +357,8 @@ pub struct RootRegistry {
     compiled: RefCell<HashMap<WorkerKey, Rc<WorkerService>>>,
     retiring: RefCell<HashMap<WorkerKey, Rc<WorkerService>>>,
     ignored_retirements: Cell<u64>,
+    next_prepared: Cell<u64>,
+    prepared: RefCell<BTreeMap<u64, PreparedRoot>>,
     server: RefCell<Weak<crate::config::Server>>,
 }
 
@@ -358,6 +382,8 @@ impl RootRegistry {
             compiled: RefCell::new(HashMap::new()),
             retiring: RefCell::new(HashMap::new()),
             ignored_retirements: Cell::new(0),
+            next_prepared: Cell::new(0),
+            prepared: RefCell::new(BTreeMap::new()),
             server: RefCell::new(Weak::new()),
         }))
     }
@@ -460,9 +486,9 @@ impl RootRegistry {
         let unused: Vec<_> = self
             .plans
             .borrow()
-            .keys()
-            .filter(|key| !needed.contains(*key))
-            .cloned()
+            .iter()
+            .filter(|(key, plan)| !needed.contains(*key) && plan.selection_pins.get() == 0)
+            .map(|(key, _)| key.clone())
             .collect();
         let mut workers = Vec::new();
         for key in unused {
@@ -693,7 +719,7 @@ impl RootRegistry {
             identity,
             &report,
         )
-        .await?;
+        .await.map_err(|error| kj::failed!("ROOT_TENANT_CODE: {}", error.description()))?;
         if report.refuses()
             || deployment
                 .namespaces
@@ -702,7 +728,7 @@ impl RootRegistry {
         {
             worker.unlink();
             return Err(kj::failed!(
-                "root worker failed to compile or is missing an exported class: {}",
+                "ROOT_TENANT_CODE: root worker failed to compile or is missing an exported class: {}",
                 errors.borrow().join("; ")
             ));
         }
@@ -940,6 +966,7 @@ impl RootRegistry {
             generation: Cell::new(Some(key.generation)),
             loaded: RefCell::new(None),
             retiring: RefCell::new(None),
+            selection_pins: Cell::new(0),
         });
         let worker = self.compile(&plan.deployment, &key).await?;
         let spaces = match self.make_spaces(&plan.deployment, &plan_key) {
@@ -1027,6 +1054,27 @@ impl RootRegistry {
         );
         *plan.loaded.borrow_mut() = Some(key);
         Ok(worker)
+    }
+
+    async fn prepare(self: &Rc<Self>, selection: RootSelection) -> Result<u64> {
+        if selection.prepared_ticket.is_some() {
+            return Err(kj::failed!("a prepared root cannot be prepared again"));
+        }
+        let plan = self.plans.borrow().get(&selection.plan).cloned()
+            .ok_or_else(|| kj::failed!("unknown root plan"))?;
+        let pin = PlanPin::new(plan);
+        // All asynchronous selection and retirement waits finish before the runtime receives a Fetcher.
+        let channel = self.root(selection.clone()).await?;
+        let ticket = self.next_prepared.get().checked_add(1)
+            .ok_or_else(|| kj::failed!("prepared root ticket space exhausted"))?;
+        self.next_prepared.set(ticket);
+        let mut prepared = self.prepared.borrow_mut();
+        // A cancelled management call must not leave an unbounded capability table.
+        if prepared.len() >= 1024 {
+            prepared.pop_first();
+        }
+        prepared.insert(ticket, PreparedRoot { selection, channel, pin });
+        Ok(ticket)
     }
 
     async fn root(self: &Rc<Self>, selection: RootSelection) -> Result<Rc<dyn Channel>> {
@@ -1684,7 +1732,7 @@ impl ActorClass for RootObjectClass {
         self.class.when_ready()
     }
     fn new_actor(&self, mut request: NewActor<'_>) -> Result<KjOwn<ffi::ActorHandle>> {
-        // Host/app presents O as a string. The native container index and storage spec retain S.
+        // The public object id is O. The native container index and storage spec retain S.
         request.id = ffi::actor_id_from_name(&self.public_id);
         self.class.new_actor(request)
     }
@@ -1725,10 +1773,25 @@ impl Channel for RootRegistry {
         props: KjOwn<ffi::Frankenvalue>,
         _persistent: bool,
     ) -> Result<Rc<dyn Channel>> {
-        let selection: RootSelection = serde_json::from_str(&ffi::frankenvalue_plain_json(&props)?)
+        let mut selection: RootSelection = serde_json::from_str(&ffi::frankenvalue_plain_json(&props)?)
             .map_err(|error| kj::failed!("invalid root selection: {error}"))?;
         if !selection.dispatch_checked {
             return Err(kj::failed!("jsg.Error: node dispatch checks are required"));
+        }
+        if let Some(ticket) = selection.prepared_ticket.take() {
+            let ticket = ticket.parse::<u64>()
+                .map_err(|_| kj::failed!("jsg.Error: invalid prepared root ticket"))?;
+            let prepared = self.prepared.borrow_mut().remove(&ticket)
+                .ok_or_else(|| kj::failed!("jsg.Error: ROOT_PLAN_MISSING: prepared selection expired"))?;
+            if prepared.selection != selection {
+                return Err(kj::failed!("jsg.Error: prepared selection does not match"));
+            }
+            return Ok(Rc::new(RootReadyChannel {
+                registry: self.this.upgrade().ok_or_else(|| kj::disconnected!("root registry gone"))?,
+                selection,
+                channel: prepared.channel,
+                _pin: prepared.pin,
+            }));
         }
         // Let the trusted runtime refresh a cached key before starting an object event.
         if !self.plans.borrow().contains_key(&selection.plan) {
@@ -1736,12 +1799,14 @@ impl Channel for RootRegistry {
                 "jsg.Error: ROOT_PLAN_MISSING: the root plan was reclaimed"
             ));
         }
+        let pin = PlanPin::new(Rc::clone(self.plans.borrow().get(&selection.plan).unwrap()));
         Ok(Rc::new(RootSelectedChannel {
             registry: self
                 .this
                 .upgrade()
                 .ok_or_else(|| kj::disconnected!("root registry gone"))?,
             selection,
+            _pin: pin,
         }))
     }
 
@@ -1767,6 +1832,26 @@ impl Channel for RootRegistry {
 struct RootSelectedChannel {
     registry: Rc<RootRegistry>,
     selection: RootSelection,
+    _pin: PlanPin,
+}
+
+struct RootReadyChannel {
+    registry: Rc<RootRegistry>,
+    selection: RootSelection,
+    channel: Rc<dyn Channel>,
+    _pin: PlanPin,
+}
+impl Channel for RootReadyChannel {
+    fn start_request(&self, mut metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
+        self.registry.stamp_metadata(&self.selection, &mut metadata)?;
+        self.channel.start_request(metadata)
+    }
+    fn require_allows_transfer(&self) -> Result<()> {
+        Err(not_transferable("Private prepared root"))
+    }
+    fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
+        Err(not_transferable("Private prepared root"))
+    }
 }
 impl Channel for RootSelectedChannel {
     fn start_request(
@@ -1777,9 +1862,7 @@ impl Channel for RootSelectedChannel {
         let selection = self.selection.clone();
         registry.stamp_metadata(&selection, &mut metadata)?;
         Ok(worker::PromisedInterface::new(async move {
-            let channel = registry.root(selection).await.map_err(|error| {
-                kj::failed!("jsg.Error: ROOT_PREPARATION_FAILED: {}", error.description())
-            })?;
+            let channel = registry.root(selection).await?;
             channel.start_request(metadata)
         })
         .into_kj())
@@ -1835,6 +1918,18 @@ async fn read_json(mut body: Pin<&mut AsyncInputStream>) -> Result<Value> {
     serde_json::from_slice(&bytes).map_err(|error| kj::failed!("invalid root description: {error}"))
 }
 
+fn preparation_failure(message: &str) -> (u32, Value) {
+    let code = "ROOT_TENANT_CODE: ";
+    let (status, kind, reason) = if let Some(index) = message.find(code) {
+        (500, "tenant-code", &message[index + code.len()..])
+    } else if message.contains("unknown root plan") || message.contains("root selection plan removed") {
+        (503, "plan-missing", message)
+    } else {
+        (503, "platform", message)
+    };
+    (status, json!({"error": {"kind": kind, "message": reason}}))
+}
+
 #[async_trait::async_trait(?Send)]
 impl Service for RootRequest {
     async fn request<'a>(
@@ -1847,6 +1942,7 @@ impl Service for RootRequest {
     ) -> Result<()> {
         let text = std::str::from_utf8(url).map_err(|error| kj::failed!("root URL: {error}"))?;
         let url = url::Url::parse(text).map_err(|error| kj::failed!("root URL: {error}"))?;
+        let mut status = 200;
         let value = match (method, url.path()) {
             (Method::POST, "/lookup") => {
                 let deployment: Deployment = serde_json::from_value(read_json(body).await?)
@@ -1858,8 +1954,26 @@ impl Service for RootRequest {
             (Method::POST, "/install") => {
                 let deployment = serde_json::from_value(read_json(body).await?)
                     .map_err(|error| kj::failed!("root deployment: {error}"))?;
-                let plan = self.registry.install(deployment).await?;
-                json!({"plan": plan, "state": self.registry.snapshot()})
+                match self.registry.install(deployment).await {
+                    Ok(plan) => json!({"plan": plan, "state": self.registry.snapshot()}),
+                    Err(error) => {
+                        let (code, value) = preparation_failure(error.description());
+                        status = code;
+                        value
+                    }
+                }
+            }
+            (Method::POST, "/prepare") => {
+                let selection = serde_json::from_value(read_json(body).await?)
+                    .map_err(|error| kj::failed!("root selection: {error}"))?;
+                match self.registry.prepare(selection).await {
+                    Ok(ticket) => json!({"ticket": ticket.to_string()}),
+                    Err(error) => {
+                        let (code, value) = preparation_failure(error.description());
+                        status = code;
+                        value
+                    }
+                }
             }
             (Method::GET, "/state") => self.registry.snapshot(),
             (Method::POST, "/collect") => {
@@ -1980,7 +2094,7 @@ impl Service for RootRequest {
             serde_json::to_vec(&value).map_err(|error| kj::failed!("root reply: {error}"))?;
         let headers = Headers::new(header_table(&self.registry.factory));
         response
-            .send(200, "OK", &headers, Some(bytes.len() as u64))?
+            .send(status, if status == 200 { "OK" } else { "Root preparation failed" }, &headers, Some(bytes.len() as u64))?
             .write(&bytes)
             .await
     }
