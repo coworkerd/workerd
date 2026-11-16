@@ -1926,16 +1926,30 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
     ownContent = kj::mv(runtimeConfig);
   }
   KJ_IF_SOME(dynamic, impl->dynamicSource) ownContent = kj::mv(dynamic.ownContent);
+  auto rootStartup = [&](auto&& operation) {
+    try {
+      return operation();
+    } catch (const kj::Exception&) {
+      if (!spec.runtime_config.empty() && spec.load_identity.present &&
+          impl->cpuLimits->outcome() != kj::none) {
+        auto cause = impl->cpuLimits->exception();
+        kj::throwFatalException(KJ_EXCEPTION(FAILED,
+            "ROOT_TENANT_CODE: tenant startup exceeded its execution limit",
+            cause.getDescription()));
+      }
+      throw;
+    }
+  };
   auto scriptStart = api::BenchTiming::now();
-  auto script = isolate->newScript(impl->name, workerSource, IsolateObserver::StartType::COLD,
+  auto script = rootStartup([&]() { return isolate->newScript(impl->name, workerSource, IsolateObserver::StartType::COLD,
       SpanParent(nullptr), workerFs.attach(kj::mv(ownContent)), errorReporter,
-      api::pyodide::ArtifactBundler::makeDisabledBundler(), kj::mv(newModuleRegistry));
+      api::pyodide::ArtifactBundler::makeDisabledBundler(), kj::mv(newModuleRegistry)); });
   timing.script = api::BenchTiming::now() - scriptStart;
 
   // `ctx.exports` is filled in once the validator has found the entrypoints, which needs the
   // Worker constructed first; the handle is held until then.
   auto workerStart = api::BenchTiming::now();
-  auto worker = kj::atomicRefcounted<Worker>(kj::mv(script), kj::atomicRefcounted<WorkerObserver>(),
+  auto worker = rootStartup([&]() { return kj::atomicRefcounted<Worker>(kj::mv(script), kj::atomicRefcounted<WorkerObserver>(),
       [&](jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target,
           v8::Local<v8::Object> ctxExports) {
     impl->ctxExportsHandle = lock.v8Ref(ctxExports);
@@ -1946,7 +1960,7 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
     }
   },
       IsolateObserver::StartType::COLD, SpanParent(nullptr),
-      Worker::Lock::TakeSynchronously(kj::none), errorReporter);
+      Worker::Lock::TakeSynchronously(kj::none), errorReporter); });
   timing.worker = api::BenchTiming::now() - workerStart;
 
   worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none),

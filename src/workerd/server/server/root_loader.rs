@@ -307,12 +307,23 @@ impl Deployment {
 }
 
 struct Plan {
+    key: String,
     deployment: Deployment,
     lock: tokio::sync::Mutex<()>,
     generation: Cell<Option<u64>>,
     loaded: RefCell<Option<WorkerKey>>,
     retiring: RefCell<Option<Shared<LocalBoxFuture<'static, ()>>>>,
     selection_pins: Cell<usize>,
+    namespace_refs: Cell<usize>,
+    object_refs: Cell<usize>,
+    retiring_refs: Cell<usize>,
+}
+
+impl Plan {
+    fn unused(&self) -> bool {
+        self.selection_pins.get() == 0 && self.namespace_refs.get() == 0
+            && self.object_refs.get() == 0 && self.retiring_refs.get() == 0
+    }
 }
 
 struct PlanPin(Rc<Plan>, Weak<RootRegistry>);
@@ -327,7 +338,7 @@ impl Drop for PlanPin {
         self.0.selection_pins.set(self.0.selection_pins.get() - 1);
         if self.0.selection_pins.get() == 0 {
             if let Some(registry) = self.1.upgrade() {
-                registry.schedule_prune();
+                registry.schedule_prune(&self.0.key);
             }
         }
     }
@@ -369,9 +380,11 @@ pub struct RootRegistry {
     storage: String,
     install_lock: tokio::sync::Mutex<()>,
     installing: RefCell<HashMap<String, Rc<InstallFlight>>>,
+    failed_installs: RefCell<HashMap<String, Result<String>>>,
     tenant_compilations: Cell<u64>,
     removed_namespaces: RefCell<HashSet<String>>,
     collect_queued: Cell<bool>,
+    prune_pending: RefCell<Vec<String>>,
     plans: RefCell<HashMap<String, Rc<Plan>>>,
     namespaces: RefCell<HashMap<String, NamespaceEntry>>,
     closing_roots: Rc<RootCloseFences>,
@@ -396,9 +409,11 @@ impl RootRegistry {
             storage,
             install_lock: tokio::sync::Mutex::new(()),
             installing: RefCell::new(HashMap::new()),
+            failed_installs: RefCell::new(HashMap::new()),
             tenant_compilations: Cell::new(0),
             removed_namespaces: RefCell::new(HashSet::new()),
             collect_queued: Cell::new(false),
+            prune_pending: RefCell::new(Vec::new()),
             plans: RefCell::new(HashMap::new()),
             namespaces: RefCell::new(HashMap::new()),
             closing_roots: Rc::default(),
@@ -482,95 +497,75 @@ impl RootRegistry {
             .get(index)
             .is_some_and(|object| Rc::ptr_eq(&object.registration, registration));
         if matches {
-            self.objects.borrow_mut().remove(index);
-            self.schedule_prune();
+            let object = self.objects.borrow_mut().remove(index).unwrap();
+            if let Some(plan) = self.plans.borrow().get(&object.origin.plan) {
+                plan.object_refs.set(plan.object_refs.get() - 1);
+            }
+            self.schedule_prune(&object.origin.plan);
         }
     }
 
-    fn schedule_prune(&self) {
+    fn schedule_prune(&self, key: &str) {
+        if !self.plans.borrow().get(key).is_some_and(|plan| plan.unused()) { return; }
+        self.prune_pending.borrow_mut().push(key.to_owned());
         if self.collect_queued.replace(true) { return; }
         let Some(registry) = self.this.upgrade() else { return; };
         let factory = Rc::clone(&self.factory);
         let timer = Rc::clone(&factory);
         factory.spawn_detached(async move {
             timer.sleep(Duration::ZERO).await;
+            loop {
+                registry.prune_plans();
+                if registry.prune_pending.borrow().is_empty() { break; }
+                timer.sleep(Duration::from_millis(1)).await;
+            }
             registry.collect_queued.set(false);
-            registry.prune_plans();
         });
     }
 
     fn prune_plans(&self) {
-        let mut needed: HashSet<String> = self
-            .namespaces
-            .borrow()
-            .values()
-            .map(|entry| entry.source.borrow().clone())
-            .collect();
-        // The common case has no obsolete plan. Do not scan every remembered object
-        // when the last Fetcher of an ordinary request releases its pin.
-        if self.plans.borrow().iter().all(|(key, plan)| {
-            needed.contains(key) || plan.selection_pins.get() != 0
-        }) {
-            return;
-        }
-        needed.extend(
-            self.objects
-                .borrow()
-                .values()
-                .map(|object| object.origin.plan.clone()),
-        );
-        needed.extend(
-            self.retiring
-                .borrow()
-                .keys()
-                .map(|key| key.plan_key.clone()),
-        );
-        let unused: Vec<_> = self
-            .plans
-            .borrow()
-            .iter()
-            .filter(|(key, plan)| !needed.contains(*key) && plan.selection_pins.get() == 0)
-            .map(|(key, _)| key.clone())
-            .collect();
-        let mut workers = Vec::new();
-        for key in unused {
-            let platform = self
-                .plans
-                .borrow_mut()
-                .remove(&key)
-                .is_some_and(|plan| plan.deployment.is_platform());
-            let instances: Vec<_> = self
-                .compiled
-                .borrow()
-                .keys()
-                .filter(|instance| instance.plan_key == key)
-                .cloned()
-                .collect();
-            for instance in instances {
-                if let Some(worker) = self.compiled.borrow_mut().remove(&instance) {
-                    if !platform {
-                        workers.push(worker);
-                    }
+        for _ in 0..64 {
+            let Some(key) = self.prune_pending.borrow_mut().pop() else { break; };
+            if !self.plans.borrow().get(&key).is_some_and(|plan| plan.unused()) { continue; }
+            let plan = self.plans.borrow_mut().remove(&key).unwrap();
+            let instance = plan.loaded.borrow_mut().take();
+            if let Some(instance) = instance {
+                let worker = self.compiled.borrow_mut().remove(&instance);
+                if let Some(worker) = worker {
+                    if !plan.deployment.is_platform() { worker.unlink(); }
                 }
             }
         }
-        for worker in workers {
-            worker.unlink();
+    }
+
+    fn change_source(&self, entry: &NamespaceEntry, key: &str) {
+        let old = entry.source.replace(key.to_owned());
+        if old == key { return; }
+        if let Some(plan) = self.plans.borrow().get(key) {
+            plan.namespace_refs.set(plan.namespace_refs.get() + 1);
+        }
+        if let Some(plan) = self.plans.borrow().get(&old) {
+            plan.namespace_refs.set(plan.namespace_refs.get() - 1);
+        }
+        self.schedule_prune(&old);
+    }
+
+    fn forget_namespace(&self, id: &str) {
+        let entry = self.namespaces.borrow_mut().remove(id);
+        if let Some(entry) = entry {
+            let key = entry.source.borrow();
+            if let Some(plan) = self.plans.borrow().get(key.as_str()) {
+                plan.namespace_refs.set(plan.namespace_refs.get() - 1);
+            }
+            self.schedule_prune(&key);
         }
     }
 
-    fn collect_inactive(&self) {
-        let namespaces: Vec<_> = self
-            .namespaces
-            .borrow()
-            .values()
-            .map(|entry| Rc::clone(&entry.namespace))
-            .collect();
-        for namespace in namespaces {
-            namespace.prune_idle_roots();
+    fn finish_retirement(&self, key: &WorkerKey, plan: &Plan) {
+        if self.retiring.borrow_mut().remove(key).is_some() {
+            plan.retiring_refs.set(plan.retiring_refs.get() - 1);
+            self.schedule_prune(&plan.key);
         }
-        if self.objects.borrow().is_empty() { self.objects.borrow_mut().shrink_to_fit(); }
-        self.prune_plans();
     }
 
     async fn collect_inactive_in_batches(&self) {
@@ -937,6 +932,9 @@ impl RootRegistry {
         deployment.validate()?;
         self.validate_install(&deployment)?;
         let plan_key = deployment.plan_key()?;
+        if let Some(result) = self.failed_installs.borrow().get(&plan_key) {
+            return result.clone();
+        }
         if let Some(existing) = self.plans.borrow().get(&plan_key).cloned() {
             if existing.deployment != deployment {
                 return Err(kj::failed!("a root plan cannot be replaced under its existing key"));
@@ -946,7 +944,7 @@ impl RootRegistry {
                     if entry.removing.get() {
                         return Err(kj::disconnected!("root namespace removal is still in progress; retry"));
                     }
-                    *entry.source.borrow_mut() = plan_key.clone();
+                    self.change_source(entry, &plan_key);
                 }
             }
             return Ok(plan_key);
@@ -974,6 +972,11 @@ impl RootRegistry {
             self.factory.spawn_detached(async move {
                 let deployment = task.deployment.borrow().as_ref().cloned().expect("install deployment");
                 let result = registry.install_compiled((*deployment).clone(), &task).await;
+                if result.as_ref().is_err_and(|error| error.description().contains("ROOT_TENANT_CODE: ")) {
+                    let mut failures = registry.failed_installs.borrow_mut();
+                    if failures.len() >= 256 { failures.clear(); }
+                    failures.insert(key.clone(), result.clone());
+                }
                 drop(deployment);
                 task.deployment.borrow_mut().take();
                 *task.result.borrow_mut() = Some(result);
@@ -1056,12 +1059,16 @@ impl RootRegistry {
         let plan_key = deployment.plan_key()?;
         let key = deployment.key(deployment.initial_generation()?)?;
         let plan = Rc::new(Plan {
+            key: plan_key.clone(),
             deployment,
             lock: tokio::sync::Mutex::new(()),
             generation: Cell::new(Some(key.generation)),
             loaded: RefCell::new(None),
             retiring: RefCell::new(None),
             selection_pins: Cell::new(0),
+            namespace_refs: Cell::new(0),
+            object_refs: Cell::new(0),
+            retiring_refs: Cell::new(0),
         });
         let worker = self.compile(&plan.deployment, &key).await?;
         let _guard = wait_for_root(&self.factory, &plan.deployment.namespaces[0].id, "",
@@ -1085,8 +1092,13 @@ impl RootRegistry {
             }
             return Err(error);
         }
-        for entry in spaces.values() {
-            *entry.source.borrow_mut() = plan_key.clone();
+        self.plans.borrow_mut().insert(plan_key.clone(), Rc::clone(&plan));
+        for (id, entry) in &spaces {
+            if self.namespaces.borrow().contains_key(id) {
+                self.change_source(entry, &plan_key);
+            } else {
+                plan.namespace_refs.set(plan.namespace_refs.get() + 1);
+            }
         }
         self.namespaces.borrow_mut().extend(spaces);
         assert!(
@@ -1097,7 +1109,6 @@ impl RootRegistry {
             "root instance key collision"
         );
         *plan.loaded.borrow_mut() = Some(key);
-        self.plans.borrow_mut().insert(plan_key.clone(), plan);
         self.prune_plans();
         Ok(plan_key)
     }
@@ -1306,7 +1317,7 @@ impl RootRegistry {
             .filter(|old| old.origin.plan == selection.plan)
             .map(|old| Rc::clone(&old.registration))
             .unwrap_or_else(|| Rc::new(()));
-        self.objects.borrow_mut().insert(
+        let old = self.objects.borrow_mut().insert(
             index.clone(),
             RootObject {
                 origin: RootOrigin::from(&selection),
@@ -1314,6 +1325,17 @@ impl RootRegistry {
                 registration: Rc::clone(&registration),
             },
         );
+        if old.as_ref().is_none_or(|old| old.origin.plan != selection.plan) {
+            if let Some(plan) = self.plans.borrow().get(&selection.plan) {
+                plan.object_refs.set(plan.object_refs.get() + 1);
+            }
+            if let Some(old) = old {
+                if let Some(plan) = self.plans.borrow().get(&old.origin.plan) {
+                    plan.object_refs.set(plan.object_refs.get() - 1);
+                }
+                self.schedule_prune(&old.origin.plan);
+            }
+        }
         let result = match selection.alarm_facet_id {
             Some(facet) => namespace.root_alarm_channel(id, facet, selection.preparation_nonce),
             None => namespace.root_channel(id, selection.preparation_nonce),
@@ -1355,6 +1377,7 @@ impl RootRegistry {
             .remove(key)
             .expect("matched root instance");
         *plan.loaded.borrow_mut() = None;
+        plan.retiring_refs.set(plan.retiring_refs.get() + 1);
         assert!(
             self.retiring
                 .borrow_mut()
@@ -1407,8 +1430,8 @@ impl RootRegistry {
                 )
                 .await;
                 worker.unlink();
-                registry.retiring.borrow_mut().remove(&key);
-                registry.collect_inactive();
+                registry.finish_retirement(&key, &plan);
+                registry.collect_inactive_in_batches().await;
             });
             return true;
         }
@@ -1468,10 +1491,10 @@ impl RootRegistry {
                 );
                 *plan.loaded.borrow_mut() = Some(key.clone());
             }
-            registry.retiring.borrow_mut().remove(&key);
+            registry.finish_retirement(&key, &plan);
             plan.retiring.borrow_mut().take();
-            registry.collect_inactive_in_batches().await;
             let _ = done.send(());
+            registry.collect_inactive_in_batches().await;
         });
         true
     }
@@ -1503,6 +1526,8 @@ impl RootRegistry {
             "key": *plan.loaded.borrow(), "namespaces": plan.deployment.namespaces,
             "kind": plan.deployment.kind, "tenant": plan.deployment.owner_tenant().ok(),
             "platformClass": plan.deployment.platform_class,
+            "references": {"namespaces": plan.namespace_refs.get(), "objects": plan.object_refs.get(),
+                "retiring": plan.retiring_refs.get(), "pins": plan.selection_pins.get()},
             "configuredWorker": if plan.deployment.is_platform() {
                 self.loaded(plan).map(|worker| format!("{:p}", Rc::as_ptr(&worker)))
             } else { None },
@@ -2034,7 +2059,15 @@ impl Service for RootRequest {
                 let deployment = serde_json::from_value(read_json(body).await?)
                     .map_err(|error| kj::failed!("root deployment: {error}"))?;
                 match self.registry.install(deployment).await {
-                    Ok(plan) => json!({"plan": plan, "state": self.registry.snapshot()}),
+                    Ok(plan) => {
+                        let plans = self.registry.plans.borrow();
+                        let installed = plans.get(&plan).expect("installed plan");
+                        json!({"plan": plan, "info": {"kind": installed.deployment.kind,
+                            "tenant": installed.deployment.owner_tenant().ok(), "workerId": installed.deployment.worker_id,
+                            "configuredWorker": if installed.deployment.is_platform() {
+                                self.registry.loaded(installed).map(|worker| format!("{:p}", Rc::as_ptr(&worker)))
+                            } else { None }, "platformClass": installed.deployment.platform_class}})
+                    },
                     Err(error) => {
                         tracing::error!("root installation: {error:?}");
                         let (code, value) = preparation_failure(error.description());
@@ -2046,7 +2079,7 @@ impl Service for RootRequest {
             (Method::GET, "/state") => self.registry.snapshot(),
             (Method::POST, "/collect") => {
                 self.registry.collect_inactive_in_batches().await;
-                self.registry.snapshot()
+                json!({"collected": true})
             }
             (Method::POST, "/remove-namespace") => {
                 let value = read_json(body).await?;
@@ -2078,7 +2111,7 @@ impl Service for RootRequest {
                                     Rc::ptr_eq(&entry.namespace, &old.namespace)
                                 });
                             if matches {
-                                registry.namespaces.borrow_mut().remove(&id);
+                                registry.forget_namespace(&id);
                             }
                             registry.prune_plans();
                         });
@@ -2118,7 +2151,7 @@ impl Service for RootRequest {
                     }
                 }
                 self.registry.prune_plans();
-                json!({"removed": removed, "state": self.registry.snapshot()})
+                json!({"removed": removed})
             }
             (Method::POST, "/hibernate") => {
                 let namespaces: Vec<_> = self
