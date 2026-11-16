@@ -103,6 +103,8 @@ struct RootSelection {
     #[serde(default)]
     trial: bool,
     #[serde(default)]
+    root_trial: bool,
+    #[serde(default)]
     classes: Vec<String>,
 }
 
@@ -770,7 +772,7 @@ impl RootRegistry {
         }
         let props = if selection.trial {
             ffi::frankenvalue_from_json(&if plan.deployment.structured_props {
-                json!({"trial": true,
+                json!({"trial": true, "rootTrial": selection.root_trial,
                     "entrypoint": if selection.entrypoint.is_empty() { "default" } else { &selection.entrypoint },
                     "classes": selection.classes})
             } else { json!({"coworkerd:trial": true}) }.to_string())
