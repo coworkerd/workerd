@@ -931,8 +931,10 @@ impl RootRegistry {
         let record = deployment.record()?;
         let identity = ffi::CoworkerdLoadIdentity {
             startup_identity: if deployment.is_plain() {
-                json!({"workerId": deployment.worker_id, "versionId": deployment.version_id,
-                    "invocationId": format!("load:{}:{}", deployment.version_fingerprint, key.generation)}).to_string()
+                let identity = json!({"workerId": deployment.worker_id, "versionId": deployment.version_id,
+                    "invocationId": format!("load:{}:{}", deployment.version_fingerprint, key.generation)}).to_string();
+                // The existing accounting scope takes JSON fields with a trailing comma.
+                format!("{},", &identity[1..identity.len() - 1])
             } else { record.startup_identity.clone() },
             present: true,
             tenant: record.tenant.clone(),
