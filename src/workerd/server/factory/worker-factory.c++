@@ -1963,8 +1963,10 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
       Worker::Lock::TakeSynchronously(kj::none), errorReporter); });
   timing.worker = api::BenchTiming::now() - workerStart;
 
-  worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none),
-      [&](Worker::Lock& lock) { lock.validateHandlers(errorReporter); });
+  rootStartup([&]() {
+    worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none),
+        [&](Worker::Lock& lock) { lock.validateHandlers(errorReporter); });
+  });
   timing.total = api::BenchTiming::now() - startTime;
 
   impl->info = WorkerInfo{
