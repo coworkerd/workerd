@@ -1407,16 +1407,18 @@ impl RootRegistry {
         // Graceful evictions run concurrently. Caller deadlines do not cancel this task.
         self.factory.spawn_detached(async move {
             let mut completed = true;
-            let results =
-                futures::future::join_all(roots.iter().map(|(namespace, storage_key)| {
-                    let factory = Rc::clone(&registry.factory);
-                    async move {
+            let mut closing = Vec::with_capacity(roots.len());
+            for (index, (namespace, storage_key)) in roots.iter().enumerate() {
+                let factory = Rc::clone(&registry.factory);
+                let namespace = Rc::clone(namespace);
+                let storage_key = storage_key.clone();
+                closing.push(registry.factory.spawn(async move {
                         let result = wait_for_root(
                             &factory,
                             namespace.unique_key().unwrap_or_default(),
-                            storage_key,
+                            &storage_key,
                             "idle tree retirement",
-                            namespace.evict_root_for_unload(storage_key),
+                            namespace.evict_root_for_unload(&storage_key),
                         )
                         .await?;
                         if let Err(error) = &result {
@@ -1427,9 +1429,13 @@ impl RootRegistry {
                             );
                         }
                         result
-                    }
-                }))
-                .await;
+                }));
+                // Start independent closes gradually; one slow hook does not hold later roots.
+                if (index + 1) % 16 == 0 {
+                    registry.factory.sleep(Duration::from_millis(1)).await;
+                }
+            }
+            let results = futures::future::join_all(closing).await;
             for result in results {
                 if let Err(error) = result {
                     tracing::error!("retiring idle root: {error:?}");
