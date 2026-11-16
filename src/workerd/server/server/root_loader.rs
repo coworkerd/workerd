@@ -350,6 +350,7 @@ struct Plan {
     deployment: Deployment,
     lock: tokio::sync::Mutex<()>,
     generation: Cell<Option<u64>>,
+    reported_plain_generation: Cell<Option<u64>>,
     loaded: RefCell<Option<WorkerKey>>,
     retiring: RefCell<Option<Shared<LocalBoxFuture<'static, ()>>>>,
     selection_pins: Cell<usize>,
@@ -746,7 +747,7 @@ impl RootRegistry {
         let previous = if selection.active_plan {
             let mut latest = self.latest_plain.borrow_mut();
             let previous = latest.get(&plan.deployment.worker_id);
-            if previous.is_none_or(|(generation, _)| selection.catalog_generation >= *generation) {
+            if previous.is_none_or(|(generation, _)| selection.catalog_generation > *generation) {
                 let changed = previous.is_none_or(|(_, key)| key != &selection.plan);
                 if changed || previous.is_some_and(|(generation, _)| *generation != selection.catalog_generation) {
                     latest.insert(plan.deployment.worker_id.clone(), (selection.catalog_generation, selection.plan.clone()))
@@ -1261,6 +1262,7 @@ impl RootRegistry {
             deployment,
             lock: tokio::sync::Mutex::new(()),
             generation: Cell::new(Some(key.generation)),
+            reported_plain_generation: Cell::new(None),
             loaded: RefCell::new(None),
             retiring: RefCell::new(None),
             selection_pins: Cell::new(0),
@@ -2324,8 +2326,11 @@ impl Service for RootRequest {
                     Ok(plan) => {
                         let plans = self.registry.plans.borrow();
                         if let Some(installed) = plans.get(&plan) {
+                        let cold = installed.deployment.is_plain() &&
+                            installed.reported_plain_generation.replace(installed.generation.get()) != installed.generation.get();
                         json!({"plan": plan, "info": {"kind": installed.deployment.kind,
                             "loaded": installed.loaded.borrow().is_some(), "generation": installed.generation.get(),
+                            "cold": cold,
                             "tenant": installed.deployment.owner_tenant().ok(), "workerId": installed.deployment.worker_id,
                             "configuredWorker": if installed.deployment.is_platform() {
                                 self.registry.loaded(installed).map(|worker| format!("{:p}", Rc::as_ptr(&worker)))
@@ -2470,6 +2475,10 @@ impl Service for RootRequest {
                     .find(|(key, _)| key == "plan")
                     .map(|(_, value)| value.into_owned())
                     .ok_or_else(|| kj::failed!("invoke needs a plan"))?;
+                if self.registry.plans.borrow().get(&plan)
+                    .is_some_and(|plan| plan.deployment.is_plain()) {
+                    return Err(kj::failed!("ordinary worker plans require the private selection entry"));
+                }
                 let worker = self.registry.worker(&plan).await?;
                 let metadata = self
                     .metadata

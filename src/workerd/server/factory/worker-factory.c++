@@ -2071,7 +2071,10 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
 }
 
 void worker_retire_when_idle(const CompiledWorker& worker) {
-  idleWorkerRetireWhenIdle(worker.getImpl().idleWorker);
+  auto& impl = worker.getImpl();
+  idleWorkerRetireWhenIdle(impl.idleWorker, [target = &impl]() {
+    return target->waitUntilTasks.isEmpty();
+  });
 }
 
 void worker_unlink(const CompiledWorker& worker) {
