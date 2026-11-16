@@ -804,6 +804,11 @@ impl WorkerService {
         Ok(())
     }
 
+    pub fn retire_when_idle(&self) -> Result<()> {
+        ffi::worker_retire_when_idle(&self.worker)?;
+        Ok(())
+    }
+
     /// The designators awaiting the link stage. Taken once, by the server's third pass.
     pub fn take_pending_link(&self) -> Option<PendingLink> {
         self.pending.borrow_mut().take()

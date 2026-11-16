@@ -1866,7 +1866,7 @@ async fn make_service(
                 ));
             }
             let storage = text(conf.get_storage_path())?;
-            crate::root_loader::RootRegistry::new(Rc::clone(factory), storage)
+            crate::root_loader::RootRegistry::new(Rc::clone(factory), storage, conf.get_plain_only())
                 .map(Service::RootLoader)
         }
         // Made once the cluster is joined (`make_bucket_services`).

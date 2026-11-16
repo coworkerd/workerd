@@ -94,6 +94,8 @@ struct IdleWorker {
   uint64_t id;
   uint32_t active = 0;
   bool ready = false, removed = false, created = false, destroyed = false, eligible = true;
+  bool retireWhenIdle = false;
+  IdleWorkerLabels labels;
   double lastEnd = monotonicMs(), loadStart = lastEnd, teardownStart = 0;
   uint64_t loadCpu = cpuNs();
   kj::String reason = kj::str("");
@@ -107,6 +109,14 @@ struct IdleWorker {
       : owner(owner), name(kj::str(name)), remove(kj::mv(remove)), id(id) {}
 };
 
+kj::String labelFields(const IdleWorkerLabels& labels) {
+  return kj::str(",\"tenant\":", escapeCpuJsonString(labels.tenant),
+      ",\"workerId\":", escapeCpuJsonString(labels.workerId),
+      ",\"versionId\":", escapeCpuJsonString(labels.versionId),
+      ",\"planRevision\":", escapeCpuJsonString(labels.planRevision),
+      ",\"loadGeneration\":", labels.loadGeneration);
+}
+
 class IdleReaper {
  public:
   explicit IdleReaper(kj::Timer& timer)
@@ -115,10 +125,14 @@ class IdleReaper {
     KJ_REQUIRE(interval > 0, "COWORKERD_IDLE_DESTROY_INTERVAL_MS must be positive");
     publishedBand = inheritedBand();
     publish();
-    if (threshold || publishedBand || gcSettings().observes()) task = loop().eagerlyEvaluate(nullptr);
+    if (threshold || publishedBand || gcSettings().observes()) startLoop();
     if (gcSettings().idleCollectMs) collectTask = collectLoop().eagerlyEvaluate(nullptr);
   }
   kj::Timer& timer;
+  bool loopStarted = false, retirementRequested = false;
+  void startLoop() {
+    if (!loopStarted) {loopStarted = true; task = loop().eagerlyEvaluate(nullptr);}
+  }
   uint32_t threshold, interval;
   uint64_t nextId = 1, created = 0, destroyed = 0, evicted = 0, failed = 0, pending = 0;
   uint64_t watermarkEvicted = 0, bandReads = 0, bandReadNs = 0;
@@ -134,6 +148,7 @@ class IdleReaper {
   void event(const IdleWorker& worker, kj::StringPtr event, double elapsed = 0, uint64_t cpu = 0) {
     emit(kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":",
         escapeCpuJsonString(worker.name), ",\"instance\":", worker.id,
+        labelFields(worker.labels),
         ",\"pid\":", coworkerdPid(), ",\"monotonicMs\":", monotonicMs(),
         ",\"active\":", worker.active, ",\"lastEndMs\":", worker.lastEnd,
         ",\"reason\":", escapeCpuJsonString(worker.reason), ",\"elapsedMs\":", elapsed,
@@ -149,7 +164,8 @@ class IdleReaper {
     for (auto it = workers.begin(); it != workers.end();) {
       if (auto worker = it->lock()) {
         if (worker->created && !worker->destroyed) entries.add(kj::str(
-            "{\"isolate\":", escapeCpuJsonString(worker->name), ",\"instance\":", worker->id, "}"));
+            "{\"isolate\":", escapeCpuJsonString(worker->name), ",\"instance\":", worker->id,
+            labelFields(worker->labels), "}"));
         ++it;
       } else {
         it = workers.erase(it);
@@ -252,15 +268,17 @@ class IdleReaper {
         lastPublish = monotonicMs();
       }
       auto minimum = effectiveThreshold();
-      if (!minimum || pending || monotonicMs() - lastDestroy < interval) continue;
+      if ((!minimum && !retirementRequested) || pending || monotonicMs() - lastDestroy < interval) continue;
       IdleWorkerRef oldest;
       auto now = monotonicMs();
+      retirementRequested = false;
       for (auto it = workers.begin(); it != workers.end();) {
         auto worker = it->lock();
         if (!worker) { it = workers.erase(it); continue; }
         ++it;
+        if (worker->retireWhenIdle && !worker->removed) retirementRequested = true;
         if (!worker->eligible || !worker->ready || !worker->created || worker->removed || worker->active ||
-            now - worker->lastEnd <= minimum) continue;
+            (!worker->retireWhenIdle && (!minimum || now - worker->lastEnd <= minimum))) continue;
         if (!oldest || worker->lastEnd < oldest->lastEnd) oldest = kj::mv(worker);
       }
       if (oldest) {
@@ -269,7 +287,8 @@ class IdleReaper {
         KJ_IF_SOME(cb, oldest->remove) {
           auto remove = kj::mv(cb);
           oldest->remove = kj::none;
-          idleWorkerRemoved(oldest, threshold && now - oldest->lastEnd > threshold ? "idle" : "watermark");
+          idleWorkerRemoved(oldest, oldest->retireWhenIdle ? "superseded" :
+              threshold && now - oldest->lastEnd > threshold ? "idle" : "watermark");
           remove();
         }
       }
@@ -281,11 +300,17 @@ std::shared_ptr<IdleReaper> idleReaper(kj::Timer& timer) {
   return std::make_shared<IdleReaper>(timer);
 }
 IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
-    kj::StringPtr name, kj::Function<void()> remove, bool eligible) {
+    kj::StringPtr name, kj::Function<void()> remove, bool eligible, IdleWorkerLabels labels) {
   auto worker = std::make_shared<IdleWorker>(reaper, name, kj::mv(remove), reaper->nextId++);
   reaper->workers.push_back(worker);
   worker->eligible = eligible;
+  worker->labels = std::move(labels);
   return worker;
+}
+void idleWorkerRetireWhenIdle(const IdleWorkerRef& worker) {
+  if (!worker || worker->removed) return;
+  worker->retireWhenIdle = true;
+  if (auto owner = worker->owner.lock()) {owner->retirementRequested = true; owner->startLoop();}
 }
 void idleWorkerReady(const IdleWorkerRef& worker) {
   if (worker) { worker->ready = true; worker->lastEnd = monotonicMs(); }

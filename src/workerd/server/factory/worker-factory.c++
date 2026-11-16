@@ -1681,11 +1681,13 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
   auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
   impl->isDynamic = dynamicSource != kj::none;
   if (spec.load_identity.present) {
+    const auto& identity = spec.load_identity;
     impl->idleWorker = registerIdleWorker(factory.idleReaper, impl->name,
         [target = impl.get()]() {
       KJ_IF_SOME(channels, target->idleChannels) channels->abort_isolate("idle");
-    }, spec.load_identity.present);
-    const auto& identity = spec.load_identity;
+    }, spec.load_identity.present, IdleWorkerLabels{
+        kj::str(identity.tenant), kj::str(identity.worker_id), kj::str(identity.version_id),
+        kj::str(spec.name), identity.generation});
     impl->coworkerdIdentity = CoworkerdWorkerIdentity{kj::str(identity.tenant),
       kj::str(identity.worker_id), kj::str(identity.version_id), identity.generation,
       identity.cpu_limit_ms, identity.memory_limit_mib};
@@ -2066,6 +2068,10 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
       return collectIdleIsolate(kj::atomicAddRef(*ref), kj::mv(gc), kj::mv(stillIdle));
     });
   }
+}
+
+void worker_retire_when_idle(const CompiledWorker& worker) {
+  idleWorkerRetireWhenIdle(worker.getImpl().idleWorker);
 }
 
 void worker_unlink(const CompiledWorker& worker) {

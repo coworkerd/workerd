@@ -463,6 +463,8 @@ struct Service {
 struct CoworkerdRootLoader {
   storagePath @0 :Text;
   # The trusted process configuration's writable root storage directory.
+  plainOnly @1 :Bool = false;
+  # Ordinary process roles accept only namespace-free tenant plans.
 }
 
 struct ClusterBucket {

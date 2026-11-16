@@ -5,16 +5,23 @@
 #include <kj/async.h>
 #include <kj/function.h>
 #include <kj/timer.h>
+#include <cstdint>
 #include <memory>
 
 namespace workerd::server {
 class IdleReaper;
 struct IdleWorker;
 using IdleWorkerRef = std::shared_ptr<IdleWorker>;
+struct IdleWorkerLabels {
+  kj::String tenant, workerId, versionId, planRevision;
+  uint64_t loadGeneration = 0;
+};
 
 std::shared_ptr<IdleReaper> idleReaper(kj::Timer& timer);
 IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
-    kj::StringPtr name, kj::Function<void()> remove, bool eligible = true);
+    kj::StringPtr name, kj::Function<void()> remove, bool eligible = true,
+    IdleWorkerLabels labels = {});
+void idleWorkerRetireWhenIdle(const IdleWorkerRef& worker);
 void idleWorkerReady(const IdleWorkerRef& worker);
 void idleWorkerFailed(const IdleWorkerRef& worker);
 void idleWorkerRemoved(const IdleWorkerRef& worker, kj::StringPtr reason);
