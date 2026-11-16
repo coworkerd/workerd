@@ -1008,6 +1008,13 @@ impl RootRegistry {
                 .any(|namespace| !worker.has_actor_class(&namespace.class_name))
         {
             worker.unlink();
+            if deployment.is_plain() {
+                let prefix = format!("service {service_name}: ");
+                let errors = errors.borrow().iter()
+                    .map(|error| error.strip_prefix(&prefix).unwrap_or(error).to_owned())
+                    .collect::<Vec<_>>().join("\n");
+                return Err(kj::failed!("ROOT_TENANT_CODE: Failed to start Worker:\n{errors}"));
+            }
             return Err(kj::failed!(
                 "ROOT_TENANT_CODE: root worker failed to compile or is missing an exported class: {}",
                 errors.borrow().join("; ")
