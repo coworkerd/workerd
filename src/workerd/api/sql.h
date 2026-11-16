@@ -51,9 +51,9 @@ class SqlStorage final: public jsg::Object {
 
   JSG_RESOURCE_TYPE(SqlStorage, CompatibilityFlags::Reader flags) {
     JSG_METHOD(exec);
-    JSG_METHOD(abortExecutionLimit);
 
     if (flags.getWorkerdExperimental()) {
+      JSG_METHOD(abortExecutionLimit);
       // Prepared statement API is experimental-only and deprecated. exec() will automatically
       // handle caching prepared statements, so apps don't need to worry about it.
       JSG_METHOD(prepare);

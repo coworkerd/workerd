@@ -347,6 +347,8 @@ class RequestLimits final: public LimitEnforcer {
     kj::Promise<void> limitDrain() override { return fallback->limitDrain(); }
     kj::Promise<void> limitScheduled() override { return fallback->limitScheduled(); }
     kj::Duration getAlarmLimit() override { return fallback->getAlarmLimit(); }
+    kj::Duration getOnHibernateLimit() override { return fallback->getOnHibernateLimit(); }
+    void limitOnHibernateCpu() override { fallback->limitOnHibernateCpu(); }
     size_t getBufferingLimit() override { return fallback->getBufferingLimit(); }
     kj::Maybe<EventOutcome> getLimitsExceeded() override {
       return accounting ? limits->outcome() : fallback->getLimitsExceeded();
@@ -392,7 +394,8 @@ kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
   const bool accounting = limits.isEnabled() || limits.memoryIdentityWanted() ||
       limits.reportsCompletion() || limits.activity();
   if (!accounting && !(isActor && SqlExecutionBudget::isEnabled())) return fallback;
-  return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata),
+  return kj::heap<RequestLimits>(kj::mv(fallback), limits,
+      accounting ? limits.identity(metadata) : kj::str(""),
       kj::mv(abortIsolate), isActor, accounting ? RequestLimits::Accounting::ENABLED
           : RequestLimits::Accounting::SQL_ONLY);
 }

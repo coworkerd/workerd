@@ -36,7 +36,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
-#include <random>
 
 namespace workerd {
 
@@ -91,8 +90,7 @@ kj::String SqlExecutionBudget::describe() const {
 
 bool SqliteDatabase::sampleSqlExecution() {
   if (executionRandomState == 0) {
-    std::random_device entropy;
-    executionRandomState = (uint64_t(entropy()) << 32) | entropy();
+    getEntropy(kj::asBytes(executionRandomState));
     if (executionRandomState == 0) executionRandomState = 0x9e3779b97f4a7c15ull;
   }
   auto value = executionRandomState;
@@ -1272,6 +1270,8 @@ void SqliteDatabase::reset() {
 
     sqlite3_progress_handler(&db, 0, nullptr, nullptr);
     auto err = sqlite3_close(&db);
+    if (err != SQLITE_OK)
+      sqlite3_progress_handler(&db, SQL_PROGRESS_INSTRUCTIONS, &progressCallback, this);
     KJ_REQUIRE(err == SQLITE_OK, "can't reset() database because dependent objects still exist",
         sqlite3_errstr(err));
 
@@ -2006,9 +2006,7 @@ void SqliteDatabase::Query::nextRow(bool first) {
 
   ExecutionScope execution(db, regulator);
   if (execution.check(ExecutionScope::CheckMode::BOUNDARY)) {
-    if (first)
-      kj::throwRecoverableException(regulator->sqlExecutionLimitException(*execution.budget));
-    sqlite3_interrupt(db);  // A suspended cursor is still an active SQLite VM.
+    kj::throwRecoverableException(regulator->sqlExecutionLimitException(*execution.budget));
   }
 
   // SQLite carries this counter across cached runs. Align its callback cadence with
