@@ -221,6 +221,14 @@ class CompiledWorker final {
 WorkerInfo worker_info(const CompiledWorker& worker);
 void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const uint64_t> globals);
 void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory> channels);
+// A private selection owns ordinary idle activity until its channel is released.
+class WorkerSelectionActivity final {
+ public:
+  explicit WorkerSelectionActivity(kj::Own<void> activity): activity(kj::mv(activity)) {}
+ private:
+  kj::Own<void> activity;
+};
+kj::Own<WorkerSelectionActivity> worker_selection_activity(const CompiledWorker& worker);
 void worker_retire_when_idle(const CompiledWorker& worker);
 void worker_unlink(const CompiledWorker& worker);
 kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,

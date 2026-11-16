@@ -1187,6 +1187,7 @@ kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
   coworkerdServing();
   TRACE_EVENT("workerd", "worker_start_request()");
   auto& impl = worker.getImpl();
+  idleWorkerObserveBackground(impl.idleWorker, [target = &impl]() { return target->waitUntilTasks.isEmpty(); });
   auto entrypointName = toKj(entrypoint);
   Frankenvalue propsValue;
   KJ_IF_SOME(p, props) propsValue = kj::mv(*p);
@@ -2057,6 +2058,7 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
   auto& impl = worker.getImpl();
   impl.idleChannels = kj::mv(channels);
   impl.idleReady = true;
+  idleWorkerObserveBackground(impl.idleWorker, [target = &impl]() { return target->waitUntilTasks.isEmpty(); });
   idleWorkerReady(impl.idleWorker);
   if (impl.idleWorker && gcSettings().idleCollectMs) {
     // The collector holds the Worker, not the Impl. Its observer holds idleWorker;
@@ -2068,6 +2070,10 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
       return collectIdleIsolate(kj::atomicAddRef(*ref), kj::mv(gc), kj::mv(stillIdle));
     });
   }
+}
+
+kj::Own<WorkerSelectionActivity> worker_selection_activity(const CompiledWorker& worker) {
+  return kj::heap<WorkerSelectionActivity>(idleActivity(worker.getImpl().idleWorker));
 }
 
 void worker_retire_when_idle(const CompiledWorker& worker) {

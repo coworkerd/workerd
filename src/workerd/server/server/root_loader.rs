@@ -96,6 +96,14 @@ struct RootSelection {
     catalog_generation: u64,
     #[serde(default)]
     active_plan: bool,
+    #[serde(default)]
+    service_versions: std::collections::BTreeMap<String, Value>,
+    #[serde(default)]
+    durable_object_bindings: std::collections::BTreeMap<String, Value>,
+    #[serde(default)]
+    trial: bool,
+    #[serde(default)]
+    classes: Vec<String>,
 }
 
 #[derive(Clone, Default, Deserialize, PartialEq)]
@@ -410,6 +418,7 @@ struct NamespaceEntry {
 }
 
 struct InstallFlight {
+    startup_identity: String,
     deployment: RefCell<Option<Rc<Deployment>>>,
     namespaces: Vec<String>,
     cancelled: Cell<bool>,
@@ -759,42 +768,76 @@ impl RootRegistry {
             let old = self.plans.borrow().get(&previous).cloned();
             if let Some(worker) = old.as_ref().and_then(|old| self.loaded(old)) { worker.retire_when_idle()?; }
         }
-        let mut services = ffi::frankenvalue_new();
-        let mut objects = ffi::frankenvalue_from_json("[]");
-        let call = |target: &RootTarget| -> Value {
-            let mut props = target.props.clone();
-            if !props.is_object() { props = json!({}); }
-            props["treeId"] = selection.tenant_cf["treeId"].clone();
-            props["parentInvocationId"] = selection.tenant_cf["invocationId"].clone();
-            props["orderSequence"] = selection.tenant_cf["orderSequence"].clone();
-            props["expiresAtMonotonicMs"] = selection.tenant_cf["lease"]["expiresAtMonotonicMs"].clone();
-            props["requiresChildSequence"] = json!(selection.requires_child_sequence);
-            props
-        };
-        for binding in &plan.deployment.service_bindings {
-            let name = binding.metadata["name"].as_str().ok_or_else(|| kj::failed!("ordinary service name missing"))?;
-            ffi::frankenvalue_set_service_stub(services.pin_mut(), name,
-                crate::channels::SubrequestChannel::new(self.target(&binding.target, &call(&binding.target))?));
-        }
-        for (index, binding) in plan.deployment.durable_objects.iter().enumerate() {
-            let mut entry = ffi::frankenvalue_from_json(&binding.metadata.to_string());
-            let available = binding.metadata["namespaceId"].as_str().is_some_and(|id| !id.is_empty());
-            if available {
-                ffi::frankenvalue_set_service_stub(entry.pin_mut(), "fetcher",
-                    crate::channels::SubrequestChannel::new(self.target(&binding.target, &call(&binding.target))?));
+        let props = if selection.trial {
+            ffi::frankenvalue_from_json(&if plan.deployment.structured_props {
+                json!({"trial": true,
+                    "entrypoint": if selection.entrypoint.is_empty() { "default" } else { &selection.entrypoint },
+                    "classes": selection.classes})
+            } else { json!({"coworkerd:trial": true}) }.to_string())
+        } else {
+            if selection.service_versions.keys().any(|name| !plan.deployment.service_bindings.iter()
+                    .any(|binding| binding.metadata["name"].as_str() == Some(name))) ||
+                selection.durable_object_bindings.keys().any(|name| !plan.deployment.durable_objects.iter()
+                    .any(|binding| binding.metadata["binding"].as_str() == Some(name))) {
+                return Err(kj::failed!("ordinary selection contains an undeclared binding"));
             }
-            ffi::frankenvalue_set_value(objects.pin_mut(), &index.to_string(), entry);
-        }
-        let props = if plan.deployment.structured_props {
-            let mut props = ffi::frankenvalue_from_json(&json!({"entrypoint": if selection.entrypoint.is_empty() { "default" } else { &selection.entrypoint }}).to_string());
-            ffi::frankenvalue_set_value(props.pin_mut(), "bindings", services);
-            ffi::frankenvalue_set_value(props.pin_mut(), "durableObjects", objects);
-            props
-        } else { services };
+            let mut services = ffi::frankenvalue_new();
+            let mut objects = ffi::frankenvalue_from_json("[]");
+            let call = |target: &RootTarget| -> Value {
+                let mut props = target.props.clone();
+                if !props.is_object() { props = json!({}); }
+                props["treeId"] = selection.tenant_cf["treeId"].clone();
+                props["parentInvocationId"] = selection.tenant_cf["invocationId"].clone();
+                props["orderSequence"] = selection.tenant_cf["orderSequence"].clone();
+                props["expiresAtMonotonicMs"] = selection.tenant_cf["lease"]["expiresAtMonotonicMs"].clone();
+                props["requiresChildSequence"] = json!(selection.requires_child_sequence);
+                props
+            };
+            for binding in &plan.deployment.service_bindings {
+                let name = binding.metadata["name"].as_str().ok_or_else(|| kj::failed!("ordinary service name missing"))?;
+                let version = selection.service_versions.get(name)
+                    .ok_or_else(|| kj::failed!("ordinary service version missing"))?;
+                if version["workerId"] != binding.target.props["workerId"] {
+                    return Err(kj::failed!("ordinary service version belongs to a different Worker"));
+                }
+                let mut props = call(&binding.target);
+                for field in ["versionId", "contentHash", "definitionHash"] {
+                    if !version[field].as_str().is_some_and(|value| !value.is_empty()) {
+                        return Err(kj::failed!("ordinary service version field missing"));
+                    }
+                    props[field] = version[field].clone();
+                }
+                ffi::frankenvalue_set_service_stub(services.pin_mut(), name,
+                    crate::channels::SubrequestChannel::new(self.target(&binding.target, &props)?));
+            }
+            for (index, binding) in plan.deployment.durable_objects.iter().enumerate() {
+                let name = binding.metadata["binding"].as_str().ok_or_else(|| kj::failed!("ordinary object binding missing"))?;
+                let resolved = selection.durable_object_bindings.get(name)
+                    .ok_or_else(|| kj::failed!("ordinary object binding resolution missing"))?;
+                let mut metadata = binding.metadata.clone();
+                metadata["namespaceId"] = resolved["namespaceId"].clone();
+                metadata["objectId"] = resolved["objectId"].clone();
+                let mut entry = ffi::frankenvalue_from_json(&metadata.to_string());
+                if resolved["namespaceId"].as_str().is_some_and(|id| !id.is_empty()) {
+                    let mut props = call(&binding.target);
+                    props["namespaceId"] = resolved["namespaceId"].clone();
+                    ffi::frankenvalue_set_service_stub(entry.pin_mut(), "fetcher",
+                        crate::channels::SubrequestChannel::new(self.target(&binding.target, &props)?));
+                }
+                ffi::frankenvalue_set_value(objects.pin_mut(), &index.to_string(), entry);
+            }
+            if plan.deployment.structured_props {
+                let mut props = ffi::frankenvalue_from_json(&json!({"entrypoint": if selection.entrypoint.is_empty() { "default" } else { &selection.entrypoint }}).to_string());
+                ffi::frankenvalue_set_value(props.pin_mut(), "bindings", services);
+                ffi::frankenvalue_set_value(props.pin_mut(), "durableObjects", objects);
+                props
+            } else { services }
+        };
         let entrypoint = worker.entrypoint(None, Some(props), false)
             .ok_or_else(|| kj::failed!("ordinary bridge has no default entrypoint"))?;
         Ok(Rc::new(PlainSelectedChannel {registry: self.this.upgrade().ok_or_else(|| kj::disconnected!("root registry gone"))?,
-            selection, entrypoint, _pin: PlanPin::new(plan, self.this.clone())}))
+            selection, entrypoint, _activity: worker.selection_activity(),
+            _pin: PlanPin::new(plan, self.this.clone())}))
     }
 
     fn stamp_metadata(
@@ -834,7 +877,7 @@ impl RootRegistry {
         Ok(())
     }
 
-    async fn compile(&self, deployment: &Deployment, key: &WorkerKey) -> Result<Rc<WorkerService>> {
+    async fn compile(&self, deployment: &Deployment, key: &WorkerKey, startup_identity: &str) -> Result<Rc<WorkerService>> {
         if let Some(class) = &deployment.platform_class {
             return self
                 .server
@@ -931,7 +974,9 @@ impl RootRegistry {
         };
         let record = deployment.record()?;
         let identity = ffi::CoworkerdLoadIdentity {
-            startup_identity: if deployment.is_plain() {
+            startup_identity: if deployment.is_plain() && !startup_identity.is_empty() {
+                startup_identity.to_owned()
+            } else if deployment.is_plain() {
                 let identity = json!({"workerId": deployment.worker_id, "versionId": deployment.version_id,
                     "invocationId": format!("load:{}:{}", deployment.version_fingerprint, key.generation)}).to_string();
                 // The existing accounting scope takes JSON fields with a trailing comma.
@@ -1119,7 +1164,7 @@ impl RootRegistry {
         Ok(result)
     }
 
-    async fn install(self: &Rc<Self>, deployment: Deployment) -> Result<String> {
+    async fn install(self: &Rc<Self>, deployment: Deployment, startup_identity: String) -> Result<String> {
         deployment.validate()?;
         self.validate_install(&deployment)?;
         let plan_key = deployment.plan_key()?;
@@ -1139,7 +1184,7 @@ impl RootRegistry {
                     self.change_source(entry, &plan_key);
                 }
             }
-            if deployment.is_plain() { self.worker(&plan_key).await?; }
+            if deployment.is_plain() { self.worker(&plan_key, &startup_identity).await?; }
             return Ok(plan_key);
         }
         let existing = self.installing.borrow().get(&plan_key).cloned();
@@ -1150,6 +1195,7 @@ impl RootRegistry {
             flight
         } else {
             let flight = Rc::new(InstallFlight {
+                startup_identity,
                 namespaces: deployment.namespaces.iter().map(|space| space.id.clone()).collect(),
                 deployment: RefCell::new(Some(Rc::new(deployment))),
                 cancelled: Cell::new(false),
@@ -1271,7 +1317,7 @@ impl RootRegistry {
             objects: RefCell::new(HashSet::new()),
             retiring_refs: Cell::new(0),
         });
-        let worker = self.compile(&plan.deployment, &key).await?;
+        let worker = self.compile(&plan.deployment, &key, &flight.startup_identity).await?;
         let _guard = wait_for_root(&self.factory,
             plan.deployment.namespaces.first().map(|space| space.id.as_str()).unwrap_or(&plan_key), "",
             "registry publication", self.install_lock.lock()).await?;
@@ -1315,7 +1361,7 @@ impl RootRegistry {
         Ok(plan_key)
     }
 
-    async fn worker(self: &Rc<Self>, plan_key: &str) -> Result<Rc<WorkerService>> {
+    async fn worker(self: &Rc<Self>, plan_key: &str, startup_identity: &str) -> Result<Rc<WorkerService>> {
         let plan = self
             .plans
             .borrow()
@@ -1354,7 +1400,7 @@ impl RootRegistry {
         };
         plan.generation.set(Some(generation));
         let key = plan.deployment.key(generation)?;
-        let worker = match self.compile(&plan.deployment, &key).await {
+        let worker = match self.compile(&plan.deployment, &key, startup_identity).await {
             Ok(worker) => worker,
             Err(error) => {
                 self.remember_failure(plan_key, &error);
@@ -1415,7 +1461,7 @@ impl RootRegistry {
             .iter()
             .find(|space| space.id == selection.namespace_id)
             .ok_or_else(|| kj::failed!("this plan does not own the root namespace"))?;
-        self.worker(&selection.plan).await?;
+        self.worker(&selection.plan, "").await?;
         let name = format!(
             "{}/{}/{}",
             selection.namespace_id, selection.object_id, selection.data_epoch
@@ -1947,6 +1993,9 @@ impl ActorClass for RootExportedClass {
     }
     fn for_root_plan(&self, root_plan: &str) -> Result<Option<Rc<dyn ActorClass>>> {
         let registry = self.registry()?;
+        if registry.plans.borrow().get(root_plan).is_some_and(|plan| plan.deployment.is_plain()) {
+            return Err(kj::failed!("an ordinary plan cannot supply an actor class"));
+        }
         let owner = registry
             .plans
             .borrow()
@@ -1972,7 +2021,10 @@ impl ActorClass for RootExportedClass {
     fn when_ready(&self) -> LocalBoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let registry = self.registry()?;
-            let worker = registry.worker(&self.plan_key).await?;
+            if registry.plans.borrow().get(&self.plan_key).is_some_and(|plan| plan.deployment.is_plain()) {
+                return Err(kj::failed!("an ordinary plan cannot supply an actor class"));
+            }
+            let worker = registry.worker(&self.plan_key, "").await?;
             *self.running_worker.borrow_mut() = Rc::downgrade(&worker);
             self.generation.set(
                 registry
@@ -2179,11 +2231,14 @@ struct PlainSelectedChannel {
     selection: RootSelection,
     entrypoint: Rc<dyn Channel>,
     _pin: PlanPin,
+    _activity: KjOwn<ffi::WorkerSelectionActivity>,
 }
 impl Channel for PlainSelectedChannel {
     fn start_request(&self, mut metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
         self.registry.stamp_metadata(&self.selection, &mut metadata)?;
-        self.entrypoint.start_request(metadata)
+        let request = self.entrypoint.start_request(metadata)?;
+        self._pin.0.reported_plain_generation.set(self._pin.0.generation.get());
+        Ok(request)
     }
     fn require_allows_transfer(&self) -> Result<()> { Err(not_transferable("Private ordinary worker")) }
     fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> { Err(not_transferable("Private ordinary worker")) }
@@ -2315,19 +2370,31 @@ impl Service for RootRequest {
                     let plans = self.registry.plans.borrow();
                     let installed = plans.get(&key);
                     json!({"plan": installed.map(|_| &key), "info": installed.map(|plan| json!({
-                        "loaded": plan.loaded.borrow().is_some(), "generation": plan.generation.get()
+                        "loaded": plan.loaded.borrow().is_some(), "generation": plan.generation.get(),
+                        "cold": plan.deployment.is_plain() && plan.reported_plain_generation.get() != plan.generation.get()
                     }))})
                 }
             }
             (Method::POST, "/install") => {
-                let deployment = serde_json::from_value(read_json(body).await?)
+                let value = read_json(body).await?;
+                let identity = value.get("startupIdentity").and_then(Value::as_str).unwrap_or("");
+                let startup_identity = if identity.is_empty() { String::new() } else {
+                    let parsed: Value = serde_json::from_str(identity)
+                        .map_err(|error| kj::failed!("ordinary startup identity: {error}"))?;
+                    if !parsed.is_object() || parsed["workerId"] != value["workerId"] ||
+                        parsed["versionId"] != value["versionId"] || !parsed["invocationId"].is_string() {
+                        return Err(kj::failed!("ordinary startup identity does not match its plan"));
+                    }
+                    format!("{},", &identity[1..identity.len() - 1])
+                };
+                let deployment = serde_json::from_value(value)
                     .map_err(|error| kj::failed!("root deployment: {error}"))?;
-                match self.registry.install(deployment).await {
+                match self.registry.install(deployment, startup_identity).await {
                     Ok(plan) => {
                         let plans = self.registry.plans.borrow();
                         if let Some(installed) = plans.get(&plan) {
                         let cold = installed.deployment.is_plain() &&
-                            installed.reported_plain_generation.replace(installed.generation.get()) != installed.generation.get();
+                            installed.reported_plain_generation.get() != installed.generation.get();
                         json!({"plan": plan, "info": {"kind": installed.deployment.kind,
                             "loaded": installed.loaded.borrow().is_some(), "generation": installed.generation.get(),
                             "cold": cold,
@@ -2479,7 +2546,7 @@ impl Service for RootRequest {
                     .is_some_and(|plan| plan.deployment.is_plain()) {
                     return Err(kj::failed!("ordinary worker plans require the private selection entry"));
                 }
-                let worker = self.registry.worker(&plan).await?;
+                let worker = self.registry.worker(&plan, "").await?;
                 let metadata = self
                     .metadata
                     .take()

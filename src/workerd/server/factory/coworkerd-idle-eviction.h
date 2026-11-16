@@ -21,6 +21,7 @@ std::shared_ptr<IdleReaper> idleReaper(kj::Timer& timer);
 IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
     kj::StringPtr name, kj::Function<void()> remove, bool eligible = true,
     IdleWorkerLabels labels = {});
+void idleWorkerObserveBackground(const IdleWorkerRef& worker, kj::Function<bool()> backgroundDone);
 void idleWorkerRetireWhenIdle(const IdleWorkerRef& worker, kj::Function<bool()> backgroundDone);
 void idleWorkerReady(const IdleWorkerRef& worker);
 void idleWorkerFailed(const IdleWorkerRef& worker);

@@ -425,6 +425,8 @@ pub mod ffi {
         fn worker_set_ctx_exports(worker: &CompiledWorker, globals: &[u64]) -> Result<()>;
         /// Gives the C++ idle reaper the linked worker's existing abort path.
         fn worker_idle_ready(worker: &CompiledWorker, channels: Box<ChannelFactory>) -> Result<()>;
+        type WorkerSelectionActivity;
+        fn worker_selection_activity(worker: &CompiledWorker) -> KjOwn<WorkerSelectionActivity>;
         fn worker_retire_when_idle(worker: &CompiledWorker) -> Result<()>;
         /// Cancels the worker's requests still in flight (background work past the response: a
         /// `waitUntil()`, a tail worker's event), each of which holds the worker and its I/O

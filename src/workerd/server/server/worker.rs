@@ -804,6 +804,10 @@ impl WorkerService {
         Ok(())
     }
 
+    pub fn selection_activity(&self) -> KjOwn<ffi::WorkerSelectionActivity> {
+        ffi::worker_selection_activity(&self.worker)
+    }
+
     pub fn retire_when_idle(&self) -> Result<()> {
         ffi::worker_retire_when_idle(&self.worker)?;
         Ok(())
