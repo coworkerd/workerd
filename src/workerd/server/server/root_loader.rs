@@ -2061,12 +2061,16 @@ impl Service for RootRequest {
                 match self.registry.install(deployment).await {
                     Ok(plan) => {
                         let plans = self.registry.plans.borrow();
-                        let installed = plans.get(&plan).expect("installed plan");
+                        if let Some(installed) = plans.get(&plan) {
                         json!({"plan": plan, "info": {"kind": installed.deployment.kind,
                             "tenant": installed.deployment.owner_tenant().ok(), "workerId": installed.deployment.worker_id,
                             "configuredWorker": if installed.deployment.is_platform() {
                                 self.registry.loaded(installed).map(|worker| format!("{:p}", Rc::as_ptr(&worker)))
                             } else { None }, "platformClass": installed.deployment.platform_class}})
+                        } else {
+                            status = 503;
+                            json!({"error":{"kind":"plan-missing","message":"root plan is no longer registered"}})
+                        }
                     },
                     Err(error) => {
                         tracing::error!("root installation: {error:?}");
