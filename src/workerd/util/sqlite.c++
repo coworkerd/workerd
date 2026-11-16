@@ -33,8 +33,183 @@
 #include <kj/vector.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
+#include <random>
 
 namespace workerd {
+
+namespace {
+uint64_t sqlLimitSetting(const char* key, uint64_t fallback) {
+  const char* value = std::getenv(key);
+  if (value == nullptr || *value == '\0') return fallback;
+  char* end;
+  auto result = std::strtoull(value, &end, 10);
+  return *end == '\0' && result > 0 && result <= 60000 ? result : fallback;
+}
+uint64_t sqlCpuLimitNs() {
+  static const auto value = sqlLimitSetting("COWORKERD_SQL_CPU_LIMIT_MS", 200) * 1000000;
+  return value;
+}
+uint64_t sqlWallLimitNs() {
+  static const auto value = sqlLimitSetting("COWORKERD_SQL_WALL_LIMIT_MS", 800) * 1000000;
+  return value;
+}
+uint64_t sqlWallNow() noexcept {
+#if defined(CLOCK_MONOTONIC_COARSE)
+  struct timespec value;
+  if (clock_gettime(CLOCK_MONOTONIC_COARSE, &value) == 0)
+    return uint64_t(value.tv_sec) * 1000000000 + value.tv_nsec;
+#endif
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+uint64_t sqlCpuNow() noexcept {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+  struct timespec value;
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0)
+    return uint64_t(value.tv_sec) * 1000000000 + value.tv_nsec;
+#endif
+  return 0;  // The independent wall limit remains active if the CPU clock is unavailable.
+}
+constexpr int SQL_PROGRESS_INSTRUCTIONS = 1000;
+constexpr uint64_t SQL_CPU_SAMPLE_NS = 1000000;
+constexpr uint64_t SQL_CPU_SAMPLING_WEIGHT = 16;
+constexpr uint64_t SQL_CPU_SAMPLING_CAP_NS = 250000;
+}
+
+bool SqlExecutionBudget::isEnabled() { return sqlCpuLimitNs() != 0 || sqlWallLimitNs() != 0; }
+SqlExecutionBudget::SqlExecutionBudget()
+    : cpuLimitNs(sqlCpuLimitNs()), wallLimitNs(sqlWallLimitNs()) {}
+kj::String SqlExecutionBudget::describe() const {
+  const bool cpu = cause == Cause::CPU;
+  return kj::str("SQL_LIMIT_EXCEEDED: ", cpu ? "cpu" : "wall", " limit ",
+      (cpu ? cpuLimitNs : wallLimitNs) / 1000000, "ms exceeded",
+      cpu ? " (short SQL CPU is sampled; long native segments are measured)" : "");
+}
+
+bool SqliteDatabase::sampleSqlExecution() {
+  if (executionRandomState == 0) {
+    std::random_device entropy;
+    executionRandomState = (uint64_t(entropy()) << 32) | entropy();
+    if (executionRandomState == 0) executionRandomState = 0x9e3779b97f4a7c15ull;
+  }
+  auto value = executionRandomState;
+  value ^= value >> 12;
+  value ^= value << 25;
+  value ^= value >> 27;
+  executionRandomState = value;
+  return ((value * 2685821657736338717ull) >> 32) % SQL_CPU_SAMPLING_WEIGHT == 0;
+}
+
+struct SqliteDatabase::ExecutionScope {
+  enum class CheckMode { BOUNDARY, PROGRESS };
+  SqliteDatabase& database;
+  std::shared_ptr<SqlExecutionBudget> budget;
+  ExecutionScope* previous;
+  uint64_t cpuStarted = 0, wallStarted = 0, lastCpuSampleWall = 0;
+  uint64_t measuredCpuNs = 0;
+  bool running = false;
+  bool sampled = false, sawCallback = false;
+
+  ExecutionScope(SqliteDatabase& database, StaticRegulator regulator)
+      : database(database), budget(regulator->getSqlExecutionBudget()),
+        previous(database.activeExecutionScope) {
+    // Acquire entropy before installing this stack scope: the random source may throw.
+    const bool enter = budget && !check(CheckMode::BOUNDARY);
+    if (enter) sampled = database.sampleSqlExecution();
+    if (previous != nullptr) previous->pause();
+    database.activeExecutionScope = this;
+    if (enter && !check(CheckMode::BOUNDARY)) resume();
+  }
+  ~ExecutionScope() noexcept {
+    pause();
+    if (budget) {
+      if (sawCallback) {
+        budget->cpuUsedNs += measuredCpuNs;
+      } else if (sampled) {
+        // A slow callback-free segment does not represent the other unsampled segments.
+        const auto weighted = kj::min(measuredCpuNs, SQL_CPU_SAMPLING_CAP_NS);
+        budget->cpuUsedNs += weighted * SQL_CPU_SAMPLING_WEIGHT + measuredCpuNs - weighted;
+      }
+    }
+    database.activeExecutionScope = previous;
+    if (previous != nullptr) previous->resume();
+  }
+  void resume() noexcept {
+    if (!budget) return;
+    wallStarted = lastCpuSampleWall = sqlWallNow();
+    cpuStarted = sampled || sawCallback ? sqlCpuNow() : 0;
+    running = true;
+  }
+  void pause() noexcept {
+    if (!running) return;
+    const auto wall = sqlWallNow();
+    if (cpuStarted) {
+      const auto cpu = sqlCpuNow();
+      if (cpu >= cpuStarted) measuredCpuNs += cpu - cpuStarted;
+    }
+    budget->wallUsedNs += wall - wallStarted;
+    running = false;
+  }
+  bool check(CheckMode mode = CheckMode::PROGRESS) noexcept {
+    if (!budget) return false;
+    if (budget->cause != SqlExecutionBudget::Cause::NONE) return true;
+    if (mode == CheckMode::BOUNDARY) {
+      if (budget->cpuUsedNs >= budget->cpuLimitNs) budget->cause = SqlExecutionBudget::Cause::CPU;
+      else if (budget->wallUsedNs >= budget->wallLimitNs) budget->cause = SqlExecutionBudget::Cause::WALL;
+      return budget->cause != SqlExecutionBudget::Cause::NONE;
+    }
+    const auto wall = sqlWallNow();
+    if (budget->wallUsedNs + wall - wallStarted >= budget->wallLimitNs) {
+      budget->cause = SqlExecutionBudget::Cause::WALL;
+      return true;
+    }
+    if (wall - lastCpuSampleWall >= SQL_CPU_SAMPLE_NS) {
+      lastCpuSampleWall = wall;
+      const auto cpu = sqlCpuNow();
+      if (budget->cpuUsedNs + measuredCpuNs + (cpuStarted && cpu >= cpuStarted ? cpu - cpuStarted : 0)
+          >= budget->cpuLimitNs) {
+        budget->cause = SqlExecutionBudget::Cause::CPU;
+        return true;
+      }
+    }
+    return false;
+  }
+  bool progress() noexcept {
+    if (!budget) return false;
+    if (!sawCallback) {
+      sawCallback = true;
+      if (!sampled) {
+        cpuStarted = sqlCpuNow();
+        lastCpuSampleWall = sqlWallNow();
+      }
+    }
+    return check();
+  }
+};
+
+int SqliteDatabase::progressCallback(void* pointer) noexcept {
+  const auto scope = static_cast<SqliteDatabase*>(pointer)->activeExecutionScope;
+  return scope != nullptr && scope->progress();
+}
+
+kj::Exception SqliteDatabase::Regulator::sqlExecutionLimitException(
+    const SqlExecutionBudget& budget) const {
+  return KJ_EXCEPTION(OVERLOADED, budget.describe());
+}
+
+void SqliteDatabase::handleExecutionLimit(kj::Maybe<int> errorCode, StaticRegulator regulator) {
+  KJ_IF_SOME(code, errorCode) {
+    if (code == SQLITE_INTERRUPT && activeExecutionScope != nullptr &&
+        activeExecutionScope->budget &&
+        activeExecutionScope->budget->getCause() != SqlExecutionBudget::Cause::NONE) {
+      kj::throwRecoverableException(
+          regulator->sqlExecutionLimitException(*activeExecutionScope->budget));
+    }
+  }
+}
 
 namespace {
 
@@ -277,6 +452,7 @@ class SqliteCallScope {
 // sqliteErrorCode is a kj::Maybe<int> and represents the error code from sqlite.
 #define SQLITE_REQUIRE_WITH_TAG(condition, sqliteErrorCode, sentryTag, errorMessage, ...)          \
   if (!(condition)) {                                                                              \
+    handleExecutionLimit(sqliteErrorCode, regulator);                                               \
     regulator->onError(sqliteErrorCode, errorMessage);                                             \
     throwSentryException(KJ_EXCEPTION(FAILED, "SQLite failed", errorMessage, ##__VA_ARGS__),       \
         sentryTag, getErrorContext());                                                             \
@@ -676,6 +852,8 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
 
   setupSecurity(db);
 
+  sqlite3_progress_handler(db, SQL_PROGRESS_INSTRUCTIONS, &progressCallback, this);
+
   maybeDb = *db;
 }
 
@@ -684,6 +862,7 @@ SqliteDatabase::~SqliteDatabase() noexcept(false) {
 
   auto memoryScope = enterMemoryScope();
 
+  sqlite3_progress_handler(db, 0, nullptr, nullptr);
   auto err = sqlite3_close(db);
   if (err == SQLITE_BUSY) {
     KJ_LOG(ERROR, "sqlite database destroyed while dependent objects still exist");
@@ -733,6 +912,15 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
         if (sqlite3_get_autocommit(db) != 0) {
           criticalErrorOccurred = true;
           KJ_IF_SOME(cb, onCriticalErrorCallback) {
+            if (code == SQLITE_INTERRUPT && activeExecutionScope != nullptr &&
+                activeExecutionScope->budget &&
+                activeExecutionScope->budget->getCause() != SqlExecutionBudget::Cause::NONE) {
+              auto error = KJ_REQUIRE_NONNULL(currentRegulator)->sqlExecutionLimitException(
+                  *activeExecutionScope->budget);
+              auto description = kj::str(error.getDescription());
+              cb(description, kj::mv(error));
+              return;
+            }
             cb(errorMessage, maybeException.map([](const kj::Exception& e) { return e.clone(); }));
           }
         }
@@ -886,6 +1074,9 @@ SqliteDatabase::StatementAndEffect SqliteDatabase::prepareSql(StaticRegulator re
     const char* tail;
 
     SQLITE_CALL_SCOPE {
+      ExecutionScope execution(*this, regulator);
+      if (execution.check(ExecutionScope::CheckMode::BOUNDARY))
+        kj::throwRecoverableException(regulator->sqlExecutionLimitException(*execution.budget));
       auto prepareResult =
           sqlite3_prepare_v3(db, sqlCode.begin(), sqlCode.size(), prepFlags, &result, &tail);
 
@@ -951,6 +1142,10 @@ SqliteDatabase::StatementAndEffect SqliteDatabase::prepareSql(StaticRegulator re
 
           // This isn't the last statement in the code. Execute it immediately.
           SQLITE_CALL_SCOPE {
+            ExecutionScope execution(*this, regulator);
+            if (execution.check(ExecutionScope::CheckMode::BOUNDARY))
+              kj::throwRecoverableException(regulator->sqlExecutionLimitException(*execution.budget));
+            if (execution.budget) sqlite3_stmt_status(result, SQLITE_STMTSTATUS_VM_STEP, 1);
             auto start = sqliteObserver.now();
             auto dbWalSizeBefore = sqliteObserver.getDbWalSize();
 
@@ -1075,6 +1270,7 @@ void SqliteDatabase::reset() {
       listener.beforeSqliteClose(CloseReason::RESET);
     }
 
+    sqlite3_progress_handler(&db, 0, nullptr, nullptr);
     auto err = sqlite3_close(&db);
     KJ_REQUIRE(err == SQLITE_OK, "can't reset() database because dependent objects still exist",
         sqlite3_errstr(err));
@@ -1114,6 +1310,7 @@ void SqliteDatabase::close() noexcept {
     // indicates a statement that isn't tracked by a ResetListener. Do not fall back to
     // sqlite3_close_v2(): a lazily-closed handle keeps the file open, which is exactly what this
     // method exists to prevent.
+    sqlite3_progress_handler(&db, 0, nullptr, nullptr);
     auto err = sqlite3_close(&db);
     KJ_ASSERT(
         err == SQLITE_OK, "close() found dependent objects that still exist", sqlite3_errstr(err));
@@ -1807,6 +2004,16 @@ void SqliteDatabase::Query::nextRow(bool first) {
   KJ_DEFER(db.currentRegulator = kj::none);
   db.currentRegulator = regulator;
 
+  ExecutionScope execution(db, regulator);
+  if (execution.check(ExecutionScope::CheckMode::BOUNDARY)) {
+    if (first)
+      kj::throwRecoverableException(regulator->sqlExecutionLimitException(*execution.budget));
+    sqlite3_interrupt(db);  // A suspended cursor is still an active SQLite VM.
+  }
+
+  // SQLite carries this counter across cached runs. Align its callback cadence with
+  // this native segment so a short run is sampled rather than measured from a late callback.
+  if (execution.budget) sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_VM_STEP, 1);
   auto memoryScope = db.enterMemoryScope();
   SQLITE_CALL_SCOPE {
     int err = sqlite3_step(statement);

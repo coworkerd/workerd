@@ -8,6 +8,7 @@
 
 #include <workerd/io/io-context.h>
 #include <workerd/util/sqlite.h>
+#include <workerd/jsg/coworkerd-rpc-code.h>
 
 #if _WIN32
 #define strncasecmp _strnicmp
@@ -148,6 +149,27 @@ bool SqlStorageRegulator::isAllowedName(kj::StringPtr name) const {
   // functions that are provided as part of SQLite's API, but that causes build
   // issues on Windows.
   return name.size() < 4 || strncasecmp(name.begin(), "_cf_", 4) != 0;
+}
+
+std::shared_ptr<SqlExecutionBudget> SqlStorageRegulator::getSqlExecutionBudget() const {
+  return IoContext::current().getLimitEnforcer().getSqlExecutionBudget();
+}
+
+kj::Exception SqlStorageRegulator::sqlExecutionLimitException(
+    const SqlExecutionBudget& budget) const {
+  return jsg::tagCoworkerdRpcError(
+      KJ_EXCEPTION(OVERLOADED, kj::str("jsg.Error: ", budget.describe())), "SQL_LIMIT_EXCEEDED");
+}
+
+void SqlStorage::abortExecutionLimit(jsg::Lock& js) {
+  auto& context = IoContext::current();
+  auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
+  JSG_REQUIRE(budget != nullptr && budget->getCause() != SqlExecutionBudget::Cause::NONE, Error,
+      "No SQL execution limit has been reached in this event");
+  auto error = regulator.sqlExecutionLimitException(*budget);
+  error.setDescription(kj::str("broken.outputGateBroken; ", error.getDescription()));
+  context.abort(kj::mv(error));
+  js.terminateExecutionNow();
 }
 
 bool SqlStorageRegulator::isAllowedTrigger(kj::StringPtr name) const {

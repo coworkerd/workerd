@@ -13,6 +13,7 @@
 #include <kj/memory.h>  // for Own
 #include <kj/one-of.h>  // for OneOf
 #include <kj/time.h>    // for Duration
+#include <memory>
 
 namespace workerd {
 class IsolateObserver;
@@ -21,6 +22,7 @@ class TrackedWasmInstanceList;
 
 struct ActorCacheSharedLruOptions;
 class IoContext;
+class SqlExecutionBudget;
 
 namespace jsg {
 class Lock;
@@ -130,6 +132,8 @@ class IsolateLimitEnforcer: public kj::Refcounted {
 // Abstract interface that enforces resource limits on a IoContext.
 class LimitEnforcer {
  public:
+  virtual std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() { return {}; }
+
   // Called just after taking the isolate lock, before executing JavaScript code, to enforce
   // limits on that code execution, particularly the CPU limit. The returned `Own<void>` should
   // be dropped when JavaScript is done, before unlocking the isolate.

@@ -14,6 +14,8 @@ namespace workerd::api {
 
 class SqlStorageRegulator: public SqliteDatabase::Regulator {
  public:
+  std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() const override;
+  kj::Exception sqlExecutionLimitException(const SqlExecutionBudget& budget) const override;
   bool isAllowedName(kj::StringPtr name) const override;
   bool isAllowedTrigger(kj::StringPtr name) const override;
   void onError(kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const override;
@@ -40,6 +42,7 @@ class SqlStorage final: public jsg::Object {
 
   jsg::Ref<Cursor> exec(jsg::Lock& js, jsg::JsString query, jsg::Arguments<BindingValue> bindings);
   IngestResult ingest(jsg::Lock& js, kj::String query);
+  void abortExecutionLimit(jsg::Lock& js);
   void setMaxPageCountForTest(jsg::Lock& js, int count);
 
   jsg::Ref<Statement> prepare(jsg::Lock& js, jsg::JsString query);
@@ -48,6 +51,7 @@ class SqlStorage final: public jsg::Object {
 
   JSG_RESOURCE_TYPE(SqlStorage, CompatibilityFlags::Reader flags) {
     JSG_METHOD(exec);
+    JSG_METHOD(abortExecutionLimit);
 
     if (flags.getWorkerdExperimental()) {
       // Prepared statement API is experimental-only and deprecated. exec() will automatically

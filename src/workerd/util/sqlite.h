@@ -14,6 +14,7 @@
 #include <kj/string.h>
 
 #include <utility>
+#include <memory>
 
 struct sqlite3;
 struct sqlite3_vfs;
@@ -30,6 +31,22 @@ using kj::uint;
 // so related statements can be grouped together in analytics. Minted by callers at the operation
 // boundary and threaded down into every Query the operation spawns.
 using SqliteQueryId = uint64_t;
+
+// Owned by an event, shared by all of its tenant SQL calls. Internal SQL never acquires it.
+class SqlExecutionBudget {
+ public:
+  enum class Cause { NONE, CPU, WALL };
+  static bool isEnabled();
+  SqlExecutionBudget();
+  Cause getCause() const { return cause; }
+  kj::String describe() const;
+
+ private:
+  uint64_t cpuLimitNs, wallLimitNs;
+  uint64_t cpuUsedNs = 0, wallUsedNs = 0;
+  Cause cause = Cause::NONE;
+  friend class SqliteDatabase;
+};
 
 // Used to collect periodic metrics about queries and size of sqlite db
 class SqliteObserver {
@@ -149,6 +166,8 @@ class SqliteDatabase {
   // a generic "not authorized" exception.
   class Regulator {
    public:
+    virtual std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() const { return {}; }
+    virtual kj::Exception sqlExecutionLimitException(const SqlExecutionBudget& budget) const;
     // Returns whether the given name (which may be a table, index, view, etc.) is allowed to be
     // accessed. Typically, this is used to deny access to names containing special prefixes
     // indicating that they are privileged, like `_cf_`.
@@ -432,6 +451,13 @@ class SqliteDatabase {
 
   // Set while a query is compiling.
   kj::Maybe<StaticRegulator> currentRegulator;
+
+  struct ExecutionScope;
+  ExecutionScope* activeExecutionScope = nullptr;
+  uint64_t executionRandomState = 0;
+  bool sampleSqlExecution();
+  static int progressCallback(void* database) noexcept;
+  void handleExecutionLimit(kj::Maybe<int> errorCode, StaticRegulator regulator);
 
   // Set during the *first* time a statement is being compiled, to capture information about it
   // from the authorizer callback. It is assumed that if the statement must be re-parsed later,
@@ -843,6 +869,10 @@ class SqliteDatabase::Query final: private ResetListener {
 
   kj::Maybe<kj::StringPtr> getErrorContext() {
     return db.getErrorContext();
+  }
+
+  void handleExecutionLimit(kj::Maybe<int> errorCode, StaticRegulator regulator) {
+    db.handleExecutionLimit(errorCode, regulator);
   }
 
   // Some reasonable automatic conversions.

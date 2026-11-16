@@ -1,5 +1,6 @@
 #include "coworkerd-cpu-limit.h"
 #include <workerd/util/autogate.h>
+#include <workerd/util/sqlite.h>
 #include <csignal>
 #include <cstdlib>
 #include <fcntl.h>
@@ -287,13 +288,21 @@ class CpuWorkerInterface final: public WorkerInterface {
 
 class RequestLimits final: public LimitEnforcer {
    public:
+    enum class Accounting { ENABLED, SQL_ONLY };
     RequestLimits(kj::Own<LimitEnforcer> fallback, CpuIsolateLimitEnforcer& limits,
-        kj::String identity, kj::Function<void()> abortIsolate, bool isActor)
+        kj::String identity, kj::Function<void()> abortIsolate, bool isActor, Accounting mode)
         : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
-          abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)), isActor(isActor) {}
+          abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)), isActor(isActor),
+          accounting(mode == Accounting::ENABLED) {}
     // The request context ends here, after its waitUntil work, whether or not it ran JavaScript. An actor's context
     // ends with the actor: its row has the CPU of all its events.
-    ~RequestLimits() noexcept(false) { limits->completed(identity, toppedUp + cpuUsed, gcExcluded); }
+    ~RequestLimits() noexcept(false) {
+      if (accounting) limits->completed(identity, toppedUp + cpuUsed, gcExcluded);
+    }
+    std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() override {
+      if (!sqlBudget) sqlBudget = std::make_shared<SqlExecutionBudget>();
+      return sqlBudget;
+    }
     struct IdentityScope {
       jsg::AsyncContextFrame::StorageScope frame;
       MemoryStartupIdentityScope startup;
@@ -305,7 +314,8 @@ class RequestLimits final: public LimitEnforcer {
             limit(owner.limits->enterRequestJs(owner.cpuUsed, owner.identity,
                 [&owner]() { if (owner.limits->publish()) owner.abortIsolate(); }, &owner.gcExcluded)) {}
     };
-    kj::Own<void> enterJs(jsg::Lock& lock, IoContext&) override {
+    kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) override {
+      if (!accounting) return fallback->enterJs(lock, context);
       if (limits->publish()) abortIsolate();
       limits->requireNotExceeded();
       if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
@@ -318,6 +328,8 @@ class RequestLimits final: public LimitEnforcer {
     // while the request lasts its total so far goes on the event pipe at most once per PROGRESS_INTERVAL, so that the
     // node meters a long connection as it runs.
     void topUpActor() override {
+      sqlBudget.reset();
+      if (!accounting) { fallback->topUpActor(); return; }
       if (isActor) idleWorkerActorEvent(limits->activity());
       toppedUp += cpuUsed;
       cpuUsed = 0;
@@ -336,22 +348,33 @@ class RequestLimits final: public LimitEnforcer {
     kj::Promise<void> limitScheduled() override { return fallback->limitScheduled(); }
     kj::Duration getAlarmLimit() override { return fallback->getAlarmLimit(); }
     size_t getBufferingLimit() override { return fallback->getBufferingLimit(); }
-    kj::Maybe<EventOutcome> getLimitsExceeded() override { return limits->outcome(); }
-    kj::Promise<void> onLimitsExceeded() override { return limits->onExceeded(); }
-    void setCpuLimitNearlyExceededCallback(kj::Function<void()>) override {}
+    kj::Maybe<EventOutcome> getLimitsExceeded() override {
+      return accounting ? limits->outcome() : fallback->getLimitsExceeded();
+    }
+    kj::Promise<void> onLimitsExceeded() override {
+      return accounting ? limits->onExceeded() : fallback->onLimitsExceeded();
+    }
+    void setCpuLimitNearlyExceededCallback(kj::Function<void()> callback) override {
+      if (!accounting) fallback->setCpuLimitNearlyExceededCallback(kj::mv(callback));
+    }
     void requireLimitsNotExceeded() override {
+      if (!accounting) { fallback->requireLimitsNotExceeded(); return; }
       if (limits->publish()) abortIsolate();
       limits->requireNotExceeded();
     }
-    void reportMetrics(RequestObserver&) override {}
-    kj::Duration consumeTimeElapsedForPeriodicLogging() override { return 0 * kj::SECONDS; }
-    size_t getSqliteMemoryUsage() const override { return 0; }
+    void reportMetrics(RequestObserver& metrics) override { if (!accounting) fallback->reportMetrics(metrics); }
+    kj::Duration consumeTimeElapsedForPeriodicLogging() override {
+      return accounting ? 0 * kj::SECONDS : fallback->consumeTimeElapsedForPeriodicLogging();
+    }
+    size_t getSqliteMemoryUsage() const override { return accounting ? 0 : fallback->getSqliteMemoryUsage(); }
    private:
     kj::Own<LimitEnforcer> fallback;
     kj::Own<CpuIsolateLimitEnforcer> limits;
     kj::Function<void()> abortIsolate;
     kj::String identity;
     const bool isActor;
+    const bool accounting;
+    std::shared_ptr<SqlExecutionBudget> sqlBudget;
     // What the limit charged since the last top-up, before it, and the GC CPU it did not charge.
     uint64_t cpuUsed = 0, toppedUp = 0, gcExcluded = 0;
     // The last progress row: when, and the CPU it reported.
@@ -366,10 +389,12 @@ class RequestLimits final: public LimitEnforcer {
 kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
     kj::Function<void()> abortIsolate, bool isActor) {
-  if (!limits.isEnabled() && !limits.memoryIdentityWanted() && !limits.reportsCompletion() &&
-      !limits.activity()) return fallback;
+  const bool accounting = limits.isEnabled() || limits.memoryIdentityWanted() ||
+      limits.reportsCompletion() || limits.activity();
+  if (!accounting && !(isActor && SqlExecutionBudget::isEnabled())) return fallback;
   return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata),
-      kj::mv(abortIsolate), isActor);
+      kj::mv(abortIsolate), isActor, accounting ? RequestLimits::Accounting::ENABLED
+          : RequestLimits::Accounting::SQL_ONLY);
 }
 kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
     CpuIsolateLimitEnforcer& limits) {
