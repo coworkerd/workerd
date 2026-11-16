@@ -171,10 +171,12 @@ class IdleReaper {
     kj::Vector<kj::String> entries;
     for (auto it = workers.begin(); it != workers.end();) {
       if (auto worker = it->lock()) {
+        bool backgroundActive = false;
+        KJ_IF_SOME(done, worker->backgroundDone) { backgroundActive = !done(); }
         if (worker->created && !worker->destroyed) entries.add(kj::str(
             "{\"isolate\":", escapeCpuJsonString(worker->name), ",\"instance\":", worker->id,
             labelFields(worker->labels), ",\"active\":", worker->active,
-            ",\"backgroundActive\":", worker->backgroundDone.map([](auto& done) { return !done(); }).orDefault(false) ? "true" : "false", "}"));
+            ",\"backgroundActive\":", backgroundActive ? "true" : "false", "}"));
         ++it;
       } else {
         it = workers.erase(it);
