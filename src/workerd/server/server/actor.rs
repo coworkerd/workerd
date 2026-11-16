@@ -3265,7 +3265,19 @@ impl Channel for RootActorChannel {
     fn start_request(&self, metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
         let client = Client(Rc::clone(&self.container.0));
         let nonce = self.nonce.clone();
+        client.require_root_not_retiring().map_err(|error| crate::root_loader::preparation_error(&nonce, error))?;
         client.require_not_broken().map_err(|error| crate::root_loader::preparation_error(&nonce, error))?;
+        if let Some(ns) = client.namespace.upgrade() { ns.ensure_cleanup_loop(); }
+        let running = if client.retirement.borrow().is_none()
+            && client.pending_class().is_none()
+            && client.class().map_err(|error| crate::root_loader::preparation_error(&nonce, error))?.request_ready()
+        {
+            client.actor.borrow().clone()
+        } else { None };
+        if let Some(actor) = running {
+            return client.request_on(metadata, &actor)
+                .map_err(|error| crate::root_loader::preparation_error(&nonce, error));
+        }
         Ok(PromisedInterface::new(async move {
             let actor = client.get_actor().await
                 .map_err(|error| crate::root_loader::preparation_error(&nonce, error))?;
