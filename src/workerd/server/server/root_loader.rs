@@ -106,6 +106,12 @@ enum SelectionKind {
     Plain,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlainSelection {
+    plain_selection: RootSelection,
+}
+
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct RootTarget {
@@ -354,11 +360,13 @@ struct Plan {
 }
 
 const FAILED_INSTALL_CAPACITY: usize = 256;
-const FAILED_INSTALL_TTL: Duration = Duration::from_secs(30);
+const FAILED_INSTALL_RESET_AFTER: Duration = Duration::from_secs(60);
 
 struct FailedInstall {
     error: crate::Error,
     expires_at: Instant,
+    failed_at: Instant,
+    failures: u8,
     last_used: u64,
 }
 
@@ -484,8 +492,11 @@ impl RootRegistry {
         let mut failures = self.failed_installs.borrow_mut();
         let expires_at = failures.get(key)?.expires_at;
         // Successful hot plans do not read the clock for an unrelated failed plan.
-        if Instant::now() >= expires_at {
-            failures.remove(key);
+        let now = Instant::now();
+        if now >= expires_at {
+            if now.duration_since(failures.get(key)?.failed_at) >= FAILED_INSTALL_RESET_AFTER {
+                failures.remove(key);
+            }
             return None;
         }
         let used = self.failure_use.get().saturating_add(1);
@@ -501,7 +512,9 @@ impl RootRegistry {
         }
         let now = Instant::now();
         let mut failures = self.failed_installs.borrow_mut();
-        failures.retain(|_, failure| failure.expires_at > now);
+        failures.retain(|_, failure| now.duration_since(failure.failed_at) < FAILED_INSTALL_RESET_AFTER);
+        let consecutive = failures.get(key).map_or(1, |failure| failure.failures.saturating_add(1));
+        let delay = Duration::from_secs((1u64 << u32::from(consecutive.saturating_sub(1).min(5))).min(30));
         if failures.len() >= FAILED_INSTALL_CAPACITY && !failures.contains_key(key) {
             let oldest = failures.iter().min_by_key(|(_, failure)| failure.last_used)
                 .map(|(key, _)| key.clone()).expect("full failed install cache");
@@ -510,7 +523,8 @@ impl RootRegistry {
         let used = self.failure_use.get().saturating_add(1);
         self.failure_use.set(used);
         failures.insert(key.to_owned(), FailedInstall {
-            error: error.clone(), expires_at: now + FAILED_INSTALL_TTL, last_used: used,
+            error: error.clone(), expires_at: now + delay, failed_at: now,
+            failures: consecutive, last_used: used,
         });
     }
 
@@ -2098,8 +2112,17 @@ impl Channel for RootRegistry {
         props: KjOwn<ffi::Frankenvalue>,
         _persistent: bool,
     ) -> Result<Rc<dyn Channel>> {
-        let selection: RootSelection = serde_json::from_str(&ffi::frankenvalue_plain_json(&props)?)
-            .map_err(|error| kj::failed!("invalid root selection: {error}"))?;
+        let json = ffi::frankenvalue_plain_json(&props)?;
+        let selection: RootSelection = if json.starts_with("{\"plainSelection\":") {
+            let value: PlainSelection = serde_json::from_str(&json)
+                .map_err(|error| kj::failed!("invalid ordinary selection: {error}"))?;
+            if value.plain_selection.kind != SelectionKind::Plain {
+                return Err(kj::failed!("an ordinary selection requires kind plain"));
+            }
+            value.plain_selection
+        } else {
+            serde_json::from_str(&json).map_err(|error| kj::failed!("invalid root selection: {error}"))?
+        };
         if !selection.dispatch_checked {
             return Err(kj::failed!("jsg.Error: node dispatch checks are required"));
         }

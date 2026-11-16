@@ -45,6 +45,15 @@ class RootBootstrapChannel final: public IoChannelFactory::SubrequestChannel {
 
 }  // namespace
 
+jsg::Ref<api::Fetcher> CoworkerdRootLoader::getPlain(
+    jsg::Lock& js, kj::String selectionJson) {
+  auto& context = IoContext::current();
+  auto channel = context.getIoChannelFactory().getSubrequestChannel(rootChannel,
+      Frankenvalue::fromJson(kj::str("{\"plainSelection\":", selectionJson, "}")));
+  return js.alloc<api::Fetcher>(
+      context.addObject(kj::mv(channel)), api::Fetcher::RequiresHostAndProtocol::NO);
+}
+
 jsg::Promise<jsg::Ref<api::Fetcher>> CoworkerdRootLoader::getRoot(
     jsg::Lock& js, kj::String selectionJson) {
   auto& context = IoContext::current();
