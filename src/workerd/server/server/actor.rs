@@ -1048,6 +1048,31 @@ impl ActorNamespace {
         self.count_resident();
     }
 
+    /// Releasing many containers also cancels their background tasks. Bound that fanout.
+    pub(crate) async fn prune_idle_roots_in_batches(&self) {
+        if !self.actor_class.runtime_root() { return; }
+        let keys: Vec<_> = self.actors.borrow().iter().filter(|(_, root)| {
+            !root.is_resident() && !root.tree_has_managers() && !root.has_clients()
+        }).map(|(key, _)| key.clone()).collect();
+        for chunk in keys.chunks(64) {
+            let mut actors = self.actors.borrow_mut();
+            let mut removed = Vec::new();
+            for key in chunk {
+                if actors.get(key).is_some_and(|root| {
+                    !root.is_resident() && !root.tree_has_managers() && !root.has_clients()
+                }) {
+                    if let Some(root) = actors.remove(key) { removed.push(root); }
+                }
+            }
+            drop(actors);
+            for root in &removed { root.namespace_removed(); }
+            drop(removed);
+            self.factory.sleep(Duration::from_millis(1)).await;
+        }
+        if self.actors.borrow().is_empty() { self.actors.borrow_mut().shrink_to_fit(); }
+        self.count_resident();
+    }
+
     /// Stops every actor that is left as this instance's handoff ends; peers take them over
     /// once it left the cluster. Any request still in flight is cancelled, as it could not
     /// commit once a peer owns the object. A later request that still reaches one here, through

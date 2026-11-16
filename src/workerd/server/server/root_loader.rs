@@ -573,6 +573,14 @@ impl RootRegistry {
         self.prune_plans();
     }
 
+    async fn collect_inactive_in_batches(&self) {
+        let namespaces: Vec<_> = self.namespaces.borrow().values()
+            .map(|entry| Rc::clone(&entry.namespace)).collect();
+        for namespace in namespaces { namespace.prune_idle_roots_in_batches().await; }
+        if self.objects.borrow().is_empty() { self.objects.borrow_mut().shrink_to_fit(); }
+        self.prune_plans();
+    }
+
     fn target(&self, target: &RootTarget, props: &Value) -> Result<Rc<dyn Channel>> {
         self.server
             .borrow()
@@ -1431,7 +1439,7 @@ impl RootRegistry {
                         result
                 }));
                 // Start independent closes gradually; one slow hook does not hold later roots.
-                if (index + 1) % 16 == 0 {
+                if (index + 1) % 64 == 0 {
                     registry.factory.sleep(Duration::from_millis(1)).await;
                 }
             }
@@ -1462,7 +1470,7 @@ impl RootRegistry {
             }
             registry.retiring.borrow_mut().remove(&key);
             plan.retiring.borrow_mut().take();
-            registry.collect_inactive();
+            registry.collect_inactive_in_batches().await;
             let _ = done.send(());
         });
         true
@@ -2037,7 +2045,7 @@ impl Service for RootRequest {
             }
             (Method::GET, "/state") => self.registry.snapshot(),
             (Method::POST, "/collect") => {
-                self.registry.collect_inactive();
+                self.registry.collect_inactive_in_batches().await;
                 self.registry.snapshot()
             }
             (Method::POST, "/remove-namespace") => {
