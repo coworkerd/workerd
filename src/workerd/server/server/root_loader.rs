@@ -578,11 +578,9 @@ impl RootRegistry {
                     futures::future::Either::Right(_)=>json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
                         "message":"Ordinary preparation timed out after 30 seconds; no tenant event was delivered"}}),
                 };
-                let success=result["ok"]==true;
                 *task.result.borrow_mut()=Some(result);task.completed.notify_waiters();
-                // A short shared memory covers pre-install failures for the arriving cohort.
-                // Completion belongs to this task, never to a cancelled requesting context.
-                if !success {registry.factory.sleep(Duration::from_millis(100)).await;}
+                // Existing waiters own the same completed result. Remove the rendezvous
+                // immediately so a new request can recover as soon as SOURCE recovers.
                 let current=registry.preparations.borrow().get(&task_key).is_some_and(|current|Rc::ptr_eq(current,&task));
                 if current {
                     registry.preparations.borrow_mut().remove(&task_key);
