@@ -169,10 +169,18 @@ class IdleReaper {
     auto& channel = lifecycleChannel();
     if (!channel) return;
     kj::Vector<kj::String> entries;
+    bool anyBackground = false, unknownBusy = false;
     for (auto it = workers.begin(); it != workers.end();) {
       if (auto worker = it->lock()) {
         bool backgroundActive = false;
         KJ_IF_SOME(done, worker->backgroundDone) { backgroundActive = !done(); }
+        if (worker->created && !worker->destroyed) {
+          anyBackground |= backgroundActive;
+          const auto& labels = worker->labels;
+          const bool tagged = labels.tenant.size() && labels.workerId.size() && labels.versionId.size() &&
+              labels.planRevision.size() && worker->id;
+          unknownBusy |= !tagged && (worker->active || backgroundActive);
+        }
         if (worker->created && !worker->destroyed) entries.add(kj::str(
             "{\"isolate\":", escapeCpuJsonString(worker->name), ",\"instance\":", worker->id,
             labelFields(worker->labels), ",\"active\":", worker->active,
@@ -182,13 +190,19 @@ class IdleReaper {
         it = workers.erase(it);
       }
     }
-    auto row = kj::str("{\"pid\":", coworkerdPid(), ",\"observedAtMonotonicMs\":", monotonicMs(), ",\"residentIsolates\":", created - destroyed,
+    const auto observed = monotonicMs();
+    // The small prefix and completion trailer share the full snapshot's atomic publication.
+    // A durable generation needs this aggregate, independently of its historical call count.
+    auto row = kj::str("{\"drain\":{\"observedAtMonotonicMs\":", observed,
+        ",\"residentCount\":", entries.size(), ",\"backgroundActive\":", anyBackground ? "true" : "false",
+        ",\"unknownBusy\":", unknownBusy ? "true" : "false", "},\"pid\":", coworkerdPid(),
+        ",\"observedAtMonotonicMs\":", observed, ",\"residentIsolates\":", created - destroyed,
         ",\"createdIsolates\":", created, ",\"destroyedIsolates\":", destroyed,
         ",\"idleEvictions\":", evicted, ",\"watermarkEvictions\":", watermarkEvicted,
         ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
         ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
         gcSettings().observes() ? processGcJson() : kj::str(""),
-        ",\"residentWorkers\":[", kj::strArray(entries, ","), "]}");
+        ",\"residentWorkers\":[", kj::strArray(entries, ","), "],\"drainSnapshotComplete\":true}");
     if (gcSettings().observes()) publishedGc = processGcVersion();
     if (!channel.publish(row) && !overflowReported) {
       overflowReported = true;
