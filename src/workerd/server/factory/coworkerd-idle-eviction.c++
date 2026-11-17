@@ -130,7 +130,7 @@ class IdleReaper {
     if (gcSettings().idleCollectMs) collectTask = collectLoop().eagerlyEvaluate(nullptr);
   }
   kj::Timer& timer;
-  bool loopStarted = false, retirementLoopStarted = false, observesBackground = false;
+  bool loopStarted = false, retirementLoopStarted = false, observesBackground = false, backgroundDirty = false;
   void startLoop() {
     if (!loopStarted) {loopStarted = true; task = loop().eagerlyEvaluate(nullptr);}
   }
@@ -182,7 +182,7 @@ class IdleReaper {
         it = workers.erase(it);
       }
     }
-    auto row = kj::str("{\"pid\":", coworkerdPid(), ",\"residentIsolates\":", created - destroyed,
+    auto row = kj::str("{\"pid\":", coworkerdPid(), ",\"observedAtMonotonicMs\":", monotonicMs(), ",\"residentIsolates\":", created - destroyed,
         ",\"createdIsolates\":", created, ",\"destroyedIsolates\":", destroyed,
         ",\"idleEvictions\":", evicted, ",\"watermarkEvictions\":", watermarkEvicted,
         ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
@@ -273,8 +273,9 @@ class IdleReaper {
         ++bandReads;
       }
       // At most once a second: for the band, and for the collections when they changed.
-      if (monotonicMs() - lastPublish >= 1000 &&
-          (publishedBand || observesBackground || (gcSettings().observes() && processGcVersion() != publishedGc))) {
+      if (backgroundDirty || (monotonicMs() - lastPublish >= 1000 &&
+          (publishedBand || observesBackground || (gcSettings().observes() && processGcVersion() != publishedGc)))) {
+        backgroundDirty = false;
         publish();
         lastPublish = monotonicMs();
       }
@@ -397,13 +398,18 @@ void idleWorkerActorEvent(const IdleWorkerRef& worker) {
   // An actor's events never pass through the isolate's entry (activity()), so its last one counts as its last use: the
   // reaper does not evict an isolate whose actors are still receiving events.
   worker->lastActorEvent = worker->lastEnd = monotonicMs();
+  if (auto owner = worker->owner.lock()) owner->backgroundDirty = true;
 }
 
 namespace {
 struct Activity {
   IdleWorkerRef worker;
   explicit Activity(IdleWorkerRef worker): worker(kj::mv(worker)) { ++this->worker->active; }
-  ~Activity() { KJ_ASSERT(worker->active); --worker->active; worker->lastEnd = monotonicMs(); }
+  ~Activity() {
+    KJ_ASSERT(worker->active); --worker->active; worker->lastEnd = monotonicMs();
+    // Publish on a later loop turn, after IncomingRequest has queued its drain task.
+    if (worker->actorEvents) if (auto owner = worker->owner.lock()) owner->backgroundDirty = true;
+  }
 };
 class IdleObserver final: public IsolateObserver {
  public:
