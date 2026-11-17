@@ -442,10 +442,7 @@ impl InstallFlight {
 }
 
 const PREPARATION_QUANTUM: u64 = 64 * 1024;
-const PREPARATION_MAX_BYTES: u64 = 84 * 1024 * 1024;
 const PREPARATION_DEFAULT_CODE_BYTES: u64 = 80 * 1024 * 1024;
-const PREPARATION_SMALL_BYTES: u64 = 1024 * 1024;
-const PREPARATION_BYTE_UNITS: u32 = (PREPARATION_MAX_BYTES / PREPARATION_QUANTUM) as u32;
 const PREPARATION_SMALL_SLOTS: usize = 4;
 const PREPARATION_LARGE_SLOTS: usize = 12;
 
@@ -496,6 +493,8 @@ pub struct RootRegistry {
     preparation_small_slots: tokio::sync::Semaphore,
     preparation_large_slots: tokio::sync::Semaphore,
     preparation_byte_units: tokio::sync::Semaphore,
+    preparation_byte_budget: u64,
+    preparation_small_budget: u64,
     active_preparations: Cell<u64>,
     active_preparation_bytes: Cell<u64>,
     peak_active_preparations: Cell<u64>,
@@ -528,6 +527,11 @@ impl RootRegistry {
             ));
         }
         ffi::factory_set_root_lifecycle(factory.raw(), !plain_only);
+        let heap_mib = std::env::var("COWORKERD_STATIC_HEAP_MIB").ok()
+            .and_then(|value| value.parse::<u64>().ok()).unwrap_or(128).clamp(1, 65536);
+        let preparation_byte_budget = (heap_mib * 1024 * 1024 * 21 / 32)
+            .max(PREPARATION_QUANTUM);
+        let preparation_small_budget = (heap_mib * 1024 * 1024 / 128).max(PREPARATION_QUANTUM);
         Ok(Rc::new_cyclic(|this| Self {
             this: this.clone(),
             factory,
@@ -538,11 +542,13 @@ impl RootRegistry {
             install_lock: tokio::sync::Mutex::new(()),
             installing: RefCell::new(HashMap::new()),
             preparations: RefCell::new(HashMap::new()),
-            // Large verified packages share the trusted runtime's bounded heap.
-            // Keep only one in preparation; other plans wait without fetching.
+            // Reserve source memory before materializing it in the runtime.
+            // Small packages retain capacity independently of the large lane.
             preparation_small_slots: tokio::sync::Semaphore::new(PREPARATION_SMALL_SLOTS),
             preparation_large_slots: tokio::sync::Semaphore::new(PREPARATION_LARGE_SLOTS),
-            preparation_byte_units: tokio::sync::Semaphore::new(PREPARATION_BYTE_UNITS as usize),
+            preparation_byte_units: tokio::sync::Semaphore::new((preparation_byte_budget / PREPARATION_QUANTUM) as usize),
+            preparation_byte_budget,
+            preparation_small_budget,
             active_preparations: Cell::new(0),
             active_preparation_bytes: Cell::new(0),
             peak_active_preparations: Cell::new(0),
@@ -574,16 +580,16 @@ impl RootRegistry {
         // A maximum 10 MiB v2 package is charged 80 MiB plus its descriptor.
         // The 84 MiB large lane and four independent 1 MiB small lanes leave
         // 40 MiB of the default 128 MiB heap outside source materialization.
-        let small = bytes <= PREPARATION_SMALL_BYTES;
+        let small = bytes <= self.preparation_small_budget;
         let slot = if small { self.preparation_small_slots.acquire().await }
             else { self.preparation_large_slots.acquire().await }
             .map_err(|_| kj::failed!("ordinary preparation queue stopped"))?;
-        let units = bytes.div_ceil(PREPARATION_QUANTUM).min(PREPARATION_BYTE_UNITS as u64) as u32;
+        let units = bytes.div_ceil(PREPARATION_QUANTUM) as u32;
         let reservation = if small { None } else {
             Some(self.preparation_byte_units.acquire_many(units).await
                 .map_err(|_| kj::failed!("ordinary preparation byte budget stopped"))?)
         };
-        let charged_bytes = if small { PREPARATION_SMALL_BYTES } else { units as u64 * PREPARATION_QUANTUM };
+        let charged_bytes = if small { self.preparation_small_budget } else { units as u64 * PREPARATION_QUANTUM };
         self.active_preparations.set(self.active_preparations.get() + 1);
         self.active_preparation_bytes.set(self.active_preparation_bytes.get() + charged_bytes);
         self.peak_active_preparations.set(self.peak_active_preparations.get().max(self.active_preparations.get()));
@@ -631,7 +637,7 @@ impl RootRegistry {
             let source_bytes = descriptor.get("preparationMemoryBytes").and_then(Value::as_u64)
                 .unwrap_or(PREPARATION_DEFAULT_CODE_BYTES).max(1)
                 .saturating_add(descriptor_bytes.saturating_mul(4));
-            if source_bytes > PREPARATION_MAX_BYTES {
+            if source_bytes > self.preparation_byte_budget {
                 return Ok(json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
                     "message":"Ordinary package exceeds the trusted runtime preparation memory budget; no tenant event was delivered"}}));
             }
@@ -2024,8 +2030,8 @@ impl RootRegistry {
             "maxActivePreparations": PREPARATION_SMALL_SLOTS + PREPARATION_LARGE_SLOTS,
             "peakActivePreparations": self.peak_active_preparations.get(),
             "activePreparationBytes": self.active_preparation_bytes.get(),
-            "largePreparationByteBudget": PREPARATION_MAX_BYTES,
-            "smallPreparationByteBudget": PREPARATION_SMALL_SLOTS as u64 * PREPARATION_SMALL_BYTES,
+            "largePreparationByteBudget": self.preparation_byte_budget,
+            "smallPreparationByteBudget": PREPARATION_SMALL_SLOTS as u64 * self.preparation_small_budget,
             "failedInstalls": self.failed_installs.borrow().len(),
             "closingFences": self.closing_roots.pending(),
             "retiredNamespaceCount": self.removed_namespaces.borrow().len(),
