@@ -8,6 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
+use std::future::Future;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -440,6 +441,20 @@ impl InstallFlight {
     }
 }
 
+struct PreparationFlight {
+    result: RefCell<Option<Value>>,
+    completed: tokio::sync::Notify,
+}
+impl PreparationFlight {
+    async fn wait(&self) -> Value {
+        loop {
+            let notified = self.completed.notified();
+            if let Some(result) = self.result.borrow().clone() { return result; }
+            notified.await;
+        }
+    }
+}
+
 pub struct RootRegistry {
     this: Weak<Self>,
     factory: Rc<Factory>,
@@ -449,7 +464,9 @@ pub struct RootRegistry {
     latest_plain: RefCell<HashMap<String, (u64, String)>>,
     install_lock: tokio::sync::Mutex<()>,
     installing: RefCell<HashMap<String, Rc<InstallFlight>>>,
-    preparations: RefCell<HashMap<String, (String, Instant)>>,
+    preparations: RefCell<HashMap<String, Rc<PreparationFlight>>>,
+    preparation_wait_cpu_ns: Cell<u64>,
+    preparation_wait_polls: Cell<u64>,
     failed_installs: RefCell<HashMap<String, FailedInstall>>,
     failure_use: Cell<u64>,
     tenant_compilations: Cell<u64>,
@@ -474,6 +491,7 @@ impl RootRegistry {
                 "the private root loader needs an absolute storagePath"
             ));
         }
+        ffi::factory_set_root_lifecycle(factory.raw(), !plain_only);
         Ok(Rc::new_cyclic(|this| Self {
             this: this.clone(),
             factory,
@@ -484,6 +502,8 @@ impl RootRegistry {
             install_lock: tokio::sync::Mutex::new(()),
             installing: RefCell::new(HashMap::new()),
             preparations: RefCell::new(HashMap::new()),
+            preparation_wait_cpu_ns: Cell::new(0),
+            preparation_wait_polls: Cell::new(0),
             failed_installs: RefCell::new(HashMap::new()),
             failure_use: Cell::new(0),
             tenant_compilations: Cell::new(0),
@@ -502,25 +522,83 @@ impl RootRegistry {
         }))
     }
 
-    fn claim_preparation(&self, key: &str, owner: &str) -> Value {
-        let now = Instant::now();
-        let mut leases = self.preparations.borrow_mut();
-        leases.retain(|_, (_, deadline)| *deadline > now);
-        // An install flight owns its source independently of its original caller.
-        if self.installing.borrow().contains_key(key) {
-            return json!({"owned":false,"retryAfterMs":25});
+    async fn prepare(self: &Rc<Self>, value: Value) -> Result<Value> {
+        let deployment: Deployment = serde_json::from_value(value.clone())
+            .map_err(|error| kj::failed!("ordinary preparation: {error}"))?;
+        if !deployment.is_plain()
+            || value["descriptor"]["workerId"] != deployment.worker_id
+            || value["descriptor"]["versionId"] != deployment.version_id
+        {
+            return Err(kj::failed!(
+                "ordinary preparation needs its trusted descriptor"
+            ));
         }
-        if let Some((current, _)) = leases.get(key) {
-            return json!({"owned":current == owner,"retryAfterMs":25});
+        let key = deployment.plan_key()?;
+        if let Some(plan) = self.plans.borrow().get(&key) {
+            if self.loaded(plan).is_some() {
+                return Ok(json!({"ok":true,"result":{"plan":key,"info":{"loaded":true,
+                    "generation":plan.generation.get(),"cold":plan.reported_plain_generation.get()!=plan.generation.get()}}}));
+            }
         }
-        if leases.len() >= 1024 { return json!({"owned":false,"retryAfterMs":25}); }
-        leases.insert(key.to_owned(), (owner.to_owned(), now + Duration::from_secs(5)));
-        json!({"owned":true,"retryAfterMs":25})
-    }
-
-    fn release_preparation(&self, key: &str, owner: &str) {
-        let mut leases = self.preparations.borrow_mut();
-        if leases.get(key).is_some_and(|(current, _)| current == owner) { leases.remove(key); }
+        let existing = self.preparations.borrow().get(&key).cloned();
+        let flight = if let Some(flight) = existing {
+            flight
+        } else {
+            // No spinning at capacity. This is twice the Node's maximum in-flight cohort;
+            // detached cancellations are bounded too, and an overflow is never a tenant event.
+            if self.preparations.borrow().len() >= 1024 {
+                return Ok(
+                    json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
+                    "message":"Ordinary preparation capacity reached; no tenant event was delivered"}}),
+                );
+            }
+            let flight = Rc::new(PreparationFlight {
+                result: RefCell::new(None),
+                completed: tokio::sync::Notify::new(),
+            });
+            self.preparations
+                .borrow_mut()
+                .insert(key.clone(), Rc::clone(&flight));
+            let registry = Rc::clone(self);
+            let task = Rc::clone(&flight);
+            let task_key = key.clone();
+            self.factory.spawn_detached(async move {
+                let prepare=async {
+                    let target=RootTarget {service:"runtime".to_owned(),entrypoint:Some("PlainPreparer".to_owned()),
+                        props:json!({"base":deployment,"descriptor":value["descriptor"]})};
+                    let channel=registry.target(&target,&target.props)?;
+                    let request=channel.start_request(ffi::new_request_metadata(None.into(),None.into()))?;
+                    let bytes=ffi::factory_prepare_plain(registry.factory.raw(),request).await?;
+                    serde_json::from_slice::<Value>(&bytes).map_err(|error|kj::failed!("ordinary preparation reply: {error}"))
+                };
+                let prepare=std::pin::pin!(prepare);let timeout=std::pin::pin!(registry.factory.sleep(Duration::from_secs(30)));
+                let result=match futures::future::select(prepare,timeout).await {
+                    futures::future::Either::Left((Ok(reply),_))=>reply,
+                    futures::future::Either::Left((Err(error),_))=>json!({"ok":false,"error":{"kind":"platform","message":error.description()}}),
+                    futures::future::Either::Right(_)=>json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
+                        "message":"Ordinary preparation timed out after 30 seconds; no tenant event was delivered"}}),
+                };
+                let success=result["ok"]==true;
+                *task.result.borrow_mut()=Some(result);task.completed.notify_waiters();
+                // A short shared memory covers pre-install failures for the arriving cohort.
+                // Completion belongs to this task, never to a cancelled requesting context.
+                if !success {registry.factory.sleep(Duration::from_millis(100)).await;}
+                let current=registry.preparations.borrow().get(&task_key).is_some_and(|current|Rc::ptr_eq(current,&task));
+                if current {
+                    registry.preparations.borrow_mut().remove(&task_key);
+                }
+            });
+            flight
+        };
+        let wait = std::pin::pin!(flight.wait());
+        let timeout = std::pin::pin!(self.factory.sleep(Duration::from_secs(25)));
+        Ok(match futures::future::select(wait, timeout).await {
+            futures::future::Either::Left((reply, _)) => reply,
+            futures::future::Either::Right(_) => {
+                json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
+                "message":"Ordinary preparation wait timed out after 25 seconds; no tenant event was delivered"}})
+            }
+        })
     }
 
     fn cached_failure(&self, key: &str) -> Option<crate::Error> {
@@ -1839,6 +1917,9 @@ impl RootRegistry {
         json!({"plans": plans, "namespaces": namespaces, "compiledWorkers": self.compiled.borrow().len(),
             "installingNamespaces": self.installing.borrow().values().flat_map(|flight| flight.namespaces.iter().cloned()).collect::<Vec<_>>(),
             "installingPlans": self.installing.borrow().len(), "tenantCompilations": self.tenant_compilations.get(),
+            "preparationWaitCpuNs": self.preparation_wait_cpu_ns.get(),
+            "preparationWaitPolls": self.preparation_wait_polls.get(),
+            "preparations": self.preparations.borrow().len(),
             "failedInstalls": self.failed_installs.borrow().len(),
             "closingFences": self.closing_roots.pending(),
             "retiredNamespaceCount": self.removed_namespaces.borrow().len(),
@@ -2388,32 +2469,37 @@ impl Service for RootRequest {
     ) -> Result<()> {
         let text = std::str::from_utf8(url).map_err(|error| kj::failed!("root URL: {error}"))?;
         let url = url::Url::parse(text).map_err(|error| kj::failed!("root URL: {error}"))?;
+        if method==Method::POST && url.path()=="/prepare" {
+            let registry=Rc::clone(&self.registry);let meter=Rc::clone(&registry);
+            let future=async move {
+                let reply=registry.prepare(read_json(body).await?).await?;
+                let (status,value)=if reply["ok"]==true {(200,reply["result"].clone())} else {
+                    (if reply["error"]["kind"]=="tenant-code" {500} else {503},reply)
+                };
+                let bytes=serde_json::to_vec(&value).map_err(|error|kj::failed!("ordinary preparation reply: {error}"))?;
+                let headers=Headers::new(header_table(&registry.factory));
+                response.send(status,"Ordinary preparation",&headers,Some(bytes.len() as u64))?.write(&bytes).await
+            };
+            let mut future=std::pin::pin!(future);
+            return futures::future::poll_fn(move |context| {
+                let start=ffi::factory_thread_cpu_ns();let result=future.as_mut().poll(context);
+                meter.preparation_wait_cpu_ns.set(meter.preparation_wait_cpu_ns.get()+ffi::factory_thread_cpu_ns()-start);
+                meter.preparation_wait_polls.set(meter.preparation_wait_polls.get()+1);result
+            }).await;
+        }
         let mut status = 200;
         let value = match (method, url.path()) {
             (Method::POST, "/lookup") => {
-                let value = read_json(body).await?;
-                let owner = value.get("preparationOwner").and_then(Value::as_str).unwrap_or("");
-                let deployment: Deployment = serde_json::from_value(value.clone())
+                let deployment: Deployment = serde_json::from_value(read_json(body).await?)
                     .map_err(|error| kj::failed!("root lookup: {error}"))?;
-                let key = deployment.plan_key()?;
-                if let Some(error) = self.registry.cached_failure(&key) {
-                    let (code, value) = preparation_failure(error.description());
-                    status = code;
-                    value
+                let key=deployment.plan_key()?;
+                if let Some(error)=self.registry.cached_failure(&key) {
+                    let (code,value)=preparation_failure(error.description());status=code;value
                 } else {
-                    let plans = self.registry.plans.borrow();
-                    let installed = plans.get(&key);
-                    let loaded = installed.is_some_and(|plan| plan.loaded.borrow().is_some());
-                    let mut reply = json!({"plan": installed.map(|_| &key), "info": installed.map(|plan| json!({
-                        "loaded": plan.loaded.borrow().is_some(), "generation": plan.generation.get(),
-                        "cold": plan.deployment.is_plain() && plan.reported_plain_generation.get() != plan.generation.get()
-                    }))});
-                    drop(plans);
-                    if deployment.is_plain() && !owner.is_empty() {
-                        if loaded { self.registry.release_preparation(&key, owner); }
-                        else { reply["preparation"] = self.registry.claim_preparation(&key, owner); }
-                    }
-                    reply
+                    let plans=self.registry.plans.borrow();let installed=plans.get(&key);
+                    json!({"plan":installed.map(|_|&key),"info":installed.map(|plan|json!({
+                        "loaded":plan.loaded.borrow().is_some(),"generation":plan.generation.get(),
+                        "cold":plan.deployment.is_plain()&&plan.reported_plain_generation.get()!=plan.generation.get()}))})
                 }
             }
             (Method::POST, "/install") => {
@@ -2428,16 +2514,9 @@ impl Service for RootRequest {
                     }
                     format!("{},", &identity[1..identity.len() - 1])
                 };
-                let owner = value.get("preparationOwner").and_then(Value::as_str).unwrap_or("").to_owned();
                 let deployment: Deployment = serde_json::from_value(value)
                     .map_err(|error| kj::failed!("root deployment: {error}"))?;
-                let key = deployment.plan_key()?;
-                if deployment.is_plain() && !owner.is_empty() && !self.registry.preparations.borrow().get(&key)
-                    .is_some_and(|(current, deadline)| current == &owner && *deadline > Instant::now()) {
-                    return Err(kj::failed!("ordinary preparation reservation expired; no event was delivered"));
-                }
-                let result = self.registry.install(deployment, startup_identity).await;
-                self.registry.release_preparation(&key, &owner);
+                let result=self.registry.install(deployment,startup_identity).await;
                 match result {
                     Ok(plan) => {
                         let plans = self.registry.plans.borrow();
@@ -2540,14 +2619,6 @@ impl Service for RootRequest {
                 }
                 self.registry.prune_plans();
                 json!({"removed": removed})
-            }
-            (Method::POST, "/release-preparation") => {
-                let value = read_json(body).await?;
-                let owner = value.get("preparationOwner").and_then(Value::as_str).unwrap_or("");
-                let deployment: Deployment = serde_json::from_value(value.clone())
-                    .map_err(|error| kj::failed!("ordinary preparation release: {error}"))?;
-                self.registry.release_preparation(&deployment.plan_key()?, owner);
-                json!({"released":true})
             }
             (Method::POST, "/hibernate") => {
                 let namespaces: Vec<_> = self

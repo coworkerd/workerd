@@ -229,6 +229,11 @@ class WorkerSelectionActivity final {
   kj::Own<void> activity;
 };
 kj::Own<WorkerSelectionActivity> worker_selection_activity(const CompiledWorker& worker);
+// A registry-owned request to the configured runtime's private ordinary preparer.
+kj::Promise<::rust::Vec<uint8_t>> factory_prepare_plain(
+    const WorkerFactory& factory, kj::Own<WorkerInterface> request);
+uint64_t factory_thread_cpu_ns();
+void factory_set_root_lifecycle(const WorkerFactory& factory, bool durable);
 void worker_retire_when_idle(const CompiledWorker& worker);
 void worker_unlink(const CompiledWorker& worker);
 kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,

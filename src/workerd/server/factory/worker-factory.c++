@@ -2072,6 +2072,62 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
   }
 }
 
+namespace {
+class PlainPreparationBody final: public kj::AsyncOutputStream {
+ public:
+  explicit PlainPreparationBody(kj::Vector<kj::byte>& body): body(body) {}
+  kj::Promise<void> write(const void* buffer, size_t size) override {
+    KJ_REQUIRE(body.size() + size <= 32768, "ordinary preparation reply too large");
+    body.addAll(kj::arrayPtr(static_cast<const kj::byte*>(buffer), size));
+    return kj::READY_NOW;
+  }
+  kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
+    for (auto piece: pieces) {KJ_REQUIRE(body.size()+piece.size()<=32768);body.addAll(piece);}
+    return kj::READY_NOW;
+  }
+ private:
+  kj::Vector<kj::byte>& body;
+};
+class PlainPreparationResponse final: public kj::HttpService::Response {
+ public:
+  kj::Vector<kj::byte> body;
+  bool sent = false;
+  kj::Own<kj::AsyncOutputStream> send(uint status, kj::StringPtr,
+      const kj::HttpHeaders&, kj::Maybe<uint64_t> expected) override {
+    KJ_REQUIRE(!sent && status == 200, "private ordinary preparer failed", status);
+    sent = true;
+    KJ_IF_SOME(size, expected) {KJ_REQUIRE(size <= 32768, "ordinary preparation reply too large");}
+    return kj::heap<PlainPreparationBody>(body);
+  }
+  kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders&) override {
+    KJ_FAIL_REQUIRE("ordinary preparation cannot upgrade");
+  }
+};
+}  // namespace
+
+kj::Promise<::rust::Vec<uint8_t>> factory_prepare_plain(
+    const WorkerFactory& factory, kj::Own<WorkerInterface> request) {
+  PlainPreparationResponse response;
+  kj::HttpHeaders headers(*factory.getImpl().headerTable);
+  auto pipe = kj::newOneWayPipe(); pipe.out = nullptr;
+  co_await request->request(kj::HttpMethod::POST, "http://coworkerd-plain-prepare/",
+      headers, *pipe.in, response);
+  KJ_REQUIRE(response.sent, "private ordinary preparer returned no reply");
+  ::rust::Vec<uint8_t> bytes;
+  for (auto byte: response.body) bytes.push_back(byte);
+  co_return bytes;
+}
+
+uint64_t factory_thread_cpu_ns() {
+  timespec time;
+  KJ_REQUIRE(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) == 0);
+  return uint64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
+}
+
+void factory_set_root_lifecycle(const WorkerFactory& factory, bool durable) {
+  idleReaperRootLifecycle(factory.getImpl().idleReaper, durable);
+}
+
 kj::Own<WorkerSelectionActivity> worker_selection_activity(const CompiledWorker& worker) {
   return kj::heap<WorkerSelectionActivity>(idleActivity(worker.getImpl().idleWorker));
 }

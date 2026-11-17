@@ -43,6 +43,9 @@ void emit(kj::StringPtr row) {
 //   [0, 8)    publications completed; the latest snapshot is in buffer (publications % 2)
 //   [8, 12)   magic 0x434c5743 ("CWLC")
 //   [12, 16)  capacity of each buffer's data in bytes
+//   [16, 24)  reader's drain request counter
+//   [24, 32)  drain reply sequence (request * 2; odd while writing)
+//   [32, 64)  observed monotonic ns, active count, background count, unknown busy count
 //   buffer i at 64 + i * (16 + capacity): sequence (8; odd while being written), length (4),
 //             4 unused, data
 // One writer, this process; a reader copies the published buffer and keeps the copy only if its
@@ -54,6 +57,19 @@ class LifecycleChannel {
     if (base) capacity = *reinterpret_cast<uint32_t*>(base + 12);
   }
   explicit operator bool() const { return base != nullptr; }
+  uint64_t drainRequest() const {
+    return base ? __atomic_load_n(reinterpret_cast<const uint64_t*>(base + 16), __ATOMIC_ACQUIRE) : 0;
+  }
+  void publishDrain(uint64_t request, uint64_t observed, uint64_t active, uint64_t background, uint64_t unknown) {
+    auto* sequence = reinterpret_cast<uint64_t*>(base + 24);
+    __atomic_store_n(sequence, request * 2 - 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 32), observed, __ATOMIC_RELAXED);
+    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 40), active, __ATOMIC_RELAXED);
+    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 48), background, __ATOMIC_RELAXED);
+    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 56), unknown, __ATOMIC_RELAXED);
+    __atomic_store_n(sequence, request * 2, __ATOMIC_RELEASE);
+  }
   // False when the snapshot does not fit; the previous one stays published.
   bool publish(kj::StringPtr row) {
     auto lock = mutex.lockExclusive();
@@ -126,11 +142,11 @@ class IdleReaper {
     KJ_REQUIRE(interval > 0, "COWORKERD_IDLE_DESTROY_INTERVAL_MS must be positive");
     publishedBand = inheritedBand();
     publish();
-    if (threshold || publishedBand || gcSettings().observes()) startLoop();
+    if (threshold || publishedBand || gcSettings().observes() || lifecycleChannel()) startLoop();
     if (gcSettings().idleCollectMs) collectTask = collectLoop().eagerlyEvaluate(nullptr);
   }
   kj::Timer& timer;
-  bool loopStarted = false, retirementLoopStarted = false, observesBackground = false, backgroundDirty = false;
+  bool loopStarted = false, retirementLoopStarted = false, observesBackground = false, durableLifecycle = false;
   void startLoop() {
     if (!loopStarted) {loopStarted = true; task = loop().eagerlyEvaluate(nullptr);}
   }
@@ -152,6 +168,28 @@ class IdleReaper {
   std::list<std::weak_ptr<IdleWorker>> retiringWorkers;
   kj::Promise<void> task = nullptr, collectTask = nullptr, retirementTask = nullptr;
   uint64_t publishedGc = 0;
+  uint64_t publicationCpuNs = 0, publications = 0, drainCpuNs = 0, drainPublications = 0, lastDrainRequest = 0;
+
+  void publishDrain() {
+    auto& channel = lifecycleChannel();
+    const auto request = channel.drainRequest();
+    if (!request || request == lastDrainRequest) return;
+    const auto start = cpuNs();
+    uint64_t active = 0, background = 0, unknown = 0;
+    for (const auto& entry: workers) if (auto worker = entry.lock()) {
+      if (!worker->created || worker->destroyed) continue;
+      bool busy = false;
+      KJ_IF_SOME(done, worker->backgroundDone) { busy = !done(); }
+      active += worker->active; background += busy;
+      const auto& labels = worker->labels;
+      if ((!labels.tenant.size() || !labels.workerId.size() || !labels.versionId.size() || !labels.planRevision.size()) &&
+          (worker->active || busy)) ++unknown;
+    }
+    const auto observed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    channel.publishDrain(request, observed, active, background, unknown);
+    lastDrainRequest = request; ++drainPublications; drainCpuNs += cpuNs() - start;
+  }
 
   void event(const IdleWorker& worker, kj::StringPtr event, double elapsed = 0, uint64_t cpu = 0) {
     emit(kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":",
@@ -168,13 +206,17 @@ class IdleReaper {
   void publish() {
     auto& channel = lifecycleChannel();
     if (!channel) return;
+    const auto now = monotonicMs();
+    if (durableLifecycle && publications && now - lastPublish < 1000) return;
+    const auto start = cpuNs();
     kj::Vector<kj::String> entries;
-    bool anyBackground = false, unknownBusy = false;
+    bool anyActive = false, anyBackground = false, unknownBusy = false;
     for (auto it = workers.begin(); it != workers.end();) {
       if (auto worker = it->lock()) {
         bool backgroundActive = false;
         KJ_IF_SOME(done, worker->backgroundDone) { backgroundActive = !done(); }
         if (worker->created && !worker->destroyed) {
+          anyActive |= worker->active > 0;
           anyBackground |= backgroundActive;
           const auto& labels = worker->labels;
           const bool tagged = labels.tenant.size() && labels.workerId.size() && labels.versionId.size() &&
@@ -194,13 +236,16 @@ class IdleReaper {
     // The small prefix and completion trailer share the full snapshot's atomic publication.
     // A durable generation needs this aggregate, independently of its historical call count.
     auto row = kj::str("{\"drain\":{\"observedAtMonotonicMs\":", observed,
-        ",\"residentCount\":", entries.size(), ",\"backgroundActive\":", anyBackground ? "true" : "false",
+        ",\"residentCount\":", entries.size(), ",\"active\":", anyActive ? "true" : "false",
+        ",\"backgroundActive\":", anyBackground ? "true" : "false",
         ",\"unknownBusy\":", unknownBusy ? "true" : "false", "},\"pid\":", coworkerdPid(),
         ",\"observedAtMonotonicMs\":", observed, ",\"residentIsolates\":", created - destroyed,
         ",\"createdIsolates\":", created, ",\"destroyedIsolates\":", destroyed,
         ",\"idleEvictions\":", evicted, ",\"watermarkEvictions\":", watermarkEvicted,
         ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
         ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
+        ",\"publicationCpuNs\":", publicationCpuNs, ",\"publications\":", publications,
+        ",\"drainCpuNs\":", drainCpuNs, ",\"drainPublications\":", drainPublications,
         gcSettings().observes() ? processGcJson() : kj::str(""),
         ",\"residentWorkers\":[", kj::strArray(entries, ","), "],\"drainSnapshotComplete\":true}");
     if (gcSettings().observes()) publishedGc = processGcVersion();
@@ -208,6 +253,7 @@ class IdleReaper {
       overflowReported = true;
       emit(kj::str("{\"event\":\"snapshot-too-large\",\"pid\":", coworkerdPid(), ",\"bytes\":", row.size(), "}"));
     }
+    ++publications; publicationCpuNs += cpuNs() - start; lastPublish = monotonicMs();
   }
   bool overflowReported = false;
  private:
@@ -286,12 +332,13 @@ class IdleReaper {
             std::chrono::steady_clock::now() - start).count();
         ++bandReads;
       }
-      // At most once a second: for the band, and for the collections when they changed.
-      if (backgroundDirty || (monotonicMs() - lastPublish >= 1000 &&
-          (publishedBand || observesBackground || (gcSettings().observes() && processGcVersion() != publishedGc)))) {
-        backgroundDirty = false;
+      publishDrain();
+      // Actor activity never causes a full publication. Even an empty registry
+      // answers drain requests and publishes its observation once per second.
+      if (monotonicMs() - lastPublish >= 1000 &&
+          (lifecycleChannel() || publishedBand || observesBackground ||
+              (gcSettings().observes() && processGcVersion() != publishedGc))) {
         publish();
-        lastPublish = monotonicMs();
       }
       auto minimum = effectiveThreshold();
       if (!minimum || pending || monotonicMs() - lastDestroy < interval) continue;
@@ -351,6 +398,10 @@ class IdleReaper {
 
 std::shared_ptr<IdleReaper> idleReaper(kj::Timer& timer) {
   return std::make_shared<IdleReaper>(timer);
+}
+void idleReaperRootLifecycle(const std::shared_ptr<IdleReaper>& reaper, bool durable) {
+  reaper->durableLifecycle = durable;
+  reaper->startLoop();
 }
 IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
     kj::StringPtr name, kj::Function<void()> remove, bool eligible, IdleWorkerLabels labels) {
@@ -412,7 +463,6 @@ void idleWorkerActorEvent(const IdleWorkerRef& worker) {
   // An actor's events never pass through the isolate's entry (activity()), so its last one counts as its last use: the
   // reaper does not evict an isolate whose actors are still receiving events.
   worker->lastActorEvent = worker->lastEnd = monotonicMs();
-  if (auto owner = worker->owner.lock()) owner->backgroundDirty = true;
 }
 
 namespace {
@@ -421,8 +471,6 @@ struct Activity {
   explicit Activity(IdleWorkerRef worker): worker(kj::mv(worker)) { ++this->worker->active; }
   ~Activity() {
     KJ_ASSERT(worker->active); --worker->active; worker->lastEnd = monotonicMs();
-    // Publish on a later loop turn, after IncomingRequest has queued its drain task.
-    if (worker->actorEvents) if (auto owner = worker->owner.lock()) owner->backgroundDirty = true;
   }
 };
 class IdleObserver final: public IsolateObserver {

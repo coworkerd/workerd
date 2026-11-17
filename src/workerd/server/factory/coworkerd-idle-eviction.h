@@ -18,6 +18,9 @@ struct IdleWorkerLabels {
 };
 
 std::shared_ptr<IdleReaper> idleReaper(kj::Timer& timer);
+// Durable registries publish the full observation at most once per second. Drain
+// requests use a separate bounded aggregate in the channel header.
+void idleReaperRootLifecycle(const std::shared_ptr<IdleReaper>& reaper, bool durable);
 IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
     kj::StringPtr name, kj::Function<void()> remove, bool eligible = true,
     IdleWorkerLabels labels = {});

@@ -427,6 +427,12 @@ pub mod ffi {
         fn worker_idle_ready(worker: &CompiledWorker, channels: Box<ChannelFactory>) -> Result<()>;
         type WorkerSelectionActivity;
         fn worker_selection_activity(worker: &CompiledWorker) -> KjOwn<WorkerSelectionActivity>;
+        async fn factory_prepare_plain(
+            factory: &WorkerFactory,
+            request: KjOwn<WorkerInterface>,
+        ) -> Result<Vec<u8>>;
+        fn factory_thread_cpu_ns() -> u64;
+        fn factory_set_root_lifecycle(factory: &WorkerFactory, durable: bool);
         fn worker_retire_when_idle(worker: &CompiledWorker) -> Result<()>;
         /// Cancels the worker's requests still in flight (background work past the response: a
         /// `waitUntil()`, a tail worker's event), each of which holds the worker and its I/O
