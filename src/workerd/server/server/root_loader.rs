@@ -501,7 +501,7 @@ pub struct RootRegistry {
     preparation_wait_cpu_ns: Cell<u64>,
     preparation_wait_polls: Cell<u64>,
     preparation_wake_cpu_ns: Cell<u64>,
-    preparation_wake_batches: Cell<u64>,
+    preparation_wake_completions: Cell<u64>,
     failed_installs: RefCell<HashMap<String, FailedInstall>>,
     failure_use: Cell<u64>,
     tenant_compilations: Cell<u64>,
@@ -555,7 +555,7 @@ impl RootRegistry {
             preparation_wait_cpu_ns: Cell::new(0),
             preparation_wait_polls: Cell::new(0),
             preparation_wake_cpu_ns: Cell::new(0),
-            preparation_wake_batches: Cell::new(0),
+            preparation_wake_completions: Cell::new(0),
             failed_installs: RefCell::new(HashMap::new()),
             failure_use: Cell::new(0),
             tenant_compilations: Cell::new(0),
@@ -638,8 +638,8 @@ impl RootRegistry {
                 .unwrap_or(PREPARATION_DEFAULT_CODE_BYTES).max(1)
                 .saturating_add(descriptor_bytes.saturating_mul(4));
             if source_bytes > self.preparation_byte_budget {
-                return Ok(json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
-                    "message":"Ordinary package exceeds the trusted runtime preparation memory budget; no tenant event was delivered"}}));
+                return Ok(json!({"ok":false,"error":{"kind":"preparation-limit","noExecution":true,"retryable":false,
+                    "message":format!("Ordinary package needs {source_bytes} preparation bytes, exceeding the trusted runtime budget of {} bytes; increase COWORKERD_STATIC_HEAP_MIB or reduce the package",self.preparation_byte_budget)}}));
             }
             let flight = Rc::new(PreparationFlight {
                 result: RefCell::new(None),
@@ -656,6 +656,12 @@ impl RootRegistry {
                 let result = {
                 let prepare=async {
                     let permit = registry.preparation_permit(source_bytes).await?;
+                    // A queued job has no reason to fetch code once every caller has left.
+                    // A late caller can start a fresh flight after this result is removed.
+                    if !task.waiters.borrow().values().any(|waiter| !waiter.is_canceled()) {
+                        return Ok(json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
+                            "message":"Ordinary preparation has no remaining callers"}}));
+                    }
                     let target=RootTarget {service:"runtime".to_owned(),entrypoint:Some("PlainPreparer".to_owned()),
                         props:json!({"base":deployment,"descriptor":descriptor})};
                     let channel=registry.target(&target,&target.props)?;
@@ -690,7 +696,7 @@ impl RootRegistry {
                     if !waiter.is_canceled() { let _ = waiter.send(result.clone()); }
                 }
                 registry.preparation_wake_cpu_ns.set(registry.preparation_wake_cpu_ns.get() + ffi::factory_thread_cpu_ns() - start);
-                registry.preparation_wake_batches.set(registry.preparation_wake_batches.get() + 1);
+                registry.preparation_wake_completions.set(registry.preparation_wake_completions.get() + 1);
             });
             flight
         };
@@ -2024,13 +2030,16 @@ impl RootRegistry {
             "preparationWaitCpuNs": self.preparation_wait_cpu_ns.get(),
             "preparationWaitPolls": self.preparation_wait_polls.get(),
             "preparationWakeCpuNs": self.preparation_wake_cpu_ns.get(),
-            "preparationWakeBatches": self.preparation_wake_batches.get(),
+            "preparationWakeCompletions": self.preparation_wake_completions.get(),
             "preparations": self.preparations.borrow().len(),
             "activePreparations": self.active_preparations.get(),
             "maxActivePreparations": PREPARATION_SMALL_SLOTS + PREPARATION_LARGE_SLOTS,
             "peakActivePreparations": self.peak_active_preparations.get(),
             "activePreparationBytes": self.active_preparation_bytes.get(),
             "largePreparationByteBudget": self.preparation_byte_budget,
+            "maximumPackagePreparationBytes": 84 * 1024 * 1024u64,
+            "maximumPackageCheckDescriptorBytes": 1024 * 1024,
+            "maximumPackageFits": self.preparation_byte_budget >= 84 * 1024 * 1024,
             "smallPreparationByteBudget": PREPARATION_SMALL_SLOTS as u64 * self.preparation_small_budget,
             "failedInstalls": self.failed_installs.borrow().len(),
             "closingFences": self.closing_roots.pending(),
@@ -2587,7 +2596,7 @@ impl Service for RootRequest {
                 let value=read_json(body).await.map_err(|_|kj::failed!("ordinary preparation request is invalid"))?;
                 let reply=registry.prepare(value).await?;
                 let (status,value)=if reply["ok"]==true {(200,reply["result"].clone())} else {
-                    (if reply["error"]["kind"]=="tenant-code" {500} else {503},reply)
+                    (if reply["error"]["kind"]=="tenant-code" || reply["error"]["kind"]=="preparation-limit" {500} else {503},reply)
                 };
                 let bytes=serde_json::to_vec(&value).map_err(|error|kj::failed!("ordinary preparation reply: {error}"))?;
                 let headers=Headers::new(header_table(&registry.factory));
