@@ -264,9 +264,12 @@ export default { async fetch(request) {
 )JS"_kj;
 
 struct Server {
-  explicit Server(uint count): slots(kj::heapArray<Slot>(count)) {}
+  enum class SourceKind { BENCHMARK, MINIMAL };
+  explicit Server(uint count, SourceKind sourceKind = SourceKind::BENCHMARK)
+      : slots(kj::heapArray<Slot>(count)), sourceKind(sourceKind) {}
   jsg::V8System v8;
   kj::Array<Slot> slots;
+  SourceKind sourceKind;
   kj::MutexGuarded<kj::Vector<int>> pending;
   kj::Vector<kj::Own<kj::Thread>> threads;
   std::atomic<uint> live{0}, busy{0}, maxBusy{0};
@@ -278,9 +281,12 @@ struct Server {
     auto cell = slot.worker.lockExclusive();
     KJ_IF_SOME(worker, *cell) { return kj::atomicAddRef(*worker); }
     auto name = kj::str("w", index);
-    auto marker = KJ_REQUIRE_NONNULL(script.findFirst('_'));
-    auto source = kj::str(script.slice(0, marker), name,
-        script.slice(marker + strlen("__ID__"))); 
+    kj::StringPtr sourceTemplate = sourceKind == SourceKind::MINIMAL
+        ? "const id='__ID__'; export default {fetch(){return new Response(id)}};"_kj
+        : script;
+    auto marker = KJ_REQUIRE_NONNULL(sourceTemplate.findFirst('_'));
+    auto source = kj::str(sourceTemplate.slice(0, marker), name,
+        sourceTemplate.slice(marker + strlen("__ID__")));
     auto config = slot.configArena.initRoot<server::config::Worker>();
     auto modules = config.initModules(1);
     modules[0].setName("main");
@@ -475,6 +481,48 @@ void lockBench(uint turns) {
       (unsigned long long)isolates[0], (unsigned long long)isolates[1]);
 }
 
+void capacity(uint maximum) {
+  ThreadState state;
+  Server server(maximum, Server::SourceKind::MINIMAL);
+  auto defaultGroup = v8::IsolateGroup::GetDefault();
+  kj::Maybe<v8::IsolateGroup> previous;
+  auto started = nowNs();
+  KJ_REQUIRE(v8::IsolateGroup::CanCreateNewGroups(), "capacity requires multiple cages");
+  printf("{\"type\":\"capacity-start\",\"pid\":%d,\"canCreateNewGroups\":true,\"maximum\":%u}\n",
+      getpid(), maximum);
+  fflush(stdout);
+  for (uint index = 0; index < maximum; ++index) {
+    uintptr_t address = 0;
+    auto failure = kj::runCatchingExceptions([&]() {
+      auto worker = server.getWorker(index);
+      worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock& lock) {
+        auto group = lock.getIsolate()->GetGroup();
+        KJ_REQUIRE(group != defaultGroup, "worker retained default group");
+        KJ_IF_SOME(old, previous) {
+          KJ_REQUIRE(group != old, "workers share an isolate group");
+        }
+        previous = kj::mv(group);
+        address = reinterpret_cast<uintptr_t>(lock.getIsolate());
+      });
+    });
+    KJ_IF_SOME(error, failure) {
+      KJ_LOG(ERROR, "worker creation rejected", index, error);
+      auto existing = server.getWorker(0);
+      existing->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [](Worker::Lock&) {});
+      printf("{\"type\":\"capacity-create-failed\",\"successfulWorkers\":%u,"
+             "\"recoverableCaught\":true,\"survivedExistingWorkerLock\":true}\n", index);
+      fflush(stdout);
+      return;
+    }
+    printf("{\"type\":\"capacity-created\",\"successfulWorkers\":%u,\"isolate\":%llu,"
+           "\"differentFromDefaultAndPrevious\":true,\"elapsedNs\":%llu}\n",
+        index + 1, (unsigned long long)address, (unsigned long long)(nowNs() - started));
+    fflush(stdout);
+  }
+  printf("{\"type\":\"capacity-bound-reached\",\"successfulWorkers\":%u}\n", maximum);
+  fflush(stdout);
+}
+
 }  // namespace
 }  // namespace workerd
 
@@ -484,6 +532,10 @@ int main(int argc, char** argv) {
   util::Autogate::initAutogateNamesForTest({}, util::IgnoreAllAutogatesEnv(true));
   if (kj::StringPtr(argv[1]) == "lockbench") {
     lockBench(strtoul(argv[2], nullptr, 10));
+    return 0;
+  }
+  if (kj::StringPtr(argv[1]) == "capacity") {
+    capacity(strtoul(argv[2], nullptr, 10));
     return 0;
   }
   Server server(strtoul(argv[2], nullptr, 10));
