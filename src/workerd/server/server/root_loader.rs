@@ -593,14 +593,17 @@ impl RootRegistry {
                 // probes. Release small groups, yielding real I/O time between them.
                 while !task.waiters.borrow().is_empty() {
                     let start = ffi::factory_thread_cpu_ns();
-                    for _ in 0..16 {
+                    for _ in 0..8 {
                         let waiter = task.waiters.borrow_mut().pop_front();
                         if let Some(waiter) = waiter { let _ = waiter.send(result.clone()); }
                         else { break; }
                     }
                     registry.preparation_wake_cpu_ns.set(registry.preparation_wake_cpu_ns.get() + ffi::factory_thread_cpu_ns() - start);
                     registry.preparation_wake_batches.set(registry.preparation_wake_batches.get() + 1);
-                    registry.factory.sleep(Duration::from_millis(1)).await;
+                    // This exceeds one small group's continuation work. A timer
+                    // already overdue on a busy KJ queue does not give socket I/O
+                    // a turn on the host loop.
+                    registry.factory.sleep(Duration::from_millis(25)).await;
                 }
             });
             flight
