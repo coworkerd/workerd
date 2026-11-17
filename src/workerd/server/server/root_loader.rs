@@ -528,9 +528,9 @@ impl RootRegistry {
         }
         ffi::factory_set_root_lifecycle(factory.raw(), !plain_only);
         let heap_mib = std::env::var("COWORKERD_STATIC_HEAP_MIB").ok()
-            .and_then(|value| value.parse::<u64>().ok()).unwrap_or(128).clamp(1, 65536);
-        let preparation_byte_budget = (heap_mib * 1024 * 1024 * 21 / 32)
-            .max(PREPARATION_QUANTUM);
+            .and_then(|value| value.parse::<u64>().ok()).filter(|value| *value > 0).unwrap_or(128).clamp(1, 65536);
+        let preparation_byte_budget = (heap_mib * 1024 * 1024 * 21 / 32 / PREPARATION_QUANTUM)
+            .max(1) * PREPARATION_QUANTUM;
         let preparation_small_budget = (heap_mib * 1024 * 1024 / 128).max(PREPARATION_QUANTUM);
         Ok(Rc::new_cyclic(|this| Self {
             this: this.clone(),
