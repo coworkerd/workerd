@@ -6,7 +6,7 @@
 //! Compiled instances and stable namespace/class providers have separate lifetimes.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 use std::future::Future;
 use std::rc::{Rc, Weak};
@@ -441,15 +441,43 @@ impl InstallFlight {
     }
 }
 
+const PREPARATION_QUANTUM: u64 = 64 * 1024;
+const PREPARATION_MAX_BYTES: u64 = 84 * 1024 * 1024;
+const PREPARATION_DEFAULT_CODE_BYTES: u64 = 80 * 1024 * 1024;
+const PREPARATION_SMALL_BYTES: u64 = 1024 * 1024;
+const PREPARATION_BYTE_UNITS: u32 = (PREPARATION_MAX_BYTES / PREPARATION_QUANTUM) as u32;
+const PREPARATION_SMALL_SLOTS: usize = 4;
+const PREPARATION_LARGE_SLOTS: usize = 12;
+
+struct PreparationPermit<'a> {
+    _slot: tokio::sync::SemaphorePermit<'a>,
+    _bytes: Option<tokio::sync::SemaphorePermit<'a>>,
+    active: &'a Cell<u64>,
+    active_bytes: &'a Cell<u64>,
+    charged_bytes: u64,
+}
+impl Drop for PreparationPermit<'_> {
+    fn drop(&mut self) {
+        self.active.set(self.active.get() - 1);
+        self.active_bytes.set(self.active_bytes.get() - self.charged_bytes);
+    }
+}
 struct PreparationFlight {
     result: RefCell<Option<Value>>,
-    waiters: RefCell<VecDeque<futures::channel::oneshot::Sender<Value>>>,
+    waiters: RefCell<BTreeMap<u64, futures::channel::oneshot::Sender<Value>>>,
+    next_waiter: Cell<u64>,
+}
+struct PreparationWaiter<'a> { flight: &'a PreparationFlight, id: u64 }
+impl Drop for PreparationWaiter<'_> {
+    fn drop(&mut self) { self.flight.waiters.borrow_mut().remove(&self.id); }
 }
 impl PreparationFlight {
     async fn wait(&self) -> Value {
         if let Some(result) = self.result.borrow().clone() { return result; }
         let (send, receive) = futures::channel::oneshot::channel();
-        self.waiters.borrow_mut().push_back(send);
+        let id = self.next_waiter.get(); self.next_waiter.set(id.wrapping_add(1));
+        self.waiters.borrow_mut().insert(id, send);
+        let _registration = PreparationWaiter { flight: self, id };
         receive.await.unwrap_or_else(|_| json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
             "message":"Ordinary preparation stopped; no tenant event was delivered"}}))
     }
@@ -465,7 +493,12 @@ pub struct RootRegistry {
     install_lock: tokio::sync::Mutex<()>,
     installing: RefCell<HashMap<String, Rc<InstallFlight>>>,
     preparations: RefCell<HashMap<String, Rc<PreparationFlight>>>,
-    preparation_slots: tokio::sync::Semaphore,
+    preparation_small_slots: tokio::sync::Semaphore,
+    preparation_large_slots: tokio::sync::Semaphore,
+    preparation_byte_units: tokio::sync::Semaphore,
+    active_preparations: Cell<u64>,
+    active_preparation_bytes: Cell<u64>,
+    peak_active_preparations: Cell<u64>,
     preparation_wait_cpu_ns: Cell<u64>,
     preparation_wait_polls: Cell<u64>,
     preparation_wake_cpu_ns: Cell<u64>,
@@ -507,7 +540,12 @@ impl RootRegistry {
             preparations: RefCell::new(HashMap::new()),
             // Large verified packages share the trusted runtime's bounded heap.
             // Keep only one in preparation; other plans wait without fetching.
-            preparation_slots: tokio::sync::Semaphore::new(1),
+            preparation_small_slots: tokio::sync::Semaphore::new(PREPARATION_SMALL_SLOTS),
+            preparation_large_slots: tokio::sync::Semaphore::new(PREPARATION_LARGE_SLOTS),
+            preparation_byte_units: tokio::sync::Semaphore::new(PREPARATION_BYTE_UNITS as usize),
+            active_preparations: Cell::new(0),
+            active_preparation_bytes: Cell::new(0),
+            peak_active_preparations: Cell::new(0),
             preparation_wait_cpu_ns: Cell::new(0),
             preparation_wait_polls: Cell::new(0),
             preparation_wake_cpu_ns: Cell::new(0),
@@ -528,6 +566,29 @@ impl RootRegistry {
             ignored_retirements: Cell::new(0),
             server: RefCell::new(Weak::new()),
         }))
+    }
+
+    async fn preparation_permit(&self, bytes: u64) -> Result<PreparationPermit<'_>> {
+        // Only verified code sizes supplied by the Node select a lane. Queued
+        // descriptors remain in Rust; their source is not materialized in V8.
+        // A maximum 10 MiB v2 package is charged 80 MiB plus its descriptor.
+        // The 84 MiB large lane and four independent 1 MiB small lanes leave
+        // 40 MiB of the default 128 MiB heap outside source materialization.
+        let small = bytes <= PREPARATION_SMALL_BYTES;
+        let slot = if small { self.preparation_small_slots.acquire().await }
+            else { self.preparation_large_slots.acquire().await }
+            .map_err(|_| kj::failed!("ordinary preparation queue stopped"))?;
+        let units = bytes.div_ceil(PREPARATION_QUANTUM).min(PREPARATION_BYTE_UNITS as u64) as u32;
+        let reservation = if small { None } else {
+            Some(self.preparation_byte_units.acquire_many(units).await
+                .map_err(|_| kj::failed!("ordinary preparation byte budget stopped"))?)
+        };
+        let charged_bytes = if small { PREPARATION_SMALL_BYTES } else { units as u64 * PREPARATION_QUANTUM };
+        self.active_preparations.set(self.active_preparations.get() + 1);
+        self.active_preparation_bytes.set(self.active_preparation_bytes.get() + charged_bytes);
+        self.peak_active_preparations.set(self.peak_active_preparations.get().max(self.active_preparations.get()));
+        Ok(PreparationPermit { _slot: slot, _bytes: reservation, active: &self.active_preparations,
+            active_bytes: &self.active_preparation_bytes, charged_bytes })
     }
 
     async fn prepare(self: &Rc<Self>, mut value: Value) -> Result<Value> {
@@ -565,9 +626,19 @@ impl RootRegistry {
                     "message":"Ordinary preparation capacity reached; no tenant event was delivered"}}),
                 );
             }
+            let descriptor_bytes = serde_json::to_vec(&descriptor)
+                .map_err(|_| kj::failed!("ordinary preparation descriptor is invalid"))?.len() as u64;
+            let source_bytes = descriptor.get("preparationMemoryBytes").and_then(Value::as_u64)
+                .unwrap_or(PREPARATION_DEFAULT_CODE_BYTES).max(1)
+                .saturating_add(descriptor_bytes.saturating_mul(4));
+            if source_bytes > PREPARATION_MAX_BYTES {
+                return Ok(json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
+                    "message":"Ordinary package exceeds the trusted runtime preparation memory budget; no tenant event was delivered"}}));
+            }
             let flight = Rc::new(PreparationFlight {
                 result: RefCell::new(None),
-                waiters: RefCell::new(VecDeque::new()),
+                waiters: RefCell::new(BTreeMap::new()),
+                next_waiter: Cell::new(1),
             });
             self.preparations
                 .borrow_mut()
@@ -576,22 +647,27 @@ impl RootRegistry {
             let task = Rc::clone(&flight);
             let task_key = key.clone();
             self.factory.spawn_detached(async move {
+                let result = {
                 let prepare=async {
-                    let _slot = registry.preparation_slots.acquire().await
-                        .map_err(|_| kj::failed!("ordinary preparation queue stopped"))?;
+                    let permit = registry.preparation_permit(source_bytes).await?;
                     let target=RootTarget {service:"runtime".to_owned(),entrypoint:Some("PlainPreparer".to_owned()),
                         props:json!({"base":deployment,"descriptor":descriptor})};
                     let channel=registry.target(&target,&target.props)?;
                     let request=channel.start_request(ffi::new_request_metadata(None.into(),None.into()))?;
                     let bytes=ffi::factory_prepare_plain(registry.factory.raw(),request).await?;
-                    serde_json::from_slice::<Value>(&bytes).map_err(|error|kj::failed!("ordinary preparation reply: {error}"))
+                    let reply = serde_json::from_slice::<Value>(&bytes)
+                        .map_err(|_| kj::failed!("ordinary preparation reply is invalid"));
+                    drop(permit);
+                    reply
                 };
                 let prepare=std::pin::pin!(prepare);let timeout=std::pin::pin!(registry.factory.sleep(Duration::from_secs(30)));
-                let result=match futures::future::select(prepare,timeout).await {
+                let result = match futures::future::select(prepare,timeout).await {
                     futures::future::Either::Left((Ok(reply),_))=>reply,
                     futures::future::Either::Left((Err(error),_))=>json!({"ok":false,"error":{"kind":"platform","message":error.description()}}),
                     futures::future::Either::Right(_)=>json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
                         "message":"Ordinary preparation timed out after 30 seconds; no tenant event was delivered"}}),
+                };
+                result
                 };
                 *task.result.borrow_mut()=Some(result.clone());
                 // Existing waiters own the same completed result. Remove the rendezvous
@@ -600,22 +676,15 @@ impl RootRegistry {
                 if current {
                     registry.preparations.borrow_mut().remove(&task_key);
                 }
-                // Completing hundreds of JS continuations in one turn also starves
-                // probes. Release small groups, yielding real I/O time between them.
-                while !task.waiters.borrow().is_empty() {
-                    let start = ffi::factory_thread_cpu_ns();
-                    for _ in 0..8 {
-                        let waiter = task.waiters.borrow_mut().pop_front();
-                        if let Some(waiter) = waiter { let _ = waiter.send(result.clone()); }
-                        else { break; }
-                    }
-                    registry.preparation_wake_cpu_ns.set(registry.preparation_wake_cpu_ns.get() + ffi::factory_thread_cpu_ns() - start);
-                    registry.preparation_wake_batches.set(registry.preparation_wake_batches.get() + 1);
-                    // This exceeds one small group's continuation work. A timer
-                    // already overdue on a busy KJ queue does not give socket I/O
-                    // a turn on the host loop.
-                    registry.factory.sleep(Duration::from_millis(25)).await;
+                // All preparation permits and pinned futures have been dropped.
+                // Wake live waiters once; canceled registrations remove themselves.
+                let start = ffi::factory_thread_cpu_ns();
+                let waiters = std::mem::take(&mut *task.waiters.borrow_mut());
+                for (_, waiter) in waiters {
+                    if !waiter.is_canceled() { let _ = waiter.send(result.clone()); }
                 }
+                registry.preparation_wake_cpu_ns.set(registry.preparation_wake_cpu_ns.get() + ffi::factory_thread_cpu_ns() - start);
+                registry.preparation_wake_batches.set(registry.preparation_wake_batches.get() + 1);
             });
             flight
         };
@@ -1951,8 +2020,12 @@ impl RootRegistry {
             "preparationWakeCpuNs": self.preparation_wake_cpu_ns.get(),
             "preparationWakeBatches": self.preparation_wake_batches.get(),
             "preparations": self.preparations.borrow().len(),
-            "activePreparations": 1-self.preparation_slots.available_permits(),
-            "maxActivePreparations": 1,
+            "activePreparations": self.active_preparations.get(),
+            "maxActivePreparations": PREPARATION_SMALL_SLOTS + PREPARATION_LARGE_SLOTS,
+            "peakActivePreparations": self.peak_active_preparations.get(),
+            "activePreparationBytes": self.active_preparation_bytes.get(),
+            "largePreparationByteBudget": PREPARATION_MAX_BYTES,
+            "smallPreparationByteBudget": PREPARATION_SMALL_SLOTS as u64 * PREPARATION_SMALL_BYTES,
             "failedInstalls": self.failed_installs.borrow().len(),
             "closingFences": self.closing_roots.pending(),
             "retiredNamespaceCount": self.removed_namespaces.borrow().len(),
