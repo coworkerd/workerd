@@ -2076,11 +2076,12 @@ namespace {
 class PlainPreparationBody final: public kj::AsyncOutputStream {
  public:
   explicit PlainPreparationBody(kj::Vector<kj::byte>& body): body(body) {}
-  kj::Promise<void> write(const void* buffer, size_t size) override {
-    KJ_REQUIRE(body.size() + size <= 32768, "ordinary preparation reply too large");
-    body.addAll(kj::arrayPtr(static_cast<const kj::byte*>(buffer), size));
+  kj::Promise<void> write(kj::ArrayPtr<const kj::byte> buffer) override {
+    KJ_REQUIRE(body.size() + buffer.size() <= 32768, "ordinary preparation reply too large");
+    body.addAll(buffer);
     return kj::READY_NOW;
   }
+  kj::Promise<void> whenWriteDisconnected() override { return kj::NEVER_DONE; }
   kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
     for (auto piece: pieces) {KJ_REQUIRE(body.size()+piece.size()<=32768);body.addAll(piece);}
     return kj::READY_NOW;
