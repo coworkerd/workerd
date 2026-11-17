@@ -169,6 +169,7 @@ class IdleReaper {
   kj::Promise<void> task = nullptr, collectTask = nullptr, retirementTask = nullptr;
   uint64_t publishedGc = 0;
   uint64_t publicationCpuNs = 0, publications = 0, drainCpuNs = 0, drainPublications = 0, lastDrainRequest = 0;
+  uint64_t publicationMaxWallNs = 0;
 
   void publishDrain() {
     auto& channel = lifecycleChannel();
@@ -245,6 +246,7 @@ class IdleReaper {
         ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
         ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
         ",\"publicationCpuNs\":", publicationCpuNs, ",\"publications\":", publications,
+        ",\"publicationMaxWallNs\":", publicationMaxWallNs,
         ",\"drainCpuNs\":", drainCpuNs, ",\"drainPublications\":", drainPublications,
         gcSettings().observes() ? processGcJson() : kj::str(""),
         ",\"residentWorkers\":[", kj::strArray(entries, ","), "],\"drainSnapshotComplete\":true}");
@@ -254,6 +256,7 @@ class IdleReaper {
       emit(kj::str("{\"event\":\"snapshot-too-large\",\"pid\":", coworkerdPid(), ",\"bytes\":", row.size(), "}"));
     }
     ++publications; publicationCpuNs += cpuNs() - start; lastPublish = monotonicMs();
+    publicationMaxWallNs = std::max(publicationMaxWallNs, uint64_t((lastPublish - now) * 1000000));
   }
   bool overflowReported = false;
  private:
