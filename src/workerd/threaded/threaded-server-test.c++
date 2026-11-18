@@ -341,6 +341,8 @@ KJ_TEST("deadline decimal spelling and native refusal mappings") {
     auto detail = KJ_REQUIRE_NONNULL(error.getDetail(jsg::COWORKERD_CODE_DETAIL_ID));
     KJ_EXPECT(detail.size() == strlen(item.second) &&
         memcmp(detail.begin(), item.second, detail.size()) == 0);
+    fprintf(stdout, "NATIVE_ERROR_CODE %.*s\n", int(detail.size()),
+        reinterpret_cast<const char*>(detail.begin()));
   }
   auto capacity = capacityError();
   KJ_EXPECT(capacity.getDetail(CAPACITY_DETAIL) != kj::none);
@@ -358,6 +360,8 @@ KJ_TEST("deadline decimal spelling and native refusal mappings") {
         Expected{R::DRAINING, 503, "PROCESS_DRAINING"}}) {
     auto info = threaded::refusalInfo(row.reason);
     KJ_EXPECT(info.status == row.status && info.code == row.code);
+    fprintf(stdout, "NATIVE_ERROR_STATUS %u %.*s\n", info.status, int(info.code.size()),
+        info.code.data());
   }
 }
 
