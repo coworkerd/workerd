@@ -1,5 +1,7 @@
 #include "coworkerd-steady.h"
 
+#include <unistd.h>
+
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
@@ -7,20 +9,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <unistd.h>
 #if __linux__
-#include <kj/debug.h>
-
 #include <fcntl.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
-#include <sched.h>
+
+#include <kj/debug.h>
+
 #include <thread>
 #include <vector>
 #endif
@@ -49,7 +51,10 @@ constexpr size_t MAX_CALLS = 512;
 // Read before the filter goes on, so openat/read/close are still the startup table's.
 size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
   const int fd = open(path, O_RDONLY | O_CLOEXEC);
-  if (fd < 0) { failure = errno; return 0; }
+  if (fd < 0) {
+    failure = errno;
+    return 0;
+  }
   size_t count = 0, held = 0;
   bool comment = false, digits = false;
   int value = 0;
@@ -57,7 +62,11 @@ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
   for (;;) {
     const auto n = read(fd, buffer, sizeof buffer);
     if (n < 0 && errno == EINTR) continue;
-    if (n < 0) { failure = errno; close(fd); return 0; }
+    if (n < 0) {
+      failure = errno;
+      close(fd);
+      return 0;
+    }
     if (n == 0) break;
     held += static_cast<size_t>(n);
     // A line that does not begin with a digit is a comment, as in the file the launcher reads; a line that does
@@ -72,7 +81,11 @@ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
         continue;
       }
       if (comment) continue;
-      if (c >= '0' && c <= '9') { digits = true; value = value * 10 + (c - '0'); continue; }
+      if (c >= '0' && c <= '9') {
+        digits = true;
+        value = value * 10 + (c - '0');
+        continue;
+      }
       if (digits) {  // the number ended; the rest of the line says what it is called
         if (count < MAX_CALLS) numbers[count++] = value;
         digits = false;
@@ -80,7 +93,11 @@ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
       }
       if (c != ' ' && c != '\t') comment = true;
     }
-    if (held > (1u << 20)) { failure = EFBIG; close(fd); return 0; }
+    if (held > (1u << 20)) {
+      failure = EFBIG;
+      close(fd);
+      return 0;
+    }
   }
   if (digits && count < MAX_CALLS) numbers[count++] = value;
   close(fd);
@@ -111,10 +128,12 @@ size_t buildFilter(const int* numbers, size_t count, __u32 action, struct sock_f
 #error "the steady-state system call filter needs this architecture's audit arch"
 #endif
   size_t at = 0;
-  program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch));
+  program[at++] =
+      (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch));
   program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, arch, 1, 0);
   program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
-  program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
+  program[at++] =
+      (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
 #if defined(__x86_64__)
   // An x32 call carries bit 30; reject the whole range rather than letting it alias an allowed number.
   program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 1, 0);
@@ -122,22 +141,26 @@ size_t buildFilter(const int* numbers, size_t count, __u32 action, struct sock_f
   program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
 #endif
   if (std::getenv("COWORKERD_THREADED") != nullptr) {
-    constexpr __u32 threadFlags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
-        CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
+    constexpr __u32 threadFlags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+        CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
     program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1);
     program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
     program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 7);
-    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
+    program[at++] = (struct sock_filter)BPF_STMT(
+        BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
     program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, threadFlags, 1, 0);
-    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
-    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]) + 4);
+    program[at++] = (struct sock_filter)BPF_STMT(
+        BPF_RET | BPF_K, action == SECCOMP_RET_USER_NOTIF ? action : SECCOMP_RET_KILL_PROCESS);
+    program[at++] = (struct sock_filter)BPF_STMT(
+        BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]) + 4);
     program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0);
-    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+    program[at++] = (struct sock_filter)BPF_STMT(
+        BPF_RET | BPF_K, action == SECCOMP_RET_USER_NOTIF ? action : SECCOMP_RET_KILL_PROCESS);
     program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
   }
   for (size_t i = 0; i < count; ++i)
-    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<__u32>(numbers[i]),
-        static_cast<__u8>(count - i), 0);
+    program[at++] = (struct sock_filter)BPF_JUMP(
+        BPF_JMP | BPF_JEQ | BPF_K, static_cast<__u32>(numbers[i]), static_cast<__u8>(count - i), 0);
   program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, action);
   program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
   return at;
@@ -158,7 +181,9 @@ size_t buildFilter(const int* numbers, size_t count, __u32 action, struct sock_f
 // the mode for production.
 class SteadySupervisor final {
  public:
-  void start() { std::thread([this] { loop(); }).detach(); }
+  void start() {
+    std::thread([this] { loop(); }).detach();
+  }
   void supervise(int fd) {
     {
       std::lock_guard<std::mutex> lock(mutex);
@@ -190,8 +215,9 @@ class SteadySupervisor final {
       struct seccomp_notif request;
       memset(&request, 0, sizeof request);
       if (ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, &request) != 0) {
-        if (errno == EINTR || errno == ENOENT) continue;  // ENOENT: that thread was signalled meanwhile
-        return;                                          // the filter is gone with this process
+        if (errno == EINTR || errno == ENOENT)
+          continue;  // ENOENT: that thread was signalled meanwhile
+        return;      // the filter is gone with this process
       }
       struct seccomp_notif_resp response;
       memset(&response, 0, sizeof response);
@@ -205,9 +231,11 @@ class SteadySupervisor final {
         char row[256];
         const auto length = snprintf(row, sizeof row,
             "[coworkerd-seccomp] {\"event\":\"steady-observed\",\"call\":%d,\"pid\":%u,\"answered\":%s,"
-            "\"notifications\":%llu}\n", static_cast<int>(request.data.nr), request.pid,
-            answered ? "true" : "false", static_cast<unsigned long long>(notifications));
-        if (length > 0 && static_cast<size_t>(length) < sizeof row) writeRow(row, static_cast<size_t>(length));
+            "\"notifications\":%llu}\n",
+            static_cast<int>(request.data.nr), request.pid, answered ? "true" : "false",
+            static_cast<unsigned long long>(notifications));
+        if (length > 0 && static_cast<size_t>(length) < sizeof row)
+          writeRow(row, static_cast<size_t>(length));
       }
     }
   }
@@ -233,14 +261,15 @@ void narrow() {
   size_t instructions = 0;
   if ((observe || enforce) && path != nullptr && *path != '\0') {
     count = readTable(path, numbers, failure);
-    if (count == 0 && failure == 0) failure = EINVAL;  // a table without a call is a configuration error
+    if (count == 0 && failure == 0)
+      failure = EINVAL;  // a table without a call is a configuration error
   } else if (observe || enforce) {
     failure = ENOENT;
   }
   if (count > 0) {
     std::vector<struct sock_filter> program(programLength(count));
-    const auto at = buildFilter(numbers, count, observe ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_KILL_PROCESS,
-        program.data());
+    const auto at = buildFilter(numbers, count,
+        observe ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_KILL_PROCESS, program.data());
     KJ_REQUIRE(at == program.size(), count, at, program.size());
     instructions = at;
     struct sock_fprog filter = {static_cast<unsigned short>(instructions), program.data()};
@@ -253,10 +282,16 @@ void narrow() {
       // table waits for an answer, and only this thread can give one.
       auto* supervisor = new SteadySupervisor();
       supervisor->start();
-      const long fd = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &filter);
-      if (fd < 0) failure = errno;
-      else { supervisor->supervise(static_cast<int>(fd)); installed = true; }
-    } else if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &filter) != 0) {
+      const long fd =
+          syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &filter);
+      if (fd < 0)
+        failure = errno;
+      else {
+        supervisor->supervise(static_cast<int>(fd));
+        installed = true;
+      }
+    } else if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &filter) !=
+        0) {
       failure = errno;
     } else {
       installed = true;
@@ -272,7 +307,8 @@ void narrow() {
     if (probe != nullptr && strcmp(probe, "execve") == 0) {
       char row[160];
       const auto length = snprintf(row, sizeof row,
-          "[coworkerd-seccomp] {\"event\":\"steady-probe\",\"call\":\"execve\",\"pid\":%d}\n", getpid());
+          "[coworkerd-seccomp] {\"event\":\"steady-probe\",\"call\":\"execve\",\"pid\":%d}\n",
+          getpid());
       if (length > 0) writeRow(row, static_cast<size_t>(length));
       char* const argv[] = {const_cast<char*>("/proc/self/exe"), nullptr};
       char* const envp[] = {nullptr};
@@ -280,7 +316,8 @@ void narrow() {
     } else if (probe != nullptr && strcmp(probe, "seccomp") == 0) {
       char row[160];
       const auto length = snprintf(row, sizeof row,
-          "[coworkerd-seccomp] {\"event\":\"steady-probe\",\"call\":\"seccomp\",\"pid\":%d}\n", getpid());
+          "[coworkerd-seccomp] {\"event\":\"steady-probe\",\"call\":\"seccomp\",\"pid\":%d}\n",
+          getpid());
       if (length > 0) writeRow(row, static_cast<size_t>(length));
       syscall(SYS_seccomp, SECCOMP_SET_MODE_STRICT, 0, nullptr);
     }
@@ -294,7 +331,8 @@ void narrow() {
       "\"instructions\":%zu,\"errno\":%d,\"nonDumpable\":%s,\"dumpableErrno\":%d,\"pid\":%d}\n",
       mode, installed ? "true" : "false", count, instructions, failure,
       wantNonDumpable && dumpable == 0 ? "true" : "false", dumpableErrno, getpid());
-  if (length > 0 && static_cast<size_t>(length) < sizeof row) writeRow(row, static_cast<size_t>(length));
+  if (length > 0 && static_cast<size_t>(length) < sizeof row)
+    writeRow(row, static_cast<size_t>(length));
 }
 #endif
 
