@@ -293,7 +293,7 @@ KJ_TEST("deadline decimal spelling and native refusal mappings") {
         "{\"decoy\":[{\"lease\":\"x\\\"}y\"}],\"lease\":{\"expiresAtMonotonicMs\":", literal, "}}");
     auto raw = threaded::rawPath(descriptor.cStr(), {"lease", "expiresAtMonotonicMs"});
     KJ_EXPECT(raw == literal);
-    auto forwarded = kj::str("{\"deadline\":", kj::StringPtr(raw.data(), raw.size()), "}");
+    auto forwarded = kj::str("{\"deadline\":", kj::heapString(raw.data(), raw.size()), "}");
     KJ_EXPECT(threaded::rawField(forwarded.cStr(), "deadline") == literal);
   }
   for (auto item: {std::pair{LimitCause::CPU, "CPU_LIMIT_EXCEEDED"},
