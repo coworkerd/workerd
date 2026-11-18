@@ -3275,15 +3275,6 @@ PreparedInvocation prepareInvocation(ThreadState &state,
   return {kj::mv(entry), kj::mv(invocation)};
 }
 
-void requireRpcEntrypoint(std::string_view format) {
-  if (format == "v1") {
-    // Legacy service-worker scripts never supported the entrypoint RPC
-    // handshake. Retain its public TypeError across the backend switch.
-    kj::throwRecoverableException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__,
-        kj::str(
-            "jsg.TypeError: The RPC receiver does not implement the method \"__coworkerdRpcTarget\".")));
-  }
-}
 
 kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
   KJ_REQUIRE(!used, "one event per invocation");
@@ -3320,7 +3311,6 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
     co_await server.confirmDecision(input, state, "load-rejected", error.getDescription(), stage);
     kj::throwRecoverableException(error.clone());
   }
-  requireRpcEntrypoint(str(input, "format"));
   auto prepared = kj::heap<PreparedInvocation>(prepareInvocation(state, server, slot, input,
       descriptor, kj::mv(props), std::move(preparation), std::move(tenant)));
   auto event = kj::heap<api::JsRpcSessionCustomEvent>(

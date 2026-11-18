@@ -430,19 +430,6 @@ KJ_TEST("validation reports retain the original JavaScript exception") {
   KJ_EXPECT(rejected);
 }
 
-KJ_TEST("legacy RPC rejects before a tenant method with its existing TypeError") {
-  requireRpcEntrypoint("v2");
-  bool refused = false;
-  try {
-    requireRpcEntrypoint("v1");
-  } catch (const kj::Exception& error) {
-    refused = true;
-    KJ_EXPECT(error.getDescription() ==
-        "jsg.TypeError: The RPC receiver does not implement the method \"__coworkerdRpcTarget\".");
-  }
-  KJ_EXPECT(refused);
-}
-
 KJ_TEST("compatibility refusals are tenant validation before package decoding") {
   Slot slot;
   Reporter reporter;
