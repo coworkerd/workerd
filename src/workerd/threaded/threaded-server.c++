@@ -1359,11 +1359,22 @@ class ObjectIdFactory final: public ActorIdFactory {
 class DescriptorQueue {
  public:
   explicit DescriptorQueue(size_t limit): entries(limit + 1) {}
+  ~DescriptorQueue() {
+    close();
+  }
+  // Called only after producer and consumer have stopped. Pending descriptors
+  // are owned by this queue until pop() transfers them to a call loop.
+  void close() {
+    closed.store(true, std::memory_order_release);
+    for (int fd; (fd = pop()) >= 0;) ::close(fd);
+  }
   bool hasSpace() const {
-    return (tail.load(std::memory_order_relaxed) + 1) % entries.size() !=
+    return !closed.load(std::memory_order_acquire) &&
+        (tail.load(std::memory_order_relaxed) + 1) % entries.size() !=
         head.load(std::memory_order_acquire);
   }
   bool push(int fd) {
+    if (closed.load(std::memory_order_acquire)) return false;
     auto position = tail.load(std::memory_order_relaxed);
     auto next = (position + 1) % entries.size();
     if (next == head.load(std::memory_order_acquire)) return false;
@@ -1382,6 +1393,7 @@ class DescriptorQueue {
  private:
   std::vector<int> entries;
   std::atomic<size_t> head{0}, tail{0};
+  std::atomic<bool> closed{false};
 };
 
 struct ThreadedServer;
@@ -1477,6 +1489,22 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
   bool used = false;
 };
 
+struct SubrequestBudget {
+  SubrequestBudget(uint32_t limit, uint32_t tenantLimit): limit(limit), tenantLimit(tenantLimit) {}
+  const uint32_t limit, tenantLimit;
+  std::atomic<uint32_t> active{0};
+  std::atomic<uint64_t> rejected{0};
+  std::mutex mutex;
+  std::map<std::string, uint32_t> tenants;
+  uint64_t nextWaiter = 0;
+  std::map<uint64_t, kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
+};
+
+bool canEvict(const std::shared_ptr<Slot> &slot, Slot *exclude) {
+  return slot.get() != exclude && slot->complete.load() && slot.use_count() == 1 &&
+      slot->contexts.load() == 0;
+}
+
 struct ThreadedServer {
   kj::Own<v8::Platform> basePlatform = jsg::defaultPlatform(16);
   server::WorkerdPlatform platform{*basePlatform};
@@ -1525,12 +1553,8 @@ struct ThreadedServer {
   std::atomic<uint> compilations{0};
   std::atomic<uint64_t> isolateCreationAttempts{0};
   std::atomic<uint> canceledLoads{0};
-  std::atomic<uint> subrequestsActive{0};
-  std::mutex subrequestMutex;
-  std::map<std::string, uint32_t> tenantSubrequests;
-  uint64_t nextSubrequestWaiter = 0;
-  std::map<uint64_t, kj::Own<kj::CrossThreadPromiseFulfiller<void>>> subrequestWaiters;
-  std::atomic<uint64_t> subrequestsRejected{0}, acceptFailures{0};
+  SubrequestBudget subrequestBudget;
+  std::atomic<uint64_t> acceptFailures{0};
   std::atomic<uint64_t> logAccepted{0}, logDroppedLines{0}, logDroppedBytes{0}, logFlushFailures{0};
   std::atomic<uint64_t> logPeakQueuedBytes{0};
   std::atomic<bool> delayedSourceForTest{false};
@@ -1546,7 +1570,8 @@ struct ThreadedServer {
             configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
             limit)),
         tenantBudget(std::make_shared<TenantBudget>(
-            configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 16))) {
+            configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 16))),
+        subrequestBudget(limit, tenantBudget->limit) {
     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
     resources->reclaimWake = managerWake;
     server::coworkerdServing();
@@ -1658,9 +1683,7 @@ struct ThreadedServer {
       auto now = nowNs();
       for (auto at = registry.begin(); at != registry.end(); ++at) {
         auto &slot = at->second;
-        if (slot.get() == exclude || !slot->complete.load() || slot.use_count() != 1 ||
-            slot->contexts.load() != 0)
-          continue;
+        if (!canEvict(slot, exclude)) continue;
         if (expiredOnly && (cutoff == 0 || now - kj::min(now, slot->lastUseNs.load()) < cutoff) &&
             !(slot->limits && slot->limits->memoryState->load() == LimitCause::MEMORY))
           continue;
@@ -2604,25 +2627,25 @@ kj::Promise<kj::Own<WorkerInterface>> openEgress(
 // Hold the permit for the entire interface lifetime, including response bodies,
 // RPC capabilities and cancellation. No connection is opened before admission.
 struct SubrequestPermit {
-  SubrequestPermit(ThreadedServer &server,
+  SubrequestPermit(SubrequestBudget &budget,
       std::shared_ptr<uint32_t> invocation,
       std::string tenant,
       bool tenantShare)
-      : server(server),
+      : budget(budget),
         invocation(std::move(invocation)),
         tenant(std::move(tenant)),
         tenantShare(tenantShare) {}
   bool acquireLocked() {
-    auto perTenant = kj::min(server.limit, kj::max<uint32_t>(1, server.tenantBudget->limit - 1));
-    auto found = server.tenantSubrequests.find(tenant);
-    if (*invocation >= 32 || server.subrequestsActive.load() >= server.limit ||
-        (tenantShare && found != server.tenantSubrequests.end() && found->second >= perTenant))
+    auto perTenant = kj::min(budget.limit, kj::max<uint32_t>(1, budget.tenantLimit - 1));
+    auto found = budget.tenants.find(tenant);
+    if (*invocation >= 32 || budget.active.load() >= budget.limit ||
+        (tenantShare && found != budget.tenants.end() && found->second >= perTenant))
       return false;
     // Bindings retain the invocation and global connection limits, but never
     // consume the external-egress tenant share a recursive child may need.
-    if (tenantShare) ++server.tenantSubrequests[tenant];
+    if (tenantShare) ++budget.tenants[tenant];
     ++*invocation;
-    server.subrequestsActive.fetch_add(1);
+    budget.active.fetch_add(1);
     acquired = true;
     return true;
   }
@@ -2632,42 +2655,42 @@ struct SubrequestPermit {
       auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
       uint64_t id;
       {
-        std::lock_guard lock(server.subrequestMutex);
+        std::lock_guard lock(budget.mutex);
         if (acquireLocked()) co_return;
         if (!counted) {
-          server.subrequestsRejected.fetch_add(1);
+          budget.rejected.fetch_add(1);
           counted = true;
         }
-        id = ++server.nextSubrequestWaiter;
-        server.subrequestWaiters.emplace(id, kj::mv(signal.fulfiller));
+        id = ++budget.nextWaiter;
+        budget.waiters.emplace(id, kj::mv(signal.fulfiller));
       }
       // Cancellation removes its waiter immediately. Registration and the
       // capacity check use the release mutex, so no release wakeup is lost.
       KJ_DEFER({
-        std::lock_guard lock(server.subrequestMutex);
-        server.subrequestWaiters.erase(id);
+        std::lock_guard lock(budget.mutex);
+        budget.waiters.erase(id);
       });
       co_await signal.promise;
     }
   }
   ~SubrequestPermit() {
     if (!acquired) return;
-    decltype(server.subrequestWaiters) wake;
+    decltype(budget.waiters) wake;
     {
-      std::lock_guard lock(server.subrequestMutex);
+      std::lock_guard lock(budget.mutex);
       --*invocation;
-      server.subrequestsActive.fetch_sub(1);
+      budget.active.fetch_sub(1);
       if (tenantShare) {
-        auto found = server.tenantSubrequests.find(tenant);
-        KJ_ASSERT(found != server.tenantSubrequests.end() && found->second > 0);
-        if (--found->second == 0) server.tenantSubrequests.erase(found);
+        auto found = budget.tenants.find(tenant);
+        KJ_ASSERT(found != budget.tenants.end() && found->second > 0);
+        if (--found->second == 0) budget.tenants.erase(found);
       }
-      wake.swap(server.subrequestWaiters);
+      wake.swap(budget.waiters);
     }
     for (auto &[id, waiter]: wake)
       if (waiter->isWaiting()) waiter->fulfill();
   }
-  ThreadedServer &server;
+  SubrequestBudget &budget;
   std::shared_ptr<uint32_t> invocation;
   std::string tenant;
   bool tenantShare, acquired = false;
@@ -2721,7 +2744,18 @@ class SubrequestWorker final: public WorkerInterface {
   kj::Own<WorkerInterface> target;
 };
 
-struct Channels final: IoChannelFactory {
+struct InvocationLogBuffer {
+  kj::Vector<kj::String> lines;
+  uint64_t queuedLogBytes = 0, inFlightLogLines = 0, inFlightLogBytes = 0;
+  bool flushing = false;
+  void resetAfterFlushFailure() {
+    lines.clear();
+    queuedLogBytes = inFlightLogLines = inFlightLogBytes = 0;
+    flushing = false;
+  }
+};
+
+struct Channels final: IoChannelFactory, InvocationLogBuffer {
   Channels(
       ThreadState &state, ThreadedServer &server, std::shared_ptr<Slot> slot, kj::StringPtr input)
       : document(input),
@@ -2735,9 +2769,6 @@ struct Channels final: IoChannelFactory {
   uint64_t sequence = 0;
   std::shared_ptr<uint32_t> subrequests = std::make_shared<uint32_t>(0);
   threaded::InvocationLogBudget logBudget;
-  kj::Vector<kj::String> lines;
-  uint64_t queuedLogBytes = 0, inFlightLogLines = 0, inFlightLogBytes = 0;
-  bool flushing = false;
 
   Json::Reader input() {
     return document.get();
@@ -2835,7 +2866,7 @@ struct Channels final: IoChannelFactory {
       bool egress, kj::String descriptor, PropsMessage props = {}) {
     auto worker = str(input(), "workerId");
     auto permit = std::make_shared<SubrequestPermit>(
-        server, subrequests, worker.substr(0, worker.find('/')), egress);
+        server.subrequestBudget, subrequests, worker.substr(0, worker.find('/')), egress);
     co_await permit->acquire();
     auto target = egress
         ? co_await openEgress(state, kj::str(server.egressAddress.c_str()), kj::mv(descriptor))
@@ -2996,8 +3027,7 @@ struct Channels final: IoChannelFactory {
       if (!success) {
         server.logFlushFailures.fetch_add(1);
         dropLog(lines.size() + inFlightLogLines, queuedLogBytes + inFlightLogBytes);
-        lines.clear();
-        queuedLogBytes = inFlightLogLines = inFlightLogBytes = 0;
+        resetAfterFlushFailure();
       }
     });
     while (lines.size() != 0) {
@@ -3531,8 +3561,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                 ",\"controlThreads\":" + std::to_string(server.CONTROL_THREADS) +
                 ",\"threadGrowthFailures\":" + std::to_string(server.growthFailures.load()) +
                 ",\"acceptFailures\":" + std::to_string(server.acceptFailures.load()) +
-                ",\"subrequestsActive\":" + std::to_string(server.subrequestsActive.load()) +
-                ",\"subrequestsRejected\":" + std::to_string(server.subrequestsRejected.load()) +
+                ",\"subrequestsActive\":" + std::to_string(server.subrequestBudget.active.load()) +
+                ",\"subrequestsRejected\":" +
+                std::to_string(server.subrequestBudget.rejected.load()) +
                 ",\"logAccepted\":" + std::to_string(server.logAccepted.load()) +
                 ",\"logDroppedLines\":" + std::to_string(server.logDroppedLines.load()) +
                 ",\"logDroppedBytes\":" + std::to_string(server.logDroppedBytes.load()) +
@@ -3631,4 +3662,5 @@ int main(int argc, char **argv) {
   const char *parent = getenv("COWORKERD_PARENT_FD");
   acceptLoop(
       *server, strtol(argv[1], nullptr, 10), parent == nullptr ? -1 : strtol(parent, nullptr, 10));
+  return 0;
 }

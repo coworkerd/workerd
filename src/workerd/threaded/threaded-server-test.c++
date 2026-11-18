@@ -1,0 +1,327 @@
+// Test the production implementation, including its private ownership types.
+// The executable's main is renamed; KJ supplies this target's test main.
+#define main coworkerdThreadedExecutableMain
+#include "threaded-server.c++"
+#undef main
+
+#include <kj/test.h>
+
+namespace workerd {
+namespace {
+
+struct TestPlatform {
+  kj::Own<v8::Platform> base = jsg::defaultPlatform(2);
+  server::WorkerdPlatform platform{*base};
+  jsg::V8System system{platform, {}, base.get()};
+};
+void initializeV8() {
+  static auto* platform = new TestPlatform;
+  (void)platform;
+}
+
+KJ_TEST("descriptor queue: empty, full, FIFO, SPSC handoff and close") {
+  DescriptorQueue queue(2);
+  KJ_EXPECT(queue.pop() == -1 && queue.hasSpace());
+  int a = open("/dev/null", O_RDONLY | O_CLOEXEC);
+  int b = open("/dev/null", O_RDONLY | O_CLOEXEC);
+  KJ_ASSERT(a >= 0 && b >= 0);
+  KJ_EXPECT(queue.push(a) && queue.push(b));
+  KJ_EXPECT(!queue.hasSpace() && !queue.push(1000000));
+  KJ_EXPECT(queue.pop() == a);
+  ::close(a);
+  queue.close();
+  KJ_EXPECT(fcntl(b, F_GETFD) == -1 && errno == EBADF);
+  KJ_EXPECT(queue.pop() == -1 && !queue.hasSpace() && !queue.push(1000000));
+
+  DescriptorQueue concurrent(8);
+  std::atomic<bool> done{false};
+  std::thread producer([&] {
+    for (unsigned i = 0; i < 2000; ++i) {
+      int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      while (!concurrent.push(fd)) std::this_thread::yield();
+    }
+    done.store(true, std::memory_order_release);
+  });
+  unsigned received = 0;
+  while (!done.load(std::memory_order_acquire) || received < 2000) {
+    int fd = concurrent.pop();
+    if (fd < 0) {
+      std::this_thread::yield();
+      continue;
+    }
+    KJ_EXPECT(fcntl(fd, F_GETFD) >= 0);
+    ::close(fd);
+    ++received;
+  }
+  producer.join();
+  KJ_EXPECT(received == 2000 && concurrent.pop() == -1);
+}
+
+KJ_TEST("actual reservation arithmetic, both watermarks and RAII release") {
+  initializeV8();
+  auto budget = std::make_shared<ResourceBudget>(2ull << 30, 10, 512);
+  KJ_EXPECT(budget->memoryMaximum - budget->admissionMaximum == (2ull << 30) / 10);
+  auto smaller = std::make_shared<ResourceBudget>(2ull << 30, 10, 16);
+  KJ_EXPECT(smaller->memoryMaximum - smaller->admissionMaximum == (16ull << 20));
+  const auto baseline = budget->memoryReserved.load();
+  {
+    auto reservation = std::make_shared<ResourceReservation>(budget);
+    KJ_ASSERT(reservation->registerPreparation());
+    auto seed = budget->memoryReserved.load();
+    KJ_EXPECT(seed > baseline && budget->residents.load() == 1);
+    KJ_EXPECT(reservation->retainSource(100));
+    KJ_EXPECT(budget->memoryReserved.load() == seed + 500);
+    KJ_EXPECT(reservation->allocateExternal(4096));
+    KJ_EXPECT(budget->memoryReserved.load() == seed + 500 + 4096);
+    KJ_EXPECT(!reservation->allocateExternal(2ull << 30));
+    KJ_EXPECT(budget->memoryReserved.load() == seed + 500 + 4096);
+    reservation->freeExternal(4096);
+    KJ_EXPECT(budget->memoryReserved.load() == seed + 500);
+    {
+      ResourcePreparation preparation(reservation);
+      KJ_EXPECT(reservation->preparing == 1);
+    }
+    KJ_EXPECT(reservation->preparing == 0);
+  }
+  KJ_EXPECT(budget->memoryReserved.load() == baseline && budget->residents.load() == 0);
+  auto memory = budget->memoryReserved.load();
+  KJ_EXPECT(!budget->change(0, budget->admissionMaximum, 0, 0, true));
+  KJ_EXPECT(budget->memoryReserved.load() == memory);
+  KJ_EXPECT(!budget->change(0, budget->memoryMaximum, 0, 0, false, true));
+  KJ_EXPECT(!budget->withinMaximum() && budget->reclaimRequested.load());
+  KJ_EXPECT(budget->change(budget->memoryMaximum, 0, 0, 0, false, true));
+  KJ_EXPECT(budget->memoryReserved.load() == baseline);
+}
+
+KJ_TEST("eviction excludes loading, referenced and open-context Workers") {
+  auto slot = std::make_shared<Slot>();
+  KJ_EXPECT(!canEvict(slot, nullptr));
+  slot->complete.store(true);
+  KJ_EXPECT(canEvict(slot, nullptr) && !canEvict(slot, slot.get()));
+  {
+    auto reference = slot;
+    KJ_EXPECT(!canEvict(slot, nullptr));
+  }
+  slot->contexts.store(1);
+  KJ_EXPECT(!canEvict(slot, nullptr));
+  slot->contexts.store(0);
+  KJ_EXPECT(canEvict(slot, nullptr));
+}
+
+KJ_TEST("tenant admission releases counts on errors and cancellation") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  auto budget = std::make_shared<TenantBudget>(1);
+  {
+    TenantPermit active(budget, "a");
+    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+        "process admission budget is full", TenantPermit(budget, "a"));
+    {
+      TenantPermit other(budget, "b");
+      KJ_EXPECT(budget->active.size() == 2);
+    }
+    KJ_EXPECT(budget->active.size() == 1);
+  }
+  KJ_EXPECT(budget->active.empty());
+  auto pair = kj::newPromiseAndFulfiller<void>();
+  auto canceled = pair.promise.attach(std::make_shared<TenantPermit>(budget, "a"));
+  canceled = nullptr;
+  KJ_EXPECT(budget->active.empty());
+}
+
+KJ_TEST("subrequest quotas, recursive bindings, release wakeup and cancellation") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  SubrequestBudget budget(512, 16);
+  auto parent = std::make_shared<uint32_t>(0);
+  std::vector<std::unique_ptr<SubrequestPermit>> bindings;
+  for (unsigned i = 0; i < 15; ++i) {
+    auto permit = std::make_unique<SubrequestPermit>(budget, parent, "a", false);
+    permit->acquire().wait(waitScope);
+    bindings.push_back(std::move(permit));
+  }
+  auto child = std::make_shared<uint32_t>(0);
+  SubrequestPermit childEgress(budget, child, "a", true);
+  auto childReady = childEgress.acquire();
+  KJ_EXPECT(childReady.poll(waitScope));
+  childReady.wait(waitScope);
+  KJ_EXPECT(budget.tenants["a"] == 1 && *parent == 15 && *child == 1);
+
+  SubrequestBudget small(1, 16);
+  auto invocation = std::make_shared<uint32_t>(0);
+  auto active = std::make_unique<SubrequestPermit>(small, invocation, "a", true);
+  active->acquire().wait(waitScope);
+  SubrequestPermit queued(small, invocation, "a", true);
+  auto pending = queued.acquire();
+  KJ_EXPECT(!pending.poll(waitScope) && small.waiters.size() == 1);
+  active.reset();
+  pending.wait(waitScope);
+  KJ_EXPECT(small.active.load() == 1 && small.waiters.empty());
+  SubrequestPermit canceled(small, invocation, "a", true);
+  auto abandoned = canceled.acquire();
+  KJ_EXPECT(!abandoned.poll(waitScope) && small.waiters.size() == 1);
+  abandoned = nullptr;
+  KJ_EXPECT(small.waiters.empty());
+
+  SubrequestBudget perCall(512, 128);
+  auto one = std::make_shared<uint32_t>(0);
+  std::vector<std::unique_ptr<SubrequestPermit>> held;
+  for (unsigned i = 0; i < 32; ++i) {
+    auto permit = std::make_unique<SubrequestPermit>(perCall, one, "a", false);
+    permit->acquire().wait(waitScope);
+    held.push_back(std::move(permit));
+  }
+  SubrequestPermit extra(perCall, one, "a", false);
+  auto waiting = extra.acquire();
+  KJ_EXPECT(!waiting.poll(waitScope));
+  held.pop_back();
+  waiting.wait(waitScope);
+  KJ_EXPECT(*one == 32);
+}
+
+KJ_TEST("log quotas and a failed flush reset pending and in-flight buffers") {
+  threaded::InvocationLogBudget bytes, lines;
+  KJ_EXPECT(bytes.accept(threaded::InvocationLogBudget::MAX_BYTES));
+  KJ_EXPECT(!bytes.accept(1) && !bytes.accept(UINT64_MAX));
+  for (unsigned i = 0; i < 1023; ++i) KJ_ASSERT(lines.accept(0));
+  KJ_EXPECT(!lines.accept(0));
+  InvocationLogBuffer buffer;
+  buffer.lines.add(kj::str("pending"));
+  buffer.queuedLogBytes = 7;
+  buffer.inFlightLogBytes = 11;
+  buffer.inFlightLogLines = 1;
+  buffer.flushing = true;
+  buffer.resetAfterFlushFailure();
+  KJ_EXPECT(buffer.lines.size() == 0 && buffer.queuedLogBytes == 0 &&
+      buffer.inFlightLogBytes == 0 && buffer.inFlightLogLines == 0 && !buffer.flushing);
+  buffer.lines.add(kj::str("recovered"));
+  KJ_EXPECT(buffer.lines.size() == 1);
+}
+
+KJ_TEST("CPU remaining budget, previous CPU, nested attribution and late termination") {
+  initializeV8();
+  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/cpu\","), nullptr);
+  auto* isolate = v8::Isolate::New(limits.getCreateParams());
+  KJ_DEFER(isolate->Dispose());
+  limits.customizeIsolate(isolate);
+  v8::Locker locker(isolate);
+  v8::Isolate::Scope entered(isolate);
+  v8::HandleScope handles(isolate);
+  std::atomic<LimitCause> cause{LimitCause::NONE}, previous{LimitCause::NONE};
+  limits.memory->pressure();
+  KJ_EXPECT(limits.memory->pendingPressure.load() && !isolate->IsExecutionTerminating());
+  {
+    CpuExecution deferred(
+        isolate, cause, limits.memoryState, limits.memory, 0, 100, 32, limits.identity);
+    KJ_EXPECT(cause.load() == LimitCause::PROCESS_MEMORY && !limits.memory->pendingPressure.load());
+    deferred.finish();
+  }
+  KJ_EXPECT(limits.memory->currentCause == nullptr && !isolate->IsExecutionTerminating());
+  cause.store(LimitCause::NONE);
+  limits.memory->currentCause = &previous;
+  CpuExecution execution(
+      isolate, cause, limits.memoryState, limits.memory, 90000000, 100, 32, limits.identity);
+  KJ_EXPECT(execution.entry.allowance == 10000000 && execution.entry.previousCpu == 90000000);
+  KJ_EXPECT(limits.memory->currentCause == &cause);
+  cause.store(LimitCause::CPU);
+  isolate->TerminateExecution();
+  execution.finish();
+  KJ_EXPECT(!isolate->IsExecutionTerminating() && limits.memory->currentCause == &previous);
+  execution.finish();
+  KJ_EXPECT(limits.memory->currentCause == &previous);
+}
+
+void allocationComponent(kj::StringPtr code) {
+  initializeV8();
+  IsolateLimits neighborLimits(1000, 32, kj::str("\"workerId\":\"a/neighbor\","), nullptr);
+  auto* neighbor = v8::Isolate::New(neighborLimits.getCreateParams());
+  KJ_DEFER(neighbor->Dispose());
+  neighborLimits.customizeIsolate(neighbor);
+  auto checkNeighbor = [&] {
+    v8::Locker lock(neighbor);
+    v8::Isolate::Scope scope(neighbor);
+    v8::HandleScope handles(neighbor);
+    auto context = v8::Context::New(neighbor);
+    v8::Context::Scope entered(context);
+    auto source = v8::String::NewFromUtf8Literal(neighbor, "6 * 7");
+    auto script = v8::Script::Compile(context, source).ToLocalChecked();
+    KJ_EXPECT(script->Run(context).ToLocalChecked()->Int32Value(context).FromJust() == 42);
+  };
+  checkNeighbor();
+  auto budget = std::make_shared<ResourceBudget>(1ull << 30, 4, 1);
+  auto reservation = std::make_shared<ResourceReservation>(budget);
+  KJ_ASSERT(reservation->registerPreparation());
+  IsolateLimits limits(1000, 32, kj::str("\"workerId\":\"a/heap\","), reservation);
+  auto params = limits.getCreateParams();
+  KJ_EXPECT(params.constraints.max_old_generation_size_in_bytes() > (1ull << 30));
+  auto* isolate = v8::Isolate::New(params);
+  KJ_DEFER(isolate->Dispose());
+  limits.customizeIsolate(isolate);
+  v8::Locker locker(isolate);
+  v8::Isolate::Scope entered(isolate);
+  v8::HandleScope handles(isolate);
+  auto context = v8::Context::New(isolate);
+  v8::Context::Scope inContext(context);
+  std::atomic<LimitCause> cause{LimitCause::NONE};
+  CpuExecution execution(
+      isolate, cause, limits.memoryState, limits.memory, 0, 1000, 32, limits.identity);
+  v8::TryCatch caught(isolate);
+  auto source =
+      v8::String::NewFromUtf8(isolate, code.begin(), v8::NewStringType::kNormal, code.size())
+          .ToLocalChecked();
+  auto script = v8::Script::Compile(context, source).ToLocalChecked();
+  auto result = script->Run(context);
+  caught.Reset();
+  execution.finish();
+  KJ_EXPECT(limits.memoryState->load() == LimitCause::MEMORY);
+  KJ_EXPECT(!isolate->IsExecutionTerminating());
+  checkNeighbor();
+}
+
+KJ_TEST("single large heap allocation preserves the process") {
+  allocationComponent("globalThis.retained = new Array(12*1024*1024).fill(7)");
+}
+KJ_TEST("continuous heap growth preserves the process") {
+  allocationComponent(
+      "globalThis.retained=[]; while(true) retained.push(new Array(50000).fill(7))");
+}
+
+KJ_TEST("deadline decimal spelling and native refusal mappings") {
+  for (auto literal: {"123456789.12345679", "123456789.12345678", "9007199254740991",
+         "1.2345678901234567e+12", "1e+09", "0.00100", "0"}) {
+    auto descriptor = kj::str(
+        "{\"decoy\":[{\"lease\":\"x\\\"}y\"}],\"lease\":{\"expiresAtMonotonicMs\":", literal, "}}");
+    auto raw = threaded::rawPath(descriptor.cStr(), {"lease", "expiresAtMonotonicMs"});
+    KJ_EXPECT(raw == literal);
+    auto forwarded = kj::str("{\"deadline\":", kj::StringPtr(raw.data(), raw.size()), "}");
+    KJ_EXPECT(threaded::rawField(forwarded.cStr(), "deadline") == literal);
+  }
+  for (auto item: {std::pair{LimitCause::CPU, "CPU_LIMIT_EXCEEDED"},
+         std::pair{LimitCause::MEMORY, "MEMORY_LIMIT_EXCEEDED"},
+         std::pair{LimitCause::PROCESS_MEMORY, "PROCESS_MEMORY_PRESSURE"}}) {
+    auto error = limitException(item.first);
+    auto detail = KJ_REQUIRE_NONNULL(error.getDetail(jsg::COWORKERD_CODE_DETAIL_ID));
+    KJ_EXPECT(detail.size() == strlen(item.second) &&
+        memcmp(detail.begin(), item.second, detail.size()) == 0);
+  }
+  auto capacity = capacityError();
+  KJ_EXPECT(capacity.getDetail(CAPACITY_DETAIL) != kj::none);
+  KJ_EXPECT(KJ_EXCEPTION(FAILED, "PROCESS_MEMORY_PRESSURE").getDetail(CAPACITY_DETAIL) == kj::none);
+  using R = threaded::Refusal;
+  struct Expected {
+    R reason;
+    unsigned status;
+    std::string_view code;
+  };
+  for (auto row:
+      {Expected{R::UNSUPPORTED, 501, "NOT_SUPPORTED"}, Expected{R::CPU, 503, "CPU_LIMIT_EXCEEDED"},
+        Expected{R::MEMORY, 503, "MEMORY_LIMIT_EXCEEDED"},
+        Expected{R::OVERLOADED, 503, "OVERLOADED"},
+        Expected{R::DRAINING, 503, "PROCESS_DRAINING"}}) {
+    auto info = threaded::refusalInfo(row.reason);
+    KJ_EXPECT(info.status == row.status && info.code == row.code);
+  }
+}
+
+}  // namespace
+}  // namespace workerd
