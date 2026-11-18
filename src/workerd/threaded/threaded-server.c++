@@ -179,6 +179,35 @@ struct Channels;
 enum class LimitCause { NONE, CPU, MEMORY, PROCESS_MEMORY };
 using LimitState = std::shared_ptr<std::atomic<LimitCause>>;
 thread_local uint64_t callDeadlineNs = 0;
+constexpr uint64_t MAX_FIXED_ARRAY_ELEMENTS = 128ull * 1024 * 1024;
+constexpr uint64_t MAX_SINGLE_HEAP_OBJECT =
+    (uint64_t(v8::String::kMaxLength) * sizeof(uint16_t) > MAX_FIXED_ARRAY_ELEMENTS * sizeof(double)
+            ? uint64_t(v8::String::kMaxLength) * sizeof(uint16_t)
+            : MAX_FIXED_ARRAY_ELEMENTS * sizeof(double)) +
+    (1ull << 20);
+static_assert(MAX_SINGLE_HEAP_OBJECT < (2ull << 30));
+
+int limitEventFd();
+thread_local const char *currentOomReport = nullptr;
+struct OomReportScope {
+  explicit OomReportScope(kj::StringPtr identity, uint32_t memoryMiB)
+      : previous(currentOomReport),
+        report(kj::str("{\"event\":\"memory-culprit\",\"pid\":",
+            getpid(),
+            ",",
+            identity,
+            "\"memoryLimitMiB\":",
+            memoryMiB,
+            "}\n")) {
+    (void)limitEventFd();
+    currentOomReport = report.cStr();
+  }
+  ~OomReportScope() {
+    currentOomReport = previous;
+  }
+  const char *previous;
+  kj::String report;
+};
 
 kj::Exception limitException(LimitCause cause);
 
@@ -190,7 +219,9 @@ struct ResourceBudget {
   ResourceBudget(uint64_t maximum, uint32_t residents, uint32_t callThreads)
       : memoryMaximum(maximum),
         admissionMaximum(maximum - kj::min(maximum / 10, 64 * MiB)),
-        addressMaximum(v8::IsolateGroup::CanCreateNewGroups() ? UINT64_MAX : (4ull << 30) / 10 * 9),
+        addressMaximum(v8::IsolateGroup::CanCreateNewGroups()
+                ? UINT64_MAX
+                : (4ull << 30) - MAX_SINGLE_HEAP_OBJECT - (256ull << 20)),
         baselineMemory(64 * MiB + uint64_t(callThreads + 16) * (256ull << 10)),
         residentMaximum(residents),
         memoryReserved(baselineMemory) {
@@ -242,19 +273,28 @@ struct ResourceReservation {
   const uint64_t maximumHeap;
   std::mutex mutex;
   uint64_t heap = 1536ull << 10, otherExternal = 0, ownedExternal = 0, source = 0, logs = 0;
-  uint64_t memoryCharge = 0, addressCharge = 0, emergency = 0;
+  uint64_t memoryCharge = 0, addressCharge = 0;
   uint32_t preparing = 0;
   bool registered = false;
   bool resize(bool admission = false, bool observe = false) {
-    auto memory =
-        NATIVE_OVERHEAD + source + heap + otherExternal + ownedExternal + logs + emergency;
-    auto address = kj::max(2 * MiB, heap + emergency);
+    auto memory = NATIVE_OVERHEAD + source + heap + otherExternal + ownedExternal + logs;
+    auto address = kj::max(2 * MiB, heap);
     bool fits = budget->change(memoryCharge, memory, addressCharge, address, admission, observe);
     if (fits || observe) {
       memoryCharge = memory;
       addressCharge = address;
     }
     return fits;
+  }
+  std::string metrics() {
+    std::lock_guard lock(mutex);
+    return "{\"heapBytes\":" + std::to_string(heap) +
+        ",\"ownedExternalBytes\":" + std::to_string(ownedExternal) +
+        ",\"otherExternalBytes\":" + std::to_string(otherExternal) +
+        ",\"sourceBytes\":" + std::to_string(source) + ",\"logBytes\":" + std::to_string(logs) +
+        ",\"fixedNativeBytes\":" + std::to_string(NATIVE_OVERHEAD) +
+        ",\"memoryCharge\":" + std::to_string(memoryCharge) +
+        ",\"preparations\":" + std::to_string(preparing) + "}";
   }
   bool registerPreparation() {
     std::lock_guard lock(mutex);
@@ -320,20 +360,6 @@ struct ResourceReservation {
     std::lock_guard lock(mutex);
     KJ_ASSERT(bytes <= logs);
     logs -= bytes;
-    (void)resize(false, true);
-  }
-  uint64_t heapEmergency(uint64_t bytes) {
-    std::lock_guard lock(mutex);
-    emergency += bytes;
-    // The upper watermark reserves headroom for V8 to unwind termination.
-    // Charge each extension before returning it to V8, including repeat
-    // callbacks.
-    (void)resize(false, true);
-    return emergency;
-  }
-  void clearEmergency() {
-    std::lock_guard lock(mutex);
-    emergency = 0;
     (void)resize(false, true);
   }
 };
@@ -443,6 +469,30 @@ bool writeLimitRow(kj::StringPtr event,
   return true;
 }
 
+[[noreturn]] void nativeOom(const char *, const v8::OOMDetails &) {
+  const int fd = limitEventFd();
+  char unknown[96];
+  int length = snprintf(
+      unknown, sizeof(unknown), "{\"event\":\"memory-oom-undetermined\",\"pid\":%d}\n", getpid());
+  auto emit = [&](const char *data, size_t size) {
+    if (fd < 0 || size > 4096) return;
+    for (unsigned retry = 0; retry < 10; ++retry) {
+      ssize_t n = write(fd, data, size);
+      if (n == ssize_t(size)) return;
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        pollfd pending{fd, POLLOUT, 0};
+        (void)poll(&pending, 1, 10);
+        continue;
+      }
+      return;
+    }
+  };
+  if (length > 0 && size_t(length) < sizeof(unknown)) emit(unknown, size_t(length));
+  if (currentOomReport) emit(currentOomReport, strlen(currentOomReport));
+  _exit(74);
+}
+
 struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   MemoryBudget(uint32_t mib, LimitState cause, std::shared_ptr<ResourceReservation> reservation)
       : maximum(uint64_t(mib == 0 ? 128 : mib) << 20),
@@ -459,6 +509,7 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   std::atomic<uint64_t> peakUsedBytes{0};
   v8::ArrayBuffer::Allocator *inner;
   v8::Isolate *isolate = nullptr;
+  std::atomic<bool> pendingPressure{false};
   std::atomic<LimitCause> *currentCause = nullptr;  // isolate-lock protected
   void pressure() {
     if (currentCause) {
@@ -466,7 +517,10 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
       if (currentCause->compare_exchange_strong(expected, LimitCause::PROCESS_MEMORY))
         reservation->budget->pressureTerminations.fetch_add(1);
     }
-    if (isolate) isolate->TerminateExecution();
+    if (currentCause) {
+      if (isolate) isolate->TerminateExecution();
+    } else
+      pendingPressure.store(true);
   }
   bool reserve(size_t size) {
     if (currentCause && currentCause->load() == LimitCause::PROCESS_MEMORY) return false;
@@ -524,7 +578,9 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     if (reservation && !reservation->observe(stats, owned)) {
       pressure();
     }
-    if (currentCause && currentCause->load() == LimitCause::PROCESS_MEMORY) return;
+    if (pendingPressure.load() ||
+        (currentCause && currentCause->load() == LimitCause::PROCESS_MEMORY))
+      return;
     if (maximum != 0 && stats.used_heap_size() + other + owned >= maximum) {
       if (!afterGc) {
         isolate->LowMemoryNotification();
@@ -537,14 +593,9 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   }
   void install(v8::Isolate *value) {
     isolate = value;
-    value->AddNearHeapLimitCallback([](void *opaque, size_t current, size_t initial) {
-      auto &self = *static_cast<MemoryBudget *>(opaque);
-      if (!self.currentCause || self.currentCause->load() != LimitCause::PROCESS_MEMORY)
-        self.cause->store(LimitCause::MEMORY);
-      self.isolate->TerminateExecution();
-      if (self.reservation) self.reservation->heapEmergency(8u << 20);
-      return current + (8u << 20);
-    }, this);
+    // Soft tenant checks run after collection. The fixed hard reserve covers
+    // one maximum-sized V8 object; repeated callbacks never enlarge this limit.
+    value->SetOOMErrorHandler(&nativeOom);
     value->AddGCEpilogueCallback([](v8::Isolate *, v8::GCType, v8::GCCallbackFlags, void *opaque) {
       static_cast<MemoryBudget *>(opaque)->observe(true);
     }, this);
@@ -634,6 +685,8 @@ class CpuWatchdog {
 struct CpuExecution {
   std::atomic<LimitCause> &cause;
   std::shared_ptr<MemoryBudget> memory;
+  std::atomic<LimitCause> *previousCause;
+  OomReportScope oom;
   CpuWatchdog::Entry entry;
   bool registered;
   bool finished = false;
@@ -647,6 +700,8 @@ struct CpuExecution {
       kj::StringPtr identity)
       : cause(cause),
         memory(std::move(memory)),
+        previousCause(this->memory ? this->memory->currentCause : nullptr),
+        oom(identity, memoryMiB),
         entry{.isolate = isolate,
           .cause = cause,
           .memory = std::move(memoryState),
@@ -662,7 +717,16 @@ struct CpuExecution {
     entry.started = nowNs(entry.clock);
     entry.due = nowNs() + (entry.allowance == UINT64_MAX ? 1000000 : entry.allowance);
     if (registered) CpuWatchdog::instance().add(entry);
-    if (this->memory) this->memory->currentCause = &cause;
+    if (this->memory) {
+      this->memory->currentCause = &cause;
+      if (this->memory->pendingPressure.exchange(false)) {
+        auto expected = LimitCause::NONE;
+        if (cause.compare_exchange_strong(expected, LimitCause::PROCESS_MEMORY) &&
+            this->memory->reservation)
+          this->memory->reservation->budget->pressureTerminations.fetch_add(1);
+        isolate->TerminateExecution();
+      }
+    }
   }
   void finish() {
     if (finished) return;
@@ -679,8 +743,7 @@ struct CpuExecution {
         entry.isolate->LowMemoryNotification();
       }
       memory->observe();
-      memory->currentCause = nullptr;
-      if (memory->reservation) memory->reservation->clearEmergency();
+      memory->currentCause = previousCause;
     }
     if (entry.terminatedAt != 0 || cause.load() != LimitCause::NONE ||
         entry.memory->load() != LimitCause::NONE)
@@ -710,7 +773,9 @@ struct IsolateLimits final: IsolateLimitEnforcer {
   v8::Isolate::CreateParams getCreateParams() override {
     v8::Isolate::CreateParams params;
     if (memory) {
-      if (memory->maximum) params.constraints.ConfigureDefaultsFromHeapSize(0, memory->maximum);
+      auto hard = memory->maximum + MAX_SINGLE_HEAP_OBJECT;
+      params.constraints.ConfigureDefaultsFromHeapSize(0, hard);
+      params.constraints.set_max_old_generation_size_in_bytes(hard);
       params.array_buffer_allocator_shared = memory;
     }
     return params;
@@ -1078,6 +1143,13 @@ struct JsonDoc {
     return arena.getRoot<Json>();
   }
 };
+
+kj::String invocationIdentity(Slot &slot, Json::Reader descriptor) {
+  return kj::str("\"workerId\":", encode(field(descriptor, "workerId")),
+      ",\"versionId\":", encode(field(descriptor, "versionId")),
+      ",\"invocationId\":", encode(field(descriptor, "invocationId")), ",\"isolate\":\"",
+      slot.isolateLabel.c_str(), "\",");
+}
 
 void ThreadState::acceptDeadline(kj::StringPtr descriptor) {
   JsonDoc document(descriptor);
@@ -1471,7 +1543,8 @@ struct ThreadedServer {
           ",\"instance\":" + std::to_string(slot->instance) +
           ",\"active\":" + std::to_string(contexts) +
           ",\"loading\":" + (complete ? "false" : "true") +
-          ",\"backgroundActive\":" + (contexts && js == 0 ? "true" : "false") + "}";
+          ",\"backgroundActive\":" + (contexts && js == 0 ? "true" : "false") +
+          ",\"nativeMemory\":" + slot->reservation->metrics() + "}";
     }
     json += "],\"createdIsolates\":" + std::to_string(compilations.load()) +
         ",\"resourceBudget\":{\"memoryBytes\":" + std::to_string(resources->memoryReserved.load()) +
@@ -1843,6 +1916,7 @@ struct ThreadedServer {
   kj::Own<Worker> compile(Slot &slot, Json::Reader descriptor, kj::StringPtr source) {
     slot.loadStage = threaded::LoadStage::PACKAGE;
     Reporter reporter;
+    slot.loadStage = threaded::LoadStage::LOAD;
     auto flags = slot.flagsArena.initRoot<CompatibilityFlags>();
     capnp::MallocMessageBuilder flagMessage;
     auto given = field(descriptor, "compatibilityFlags");
@@ -1863,6 +1937,7 @@ struct ThreadedServer {
     auto config = slot.configArena.initRoot<server::config::Worker>();
     auto main = text(descriptor, "mainModule");
     if (field(descriptor, "format").isString() && text(descriptor, "format") == "v2") {
+      slot.loadStage = threaded::LoadStage::PACKAGE;
       JsonDoc payload(source);
       auto manifestText = text(payload.get(), "manifest");
       KJ_REQUIRE(digest(manifestText.asBytes()) == str(descriptor, "contentHash"),
@@ -1923,6 +1998,7 @@ struct ThreadedServer {
         slot.reservation);
     slot.limits = limits.get();
     slot.limitsOwner = kj::addRef(*limits);
+    OomReportScope oom(limits->identity, limits->memoryMiB);
     isolateCreationAttempts.fetch_add(1);
     auto group = jsg::newIsolateGroup();
     const api::pyodide::PythonConfig python{
@@ -2190,9 +2266,13 @@ struct ThreadedServer {
         }
         bool callerFailure = false;
         KJ_IF_SOME(error, slot->error) {
-          callerFailure = error.getType() == kj::Exception::Type::DISCONNECTED ||
-              std::string(error.getDescription().cStr()).find("PROCESS_MEMORY_PRESSURE") !=
-                  std::string::npos;
+          callerFailure = error.getType() == kj::Exception::Type::DISCONNECTED;
+        }
+        if (slot->limits &&
+            (slot->limits->startupCause.load() == LimitCause::PROCESS_MEMORY ||
+                slot->limits->memory->pendingPressure.load())) {
+          slot->error = capacityError();
+          callerFailure = true;
         }
         if (!fetched || callerFailure) {
           slot->retryableLoad.store(true);
@@ -2933,9 +3013,10 @@ struct PreparedInvocation {
 // for that handshake. The reference uses the library's normal RPC serializer.
 class BindingTarget final: public rpc::JsRpcTarget::Server {
  public:
-  BindingTarget(std::shared_ptr<Slot> slot, rpc::JsRpcTarget::Client target)
+  BindingTarget(std::shared_ptr<Slot> slot, rpc::JsRpcTarget::Client target, kj::String identity)
       : slot(std::move(slot)),
-        target(kj::mv(target)) {}
+        target(kj::mv(target)),
+        identity(kj::mv(identity)) {}
 
   DispatchCallResult dispatchCall(uint64_t interfaceId,
       uint16_t methodId,
@@ -2965,6 +3046,7 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
     auto results = context.getResults().initAs<rpc::JsRpcTarget::CallResults>();
     auto &worker = *KJ_REQUIRE_NONNULL(slot->worker);
     auto asyncLock = co_await worker.takeAsyncLockWithoutRequest(SpanParent(nullptr));
+    OomReportScope oom(identity, slot->limits->memoryMiB);
     worker.runInLockScope(asyncLock, [&](Worker::Lock &lock) {
       JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock &js) {
         auto placeholder = jsg::check(
@@ -2985,6 +3067,7 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
 
   std::shared_ptr<Slot> slot;
   rpc::JsRpcTarget::Client target;
+  kj::String identity;
   bool bound = false;
 };
 
@@ -3072,7 +3155,8 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
   auto target = event->getCap();
   auto completed = prepared->entry->customEvent(kj::mv(event));
   auto results = context.getResults();
-  results.setTopLevel(kj::heap<BindingTarget>(std::move(slot), kj::mv(target)));
+  auto identity = invocationIdentity(*slot, input);
+  results.setTopLevel(kj::heap<BindingTarget>(std::move(slot), kj::mv(target), kj::mv(identity)));
   results.setSession(completed.then(
       [prepared = kj::mv(prepared)](auto) { return rpc::JsRpcSession::Client(nullptr); }));
 }
