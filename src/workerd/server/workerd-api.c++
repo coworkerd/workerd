@@ -557,7 +557,8 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     Global::Reader global,
     CompatibilityFlags::Reader featureFlags,
     api::MemoryCacheProvider& memoryCacheProvider,
-    IsInternalBinding isInternal) {
+    IsInternalBinding isInternal,
+    kj::FunctionParam<kj::Own<ActorIdFactory>(kj::StringPtr)> actorIds) {
   TRACE_EVENT("workerd", "WorkerdApi::createBindingValue()");
   auto context = lock.v8Context();
 
@@ -590,8 +591,8 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
 
     case Global::COWORKERD_ROOT_LOADER: {
       auto root = global.getCoworkerdRootLoader();
-      return lock.wrap(context,
-          lock.alloc<CoworkerdRootLoader>(root.getChannel(), kj::str(root.getService())));
+      return lock.wrap(
+          context, lock.alloc<CoworkerdRootLoader>(root.getChannel(), kj::str(root.getService())));
     }
 
     case Global::LOOPBACK_SERVICE_STUB:
@@ -670,16 +671,15 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     case Global::DURABLE_ACTOR_NAMESPACE: {
       auto ns = global.getDurableActorNamespace();
       return lock.wrap(context,
-          lock.alloc<api::DurableObjectNamespace>(ns.getActorChannel(),
-              kj::heap<ActorIdFactoryImpl>(ns.getUniqueKey()), api::ActorCallRetriesAllowed::YES,
-              Persistent::NO));
+          lock.alloc<api::DurableObjectNamespace>(ns.getActorChannel(), actorIds(ns.getUniqueKey()),
+              api::ActorCallRetriesAllowed::YES, Persistent::NO));
     }
 
     case Global::LOOPBACK_DURABLE_ACTOR_NAMESPACE: {
       auto ns = global.getLoopbackDurableActorNamespace();
       return lock.wrap(context,
           lock.alloc<api::LoopbackDurableObjectNamespace>(ns.getActorChannel(),
-              kj::heap<ActorIdFactoryImpl>(ns.getUniqueKey()), api::ActorCallRetriesAllowed::YES,
+              actorIds(ns.getUniqueKey()), api::ActorCallRetriesAllowed::YES,
               lock.alloc<api::LoopbackDurableObjectClass>(ns.getClassChannel()), featureFlags));
     }
 
@@ -706,8 +706,8 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
         auto env = v8::Object::New(lock.v8Isolate);
         for (auto innerBinding: innerBindings) {
           lock.v8Set(env, innerBinding.getName(),
-              createBindingValue(
-                  lock, innerBinding, featureFlags, memoryCacheProvider, IsInternalBinding::YES));
+              createBindingValue(lock, innerBinding, featureFlags, memoryCacheProvider,
+                  IsInternalBinding::YES, actorIds));
         }
 
         // obtain exported function to call
@@ -763,6 +763,15 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
 
 void WorkerdApi::compileGlobals(
     jsg::Lock& lockParam, capnp::List<Global>::Reader globals, v8::Local<v8::Object> target) const {
+  compileGlobals(lockParam, globals, target, [](kj::StringPtr key) -> kj::Own<ActorIdFactory> {
+    return kj::heap<ActorIdFactoryImpl>(key);
+  });
+}
+
+void WorkerdApi::compileGlobals(jsg::Lock& lockParam,
+    capnp::List<Global>::Reader globals,
+    v8::Local<v8::Object> target,
+    kj::FunctionParam<kj::Own<ActorIdFactory>(kj::StringPtr)> actorIds) const {
   TRACE_EVENT("workerd", "WorkerdApi::compileGlobals()");
   auto& lock = kj::downcast<JsgWorkerdIsolate::Lock>(lockParam);
   lockParam.withinHandleScope([&] {
@@ -772,7 +781,7 @@ void WorkerdApi::compileGlobals(
       lockParam.withinHandleScope([&] {
         // Don't use String's usual TypeHandler here because we want to intern the string.
         auto value = createBindingValue(
-            lock, global, featureFlags, impl->memoryCacheProvider, IsInternalBinding::NO);
+            lock, global, featureFlags, impl->memoryCacheProvider, IsInternalBinding::NO, actorIds);
         KJ_ASSERT(!value.IsEmpty(), "global did not produce v8::Value");
         lockParam.v8Set(target, global.getName(), value);
       });

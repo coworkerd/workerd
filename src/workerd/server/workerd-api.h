@@ -95,6 +95,12 @@ class WorkerdApi final: public Worker::Api {
   // Sets each of `globals`, a worker's bindings as the server interpreted them, on `target`.
   void compileGlobals(
       jsg::Lock& lock, capnp::List<Global>::Reader globals, v8::Local<v8::Object> target) const;
+  // The embedder may preserve an established Durable Object ID format. The
+  // provider runs synchronously while constructing the binding, under its lock.
+  void compileGlobals(jsg::Lock& lock,
+      capnp::List<Global>::Reader globals,
+      v8::Local<v8::Object> target,
+      kj::FunctionParam<kj::Own<ActorIdFactory>(kj::StringPtr)> actorIds) const;
 
   // Whether a binding of this kind can be created in the startup-snapshot zygote and transferred
   // to the Worker started from the snapshot. A Worker with a binding of any other kind starts
