@@ -40,6 +40,7 @@
 #include <capnp/message.h>
 #include <capnp/rpc-twoparty.h>
 #include <kj/async-io.h>
+#include <kj/async-unix.h>
 #include <kj/compat/http.h>
 #include <kj/debug.h>
 #include <kj/encoding.h>
@@ -529,6 +530,8 @@ struct ThreadedServer {
   int managerWake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   std::atomic<bool> ready{false};
   std::atomic<uint> compilations{0};
+  std::atomic<uint> canceledLoads{0};
+  std::atomic<bool> delayedSourceForTest{false};
   std::thread manager;
 
   ThreadedServer(uint limit, std::string sourceAddress, std::string identity)
@@ -606,6 +609,9 @@ struct ThreadedServer {
       KJ_REQUIRE(n == sizeof(count));
       auto fd = thread.descriptor.exchange(-2);
       KJ_REQUIRE(fd >= 0);
+      // The idle mailbox wait is outside KJ. Refresh its cached I/O time before
+      // an already-buffered RPC can enter JavaScript without another OS poll.
+      state.io.unixEventPort.poll();
       auto error = kj::runCatchingExceptions([&]() {
         auto stream = state.io.lowLevelProvider->wrapSocketFd(
             fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
@@ -629,6 +635,12 @@ struct ThreadedServer {
   }
 
   kj::Promise<kj::String> fetchSource(Json::Reader descriptor, ThreadState& state) {
+    if (const char* delay = getenv("COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST")) {
+      const auto milliseconds = strtoul(delay, nullptr, 10);
+      KJ_REQUIRE(milliseconds <= 10000, "invalid source test delay");
+      if (!delayedSourceForTest.exchange(true))
+        co_await state.io.provider->getTimer().afterDelay(milliseconds * kj::MILLISECONDS);
+    }
     auto invocation = text(descriptor, "invocationId");
     auto forInvocation = field(descriptor, "sourceInvocationId");
     if (forInvocation.isString() && forInvocation.getString().size() > 0)
@@ -821,19 +833,48 @@ struct ThreadedServer {
       slot = iterator->second;
     }
     if (creator) {
+      auto trace = [&](const char* phase) {
+        if (getenv("COWORKERD_THREADED_TRACE_FOR_TEST") == nullptr) return;
+        auto row = kj::str("[threaded-load] {\"workerId\":", encode(field(descriptor, "workerId")),
+            ",\"phase\":\"", phase, "\",\"atNs\":", nowNs(), "}\n");
+        (void)!write(STDERR_FILENO, row.begin(), row.size());
+      };
+      auto remove = [this, &key, &slot] {
+        std::lock_guard lock(registryMutex);
+        auto found = registry.find(key);
+        if (found != registry.end() && found->second == slot) registry.erase(found);
+      };
+      auto publish = [&slot] {
+        std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
+        {
+          std::lock_guard lock(slot->mutex);
+          slot->complete = true;
+          waiters.swap(slot->waiters);
+        }
+        for (auto& waiter: waiters) waiter->fulfill();
+      };
+      auto cancel = kj::defer([&] {
+        if (!slot->complete) {
+          canceledLoads.fetch_add(1);
+          remove();
+          slot->error =
+              KJ_EXCEPTION(DISCONNECTED, "Worker initialization canceled before publication");
+          publish();
+        }
+      });
+      bool fetched = false;
       try {
+        trace("source-start");
         auto source = co_await fetchSource(descriptor, state);
+        trace("source-end");
+        fetched = true;
         slot->worker = compile(*slot, descriptor, source);
+        trace("compiled");
       } catch (kj::Exception& error) {
         slot->error = kj::mv(error);
       }
-      std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
-      {
-        std::lock_guard lock(slot->mutex);
-        slot->complete = true;
-        waiters.swap(slot->waiters);
-      }
-      for (auto& waiter: waiters) waiter->fulfill();
+      if (!fetched) remove();
+      publish();
     } else {
       auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
       bool wait;
@@ -1022,7 +1063,8 @@ void acceptLoop(ThreadedServer& server, int listener, int parent) {
             body = "{\"threadLimit\":" + std::to_string(server.limit) +
                 ",\"busyThreads\":" + std::to_string(busy) +
                 ",\"idleConnections\":" + std::to_string(connections.size() - 1) +
-                ",\"compilations\":" + std::to_string(server.compilations.load()) + "}";
+                ",\"compilations\":" + std::to_string(server.compilations.load()) +
+                ",\"canceledLoads\":" + std::to_string(server.canceledLoads.load()) + "}";
           }
           auto status = server.ready.load(std::memory_order_acquire) ? "200 OK" : "503 Starting";
           if (!connection.input.starts_with("GET /__coworkerd/probe ") &&
