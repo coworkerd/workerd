@@ -20,6 +20,7 @@
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sched.h>
 #include <thread>
 #include <vector>
 #endif
@@ -87,10 +88,11 @@ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
 }
 
 size_t programLength(size_t count) {
+  const bool threaded = std::getenv("COWORKERD_THREADED") != nullptr;
 #if defined(__x86_64__)
-  return count + 9;
+  return count + 9 + (threaded ? 10 : 0);
 #elif defined(__aarch64__)
-  return count + 6;
+  return count + 6 + (threaded ? 10 : 0);
 #else
 #error "the steady-state system call filter needs this architecture's audit arch"
 #endif
@@ -119,6 +121,20 @@ size_t buildFilter(const int* numbers, size_t count, __u32 action, struct sock_f
   program[at++] = (struct sock_filter)BPF_STMT(BPF_JMP | BPF_JA | BPF_K, 1);
   program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
 #endif
+  if (std::getenv("COWORKERD_THREADED") != nullptr) {
+    constexpr __u32 threadFlags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+        CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 7);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, threadFlags, 1, 0);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]) + 4);
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+  }
   for (size_t i = 0; i < count; ++i)
     program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<__u32>(numbers[i]),
         static_cast<__u8>(count - i), 0);

@@ -368,7 +368,7 @@ wd_cc_library(
     hdrs = [
         "v8-platform-impl.h",
     ],
-    visibility = [":__subpackages__"],
+    visibility = [":__subpackages__", "//src/workerd/threaded:__pkg__"],
     deps = [
         "//src/workerd/io",
         "//src/workerd/jsg",

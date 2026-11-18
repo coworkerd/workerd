@@ -125,3 +125,12 @@ wd_cc_library(
     # of libc++'s std::regex parser aborts where workerd's throws.
     alwayslink = True,
 )
+
+# Standalone C++ servers use the same process-level narrowing, without the Rust factory.
+wd_cc_library(
+    name = "coworkerd-steady",
+    srcs = ["coworkerd-steady.c++"],
+    hdrs = ["coworkerd-steady.h"],
+    deps = ["@capnp-cpp//src/kj"],
+    visibility = ["//src/workerd/threaded:__pkg__"],
+)
