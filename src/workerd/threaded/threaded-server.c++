@@ -312,7 +312,8 @@ struct ResourceReservation {
   std::shared_ptr<ResourceBudget> budget;
   const uint64_t maximumHeap;
   std::mutex mutex;
-  uint64_t heap = 1536ull << 10, otherExternal = 0, ownedExternal = 0, source = 0, logs = 0;
+  uint64_t heap = 2 * MiB, heapPhysical = 0, otherExternal = 0, ownedExternal = 0, source = 0,
+           logs = 0;
   uint64_t memoryCharge = 0, addressCharge = 0;
   uint32_t preparing = 0;
   bool registered = false;
@@ -329,6 +330,7 @@ struct ResourceReservation {
   std::string metrics() {
     std::lock_guard lock(mutex);
     return "{\"heapBytes\":" + std::to_string(heap) +
+        ",\"heapPhysicalBytes\":" + std::to_string(heapPhysical) +
         ",\"ownedExternalBytes\":" + std::to_string(ownedExternal) +
         ",\"otherExternalBytes\":" + std::to_string(otherExternal) +
         ",\"sourceBytes\":" + std::to_string(source) + ",\"logBytes\":" + std::to_string(logs) +
@@ -364,6 +366,7 @@ struct ResourceReservation {
   bool observe(v8::HeapStatistics &stats, uint64_t owned) {
     std::lock_guard lock(mutex);
     heap = stats.total_heap_size();
+    heapPhysical = stats.total_physical_size();
     otherExternal = stats.external_memory() > owned ? stats.external_memory() - owned : 0;
     return resize(false, true);
   }

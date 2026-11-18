@@ -309,6 +309,10 @@ void allocationComponent(kj::StringPtr code) {
   execution.finish();
   KJ_EXPECT(limits.memoryState->load() == LimitCause::MEMORY);
   KJ_EXPECT(!isolate->IsExecutionTerminating());
+  auto metrics = reservation->metrics();
+  KJ_EXPECT(reservation->heapPhysical > 0);
+  KJ_EXPECT(threaded::rawField(metrics, "heapPhysicalBytes") ==
+      std::to_string(reservation->heapPhysical));
   checkNeighbor();
 }
 
