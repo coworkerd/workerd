@@ -167,7 +167,7 @@ struct Cache final: CacheClient {
 
 struct Channels;
 
-enum class LimitCause { NONE, CPU, MEMORY, DEADLINE };
+enum class LimitCause { NONE, CPU, MEMORY };
 using LimitState = std::shared_ptr<std::atomic<LimitCause>>;
 thread_local uint64_t callDeadlineNs = 0;
 
@@ -383,10 +383,6 @@ uint64_t configuredCount(const char* name, uint64_t fallback) {
 kj::StringPtr executionIdentity(kj::StringPtr fallback);
 
 kj::Exception limitException(LimitCause cause) {
-  if (cause == LimitCause::DEADLINE)
-    return jsg::tagCoworkerdRpcError(
-        KJ_EXCEPTION(OVERLOADED, "jsg.Error: LEASE_EXPIRED: invocation lease expired"),
-        "LEASE_EXPIRED");
   auto info = threaded::refusalInfo(
       cause == LimitCause::MEMORY ? threaded::Refusal::MEMORY : threaded::Refusal::CPU);
   auto code = kj::StringPtr(info.code.data(), info.code.size());
@@ -533,7 +529,7 @@ class CpuWatchdog {
     v8::Isolate* isolate;
     std::atomic<LimitCause>& cause;
     LimitState memory;
-    uint64_t started, allowance, due, terminatedAt = 0, deadline = 0, previousCpu = 0;
+    uint64_t started, allowance, due, terminatedAt = 0, previousCpu = 0;
     kj::String identity;
     uint32_t cpuMs, memoryMiB;
     bool culpritReported = false;
@@ -573,10 +569,6 @@ class CpuWatchdog {
         }
         auto used = nowNs(entry->clock) - entry->started;
         if (entry->memory->load() == LimitCause::MEMORY) entry->cause.store(LimitCause::MEMORY);
-        if (entry->deadline && now >= entry->deadline) {
-          auto expected = LimitCause::NONE;
-          entry->cause.compare_exchange_strong(expected, LimitCause::DEADLINE);
-        }
         if (entry->allowance != UINT64_MAX && used >= entry->allowance) {
           auto expected = LimitCause::NONE;
           entry->cause.compare_exchange_strong(expected, LimitCause::CPU);
@@ -585,9 +577,7 @@ class CpuWatchdog {
           if (entry->terminatedAt == 0) {
             entry->isolate->TerminateExecution();
             entry->terminatedAt = now;
-          } else if (!entry->culpritReported && now - entry->terminatedAt >= 100000000 &&
-              (entry->cause.load() != LimitCause::DEADLINE ||
-                  (entry->cpuMs != 0 && used >= entry->allowance))) {
+          } else if (!entry->culpritReported && now - entry->terminatedAt >= 100000000) {
             entry->culpritReported = writeLimitRow("culprit", entry->identity,
                 used + entry->previousCpu, entry->cpuMs, entry->memoryMiB);
           }
@@ -597,8 +587,6 @@ class CpuWatchdog {
               std::max<uint64_t>(
                   100000, entry->allowance == UINT64_MAX ? 1000000 : entry->allowance - used);
         }
-        if (entry->deadline && entry->cause.load() == LimitCause::NONE)
-          entry->due = std::min(entry->due, entry->deadline);
         next = std::min(next, entry->due);
       }
       if (entries.empty())
@@ -635,16 +623,14 @@ struct CpuExecution {
           .allowance = cpuMs == 0                ? UINT64_MAX
               : uint64_t(cpuMs) * 1000000 > used ? uint64_t(cpuMs) * 1000000 - used
                                                  : 0,
-          .deadline = callDeadlineNs,
           .previousCpu = used,
           .identity = kj::str(identity),
           .cpuMs = cpuMs,
           .memoryMiB = memoryMiB},
-        registered(cpuMs != 0 || memoryMiB != 0 || callDeadlineNs != 0) {
+        registered(cpuMs != 0 || memoryMiB != 0) {
     KJ_REQUIRE(pthread_getcpuclockid(pthread_self(), &entry.clock) == 0);
     entry.started = nowNs(entry.clock);
     entry.due = nowNs() + (entry.allowance == UINT64_MAX ? 1000000 : entry.allowance);
-    if (entry.deadline) entry.due = std::min(entry.due, entry.deadline);
     if (registered) CpuWatchdog::instance().add(entry);
     if (this->memory) this->memory->observe();
   }
@@ -732,10 +718,8 @@ struct IsolateLimits final: IsolateLimitEnforcer {
         result = int64_t(totalCpu) * kj::NANOSECONDS;
       else {
         result = limitException(exceeded);
-        writeLimitRow(exceeded == LimitCause::DEADLINE ? "deadline-terminated"
-                : exceeded == LimitCause::CPU          ? "terminated"
-                                                       : "memory-terminated",
-            identity, totalCpu, owner.cpuMs, owner.memoryMiB, owner.memory->peakUsedBytes.load());
+        writeLimitRow(exceeded == LimitCause::CPU ? "terminated" : "memory-terminated", identity,
+            totalCpu, owner.cpuMs, owner.memoryMiB, owner.memory->peakUsedBytes.load());
       }
     }
   };
@@ -929,10 +913,8 @@ struct RequestLimits final: LimitEnforcer {
     auto value = cause();
     if (value == LimitCause::NONE || published) return;
     published = true;
-    writeLimitRow(value == LimitCause::DEADLINE ? "deadline-terminated"
-            : value == LimitCause::MEMORY       ? "memory-terminated"
-                                                : "terminated",
-        identity, measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB,
+    writeLimitRow(value == LimitCause::MEMORY ? "memory-terminated" : "terminated", identity,
+        measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB,
         slot.limits->memory->peakUsedBytes.load());
     if (failurePair.fulfiller->isWaiting()) failurePair.fulfiller->reject(limitException(value));
     context.abort(limitException(value));
@@ -940,7 +922,6 @@ struct RequestLimits final: LimitEnforcer {
   kj::Maybe<EventOutcome> getLimitsExceeded() override {
     auto value = cause();
     if (value == LimitCause::NONE) return kj::none;
-    if (value == LimitCause::DEADLINE) return EventOutcome::CANCELED;
     return value == LimitCause::MEMORY ? EventOutcome::EXCEEDED_MEMORY : EventOutcome::EXCEEDED_CPU;
   }
   kj::Promise<void> onLimitsExceeded() override {
@@ -1004,9 +985,6 @@ struct ThreadState {
   kj::TaskSet tasks{errors};
   bool rejectOnly = false;
   uint64_t deadlineNs = 0;
-  kj::Own<kj::PromiseFulfiller<void>> expirationFulfiller;
-  kj::Maybe<kj::ForkedPromise<void>> expiration;
-  kj::Maybe<kj::Promise<void>> deadlineTimer;
   void acceptDeadline(kj::StringPtr descriptor);
   kj::Duration backgroundAllowance() {
     auto remaining = deadlineNs == 0
@@ -1060,14 +1038,6 @@ void ThreadState::acceptDeadline(kj::StringPtr descriptor) {
     return;
   deadlineNs = uint64_t(value.getNumber() * 1000000);
   callDeadlineNs = deadlineNs;
-  auto now = nowNs();
-  deadlineTimer =
-      io.provider->getTimer()
-          .afterDelay(int64_t(deadlineNs > now ? deadlineNs - now : 0) * kj::NANOSECONDS)
-          .then([this] {
-    if (expirationFulfiller.get() && expirationFulfiller->isWaiting())
-      expirationFulfiller->reject(KJ_EXCEPTION(DISCONNECTED, "invocation lease expired"));
-  }).eagerlyEvaluate(nullptr);
 }
 
 // The existing node lifecycle wire layout, with one native writer. No KJ
@@ -1708,9 +1678,6 @@ struct ThreadedServer {
       }
       KJ_REQUIRE(fd >= 0);
       state.deadlineNs = callDeadlineNs = 0;
-      auto expiration = kj::newPromiseAndFulfiller<void>();
-      state.expiration = kj::mv(expiration.promise).fork();
-      state.expirationFulfiller = kj::mv(expiration.fulfiller);
       // The idle mailbox wait is outside KJ. Refresh its cached I/O time before
       // an already-buffered RPC can enter JavaScript without another OS poll.
       state.io.unixEventPort.poll();
@@ -1718,9 +1685,7 @@ struct ThreadedServer {
         auto stream = state.io.lowLevelProvider->wrapSocketFd(
             fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
         capnp::TwoPartyServer session(kj::heap<Bootstrap>(*this, state));
-        session.accept(*stream)
-            .exclusiveJoin(KJ_ASSERT_NONNULL(state.expiration).addBranch())
-            .wait(state.io.waitScope);
+        session.accept(*stream).wait(state.io.waitScope);
       });
       KJ_IF_SOME(exception, error) {
         // Never print the descriptor, variables, secret values, or request body.
@@ -1729,15 +1694,10 @@ struct ThreadedServer {
       }
       auto backgroundError = kj::runCatchingExceptions([&]() {
         state.io.provider->getTimer()
-            .timeoutAfter(state.backgroundAllowance(),
-                state.tasks.onEmpty().exclusiveJoin(
-                    KJ_ASSERT_NONNULL(state.expiration).addBranch()))
+            .timeoutAfter(state.backgroundAllowance(), state.tasks.onEmpty())
             .wait(state.io.waitScope);
       });
       if (backgroundError != kj::none) state.tasks.clear();
-      state.deadlineTimer = kj::none;
-      state.expiration = kj::none;
-      state.expirationFulfiller = nullptr;
       state.deadlineNs = callDeadlineNs = 0;
       thread.invocation.store(false);
       thread.idleSince.store(nowNs());
