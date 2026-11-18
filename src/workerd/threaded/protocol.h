@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace workerd::threaded {
@@ -95,20 +96,33 @@ inline std::string_view rawPath(
   return value;
 }
 
+inline std::string normalizeEntrypoint(std::string_view format, std::string_view entrypoint) {
+  // A legacy service-worker script has only its global fetch handler. Named
+  // HTTP bindings historically select that handler as well.
+  return format == "v1" || entrypoint.empty() ? "default" : std::string(entrypoint);
+}
+
+inline std::string childOrderSequence(
+    bool required, std::string_view inherited, uint64_t generated) {
+  if (!required) return "0";
+  return inherited.empty() || inherited == "0" || inherited == "\"0\"" ? std::to_string(generated)
+                                                                       : std::string(inherited);
+}
+
 enum class LoadStage { LOAD, PACKAGE, DECODE, EVALUATION };
 struct LoadStageInfo {
-  std::string_view stage, codeStage, category;
+  std::string_view stage, codeStage, category, name;
 };
 inline constexpr LoadStageInfo loadStageInfo(LoadStage stage) {
   switch (stage) {
     case LoadStage::LOAD:
-      return {"load", "", "LOAD_FAILED"};
+      return {"bridge", "", "LOAD_FAILED", "Error"};
     case LoadStage::PACKAGE:
-      return {"code", "package", "LOAD_FAILED"};
+      return {"code", "package", "LOAD_FAILED", "Error"};
     case LoadStage::DECODE:
-      return {"code", "decode", "LOAD_FAILED"};
+      return {"code", "decode", "LOAD_FAILED", "SyntaxError"};
     case LoadStage::EVALUATION:
-      return {"evaluation", "", "TOP_LEVEL_THROW"};
+      return {"evaluation", "", "TOP_LEVEL_THROW", "Error"};
   }
   throw std::invalid_argument("unknown load stage");
 }

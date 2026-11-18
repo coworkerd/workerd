@@ -4,6 +4,8 @@
 #include "threaded-server.c++"
 #undef main
 
+#include <sys/wait.h>
+
 #include <kj/test.h>
 
 namespace workerd {
@@ -364,6 +366,81 @@ KJ_TEST("deadline decimal spelling and native refusal mappings") {
         info.code.data());
   }
   fflush(stdout);
+}
+
+KJ_TEST("legacy named HTTP entrypoints select the global handler") {
+  KJ_EXPECT(threaded::normalizeEntrypoint("v1", "Named") == "default");
+  KJ_EXPECT(threaded::normalizeEntrypoint("v1", "") == "default");
+  KJ_EXPECT(threaded::normalizeEntrypoint("v2", "") == "default");
+  KJ_EXPECT(threaded::normalizeEntrypoint("v2", "Named") == "Named");
+}
+
+KJ_TEST("bridge and decode failures retain their distinct trial stages") {
+  using L = threaded::LoadStage;
+  auto bridge = threaded::loadStageInfo(L::LOAD);
+  auto package = threaded::loadStageInfo(L::PACKAGE);
+  auto decode = threaded::loadStageInfo(L::DECODE);
+  auto evaluation = threaded::loadStageInfo(L::EVALUATION);
+  KJ_EXPECT(bridge.stage == "bridge" && bridge.category == "LOAD_FAILED");
+  KJ_EXPECT(package.stage == "code" && package.codeStage == "package" && package.name == "Error");
+  KJ_EXPECT(decode.stage == "code" && decode.codeStage == "decode" && decode.name == "SyntaxError");
+  KJ_EXPECT(evaluation.stage == "evaluation" && evaluation.category == "TOP_LEVEL_THROW");
+}
+
+KJ_TEST("the naive ordering counterexample inherits the parent order") {
+  KJ_EXPECT(threaded::childOrderSequence(false, "9", 1) == "0");
+  KJ_EXPECT(threaded::childOrderSequence(true, "0", 7) == "7");
+  KJ_EXPECT(threaded::childOrderSequence(true, "\"0\"", 7) == "7");
+  KJ_EXPECT(threaded::childOrderSequence(true, "9", 1) == "9");
+  KJ_EXPECT(threaded::childOrderSequence(true, "\"9\"", 1) == "\"9\"");
+}
+
+KJ_TEST("descriptor preflight raises a low soft limit and rejects a low hard limit") {
+  for (bool hardLow: {false, true}) {
+    auto pid = fork();
+    KJ_REQUIRE(pid >= 0);
+    if (pid == 0) {
+      struct rlimit limits;
+      if (getrlimit(RLIMIT_NOFILE, &limits) != 0) _exit(2);
+      limits.rlim_cur = hardLow ? 128 : 1024;
+      if (hardLow) limits.rlim_max = 128;
+      if (setrlimit(RLIMIT_NOFILE, &limits) != 0) _exit(3);
+      auto accepted = prepareDescriptors(512);
+      if (getrlimit(RLIMIT_NOFILE, &limits) != 0) _exit(4);
+      _exit(hardLow ? (accepted ? 5 : 0) : (accepted && limits.rlim_cur >= 4352 ? 0 : 6));
+    }
+    int status;
+    KJ_REQUIRE(waitpid(pid, &status, 0) == pid);
+    KJ_EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+KJ_TEST("validation reports retain the original JavaScript exception") {
+  Reporter reporter;
+  reporter.addError(kj::str("Uncaught SyntaxError: Unexpected token '='\nat index.js:1:6"));
+  reporter.addError(kj::str("a later validation error"));
+  bool rejected = false;
+  try {
+    reporter.requireValid();
+  } catch (const kj::Exception& error) {
+    rejected = true;
+    KJ_EXPECT(
+        error.getDescription() == "Uncaught SyntaxError: Unexpected token '='\nat index.js:1:6");
+  }
+  KJ_EXPECT(rejected);
+}
+
+KJ_TEST("legacy RPC rejects before a tenant method with its existing TypeError") {
+  requireRpcEntrypoint("v2");
+  bool refused = false;
+  try {
+    requireRpcEntrypoint("v1");
+  } catch (const kj::Exception& error) {
+    refused = true;
+    KJ_EXPECT(error.getDescription() ==
+        "jsg.TypeError: The RPC receiver does not implement the method \"__coworkerdRpcTarget\".");
+  }
+  KJ_EXPECT(refused);
 }
 
 }  // namespace

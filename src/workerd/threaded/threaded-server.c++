@@ -922,8 +922,15 @@ constexpr kj::Exception::DetailTypeId LOAD_STAGE_DETAIL = 0xd6eae4a9047382b1ull;
 
 struct Reporter final: Worker::ValidationErrorReporter {
   std::set<std::string> httpEntrypoints, entrypoints, actorClasses;
+  kj::Maybe<kj::String> failure;
   void addError(kj::String error) override {
-    KJ_FAIL_REQUIRE("invalid Worker", error);
+    if (failure == kj::none) failure = kj::mv(error);
+  }
+  void requireValid() {
+    KJ_IF_SOME(error, failure) {
+      kj::throwRecoverableException(
+          kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str(error)));
+    }
   }
   void addEntrypoint(kj::Maybe<kj::StringPtr> name, kj::Array<kj::String> handlers) override {
     std::string key = "default";
@@ -1992,8 +1999,10 @@ struct ThreadedServer {
     kj::HttpHeaders headers(*state.headers);
     auto request = client->request(kj::HttpMethod::GET, url, headers);
     auto response = co_await request.response;
-    KJ_REQUIRE(
-        response.statusCode == 200, kj::str("Trusted source fetch failed: ", response.statusCode));
+    if (response.statusCode != 200) {
+      kj::throwRecoverableException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__,
+          kj::str("Trusted source fetch failed: ", response.statusCode)));
+    }
     auto length =
         KJ_REQUIRE_NONNULL(response.body->tryGetLength(), "Trusted source omitted its length");
     while (!slot.reservation->retainSource(length)) {
@@ -2003,7 +2012,9 @@ struct ThreadedServer {
       }
     }
     auto content = co_await response.body->readAllText(256u << 20);
+    slot.loadStage = threaded::LoadStage::DECODE;
     JsonDoc source(content);
+    slot.loadStage = threaded::LoadStage::PACKAGE;
     KJ_REQUIRE(text(source.get(), "workerId") == text(descriptor, "workerId") &&
             text(source.get(), "versionId") == text(descriptor, "versionId") &&
             text(source.get(), "contentHash") == text(descriptor, "contentHash"),
@@ -2109,11 +2120,13 @@ struct ThreadedServer {
         kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), kj::atomicRefcounted<IsolateObserver>(),
             name, kj::mv(limits), Worker::Isolate::InspectorPolicy::DISALLOW,
             Worker::LoggingOptions(Worker::ConsoleMode::STDOUT));
-    slot.loadStage = threaded::LoadStage::LOAD;
-    auto compiled = kj::atomicRefcounted<Worker::Script>(kj::mv(isolate), name,
-        server::WorkerdApi::extractSource(name, config, flags.asReader(), reporter),
-        IsolateObserver::StartType::COLD, kj::none, kj::none, SpanParent(nullptr),
+    slot.loadStage = threaded::LoadStage::EVALUATION;
+    auto extracted = server::WorkerdApi::extractSource(name, config, flags.asReader(), reporter);
+    reporter.requireValid();
+    auto compiled = kj::atomicRefcounted<Worker::Script>(kj::mv(isolate), name, extracted,
+        IsolateObserver::StartType::COLD, reporter, kj::none, SpanParent(nullptr),
         newWorkerFileSystem(kj::heap<FsMap>(), getTmpDirectoryImpl()), kj::none);
+    reporter.requireValid();
     kj::Maybe<jsg::V8Ref<v8::Object>> exportsHandle;
     slot.loadStage = threaded::LoadStage::EVALUATION;
     auto worker =
@@ -2179,6 +2192,7 @@ struct ThreadedServer {
     },
             IsolateObserver::StartType::COLD, SpanParent(nullptr),
             Worker::Lock::TakeSynchronously(kj::none), reporter);
+    reporter.requireValid();
     uintptr_t isolateAddress = 0;
     worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock &lock) {
       lock.validateHandlers(reporter);
@@ -2225,6 +2239,7 @@ struct ThreadedServer {
       });
       isolateAddress = reinterpret_cast<uintptr_t>(lock.getIsolate());
     });
+    reporter.requireValid();
     slot.httpEntrypoints = std::move(reporter.httpEntrypoints);
     slot.entrypoints = std::move(reporter.entrypoints);
     slot.actorClasses = std::move(reporter.actorClasses);
@@ -2808,7 +2823,10 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
     add("parentInvocationId", encode(field(input(), "invocationId")));
     auto next = flag(input(), "requiresChildSequence") && !assets ? ++sequence : 0;
     add("callSequence", kj::str(next));
-    add("orderSequence", kj::str(next));
+    auto inherited = threaded::rawField(
+        std::string_view(document.original.begin(), document.original.size()), "orderSequence");
+    auto order = threaded::childOrderSequence(next != 0, inherited, next);
+    add("orderSequence", kj::str(order));
     add("sequenceMapSize", kj::str(next == 0 ? 0 : 1));
     auto deadline =
         threaded::rawPath(std::string_view(document.original.begin(), document.original.size()),
@@ -3230,7 +3248,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
   auto generation = field(input, "processGeneration");
   cf = kj::str(cf, ",\"processGeneration\":",
       generation.isString() ? kj::str(generation.getString()) : encode(generation), "}");
-  auto entrypoint = field(input, "entrypoint").isString() ? str(input, "entrypoint") : "";
+  auto entrypoint = threaded::normalizeEntrypoint(
+      str(input, "format"), field(input, "entrypoint").isString() ? str(input, "entrypoint") : "");
   auto channels = kj::rc<Channels>(state, server, slot, raw);
   auto tracer = kj::rc<TenantTracer>(channels.addRef());
   auto entry = newWorkerEntrypoint(state.context, kj::mv(worker),
@@ -3246,6 +3265,16 @@ PreparedInvocation prepareInvocation(ThreadState &state,
       kj::addRef(*invocation), kj::mv(channels), kj::refcounted<RequestObserver>(), state.tasks,
       true, kj::mv(tracer), kj::mv(cf), kj::none);
   return {kj::mv(entry), kj::mv(invocation)};
+}
+
+void requireRpcEntrypoint(std::string_view format) {
+  if (format == "v1") {
+    // Legacy service-worker scripts never supported the entrypoint RPC
+    // handshake. Retain its public TypeError across the backend switch.
+    kj::throwRecoverableException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__,
+        kj::str(
+            "jsg.TypeError: The RPC receiver does not implement the method \"__coworkerdRpcTarget\".")));
+  }
 }
 
 kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
@@ -3283,6 +3312,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
     co_await server.confirmDecision(input, state, "load-rejected", error.getDescription(), stage);
     kj::throwRecoverableException(error.clone());
   }
+  requireRpcEntrypoint(str(input, "format"));
   auto prepared = kj::heap<PreparedInvocation>(prepareInvocation(state, server, slot, input,
       descriptor, kj::mv(props), std::move(preparation), std::move(tenant)));
   auto event = kj::heap<api::JsRpcSessionCustomEvent>(
@@ -3372,10 +3402,10 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
     auto value = arena.initRoot<Json>();
     value.setString(message);
     auto info = threaded::loadStageInfo(loadStage);
-    auto report =
-        kj::str("{\"ok\":false,\"stage\":\"", kj::heapString(info.stage.data(), info.stage.size()),
-            "\",\"codeStage\":\"", kj::heapString(info.codeStage.data(), info.codeStage.size()),
-            "\",\"name\":\"Error\",\"message\":", encode(value), "}");
+    auto report = kj::str("{\"ok\":false,\"stage\":\"",
+        kj::heapString(info.stage.data(), info.stage.size()), "\",\"codeStage\":\"",
+        kj::heapString(info.codeStage.data(), info.codeStage.size()), "\",\"name\":\"",
+        kj::heapString(info.name.data(), info.name.size()), "\",\"message\":", encode(value), "}");
     if (!trial)
       report = co_await server.confirmDecision(input, state, "load-rejected", message, loadStage);
     auto output = response.send(trial ? 200 : 503, trial ? "OK" : "Service Unavailable",
@@ -3383,9 +3413,8 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
     co_await output->write(report.asBytes());
     co_return;
   }
-  auto entrypoint =
-      field(input, "entrypoint").isString() ? str(input, "entrypoint") : std::string();
-  if (entrypoint.empty()) entrypoint = "default";
+  auto entrypoint = threaded::normalizeEntrypoint(
+      str(input, "format"), field(input, "entrypoint").isString() ? str(input, "entrypoint") : "");
   if (trial) {
     auto names = kj::str("[");
     bool first = true;
