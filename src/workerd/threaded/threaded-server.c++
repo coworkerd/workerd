@@ -3161,6 +3161,38 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
       [prepared = kj::mv(prepared)](auto) { return rpc::JsRpcSession::Client(nullptr); }));
 }
 
+// Response::send() can run inside the same JS turn that allocated a large
+// object, before the turn's final limit check. Check before committing headers.
+class LimitedResponse final: public kj::HttpService::Response {
+ public:
+  LimitedResponse(kj::HttpService::Response &inner, InvocationState &invocation)
+      : inner(inner),
+        invocation(invocation) {}
+  kj::Own<kj::AsyncOutputStream> send(uint status,
+      kj::StringPtr text,
+      const kj::HttpHeaders &headers,
+      kj::Maybe<uint64_t> length) override {
+    check();
+    return inner.send(status, text, headers, length);
+  }
+  kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders &headers) override {
+    check();
+    return inner.acceptWebSocket(headers);
+  }
+
+ private:
+  void check() {
+    auto &limits = *invocation.slot->limits;
+    if (v8::Isolate::TryGetCurrent() == limits.memory->isolate) limits.memory->observe();
+    auto cause = limits.memoryState->load() == LimitCause::MEMORY
+        ? LimitCause::MEMORY
+        : invocation.measurement.limitCause.load();
+    if (cause != LimitCause::NONE) kj::throwRecoverableException(limitException(cause));
+  }
+  kj::HttpService::Response &inner;
+  InvocationState &invocation;
+};
+
 kj::Promise<void> Invocation::request(kj::HttpMethod method,
     kj::StringPtr url,
     const kj::HttpHeaders &headers,
@@ -3260,8 +3292,9 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
   auto &invocation = prepared.invocation;
   auto &entry = prepared.entry;
   kj::Maybe<kj::Exception> failure;
+  LimitedResponse checkedResponse(response, *invocation);
   try {
-    co_await entry->request(method, url, headers, body, response);
+    co_await entry->request(method, url, headers, body, checkedResponse);
   } catch (const kj::Exception &error) {
     failure = error.clone();
   }
