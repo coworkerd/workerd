@@ -65,7 +65,7 @@ KJ_TEST("actual reservation arithmetic, both watermarks and RAII release") {
   KJ_EXPECT(smaller->memoryMaximum - smaller->admissionMaximum == (16ull << 20));
   const auto baseline = budget->memoryReserved.load();
   {
-    auto reservation = std::make_shared<ResourceReservation>(budget);
+    auto reservation = std::make_shared<ResourceReservation>(budget, 128);
     KJ_ASSERT(reservation->registerPreparation());
     auto seed = budget->memoryReserved.load();
     KJ_EXPECT(seed > baseline && budget->residents.load() == 1);
@@ -249,7 +249,7 @@ void allocationComponent(kj::StringPtr code) {
   };
   checkNeighbor();
   auto budget = std::make_shared<ResourceBudget>(1ull << 30, 4, 1);
-  auto reservation = std::make_shared<ResourceReservation>(budget);
+  auto reservation = std::make_shared<ResourceReservation>(budget, 32);
   KJ_ASSERT(reservation->registerPreparation());
   IsolateLimits limits(1000, 32, kj::str("\"workerId\":\"a/heap\","), reservation);
   auto params = limits.getCreateParams();
