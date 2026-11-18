@@ -363,6 +363,7 @@ KJ_TEST("deadline decimal spelling and native refusal mappings") {
     fprintf(stdout, "NATIVE_ERROR_STATUS %u %.*s\n", info.status, int(info.code.size()),
         info.code.data());
   }
+  fflush(stdout);
 }
 
 }  // namespace
