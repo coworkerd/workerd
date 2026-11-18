@@ -1213,6 +1213,31 @@ kj::String invocationIdentity(Slot &slot, Json::Reader descriptor) {
       slot.isolateLabel.c_str(), "\",");
 }
 
+CompatibilityFlags::Builder compileTenantFlags(
+    Slot &slot, Json::Reader descriptor, Reporter &reporter) {
+  // Compatibility flags are tenant validation, before package decoding.
+  slot.loadStage = threaded::LoadStage::EVALUATION;
+  auto flags = slot.flagsArena.initRoot<CompatibilityFlags>();
+  capnp::MallocMessageBuilder flagMessage;
+  auto given = field(descriptor, "compatibilityFlags");
+  auto list =
+      flagMessage.initRoot<capnp::List<capnp::Text>>(given.isArray() ? given.getArray().size() : 0);
+  if (given.isArray()) {
+    uint i = 0;
+    for (auto item: given.getArray()) {
+      KJ_REQUIRE(item.isString(), "invalid compatibility flag");
+      if (item.getString() == "precise_timers")
+        unsupported("precise_timers is disabled for tenants");
+      list.set(i++, item.getString());
+    }
+  }
+  compileCompatibilityFlags(text(descriptor, "compatibilityDate"), list.asReader(), flags, reporter,
+      false, CompatibilityDateValidation::CODE_VERSION, {});
+  reporter.requireValid();
+  if (flags.getPreciseTimers()) unsupported("precise_timers is disabled for tenants");
+  return flags;
+}
+
 void ThreadState::acceptDeadline(kj::StringPtr descriptor) {
   JsonDoc document(descriptor);
   auto value = field(field(document.get(), "lease"), "expiresAtMonotonicMs");
@@ -2025,24 +2050,7 @@ struct ThreadedServer {
   kj::Own<Worker> compile(Slot &slot, Json::Reader descriptor, kj::StringPtr source) {
     slot.loadStage = threaded::LoadStage::PACKAGE;
     Reporter reporter;
-    slot.loadStage = threaded::LoadStage::LOAD;
-    auto flags = slot.flagsArena.initRoot<CompatibilityFlags>();
-    capnp::MallocMessageBuilder flagMessage;
-    auto given = field(descriptor, "compatibilityFlags");
-    auto list = flagMessage.initRoot<capnp::List<capnp::Text>>(
-        given.isArray() ? given.getArray().size() : 0);
-    if (given.isArray()) {
-      uint i = 0;
-      for (auto item: given.getArray()) {
-        KJ_REQUIRE(item.isString(), "invalid compatibility flag");
-        if (item.getString() == "precise_timers")
-          unsupported("precise_timers is disabled for tenants");
-        list.set(i++, item.getString());
-      }
-    }
-    compileCompatibilityFlags(text(descriptor, "compatibilityDate"), list.asReader(), flags,
-        reporter, false, CompatibilityDateValidation::CODE_VERSION, {});
-    if (flags.getPreciseTimers()) unsupported("precise_timers is disabled for tenants");
+    auto flags = compileTenantFlags(slot, descriptor, reporter);
     auto config = slot.configArena.initRoot<server::config::Worker>();
     auto main = text(descriptor, "mainModule");
     if (field(descriptor, "format").isString() && text(descriptor, "format") == "v2") {

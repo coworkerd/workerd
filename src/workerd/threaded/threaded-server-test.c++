@@ -443,5 +443,23 @@ KJ_TEST("legacy RPC rejects before a tenant method with its existing TypeError")
   KJ_EXPECT(refused);
 }
 
+KJ_TEST("compatibility refusals are tenant validation before package decoding") {
+  Slot slot;
+  Reporter reporter;
+  JsonDoc invalid(kj::str(
+      "{\"compatibilityDate\":\"2026-11-01\",\"compatibilityFlags\":[\"no_such_threaded_test_flag\"]}"));
+  bool rejected = false;
+  try {
+    compileTenantFlags(slot, invalid.get(), reporter);
+  } catch (const kj::Exception&) {
+    rejected = true;
+  }
+  KJ_EXPECT(rejected && slot.loadStage == threaded::LoadStage::EVALUATION);
+  Slot validSlot;
+  Reporter validReporter;
+  JsonDoc valid(kj::str("{\"compatibilityDate\":\"2026-11-01\",\"compatibilityFlags\":[]}"));
+  KJ_EXPECT(!compileTenantFlags(validSlot, valid.get(), validReporter).getPreciseTimers());
+}
+
 }  // namespace
 }  // namespace workerd
