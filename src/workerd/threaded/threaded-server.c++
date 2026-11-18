@@ -1596,6 +1596,7 @@ struct ThreadedServer {
         uint growing = 0;
         for (auto& item: threads) {
           if (item->control || item->descriptor.load() != STOPPED || growing == 16) continue;
+          if (item->thread.joinable()) item->thread.join();
           item->descriptor.store(-2);
           liveThreads.fetch_add(1);
           try {
