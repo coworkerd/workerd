@@ -215,8 +215,9 @@ struct ResourceBudget {
     auto memory = memoryReserved.load() - oldMemory;
     auto address = addressReserved.load() - oldAddress;
     auto ceiling = admission ? admissionMaximum : memoryMaximum;
-    bool fits = newMemory <= ceiling - kj::min(memory, ceiling) &&
-        newAddress <= addressMaximum - kj::min(address, addressMaximum);
+    bool fits = (!admission && newMemory <= oldMemory && newAddress <= oldAddress) ||
+        (newMemory <= ceiling - kj::min(memory, ceiling) &&
+            newAddress <= addressMaximum - kj::min(address, addressMaximum));
     if (!fits && !observe) return false;
     memoryReserved.store(memory + newMemory);
     addressReserved.store(address + newAddress);
@@ -670,6 +671,10 @@ struct CpuExecution {
     // remove() synchronizes with the watchdog before a new invocation can take
     // this isolate lock. A late termination must not leak into that invocation.
     if (memory) {
+      if (cause.load() == LimitCause::PROCESS_MEMORY) {
+        entry.isolate->CancelTerminateExecution();
+        entry.isolate->LowMemoryNotification();
+      }
       memory->observe();
       memory->currentCause = nullptr;
       if (memory->reservation) memory->reservation->clearEmergency();
