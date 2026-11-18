@@ -88,7 +88,9 @@ bool prepareDescriptors(uint32_t threads) {
   auto required = threaded::descriptorBudget(threads);
   if (getrlimit(RLIMIT_NOFILE, &current) != 0 || current.rlim_max < required) {
     fprintf(stderr,
-        "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"descriptors\",\"required\":%llu}\n",
+        "[threaded-start] "
+        "{\"event\":\"startup-rejected\",\"resource\":\"descriptors\","
+        "\"required\":%llu}\n",
         (unsigned long long)required);
     return false;
   }
@@ -96,7 +98,9 @@ bool prepareDescriptors(uint32_t threads) {
     current.rlim_cur = required;
     if (setrlimit(RLIMIT_NOFILE, &current) != 0) {
       fprintf(stderr,
-          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"descriptor-soft-limit\"}\n");
+          "[threaded-start] "
+          "{\"event\":\"startup-rejected\",\"resource\":"
+          "\"descriptor-soft-limit\"}\n");
       return false;
     }
   }
@@ -111,7 +115,7 @@ struct Entropy final: kj::EntropySource {
 
 // KJ's native timer advances at event-port polls, never while JavaScript runs.
 struct Timer final: TimerChannel {
-  explicit Timer(kj::Timer& timer)
+  explicit Timer(kj::Timer &timer)
       : timer(timer),
         originMono(timer.now()),
         originWall(kj::systemPreciseCalendarClock().now()),
@@ -136,10 +140,15 @@ struct Timer final: TimerChannel {
   kj::Promise<void> afterLimitTimeout(kj::Duration delay) override {
     return timer.afterDelay(delay);
   }
-  kj::Timer& timer;
+  kj::Timer &timer;
   kj::TimePoint originMono;
   kj::Date originWall, observed;
 };
+
+bool traceForTest() {
+  static const bool enabled = getenv("COWORKERD_THREADED_TRACE_FOR_TEST") != nullptr;
+  return enabled;
+}
 
 void noteUnsupported(kj::StringPtr feature);
 
@@ -167,49 +176,59 @@ struct Cache final: CacheClient {
 
 struct Channels;
 
-enum class LimitCause { NONE, CPU, MEMORY };
+enum class LimitCause { NONE, CPU, MEMORY, PROCESS_MEMORY };
 using LimitState = std::shared_ptr<std::atomic<LimitCause>>;
 thread_local uint64_t callDeadlineNs = 0;
 
 kj::Exception limitException(LimitCause cause);
 
-// Only native counters and ownership cross threads. A resident Worker keeps its
-// committed heap charged; JavaScript turns reserve their whole possible heap
-// before entering V8, and return unused capacity when they yield.
+// Each resident owns its measured heap, external allocations and native
+// overhead. Invocation ownership survives yields; only new admission uses the
+// lower watermark. Growth over the upper watermark belongs to the growing call.
 struct ResourceBudget {
   static constexpr uint64_t MiB = 1ull << 20;
-  ResourceBudget(uint64_t memoryMaximum, uint32_t residentMaximum, uint32_t callThreads)
-      : memoryMaximum(memoryMaximum),
+  ResourceBudget(uint64_t maximum, uint32_t residents, uint32_t callThreads)
+      : memoryMaximum(maximum),
+        admissionMaximum(maximum - kj::min(maximum / 10, 64 * MiB)),
         addressMaximum(v8::IsolateGroup::CanCreateNewGroups() ? UINT64_MAX : (4ull << 30) / 10 * 9),
         baselineMemory(64 * MiB + uint64_t(callThreads + 16) * (256ull << 10)),
-        residentMaximum(residentMaximum),
+        residentMaximum(residents),
         memoryReserved(baselineMemory) {
+    KJ_REQUIRE(admissionMaximum > baselineMemory + 2 * MiB,
+        "native thread budget leaves no memory for an active Worker");
     KJ_REQUIRE(
-        memoryMaximum > baselineMemory, "native thread budget exceeds process memory budget");
-    KJ_REQUIRE(residentMaximum > 0 && residentMaximum <= 1840,
-        "invalid resident budget for this shared-group build");
+        residents > 0 && residents <= 1840, "invalid resident budget for this shared-group build");
   }
-  const uint64_t memoryMaximum, addressMaximum, baselineMemory;
+  const uint64_t memoryMaximum, admissionMaximum, addressMaximum, baselineMemory;
   const uint32_t residentMaximum;
   std::mutex mutex;
   std::atomic<uint64_t> memoryReserved{0}, addressReserved{0};
   std::atomic<uint32_t> residents{0};
-  std::atomic<uint64_t> rejections{0}, evictions{0};
-  bool change(uint64_t oldMemory, uint64_t newMemory, uint64_t oldAddress, uint64_t newAddress) {
+  std::atomic<uint64_t> rejections{0}, evictions{0}, pressureTerminations{0};
+  bool change(uint64_t oldMemory,
+      uint64_t newMemory,
+      uint64_t oldAddress,
+      uint64_t newAddress,
+      bool admission = false,
+      bool observe = false) {
     std::lock_guard lock(mutex);
     auto memory = memoryReserved.load() - oldMemory;
     auto address = addressReserved.load() - oldAddress;
-    if (newMemory > memoryMaximum - kj::min(memory, memoryMaximum) ||
-        newAddress > addressMaximum - kj::min(address, addressMaximum))
-      return false;
+    auto ceiling = admission ? admissionMaximum : memoryMaximum;
+    bool fits = newMemory <= ceiling - kj::min(memory, ceiling) &&
+        newAddress <= addressMaximum - kj::min(address, addressMaximum);
+    if (!fits && !observe) return false;
     memoryReserved.store(memory + newMemory);
     addressReserved.store(address + newAddress);
-    return true;
+    return fits;
   }
 };
 
 struct ResourceReservation {
   static constexpr uint64_t MiB = ResourceBudget::MiB;
+  // The capacity acquisition records heap and RSS deltas to validate this seed
+  // and fixed native overhead separately from each isolate's own heap ceiling.
+  static constexpr uint64_t NATIVE_OVERHEAD = 512ull << 10;
   ResourceReservation(std::shared_ptr<ResourceBudget> budget, uint32_t memoryMiB)
       : budget(std::move(budget)),
         maximumHeap(uint64_t(memoryMiB == 0 ? 128 : memoryMiB) * MiB) {}
@@ -221,18 +240,20 @@ struct ResourceReservation {
   std::shared_ptr<ResourceBudget> budget;
   const uint64_t maximumHeap;
   std::mutex mutex;
-  uint64_t heap = 0, otherExternal = 0, ownedExternal = 0, source = 0;
-  uint64_t memoryCharge = 0, addressCharge = 0;
-  uint32_t preparing = 0, entering = 0;
+  uint64_t heap = 1536ull << 10, otherExternal = 0, ownedExternal = 0, source = 0, logs = 0;
+  uint64_t memoryCharge = 0, addressCharge = 0, emergency = 0;
+  uint32_t preparing = 0;
   bool registered = false;
-  bool resize(bool active) {
-    uint64_t memory = 8 * MiB + source + ownedExternal +
-        (active ? kj::max(2 * maximumHeap + 8 * MiB, heap + otherExternal) : heap + otherExternal);
-    uint64_t address = kj::max(2 * MiB, active ? kj::max(maximumHeap + 8 * MiB, heap) : heap);
-    if (!budget->change(memoryCharge, memory, addressCharge, address)) return false;
-    memoryCharge = memory;
-    addressCharge = address;
-    return true;
+  bool resize(bool admission = false, bool observe = false) {
+    auto memory =
+        NATIVE_OVERHEAD + source + heap + otherExternal + ownedExternal + logs + emergency;
+    auto address = kj::max(2 * MiB, heap + emergency);
+    bool fits = budget->change(memoryCharge, memory, addressCharge, address, admission, observe);
+    if (fits || observe) {
+      memoryCharge = memory;
+      addressCharge = address;
+    }
+    return fits;
   }
   bool registerPreparation() {
     std::lock_guard lock(mutex);
@@ -258,40 +279,26 @@ struct ResourceReservation {
     std::lock_guard lock(mutex);
     KJ_ASSERT(preparing > 0);
     --preparing;
-    (void)resize(preparing || entering);
   }
-  bool enter() {
-    std::lock_guard lock(mutex);
-    if (!resize(true)) return false;
-    ++entering;
-    return true;
-  }
-  void exit() {
-    std::lock_guard lock(mutex);
-    KJ_ASSERT(entering > 0);
-    --entering;
-    (void)resize(preparing || entering);
-  }
-  // Called only on the isolate's current thread while its lock is held.
-  bool observe(v8::HeapStatistics& stats, uint64_t owned) {
+  bool observe(v8::HeapStatistics &stats, uint64_t owned) {
     std::lock_guard lock(mutex);
     heap = stats.total_heap_size();
     otherExternal = stats.external_memory() > owned ? stats.external_memory() - owned : 0;
-    return resize(preparing || entering);
+    return resize(false, true);
   }
   bool retainSource(uint64_t length) {
     std::lock_guard lock(mutex);
-    auto old = source;
     if (length > (256ull << 20)) return false;
+    auto old = source;
     source = length * 5;
-    if (resize(preparing || entering)) return true;
+    if (resize()) return true;
     source = old;
     return false;
   }
   bool allocateExternal(uint64_t size) {
     std::lock_guard lock(mutex);
     ownedExternal += size;
-    if (resize(preparing || entering)) return true;
+    if (resize()) return true;
     ownedExternal -= size;
     return false;
   }
@@ -299,26 +306,35 @@ struct ResourceReservation {
     std::lock_guard lock(mutex);
     KJ_ASSERT(size <= ownedExternal);
     ownedExternal -= size;
-    (void)resize(preparing || entering);
+    (void)resize(false, true);
   }
-};
-
-struct ResourceJsScope {
-  explicit ResourceJsScope(std::shared_ptr<ResourceReservation> reservation)
-      : reservation(std::move(reservation)) {
-    if (this->reservation && !this->reservation->enter())
-      kj::throwRecoverableException(limitException(LimitCause::MEMORY));
+  bool retainLogs(uint64_t bytes) {
+    std::lock_guard lock(mutex);
+    logs += bytes;
+    if (resize()) return true;
+    logs -= bytes;
+    return false;
   }
-  void finish() {
-    if (reservation) {
-      reservation->exit();
-      reservation.reset();
-    }
+  void releaseLogs(uint64_t bytes) {
+    std::lock_guard lock(mutex);
+    KJ_ASSERT(bytes <= logs);
+    logs -= bytes;
+    (void)resize(false, true);
   }
-  ~ResourceJsScope() noexcept(false) {
-    finish();
+  uint64_t heapEmergency(uint64_t bytes) {
+    std::lock_guard lock(mutex);
+    emergency += bytes;
+    // The upper watermark reserves headroom for V8 to unwind termination.
+    // Charge each extension before returning it to V8, including repeat
+    // callbacks.
+    (void)resize(false, true);
+    return emergency;
   }
-  std::shared_ptr<ResourceReservation> reservation;
+  void clearEmergency() {
+    std::lock_guard lock(mutex);
+    emergency = 0;
+    (void)resize(false, true);
+  }
 };
 
 struct ResourcePreparation {
@@ -369,10 +385,10 @@ struct TenantPermit {
   std::string tenant;
 };
 
-uint64_t configuredCount(const char* name, uint64_t fallback) {
+uint64_t configuredCount(const char *name, uint64_t fallback) {
   auto text = getenv(name);
   if (!text) return fallback;
-  char* end;
+  char *end;
   errno = 0;
   auto result = strtoull(text, &end, 10);
   KJ_REQUIRE(
@@ -383,6 +399,9 @@ uint64_t configuredCount(const char* name, uint64_t fallback) {
 kj::StringPtr executionIdentity(kj::StringPtr fallback);
 
 kj::Exception limitException(LimitCause cause) {
+  if (cause == LimitCause::PROCESS_MEMORY)
+    return jsg::tagCoworkerdRpcError(
+        KJ_EXCEPTION(OVERLOADED, "jsg.Error: PROCESS_MEMORY_PRESSURE"), "PROCESS_MEMORY_PRESSURE");
   auto info = threaded::refusalInfo(
       cause == LimitCause::MEMORY ? threaded::Refusal::MEMORY : threaded::Refusal::CPU);
   auto code = kj::StringPtr(info.code.data(), info.code.size());
@@ -425,7 +444,7 @@ bool writeLimitRow(kj::StringPtr event,
 
 struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   MemoryBudget(uint32_t mib, LimitState cause, std::shared_ptr<ResourceReservation> reservation)
-      : maximum(uint64_t(mib) << 20),
+      : maximum(uint64_t(mib == 0 ? 128 : mib) << 20),
         cause(std::move(cause)),
         reservation(std::move(reservation)),
         inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
@@ -437,28 +456,36 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   std::shared_ptr<ResourceReservation> reservation;
   std::atomic<uint64_t> external{0}, heap{0};
   std::atomic<uint64_t> peakUsedBytes{0};
-  v8::ArrayBuffer::Allocator* inner;
-  v8::Isolate* isolate = nullptr;
-  bool reserve(size_t size) {
-    if (reservation && !reservation->allocateExternal(size)) {
-      cause->store(LimitCause::MEMORY);
-      if (isolate) isolate->TerminateExecution();
-      return false;
+  v8::ArrayBuffer::Allocator *inner;
+  v8::Isolate *isolate = nullptr;
+  std::atomic<LimitCause> *currentCause = nullptr;  // isolate-lock protected
+  void pressure() {
+    if (currentCause) {
+      auto expected = LimitCause::NONE;
+      if (currentCause->compare_exchange_strong(expected, LimitCause::PROCESS_MEMORY))
+        reservation->budget->pressureTerminations.fetch_add(1);
     }
+    if (isolate) isolate->TerminateExecution();
+  }
+  bool reserve(size_t size) {
     auto used = external.load();
     for (;;) {
       auto base = heap.load();
-      if (maximum != 0 &&
-          (size > maximum || base > maximum - size || used > maximum - size - base)) {
-        if (reservation) reservation->freeExternal(size);
+      if (size > maximum || base > maximum - size || used > maximum - size - base) {
         cause->store(LimitCause::MEMORY);
-        if (isolate != nullptr) isolate->TerminateExecution();
+        if (isolate) isolate->TerminateExecution();
         return false;
       }
-      if (external.compare_exchange_weak(used, used + size)) return true;
+      if (external.compare_exchange_weak(used, used + size)) break;
     }
+    if (reservation && !reservation->allocateExternal(size)) {
+      external.fetch_sub(size);
+      pressure();
+      return false;
+    }
+    return true;
   }
-  void* Allocate(size_t size) override {
+  void *Allocate(size_t size) override {
     if (!reserve(size)) return nullptr;
     auto result = inner->Allocate(size);
     if (result == nullptr) {
@@ -467,7 +494,7 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     }
     return result;
   }
-  void* AllocateUninitialized(size_t size) override {
+  void *AllocateUninitialized(size_t size) override {
     if (!reserve(size)) return nullptr;
     auto result = inner->AllocateUninitialized(size);
     if (result == nullptr) {
@@ -476,7 +503,7 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     }
     return result;
   }
-  void Free(void* pointer, size_t size) override {
+  void Free(void *pointer, size_t size) override {
     inner->Free(pointer, size);
     external.fetch_sub(size);
     if (reservation) reservation->freeExternal(size);
@@ -493,8 +520,7 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     // unreclaimed garbage from an ordinary turn is not an isolate violation.
     if (afterGc) heap.store(stats.used_heap_size() + other);
     if (reservation && !reservation->observe(stats, owned)) {
-      cause->store(LimitCause::MEMORY);
-      isolate->TerminateExecution();
+      pressure();
     }
     if (maximum != 0 && stats.used_heap_size() + other + owned >= maximum) {
       if (!afterGc) {
@@ -506,44 +532,46 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
       isolate->TerminateExecution();
     }
   }
-  void install(v8::Isolate* value) {
+  void install(v8::Isolate *value) {
     isolate = value;
-    value->AddNearHeapLimitCallback([](void* opaque, size_t current, size_t initial) {
-      auto& self = *static_cast<MemoryBudget*>(opaque);
+    value->AddNearHeapLimitCallback([](void *opaque, size_t current, size_t initial) {
+      auto &self = *static_cast<MemoryBudget *>(opaque);
       self.cause->store(LimitCause::MEMORY);
       self.isolate->TerminateExecution();
-      return std::max(current, initial + (8u << 20));
+      if (self.reservation) self.reservation->heapEmergency(8u << 20);
+      return current + (8u << 20);
     }, this);
-    value->AddGCEpilogueCallback([](v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void* opaque) {
-      static_cast<MemoryBudget*>(opaque)->observe(true);
+    value->AddGCEpilogueCallback([](v8::Isolate *, v8::GCType, v8::GCCallbackFlags, void *opaque) {
+      static_cast<MemoryBudget *>(opaque)->observe(true);
     }, this);
   }
 };
 
-// Only native state, a thread CPU clock and V8's thread-safe termination API are
-// shared with the watchdog. Promises and IoContexts remain on the call thread.
+// Only native state, a thread CPU clock and V8's thread-safe termination API
+// are shared with the watchdog. Promises and IoContexts remain on the call
+// thread.
 class CpuWatchdog {
  public:
   struct Entry {
     clockid_t clock;
-    v8::Isolate* isolate;
-    std::atomic<LimitCause>& cause;
+    v8::Isolate *isolate;
+    std::atomic<LimitCause> &cause;
     LimitState memory;
     uint64_t started, allowance, due, terminatedAt = 0, previousCpu = 0;
     kj::String identity;
     uint32_t cpuMs, memoryMiB;
     bool culpritReported = false;
   };
-  static CpuWatchdog& instance() {
-    static auto* watchdog = new CpuWatchdog();
+  static CpuWatchdog &instance() {
+    static auto *watchdog = new CpuWatchdog();
     return *watchdog;
   }
-  void add(Entry& entry) {
+  void add(Entry &entry) {
     std::lock_guard lock(mutex);
     entries.push_back(&entry);
     changed.notify_one();
   }
-  void remove(Entry& entry) {
+  void remove(Entry &entry) {
     std::lock_guard lock(mutex);
     auto found = std::find(entries.begin(), entries.end(), &entry);
     KJ_REQUIRE(found != entries.end());
@@ -553,7 +581,7 @@ class CpuWatchdog {
  private:
   std::mutex mutex;
   std::condition_variable changed;
-  std::vector<Entry*> entries;
+  std::vector<Entry *> entries;
   std::thread thread;
   CpuWatchdog(): thread([this] { run(); }) {}
   void run() {
@@ -562,7 +590,7 @@ class CpuWatchdog {
     for (;;) {
       auto now = nowNs();
       uint64_t next = now + 1000000000;
-      for (auto* entry: entries) {
+      for (auto *entry: entries) {
         if (now < entry->due && entry->memory->load() == LimitCause::NONE) {
           next = std::min(next, entry->due);
           continue;
@@ -600,14 +628,13 @@ class CpuWatchdog {
 };
 
 struct CpuExecution {
-  std::atomic<LimitCause>& cause;
+  std::atomic<LimitCause> &cause;
   std::shared_ptr<MemoryBudget> memory;
-  ResourceJsScope resources;
   CpuWatchdog::Entry entry;
   bool registered;
   bool finished = false;
-  CpuExecution(v8::Isolate* isolate,
-      std::atomic<LimitCause>& cause,
+  CpuExecution(v8::Isolate *isolate,
+      std::atomic<LimitCause> &cause,
       LimitState memoryState,
       std::shared_ptr<MemoryBudget> memory,
       uint64_t used,
@@ -616,7 +643,6 @@ struct CpuExecution {
       kj::StringPtr identity)
       : cause(cause),
         memory(std::move(memory)),
-        resources(this->memory ? this->memory->reservation : nullptr),
         entry{.isolate = isolate,
           .cause = cause,
           .memory = std::move(memoryState),
@@ -632,7 +658,7 @@ struct CpuExecution {
     entry.started = nowNs(entry.clock);
     entry.due = nowNs() + (entry.allowance == UINT64_MAX ? 1000000 : entry.allowance);
     if (registered) CpuWatchdog::instance().add(entry);
-    if (this->memory) this->memory->observe();
+    if (this->memory) this->memory->currentCause = &cause;
   }
   void finish() {
     if (finished) return;
@@ -643,9 +669,14 @@ struct CpuExecution {
     }
     // remove() synchronizes with the watchdog before a new invocation can take
     // this isolate lock. A late termination must not leak into that invocation.
-    if (entry.terminatedAt != 0) entry.isolate->CancelTerminateExecution();
-    if (memory) memory->observe();
-    resources.finish();
+    if (memory) {
+      memory->observe();
+      memory->currentCause = nullptr;
+      if (memory->reservation) memory->reservation->clearEmergency();
+    }
+    if (entry.terminatedAt != 0 || cause.load() != LimitCause::NONE ||
+        entry.memory->load() != LimitCause::NONE)
+      entry.isolate->CancelTerminateExecution();
   }
   ~CpuExecution() noexcept(false) {
     finish();
@@ -676,25 +707,25 @@ struct IsolateLimits final: IsolateLimitEnforcer {
     }
     return params;
   }
-  void customizeIsolate(v8::Isolate* value) override {
+  void customizeIsolate(v8::Isolate *value) override {
     if (memory) memory->install(value);
   }
   ActorCacheSharedLruOptions getActorCacheLruOptions() override {
     return {};
   }
   struct Startup {
-    const IsolateLimits& owner;
-    kj::OneOf<kj::Exception, kj::Duration>& result;
+    const IsolateLimits &owner;
+    kj::OneOf<kj::Exception, kj::Duration> &result;
     uint64_t localCpu = 0;
     std::atomic<LimitCause> localCause{LimitCause::NONE};
-    uint64_t& totalCpu;
-    std::atomic<LimitCause>& cause;
+    uint64_t &totalCpu;
+    std::atomic<LimitCause> &cause;
     kj::String identity;
     uint64_t start = nowNs(CLOCK_THREAD_CPUTIME_ID);
     CpuExecution execution;
-    Startup(const IsolateLimits& owner,
-        jsg::Lock& js,
-        kj::OneOf<kj::Exception, kj::Duration>& result,
+    Startup(const IsolateLimits &owner,
+        jsg::Lock &js,
+        kj::OneOf<kj::Exception, kj::Duration> &result,
         bool startup)
         : owner(owner),
           result(result),
@@ -718,40 +749,42 @@ struct IsolateLimits final: IsolateLimitEnforcer {
         result = int64_t(totalCpu) * kj::NANOSECONDS;
       else {
         result = limitException(exceeded);
-        writeLimitRow(exceeded == LimitCause::CPU ? "terminated" : "memory-terminated", identity,
-            totalCpu, owner.cpuMs, owner.memoryMiB, owner.memory->peakUsedBytes.load());
+        writeLimitRow(exceeded == LimitCause::CPU        ? "terminated"
+                : exceeded == LimitCause::PROCESS_MEMORY ? "process-memory-pressure"
+                                                         : "memory-terminated",
+            identity, totalCpu, owner.cpuMs, owner.memoryMiB, owner.memory->peakUsedBytes.load());
       }
     }
   };
   kj::Own<void> enterStartupJs(
-      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
+      jsg::Lock &js, kj::OneOf<kj::Exception, kj::Duration> &result) const override {
     return kj::heap<Startup>(*this, js, result, true);
   }
   kj::Own<void> enterStartupPython(
-      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& r) const override {
+      jsg::Lock &js, kj::OneOf<kj::Exception, kj::Duration> &r) const override {
     return enterStartupJs(js, r);
   }
   kj::Own<void> enterDynamicImportJs(
-      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& r) const override {
+      jsg::Lock &js, kj::OneOf<kj::Exception, kj::Duration> &r) const override {
     return kj::heap<Startup>(*this, js, r, false);
   }
   kj::Own<void> enterLoggingJs(
-      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& r) const override {
+      jsg::Lock &js, kj::OneOf<kj::Exception, kj::Duration> &r) const override {
     return kj::heap<Startup>(*this, js, r, false);
   }
   kj::Own<void> enterInspectorJs(
-      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& r) const override {
+      jsg::Lock &js, kj::OneOf<kj::Exception, kj::Duration> &r) const override {
     return kj::heap<Startup>(*this, js, r, false);
   }
   void completedRequest(kj::StringPtr) const override {}
-  bool exitJs(jsg::Lock&) const override {
+  bool exitJs(jsg::Lock &) const override {
     return memoryState->load() == LimitCause::MEMORY;
   }
-  void reportMetrics(IsolateObserver&) const override {}
+  void reportMetrics(IsolateObserver &) const override {}
   bool hasExcessivelyExceededHeapLimit() const override {
     return memoryState->load() == LimitCause::MEMORY;
   }
-  const TrackedWasmInstanceList& getTrackedWasmInstances() const override {
+  const TrackedWasmInstanceList &getTrackedWasmInstances() const override {
     return instances;
   }
   TrackedWasmInstanceList instances;
@@ -770,7 +803,7 @@ struct Reporter final: Worker::ValidationErrorReporter {
       key = value.cStr();
     }
     entrypoints.insert(key);
-    for (auto& handler: handlers)
+    for (auto &handler: handlers)
       if (handler == "fetch") httpEntrypoints.insert(key);
   }
   void addActorClass(kj::StringPtr name) override {
@@ -792,7 +825,7 @@ struct Slot {
   std::atomic<uint32_t> contexts{0};
   kj::Maybe<kj::Own<Worker>> worker;
   kj::Own<IsolateLimits> limitsOwner;
-  IsolateLimits* limits = nullptr;
+  IsolateLimits *limits = nullptr;
   threaded::LoadStage loadStage = threaded::LoadStage::LOAD;
   kj::Maybe<kj::Exception> error;
   std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
@@ -815,7 +848,7 @@ struct Measurement {
 };
 
 struct RequestLimits final: LimitEnforcer {
-  RequestLimits(Slot& slot, Measurement& measurement, Timer& timer, kj::String identity)
+  RequestLimits(Slot &slot, Measurement &measurement, Timer &timer, kj::String identity)
       : slot(slot),
         measurement(measurement),
         timer(timer),
@@ -826,7 +859,7 @@ struct RequestLimits final: LimitEnforcer {
         slot.limits->memoryMiB, slot.limits->memory->peakUsedBytes.load());
   }
   struct Scope {
-    Scope(RequestLimits& owner, IoContext& context, v8::Isolate* isolate)
+    Scope(RequestLimits &owner, IoContext &context, v8::Isolate *isolate)
         : owner(owner),
           context(context),
           slot(owner.slot),
@@ -850,10 +883,12 @@ struct RequestLimits final: LimitEnforcer {
       execution.finish();
       auto used = nowNs(CLOCK_THREAD_CPUTIME_ID) - cpu;
       measurement.totalCpu += used;
-      if (getenv("COWORKERD_THREADED_TRACE_FOR_TEST") != nullptr) {
+      if (traceForTest()) {
         char row[320];
         int size = snprintf(row, sizeof(row),
-            "[threaded-js] {\"tid\":%ld,\"isolate\":%llu,\"startNs\":%llu,\"endNs\":%llu,\"cpuNs\":%llu}\n",
+            "[threaded-js] "
+            "{\"tid\":%ld,\"isolate\":%llu,\"startNs\":%llu,\"endNs\":"
+            "%llu,\"cpuNs\":%llu}\n",
             syscall(SYS_gettid), (unsigned long long)reinterpret_cast<uintptr_t>(isolate),
             (unsigned long long)start, (unsigned long long)nowNs(), (unsigned long long)used);
         if (size > 0) (void)!write(STDERR_FILENO, row, size);
@@ -861,21 +896,20 @@ struct RequestLimits final: LimitEnforcer {
       slot.active.fetch_sub(1);
       owner.publish(context);
     }
-    RequestLimits& owner;
-    IoContext& context;
-    Slot& slot;
-    Measurement& measurement;
-    v8::Isolate* isolate;
+    RequestLimits &owner;
+    IoContext &context;
+    Slot &slot;
+    Measurement &measurement;
+    v8::Isolate *isolate;
     uint64_t start, cpu;
     CpuExecution execution;
   };
-  kj::Own<void> enterJs(jsg::Lock& js, IoContext& context) override {
+  kj::Own<void> enterJs(jsg::Lock &js, IoContext &context) override {
     requireLimitsNotExceeded();
     // runImpl synchronizes before waiting for the isolate; sample again after
     // that wait, while its lock is held and before this turn enters JavaScript.
     timer.syncTime();
     auto scope = kj::heap<Scope>(*this, context, js.v8Isolate);
-    measurement.preparation.reset();
     return scope;
   }
   void topUpActor() override {}
@@ -905,7 +939,7 @@ struct RequestLimits final: LimitEnforcer {
     return slot.limits->memoryState->load() == LimitCause::MEMORY ? LimitCause::MEMORY
                                                                   : measurement.limitCause.load();
   }
-  void publish(IoContext& context) {
+  void publish(IoContext &context) {
     if (slot.limits->cpuMs != 0 && measurement.totalCpu >= uint64_t(slot.limits->cpuMs) * 1000000) {
       auto expected = LimitCause::NONE;
       measurement.limitCause.compare_exchange_strong(expected, LimitCause::CPU);
@@ -913,8 +947,10 @@ struct RequestLimits final: LimitEnforcer {
     auto value = cause();
     if (value == LimitCause::NONE || published) return;
     published = true;
-    writeLimitRow(value == LimitCause::MEMORY ? "memory-terminated" : "terminated", identity,
-        measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB,
+    writeLimitRow(value == LimitCause::MEMORY     ? "memory-terminated"
+            : value == LimitCause::PROCESS_MEMORY ? "process-memory-pressure"
+                                                  : "terminated",
+        identity, measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB,
         slot.limits->memory->peakUsedBytes.load());
     if (failurePair.fulfiller->isWaiting()) failurePair.fulfiller->reject(limitException(value));
     context.abort(limitException(value));
@@ -922,6 +958,7 @@ struct RequestLimits final: LimitEnforcer {
   kj::Maybe<EventOutcome> getLimitsExceeded() override {
     auto value = cause();
     if (value == LimitCause::NONE) return kj::none;
+    if (value == LimitCause::PROCESS_MEMORY) return EventOutcome::EXCEPTION;
     return value == LimitCause::MEMORY ? EventOutcome::EXCEEDED_MEMORY : EventOutcome::EXCEEDED_CPU;
   }
   kj::Promise<void> onLimitsExceeded() override {
@@ -931,16 +968,16 @@ struct RequestLimits final: LimitEnforcer {
   void requireLimitsNotExceeded() override {
     if (cause() != LimitCause::NONE) kj::throwFatalException(limitException(cause()));
   }
-  void reportMetrics(RequestObserver&) override {}
+  void reportMetrics(RequestObserver &) override {}
   kj::Duration consumeTimeElapsedForPeriodicLogging() override {
     return 0 * kj::SECONDS;
   }
   size_t getSqliteMemoryUsage() const override {
     return 0;
   }
-  Slot& slot;
-  Measurement& measurement;
-  Timer& timer;
+  Slot &slot;
+  Measurement &measurement;
+  Timer &timer;
   kj::String identity;
   kj::PromiseFulfillerPair<void> failurePair = kj::newPromiseAndFulfiller<void>();
   kj::ForkedPromise<void> failure;
@@ -949,20 +986,20 @@ struct RequestLimits final: LimitEnforcer {
 
 kj::StringPtr executionIdentity(kj::StringPtr fallback) {
   if (IoContext::hasCurrent()) {
-    return static_cast<RequestLimits&>(IoContext::current().getLimitEnforcer()).identity;
+    return static_cast<RequestLimits &>(IoContext::current().getLimitEnforcer()).identity;
   }
   return fallback;
 }
 
 void noteUnsupported(kj::StringPtr feature) {
   if (IoContext::hasCurrent()) {
-    auto& limits = static_cast<RequestLimits&>(IoContext::current().getLimitEnforcer());
+    auto &limits = static_cast<RequestLimits &>(IoContext::current().getLimitEnforcer());
     limits.measurement.unsupportedFeature = kj::str(feature);
   }
 }
 
 struct Errors final: kj::TaskSet::ErrorHandler {
-  void taskFailed(kj::Exception&& error) override {
+  void taskFailed(kj::Exception &&error) override {
     KJ_LOG(ERROR, "threaded background task failed");
   }
 };
@@ -983,6 +1020,10 @@ struct ThreadState {
   Timer timer{io.provider->getTimer()};
   Errors errors;
   kj::TaskSet tasks{errors};
+  int decisionSpare = open("/dev/null", O_RDONLY | O_CLOEXEC);
+  ~ThreadState() {
+    if (decisionSpare >= 0) close(decisionSpare);
+  }
   bool rejectOnly = false;
   uint64_t deadlineNs = 0;
   void acceptDeadline(kj::StringPtr descriptor);
@@ -994,7 +1035,7 @@ struct ThreadState {
   }
 };
 
-Frankenvalue readNativeProps(ThreadState& state, rpc::Frankenvalue::Reader value);
+Frankenvalue readNativeProps(ThreadState &state, rpc::Frankenvalue::Reader value);
 
 using Json = capnp::JsonValue;
 Json::Reader field(Json::Reader value, kj::StringPtr name) {
@@ -1055,39 +1096,39 @@ class LifecycleChannel {
     auto mapping = mmap(nullptr, SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     KJ_REQUIRE(mapping != MAP_FAILED, "cannot map lifecycle channel");
     close(fd);
-    base = static_cast<char*>(mapping);
-    KJ_REQUIRE(*reinterpret_cast<uint32_t*>(base + 8) == 0x434c5743 &&
-            *reinterpret_cast<uint32_t*>(base + 12) == CAPACITY,
+    base = static_cast<char *>(mapping);
+    KJ_REQUIRE(*reinterpret_cast<uint32_t *>(base + 8) == 0x434c5743 &&
+            *reinterpret_cast<uint32_t *>(base + 12) == CAPACITY,
         "invalid lifecycle channel header");
   }
   ~LifecycleChannel() {
     if (base) munmap(base, SIZE);
   }
-  void publish(const std::string& json, uint64_t active, uint64_t background, uint64_t unknown) {
+  void publish(const std::string &json, uint64_t active, uint64_t background, uint64_t unknown) {
     if (!base) return;
     KJ_REQUIRE(json.size() <= CAPACITY, "lifecycle snapshot exceeds channel");
     std::lock_guard lock(writer);
-    auto next = __atomic_load_n(reinterpret_cast<uint64_t*>(base), __ATOMIC_ACQUIRE) + 1;
+    auto next = __atomic_load_n(reinterpret_cast<uint64_t *>(base), __ATOMIC_ACQUIRE) + 1;
     auto buffer = base + 64 + (next % 2) * (16 + size_t(CAPACITY));
-    auto sequence = reinterpret_cast<uint64_t*>(buffer);
+    auto sequence = reinterpret_cast<uint64_t *>(buffer);
     __atomic_store_n(sequence, next * 2 + 1, __ATOMIC_SEQ_CST);
     memcpy(buffer + 16, json.data(), json.size());
     __atomic_store_n(
-        reinterpret_cast<uint32_t*>(buffer + 8), uint32_t(json.size()), __ATOMIC_RELAXED);
+        reinterpret_cast<uint32_t *>(buffer + 8), uint32_t(json.size()), __ATOMIC_RELAXED);
     __atomic_store_n(sequence, next * 2 + 2, __ATOMIC_RELEASE);
-    __atomic_store_n(reinterpret_cast<uint64_t*>(base), next, __ATOMIC_RELEASE);
-    auto drainSequence = reinterpret_cast<uint64_t*>(base + 24);
+    __atomic_store_n(reinterpret_cast<uint64_t *>(base), next, __ATOMIC_RELEASE);
+    auto drainSequence = reinterpret_cast<uint64_t *>(base + 24);
     auto drain = __atomic_load_n(drainSequence, __ATOMIC_RELAXED);
     __atomic_store_n(drainSequence, drain + 1, __ATOMIC_SEQ_CST);
-    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 32), nowNs(), __ATOMIC_RELAXED);
-    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 40), active, __ATOMIC_RELAXED);
-    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 48), background, __ATOMIC_RELAXED);
-    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 56), unknown, __ATOMIC_RELAXED);
+    __atomic_store_n(reinterpret_cast<uint64_t *>(base + 32), nowNs(), __ATOMIC_RELAXED);
+    __atomic_store_n(reinterpret_cast<uint64_t *>(base + 40), active, __ATOMIC_RELAXED);
+    __atomic_store_n(reinterpret_cast<uint64_t *>(base + 48), background, __ATOMIC_RELAXED);
+    __atomic_store_n(reinterpret_cast<uint64_t *>(base + 56), unknown, __ATOMIC_RELAXED);
     __atomic_store_n(drainSequence, drain + 2, __ATOMIC_RELEASE);
   }
 
  private:
-  char* base = nullptr;
+  char *base = nullptr;
   std::mutex writer;
 };
 std::string digest(kj::ArrayPtr<const kj::byte> value) {
@@ -1098,8 +1139,8 @@ std::string digest(kj::ArrayPtr<const kj::byte> value) {
 std::string decode64(kj::StringPtr input) {
   KJ_REQUIRE(input.size() % 4 == 0, "invalid module encoding");
   std::string value(input.size() / 4 * 3, '\0');
-  int size = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(value.data()),
-      reinterpret_cast<const unsigned char*>(input.begin()), input.size());
+  int size = EVP_DecodeBlock(reinterpret_cast<unsigned char *>(value.data()),
+      reinterpret_cast<const unsigned char *>(input.begin()), input.size());
   KJ_REQUIRE(size >= 0, "invalid module encoding");
   if (input.size() && input.endsWith("=")) --size;
   if (input.size() > 1 && input.endsWith("==")) --size;
@@ -1127,20 +1168,21 @@ class ObjectIdFactory final: public ActorIdFactory {
     kj::Maybe<kj::StringPtr> getJurisdiction() const override {
       return kj::none;
     }
-    bool equals(const ActorId& other) const override {
-      auto& value = kj::downcast<const Id>(other);
+    bool equals(const ActorId &other) const override {
+      auto &value = kj::downcast<const Id>(other);
       return id == value.id;
     }
     kj::Own<ActorId> clone() const override {
       return kj::heap<Id>(
-          kj::str(space), kj::str(id), name.map([](auto& value) { return kj::str(value); }));
+          kj::str(space), kj::str(id), name.map([](auto &value) { return kj::str(value); }));
     }
   };
   explicit ObjectIdFactory(kj::StringPtr space): space(kj::str(space)) {}
   kj::String space;
   void requireAvailable() {
     JSG_REQUIRE(space.size() == 64, Error,
-        "DO_NAMESPACE_UNAVAILABLE: the Durable Object namespace cannot be used");
+        "DO_NAMESPACE_UNAVAILABLE: the Durable Object namespace cannot "
+        "be used");
   }
   kj::Own<ActorId> newUniqueId(kj::Maybe<kj::StringPtr> jurisdiction) override {
     requireAvailable();
@@ -1167,7 +1209,7 @@ class ObjectIdFactory final: public ActorIdFactory {
     JSG_REQUIRE(valid, TypeError, "Invalid Durable Object ID: 64 lowercase hexadecimal digits");
     return kj::heap<Id>(kj::str(space), kj::mv(id), kj::none);
   }
-  bool matchesJurisdiction(const ActorId&) override {
+  bool matchesJurisdiction(const ActorId &) override {
     return true;
   }
   kj::Own<ActorIdFactory> cloneWithJurisdiction(kj::Maybe<kj::StringPtr> jurisdiction) override {
@@ -1180,7 +1222,8 @@ class ObjectIdFactory final: public ActorIdFactory {
   }
 };
 
-// Raw descriptors and atomic queue positions are the accept loop's only shared state.
+// Raw descriptors and atomic queue positions are the accept loop's only shared
+// state.
 class DescriptorQueue {
  public:
   explicit DescriptorQueue(size_t limit): entries(limit + 1) {}
@@ -1228,20 +1271,20 @@ struct InvocationState: kj::Refcounted {
 
 class Invocation final: public kj::HttpService {
  public:
-  Invocation(ThreadedServer& server, ThreadState& state, kj::String descriptor, Frankenvalue props)
+  Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props)
       : server(server),
         state(state),
         descriptor(kj::mv(descriptor)),
         props(kj::mv(props)) {}
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
-      const kj::HttpHeaders& headers,
-      kj::AsyncInputStream& body,
-      Response& response) override;
+      const kj::HttpHeaders &headers,
+      kj::AsyncInputStream &body,
+      Response &response) override;
 
  private:
-  ThreadedServer& server;
-  ThreadState& state;
+  ThreadedServer &server;
+  ThreadState &state;
   kj::String descriptor;
   Frankenvalue props;
   bool used = false;
@@ -1249,7 +1292,7 @@ class Invocation final: public kj::HttpService {
 
 class Dispatcher final: public rpc::EventDispatcher::Server {
  public:
-  Dispatcher(ThreadedServer& server, ThreadState& state, kj::String descriptor, Frankenvalue props)
+  Dispatcher(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props)
       : server(server),
         state(state),
         descriptor(kj::mv(descriptor)),
@@ -1264,8 +1307,8 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override;
 
  private:
-  ThreadedServer& server;
-  ThreadState& state;
+  ThreadedServer &server;
+  ThreadState &state;
   kj::String descriptor;
   Frankenvalue props;
   bool used = false;
@@ -1273,7 +1316,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
 
 class Bootstrap final: public threaded::rpc::Bootstrap::Server {
  public:
-  Bootstrap(ThreadedServer& server, ThreadState& state): server(server), state(state) {}
+  Bootstrap(ThreadedServer &server, ThreadState &state): server(server), state(state) {}
   kj::Promise<void> startEvent(StartEventContext context) override {
     KJ_REQUIRE(!used, "NOT_SUPPORTED: one startEvent per connection");
     used = true;
@@ -1297,8 +1340,8 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
   }
 
  private:
-  ThreadedServer& server;
-  ThreadState& state;
+  ThreadedServer &server;
+  ThreadState &state;
   bool used = false;
 };
 
@@ -1351,6 +1394,8 @@ struct ThreadedServer {
   std::atomic<uint64_t> isolateCreationAttempts{0};
   std::atomic<uint> canceledLoads{0};
   std::atomic<uint> subrequestsActive{0};
+  std::mutex subrequestMutex;
+  std::map<std::string, uint32_t> tenantSubrequests;
   std::atomic<uint64_t> subrequestsRejected{0}, acceptFailures{0};
   std::atomic<uint64_t> logAccepted{0}, logDroppedLines{0}, logDroppedBytes{0}, logFlushFailures{0};
   std::atomic<uint64_t> logPeakQueuedBytes{0};
@@ -1387,10 +1432,10 @@ struct ThreadedServer {
     std::vector<std::shared_ptr<Slot>> snapshot;
     {
       std::lock_guard lock(registryMutex);
-      for (auto& [key, slot]: registry) snapshot.push_back(slot);
-      for (auto& slot: retiredSlots) snapshot.push_back(slot);
+      for (auto &[key, slot]: registry) snapshot.push_back(slot);
+      for (auto &slot: retiredSlots) snapshot.push_back(slot);
     }
-    auto quote = [](const std::string& value) {
+    auto quote = [](const std::string &value) {
       capnp::MallocMessageBuilder arena;
       auto root = arena.initRoot<Json>();
       root.setString(value.c_str());
@@ -1399,7 +1444,7 @@ struct ThreadedServer {
     std::string json = "{\"ordinaryServer\":\"threaded\",\"residentWorkers\":[";
     uint64_t active = 0, background = 0, unknown = 0;
     bool first = true;
-    for (auto& slot: snapshot) {
+    for (auto &slot: snapshot) {
       auto complete = slot->complete.load();
       if (!complete) ++unknown;
       if (complete && slot->worker == kj::none) continue;
@@ -1423,6 +1468,8 @@ struct ThreadedServer {
     json += "],\"createdIsolates\":" + std::to_string(compilations.load()) +
         ",\"resourceBudget\":{\"memoryBytes\":" + std::to_string(resources->memoryReserved.load()) +
         ",\"memoryMaximum\":" + std::to_string(resources->memoryMaximum) +
+        ",\"admissionMaximum\":" + std::to_string(resources->admissionMaximum) +
+        ",\"pressureTerminations\":" + std::to_string(resources->pressureTerminations.load()) +
         ",\"addressBytes\":" + std::to_string(resources->addressReserved.load()) +
         ",\"addressMaximum\":" + std::to_string(resources->addressMaximum) +
         ",\"residents\":" + std::to_string(resources->residents.load()) +
@@ -1437,7 +1484,7 @@ struct ThreadedServer {
     std::vector<std::shared_ptr<Slot>> released;
     {
       std::lock_guard lock(registryMutex);
-      std::erase_if(retiredSlots, [&](auto& slot) {
+      std::erase_if(retiredSlots, [&](auto &slot) {
         if (slot.use_count() != 1 || slot->contexts.load() != 0) return false;
         released.push_back(std::move(slot));
         return true;
@@ -1446,7 +1493,7 @@ struct ThreadedServer {
     released.clear();
   }
 
-  static uint32_t workerLimit(Json::Reader descriptor, kj::StringPtr name, const char* variable) {
+  static uint32_t workerLimit(Json::Reader descriptor, kj::StringPtr name, const char *variable) {
     auto value = field(descriptor, name);
     if (value.isNumber() && value.getNumber() != 0) return uint32_t(value.getNumber());
     return uint32_t(configuredCount(variable, 0));
@@ -1454,7 +1501,7 @@ struct ThreadedServer {
 
   // Destruction runs on the current call thread, with its ThreadContext alive,
   // and never while holding the shared registry lock.
-  bool evictOne(Slot* exclude = nullptr, bool expiredOnly = false) {
+  bool evictOne(Slot *exclude = nullptr, bool expiredOnly = false) {
     std::shared_ptr<Slot> victim;
     {
       std::lock_guard lock(registryMutex);
@@ -1462,11 +1509,11 @@ struct ThreadedServer {
       auto cutoff = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000) * 1000000;
       auto now = nowNs();
       for (auto at = registry.begin(); at != registry.end(); ++at) {
-        auto& slot = at->second;
+        auto &slot = at->second;
         if (slot.get() == exclude || !slot->complete.load() || slot.use_count() != 1 ||
             slot->contexts.load() != 0)
           continue;
-        if (expiredOnly && (cutoff == 0 || now - slot->lastUseNs.load() < cutoff) &&
+        if (expiredOnly && (cutoff == 0 || now - kj::min(now, slot->lastUseNs.load()) < cutoff) &&
             !(slot->limits && slot->limits->memoryState->load() == LimitCause::MEMORY))
           continue;
         if (selected == registry.end() ||
@@ -1482,7 +1529,7 @@ struct ThreadedServer {
     return true;
   }
 
-  std::shared_ptr<ResourcePreparation> prepareSlot(const std::shared_ptr<Slot>& slot) {
+  std::shared_ptr<ResourcePreparation> prepareSlot(const std::shared_ptr<Slot> &slot) {
     while (!slot->reservation->prepare()) {
       if (!evictOne(slot.get())) {
         resources->rejections.fetch_add(1);
@@ -1492,13 +1539,30 @@ struct ThreadedServer {
     return std::make_shared<ResourcePreparation>(slot->reservation);
   }
 
-  kj::Promise<kj::String> confirmCapacity(Json::Reader input, ThreadState& state) {
+  kj::Promise<kj::String> confirmDecisionImpl(Json::Reader input,
+      ThreadState &state,
+      kj::StringPtr decision,
+      kj::StringPtr reason,
+      threaded::LoadStage loadStage) {
+    // One descriptor per event loop is held aside for this private proof path.
+    // Releasing it permits the receipt exchange even during process EMFILE.
+    if (state.decisionSpare >= 0) {
+      close(state.decisionSpare);
+      state.decisionSpare = -1;
+    }
+    KJ_DEFER(state.decisionSpare = open("/dev/null", O_RDONLY | O_CLOEXEC));
     auto receipt = field(input, "dispatchReceipt");
     KJ_REQUIRE(receipt.isString() && receipt.getString().size() == 32,
         "missing private dispatch decision receipt");
+    capnp::MallocMessageBuilder arena;
+    auto value = arena.initRoot<Json>();
+    value.setString(reason);
+    auto stage = threaded::loadStageInfo(loadStage);
     auto body = kj::str("{\"invocationId\":", encode(field(input, "invocationId")),
-        ",\"receipt\":", encode(receipt), ",\"state\":\"capacity-rejected\",",
-        "\"reason\":\"process admission budget is full\"}");
+        ",\"receipt\":", encode(receipt), ",\"state\":\"", decision,
+        "\",\"reason\":", encode(value.asReader()), ",\"stage\":\"",
+        kj::heapString(stage.stage.data(), stage.stage.size()), "\",\"codeStage\":\"",
+        kj::heapString(stage.codeStage.data(), stage.codeStage.size()), "\"}");
     auto address = co_await state.io.provider->getNetwork().parseAddress(sourceAddress.c_str());
     auto client = kj::newHttpClient(state.io.provider->getTimer(), *state.headers, *address);
     kj::HttpHeaders headers(*state.headers);
@@ -1512,6 +1576,17 @@ struct ThreadedServer {
     JsonDoc decoded(report);
     KJ_REQUIRE(flag(decoded.get(), "accepted"), "private dispatch decision refused");
     co_return encode(field(decoded.get(), "refusal"));
+  }
+  kj::Promise<kj::String> confirmDecision(Json::Reader input,
+      ThreadState &state,
+      kj::StringPtr decision,
+      kj::StringPtr reason,
+      threaded::LoadStage stage = threaded::LoadStage::LOAD) {
+    return state.io.provider->getTimer().timeoutAfter(
+        250 * kj::MILLISECONDS, confirmDecisionImpl(input, state, decision, reason, stage));
+  }
+  kj::Promise<kj::String> confirmCapacity(Json::Reader input, ThreadState &state) {
+    return confirmDecision(input, state, "capacity-rejected", "process admission budget is full");
   }
   static void wake(int fd) {
     uint64_t one = 1;
@@ -1528,36 +1603,39 @@ struct ThreadedServer {
   }
   void manage() {
     pthread_setname_np(pthread_self(), "cwkd-pool");
-    // The initial high watermark is the in-flight limit. Readiness waits for all
-    // native loops, so a cold burst never makes the accept thread initialize one.
+    // The initial high watermark is the in-flight limit. Readiness waits for
+    // all native loops, so a cold burst never makes the accept thread
+    // initialize one.
     try {
       threads.reserve(limit + CONTROL_THREADS);
       for (uint i = 0; i < limit + CONTROL_THREADS; ++i) {
         auto item = std::make_unique<Thread>(i >= limit, i == limit + CONTROL_THREADS - 1);
-        auto* pointer = item.get();
+        auto *pointer = item.get();
         liveThreads.fetch_add(1);
         item->thread = std::thread([this, pointer]() { runThread(*pointer); });
         threads.push_back(std::move(item));
       }
     } catch (...) {
       fprintf(stderr,
-          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"call-thread-pool\"}\n");
-      _exit(78);
+          "[threaded-start] "
+          "{\"event\":\"startup-rejected\",\"resource\":\"call-"
+          "thread-pool\"}\n");
+      _exit(70);
     }
-    for (auto& item: threads)
+    for (auto &item: threads)
       while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
     ready.store(true, std::memory_order_release);
     int held = -1;
     auto nextMaintenance = nowNs();
     auto idleMs = configuredCount("COWORKERD_THREADED_THREAD_IDLE_MS", 60000);
     for (;;) {
-      for (auto& item: threads) {
+      for (auto &item: threads) {
         if (item->descriptor.load() == STOPPED && item->thread.joinable()) item->thread.join();
       }
       auto now = nowNs();
       if (now >= nextMaintenance) {
         nextMaintenance = now + 100000000;
-        for (auto& item: threads) {
+        for (auto &item: threads) {
           if (!item->maintenanceOnly) continue;
           int idle = -1;
           if (item->descriptor.compare_exchange_strong(idle, MAINTAIN)) {
@@ -1567,9 +1645,9 @@ struct ThreadedServer {
         }
         auto remaining = liveThreads.load();
         if (idleMs != 0)
-          for (auto& item: threads) {
+          for (auto &item: threads) {
             if (item->control || remaining <= std::min(limit, 32u) + CONTROL_THREADS ||
-                now - item->idleSince.load() < idleMs * 1000000)
+                now - kj::min(now, item->idleSince.load()) < idleMs * 1000000)
               continue;
             int idle = -1;
             if (item->descriptor.compare_exchange_strong(idle, STOP)) {
@@ -1581,7 +1659,7 @@ struct ThreadedServer {
       if (held < 0) held = pending.pop();
       if (held >= 0) {
         bool assigned = false;
-        for (auto& item: threads) {
+        for (auto &item: threads) {
           if (item->control) continue;
           int idle = -1;
           if (item->descriptor.compare_exchange_strong(idle, held)) {
@@ -1594,7 +1672,7 @@ struct ThreadedServer {
         }
         if (assigned) continue;
         uint growing = 0;
-        for (auto& item: threads) {
+        for (auto &item: threads) {
           if (item->control || item->descriptor.load() != STOPPED || growing == 16) continue;
           if (item->thread.joinable()) item->thread.join();
           item->descriptor.store(-2);
@@ -1610,12 +1688,12 @@ struct ThreadedServer {
         }
         // Dedicated control loops can decode a descriptor and confirm a refusal
         // even while every execution loop owns an invocation's background work.
-        const bool warming = std::any_of(threads.begin(), threads.end(), [](const auto& item) {
+        const bool warming = std::any_of(threads.begin(), threads.end(), [](const auto &item) {
           const auto descriptor = item->descriptor.load();
           return !item->control && (descriptor == -2 || descriptor == STOP);
         });
         if (growing == 0 && !warming)
-          for (auto& item: threads) {
+          for (auto &item: threads) {
             if (!item->control || item->maintenanceOnly) continue;
             int idle = -1;
             if (item->descriptor.compare_exchange_strong(idle, held)) {
@@ -1642,22 +1720,24 @@ struct ThreadedServer {
       while (read(managerWake, &count, sizeof(count)) > 0) {}
     }
   }
-  void runThread(Thread& thread) {
+  void runThread(Thread &thread) {
     pthread_setname_np(pthread_self(), thread.control ? "cwkd-refuse" : "cwkd-call");
     std::unique_ptr<ThreadState> storage;
     try {
       storage = std::make_unique<ThreadState>();
     } catch (...) {
       fprintf(stderr,
-          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"call-event-loop\"}\n");
-      if (!ready.load()) _exit(78);
+          "[threaded-start] "
+          "{\"event\":\"startup-rejected\",\"resource\":\"call-"
+          "event-loop\"}\n");
+      if (!ready.load()) _exit(70);
       growthFailures.fetch_add(1);
       liveThreads.fetch_sub(1);
       thread.descriptor.store(STOPPED);
       wake(managerWake);
       return;
     }
-    auto& state = *storage;
+    auto &state = *storage;
     state.rejectOnly = thread.control;
     thread.idleSince.store(nowNs());
     thread.descriptor.store(-1, std::memory_order_release);
@@ -1689,7 +1769,8 @@ struct ThreadedServer {
         session.accept(*stream).wait(state.io.waitScope);
       });
       KJ_IF_SOME(exception, error) {
-        // Never print the descriptor, variables, secret values, or request body.
+        // Never print the descriptor, variables, secret values, or request
+        // body.
         if (exception.getType() != kj::Exception::Type::DISCONNECTED)
           KJ_LOG(INFO, "threaded invocation connection failed");
       }
@@ -1711,8 +1792,8 @@ struct ThreadedServer {
     wake(managerWake);
   }
 
-  kj::Promise<kj::String> fetchSource(Json::Reader descriptor, ThreadState& state, Slot& slot) {
-    if (const char* delay = getenv("COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST")) {
+  kj::Promise<kj::String> fetchSource(Json::Reader descriptor, ThreadState &state, Slot &slot) {
+    if (const char *delay = getenv("COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST")) {
       const auto milliseconds = strtoul(delay, nullptr, 10);
       KJ_REQUIRE(milliseconds <= 10000, "invalid source test delay");
       if (!delayedSourceForTest.exchange(true))
@@ -1751,7 +1832,7 @@ struct ThreadedServer {
     co_return text(source.get(), "source");
   }
 
-  kj::Own<Worker> compile(Slot& slot, Json::Reader descriptor, kj::StringPtr source) {
+  kj::Own<Worker> compile(Slot &slot, Json::Reader descriptor, kj::StringPtr source) {
     slot.loadStage = threaded::LoadStage::PACKAGE;
     Reporter reporter;
     auto flags = slot.flagsArena.initRoot<CompatibilityFlags>();
@@ -1793,7 +1874,7 @@ struct ThreadedServer {
         auto encoded = field(field(payload.get(), "modules"), hash);
         KJ_REQUIRE(encoded.isString(), "missing module bytes");
         auto bytes = decode64(encoded.getString());
-        auto view = kj::arrayPtr(reinterpret_cast<const kj::byte*>(bytes.data()), bytes.size());
+        auto view = kj::arrayPtr(reinterpret_cast<const kj::byte *>(bytes.data()), bytes.size());
         KJ_REQUIRE(
             digest(view) == hash.cStr() && bytes.size() == field(declaration, "bytes").getNumber(),
             "Trusted module content hash mismatch");
@@ -1855,7 +1936,7 @@ struct ThreadedServer {
     slot.loadStage = threaded::LoadStage::EVALUATION;
     auto worker =
         kj::atomicRefcounted<Worker>(kj::mv(compiled), kj::atomicRefcounted<WorkerObserver>(),
-            [&](jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target,
+            [&](jsg::Lock &lock, const Worker::Api &api, v8::Local<v8::Object> target,
                 v8::Local<v8::Object> ctxExports) {
       exportsHandle = lock.v8Ref(ctxExports);
       auto context = lock.v8Context();
@@ -1909,7 +1990,7 @@ struct ThreadedServer {
           ns.setUniqueKey(text(space, "namespaceId"));
         }
       }
-      static_cast<const server::WorkerdApi&>(api).compileGlobals(
+      static_cast<const server::WorkerdApi &>(api).compileGlobals(
           lock, globals.asReader(), target, [](kj::StringPtr key) -> kj::Own<ActorIdFactory> {
         return kj::heap<ObjectIdFactory>(key);
       });
@@ -1917,7 +1998,7 @@ struct ThreadedServer {
             IsolateObserver::StartType::COLD, SpanParent(nullptr),
             Worker::Lock::TakeSynchronously(kj::none), reporter);
     uintptr_t isolateAddress = 0;
-    worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock& lock) {
+    worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock &lock) {
       lock.validateHandlers(reporter);
       slot.loopbacks.assign(reporter.entrypoints.begin(), reporter.entrypoints.end());
       auto namespaces = field(descriptor, "nativeNamespaces");
@@ -1932,7 +2013,7 @@ struct ThreadedServer {
         auto values = field(plan, name);
         if (values.isArray()) base += values.getArray().size();
       }
-      JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock& js) {
+      JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock &js) {
         capnp::MallocMessageBuilder arena;
         auto globals = arena.initRoot<capnp::List<server::Global>>(
             slot.loopbacks.size() + slot.loopbackActors.size());
@@ -1943,7 +2024,7 @@ struct ThreadedServer {
         auto objects = field(field(descriptor, "rootPlan"), "durableObjects");
         uint objectCount = objects.isArray() ? objects.getArray().size() : 0;
         for (uint i = 0; i < slot.loopbackActors.size(); ++i) {
-          auto& name = slot.loopbackActors[i];
+          auto &name = slot.loopbackActors[i];
           auto global = globals[slot.loopbacks.size() + i];
           global.setName(name.c_str());
           auto ns = global.initLoopbackDurableActorNamespace();
@@ -1953,7 +2034,7 @@ struct ThreadedServer {
             if (text(value, "className") == name.c_str())
               ns.setUniqueKey(text(value, "namespaceId"));
         }
-        static_cast<const server::WorkerdApi&>(worker->getIsolate().getApi())
+        static_cast<const server::WorkerdApi &>(worker->getIsolate().getApi())
             .compileGlobals(js, globals.asReader(), KJ_REQUIRE_NONNULL(exportsHandle).getHandle(js),
                 [](kj::StringPtr key) -> kj::Own<ActorIdFactory> {
           return kj::heap<ObjectIdFactory>(key);
@@ -1979,7 +2060,7 @@ struct ThreadedServer {
   }
 
   kj::Promise<std::shared_ptr<Slot>> getWorker(
-      Json::Reader descriptor, ThreadState& state, bool& coldLoaded) {
+      Json::Reader descriptor, ThreadState &state, bool &coldLoaded) {
     auto plan = field(descriptor, "rootPlan");
     auto selection = field(descriptor, "rootSelection");
     if (!field(plan, "kind").isString() || text(plan, "kind") != "tenant" ||
@@ -2033,7 +2114,7 @@ struct ThreadedServer {
                   ? std::string(fingerprint.getString().cStr())
                   : str(descriptor, "definitionHash");
               slot->isolateLabel = "coworkerd-v1:" + slot->workerId + "@" + slot->versionId + "#" +
-                  digest(kj::arrayPtr(reinterpret_cast<const kj::byte*>(key.data()), key.size()));
+                  digest(kj::arrayPtr(reinterpret_cast<const kj::byte *>(key.data()), key.size()));
               registry.emplace(key, slot);
               creator = true;
             }
@@ -2053,8 +2134,8 @@ struct ThreadedServer {
       }
       if (creator) {
         auto preparation = std::make_shared<ResourcePreparation>(slot->reservation);
-        auto trace = [&](const char* phase) {
-          if (getenv("COWORKERD_THREADED_TRACE_FOR_TEST") == nullptr) return;
+        auto trace = [&](const char *phase) {
+          if (!traceForTest()) return;
           auto row =
               kj::str("[threaded-load] {\"workerId\":", encode(field(descriptor, "workerId")),
                   ",\"phase\":\"", phase, "\",\"atNs\":", nowNs(), "}\n");
@@ -2072,7 +2153,7 @@ struct ThreadedServer {
             slot->complete = true;
             waiters.swap(slot->waiters);
           }
-          for (auto& waiter: waiters) waiter->fulfill();
+          for (auto &waiter: waiters) waiter->fulfill();
         };
         auto cancel = kj::defer([&] {
           if (!slot->complete) {
@@ -2093,13 +2174,19 @@ struct ThreadedServer {
           fetched = true;
           slot->worker = compile(*slot, descriptor, source);
           trace("compiled");
-        } catch (kj::Exception& error) {
+        } catch (kj::Exception &error) {
           auto stage = kj::heapArray<kj::byte>(1);
           stage[0] = static_cast<kj::byte>(slot->loadStage);
           error.setDetail(LOAD_STAGE_DETAIL, kj::mv(stage));
           slot->error = kj::mv(error);
         }
-        if (!fetched) {
+        bool callerFailure = false;
+        KJ_IF_SOME(error, slot->error) {
+          callerFailure = error.getType() == kj::Exception::Type::DISCONNECTED ||
+              std::string(error.getDescription().cStr()).find("PROCESS_MEMORY_PRESSURE") !=
+                  std::string::npos;
+        }
+        if (!fetched || callerFailure) {
           slot->retryableLoad.store(true);
           remove();
         }
@@ -2127,7 +2214,7 @@ struct ThreadedServer {
 
 class ChannelDispatcher final: public rpc::EventDispatcher::Server {
  public:
-  ChannelDispatcher(ThreadState& state, kj::Own<WorkerInterface> worker)
+  ChannelDispatcher(ThreadState &state, kj::Own<WorkerInterface> worker)
       : state(state),
         worker(kj::mv(worker)) {}
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
@@ -2141,13 +2228,13 @@ class ChannelDispatcher final: public rpc::EventDispatcher::Server {
   }
 
  private:
-  ThreadState& state;
+  ThreadState &state;
   kj::Own<WorkerInterface> worker;
 };
 
 class ChannelBootstrap final: public rpc::WorkerdBootstrap::Server {
  public:
-  ChannelBootstrap(ThreadState& state, kj::Rc<IoChannelFactory::SubrequestChannel> channel)
+  ChannelBootstrap(ThreadState &state, kj::Rc<IoChannelFactory::SubrequestChannel> channel)
       : state(state),
         channel(kj::mv(channel)) {}
   kj::Promise<void> startEvent(StartEventContext context) override {
@@ -2160,13 +2247,13 @@ class ChannelBootstrap final: public rpc::WorkerdBootstrap::Server {
   }
 
  private:
-  ThreadState& state;
+  ThreadState &state;
   kj::Rc<IoChannelFactory::SubrequestChannel> channel;
 };
 
 class RemoteChannel final: public IoChannelFactory::SubrequestChannel {
  public:
-  RemoteChannel(ThreadState& state, rpc::WorkerdBootstrap::Client bootstrap)
+  RemoteChannel(ThreadState &state, rpc::WorkerdBootstrap::Client bootstrap)
       : state(state),
         bootstrap(kj::mv(bootstrap)) {}
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
@@ -2184,11 +2271,11 @@ class RemoteChannel final: public IoChannelFactory::SubrequestChannel {
   }
 
  private:
-  ThreadState& state;
+  ThreadState &state;
   rpc::WorkerdBootstrap::Client bootstrap;
 };
 
-Frankenvalue readNativeProps(ThreadState& state, rpc::Frankenvalue::Reader value) {
+Frankenvalue readNativeProps(ThreadState &state, rpc::Frankenvalue::Reader value) {
   kj::Vector<kj::Own<Frankenvalue::CapTableEntry>> capabilities;
   auto table = value.getCapTable().getAs<capnp::List<threaded::rpc::Channel>>();
   for (auto item: table) {
@@ -2199,14 +2286,14 @@ Frankenvalue readNativeProps(ThreadState& state, rpc::Frankenvalue::Reader value
 }
 
 using PropsMessage = kj::Own<capnp::MallocMessageBuilder>;
-PropsMessage writeNativeProps(ThreadState& state, Frankenvalue& props) {
+PropsMessage writeNativeProps(ThreadState &state, Frankenvalue &props) {
   auto message = kj::heap<capnp::MallocMessageBuilder>();
   auto root = message->initRoot<rpc::Frankenvalue>();
   props.toCapnp(root);
   auto caps = props.getCapTable();
   auto table = root.getCapTable().initAs<capnp::List<threaded::rpc::Channel>>(caps.size());
   for (auto i: kj::indices(caps)) {
-    auto& channel =
+    auto &channel =
         KJ_REQUIRE_NONNULL(kj::tryDowncast<IoChannelFactory::SubrequestChannel>(*caps[i]),
             "native props only transfer resolved service or actor channels");
     table[i].setService(kj::heap<ChannelBootstrap>(state, channel.addRef()));
@@ -2267,7 +2354,7 @@ struct BindingConnection {
 };
 
 kj::Promise<kj::Own<WorkerInterface>> openBinding(
-    ThreadState& state, kj::String addressText, kj::String envelope, PropsMessage props = {}) {
+    ThreadState &state, kj::String addressText, kj::String envelope, PropsMessage props = {}) {
   KJ_REQUIRE(addressText.size() != 0, "missing node binding socket");
   auto address = co_await state.io.provider->getNetwork().parseAddress(addressText);
   auto connector = kj::newHttpClient(state.io.provider->getTimer(), *state.headers, *address);
@@ -2285,7 +2372,7 @@ kj::Promise<kj::Own<WorkerInterface>> openBinding(
 
 class EgressWorker final: public WorkerInterface {
  public:
-  EgressWorker(ThreadState& state, kj::Own<kj::NetworkAddress> address, kj::String identity)
+  EgressWorker(ThreadState &state, kj::Own<kj::NetworkAddress> address, kj::String identity)
       : state(state),
         address(kj::mv(address)),
         client(kj::newHttpClient(state.io.provider->getTimer(), *state.headers, *this->address)),
@@ -2293,34 +2380,34 @@ class EgressWorker final: public WorkerInterface {
         identity(kj::mv(identity)) {}
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
-      const kj::HttpHeaders& headers,
-      kj::AsyncInputStream& body,
-      Response& response) override {
+      const kj::HttpHeaders &headers,
+      kj::AsyncInputStream &body,
+      Response &response) override {
     auto outgoing = headers.clone();
     outgoing.set(state.egressSource, identity);
     struct EgressResponse final: Response {
-      EgressResponse(Response& inner, kj::HttpHeaderId errorId): inner(inner), errorId(errorId) {}
+      EgressResponse(Response &inner, kj::HttpHeaderId errorId): inner(inner), errorId(errorId) {}
       kj::Own<kj::AsyncOutputStream> send(uint status,
           kj::StringPtr text,
-          const kj::HttpHeaders& headers,
+          const kj::HttpHeaders &headers,
           kj::Maybe<uint64_t> size) override {
         KJ_IF_SOME(error, headers.get(errorId)) {
           kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str("jsg.Error: ", error)));
         }
         return inner.send(status, text, headers, size);
       }
-      kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
+      kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders &headers) override {
         return inner.acceptWebSocket(headers);
       }
-      Response& inner;
+      Response &inner;
       kj::HttpHeaderId errorId;
     } checked(response, state.egressError);
     co_await service->request(method, url, outgoing, body, checked);
   }
   kj::Promise<void> connect(kj::StringPtr,
-      const kj::HttpHeaders&,
-      kj::AsyncIoStream&,
-      ConnectResponse&,
+      const kj::HttpHeaders &,
+      kj::AsyncIoStream &,
+      ConnectResponse &,
       kj::HttpConnectSettings) override {
     unsupported("outbound CONNECT");
   }
@@ -2338,7 +2425,7 @@ class EgressWorker final: public WorkerInterface {
   }
 
  private:
-  ThreadState& state;
+  ThreadState &state;
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> client;
   kj::Own<kj::HttpService> service;
@@ -2346,7 +2433,7 @@ class EgressWorker final: public WorkerInterface {
 };
 
 kj::Promise<kj::Own<WorkerInterface>> openEgress(
-    ThreadState& state, kj::String addressText, kj::String identity) {
+    ThreadState &state, kj::String addressText, kj::String identity) {
   if (addressText.size() == 0) {
     kj::throwRecoverableException(KJ_EXCEPTION(FAILED, "jsg.Error: EGRESS_DENIED: egress-off"));
   }
@@ -2357,29 +2444,36 @@ kj::Promise<kj::Own<WorkerInterface>> openEgress(
 // Hold the permit for the entire interface lifetime, including response bodies,
 // RPC capabilities and cancellation. No connection is opened before admission.
 struct SubrequestPermit {
-  SubrequestPermit(ThreadedServer& server, std::shared_ptr<uint32_t> invocation)
+  SubrequestPermit(ThreadedServer &server, std::shared_ptr<uint32_t> invocation, std::string tenant)
       : server(server),
-        invocation(std::move(invocation)) {
-    if (*this->invocation >= 32) reject();
-    auto active = server.subrequestsActive.load();
-    for (;;) {
-      if (active >= server.limit) reject();
-      if (server.subrequestsActive.compare_exchange_weak(active, active + 1)) break;
-    }
-    ++*this->invocation;
+        invocation(std::move(invocation)),
+        tenant(std::move(tenant)) {}
+  bool acquire() {
+    std::lock_guard lock(server.subrequestMutex);
+    auto perTenant = kj::min(server.limit, kj::max<uint32_t>(1, server.tenantBudget->limit - 1));
+    auto found = server.tenantSubrequests.find(tenant);
+    if (*invocation >= 32 || server.subrequestsActive.load() >= server.limit ||
+        (found != server.tenantSubrequests.end() && found->second >= perTenant))
+      return false;
+    ++server.tenantSubrequests[tenant];
+    ++*invocation;
+    server.subrequestsActive.fetch_add(1);
+    acquired = true;
+    return true;
   }
   ~SubrequestPermit() {
+    if (!acquired) return;
+    std::lock_guard lock(server.subrequestMutex);
     --*invocation;
     server.subrequestsActive.fetch_sub(1);
+    auto found = server.tenantSubrequests.find(tenant);
+    KJ_ASSERT(found != server.tenantSubrequests.end() && found->second > 0);
+    if (--found->second == 0) server.tenantSubrequests.erase(found);
   }
-  [[noreturn]] void reject() {
-    server.subrequestsRejected.fetch_add(1);
-    kj::throwRecoverableException(
-        KJ_EXCEPTION(OVERLOADED, "jsg.Error: too many concurrent subrequests"));
-    KJ_UNREACHABLE;
-  }
-  ThreadedServer& server;
-  std::shared_ptr<uint32_t> invocation;  // Used only by this invocation's thread.
+  ThreadedServer &server;
+  std::shared_ptr<uint32_t> invocation;
+  std::string tenant;
+  bool acquired = false;
 };
 
 class SubrequestWorker final: public WorkerInterface {
@@ -2389,16 +2483,16 @@ class SubrequestWorker final: public WorkerInterface {
         target(kj::mv(target)) {}
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
-      const kj::HttpHeaders& headers,
-      kj::AsyncInputStream& body,
-      Response& response) override {
+      const kj::HttpHeaders &headers,
+      kj::AsyncInputStream &body,
+      Response &response) override {
     auto active = std::move(permit);
     return target->request(method, url, headers, body, response).attach(std::move(active));
   }
   kj::Promise<void> connect(kj::StringPtr host,
-      const kj::HttpHeaders& headers,
-      kj::AsyncIoStream& connection,
-      ConnectResponse& response,
+      const kj::HttpHeaders &headers,
+      kj::AsyncIoStream &connection,
+      ConnectResponse &response,
       kj::HttpConnectSettings settings) override {
     auto active = std::move(permit);
     return target->connect(host, headers, connection, response, kj::mv(settings))
@@ -2432,14 +2526,14 @@ class SubrequestWorker final: public WorkerInterface {
 
 struct Channels final: IoChannelFactory {
   Channels(
-      ThreadState& state, ThreadedServer& server, std::shared_ptr<Slot> slot, kj::StringPtr input)
+      ThreadState &state, ThreadedServer &server, std::shared_ptr<Slot> slot, kj::StringPtr input)
       : document(input),
         state(state),
         server(server),
         slot(std::move(slot)) {}
   JsonDoc document;
-  ThreadState& state;
-  ThreadedServer& server;
+  ThreadState &state;
+  ThreadedServer &server;
   std::shared_ptr<Slot> slot;
   uint64_t sequence = 0;
   std::shared_ptr<uint32_t> subrequests = std::make_shared<uint32_t>(0);
@@ -2513,19 +2607,21 @@ struct Channels final: IoChannelFactory {
     }
     auto index = channel - count(all);
     KJ_REQUIRE(index < slot->loopbackActors.size(), "invalid durable namespace channel");
-    auto& name = slot->loopbackActors[index];
+    auto &name = slot->loopbackActors[index];
     auto spaces = field(input(), "nativeNamespaces");
     if (spaces.isArray())
       for (auto value: spaces.getArray()) {
         if (text(value, "className") == name.c_str())
           return {text(value, "namespaceId"), kj::str(name.c_str()), kj::str("")};
       }
-    KJ_FAIL_REQUIRE("DO_NAMESPACE_UNAVAILABLE: the Durable Object namespace cannot be used");
+    KJ_FAIL_REQUIRE("DO_NAMESPACE_UNAVAILABLE: the Durable Object namespace "
+                    "cannot be used");
   }
   kj::String objectEnvelope(uint channel, kj::StringPtr objectId) {
     auto route = objectRoute(channel);
     KJ_REQUIRE(route.space.size() != 0,
-        "jsg.Error: DO_NAMESPACE_UNAVAILABLE: the Durable Object namespace cannot be used");
+        "jsg.Error: DO_NAMESPACE_UNAVAILABLE: the Durable Object "
+        "namespace cannot be used");
     auto quoted = [](kj::StringPtr value) {
       capnp::MallocMessageBuilder arena;
       auto root = arena.initRoot<Json>();
@@ -2538,19 +2634,36 @@ struct Channels final: IoChannelFactory {
         "}");
     return envelope(input(), "", false, kj::mv(object));
   }
+  kj::Promise<kj::Own<WorkerInterface>> queuedRequest(
+      bool egress, kj::String descriptor, PropsMessage props = {}) {
+    auto worker = str(input(), "workerId");
+    auto permit =
+        std::make_shared<SubrequestPermit>(server, subrequests, worker.substr(0, worker.find('/')));
+    // Waiting stays on the invocation's event loop and cancellation drops the
+    // queued operation before a private or external connection is opened.
+    if (!permit->acquire()) {
+      server.subrequestsRejected.fetch_add(1);
+      do {
+        co_await state.io.provider->getTimer().afterDelay(1 * kj::MILLISECONDS);
+      } while (!permit->acquire());
+    }
+    auto target = egress
+        ? co_await openEgress(state, kj::str(server.egressAddress.c_str()), kj::mv(descriptor))
+        : co_await openBinding(
+              state, kj::str(server.bindingAddress.c_str()), kj::mv(descriptor), kj::mv(props));
+    co_return kj::heap<SubrequestWorker>(std::move(permit), kj::mv(target));
+  }
   kj::Own<WorkerInterface> startSubrequest(uint channel, SubrequestMetadata metadata) override {
     return startRequest(channel, kj::mv(metadata), kj::none);
   }
   kj::Own<WorkerInterface> startRequest(
       uint channel, SubrequestMetadata metadata, kj::Maybe<Frankenvalue> props) {
-    auto permit = std::make_shared<SubrequestPermit>(server, subrequests);
     if (channel < IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT) {
       auto identity =
           kj::str(server.egressToken.c_str(), " {\"workerId\":", encode(field(input(), "workerId")),
               ",\"versionId\":", encode(field(input(), "versionId")), "}");
-      return kj::heap<SubrequestWorker>(std::move(permit),
-          newPromisedWorkerInterface(
-              openEgress(state, kj::str(server.egressAddress.c_str()), kj::mv(identity))));
+      return newPromisedWorkerInterface(
+          queuedRequest(true, kj::mv(identity)).attach(kj::addRef(*this)));
     }
     auto serviceCount = count(services());
     auto objectCount = count(objects());
@@ -2578,9 +2691,8 @@ struct Channels final: IoChannelFactory {
     KJ_IF_SOME(value, props) {
       serialized = writeNativeProps(state, value);
     }
-    return kj::heap<SubrequestWorker>(std::move(permit),
-        newPromisedWorkerInterface(openBinding(state, kj::str(server.bindingAddress.c_str()),
-            kj::mv(descriptor), kj::mv(serialized))));
+    return newPromisedWorkerInterface(
+        queuedRequest(false, kj::mv(descriptor), kj::mv(serialized)).attach(kj::addRef(*this)));
   }
   struct Bound final: SubrequestChannel {
     Bound(kj::Rc<Channels> owner,
@@ -2593,14 +2705,11 @@ struct Channels final: IoChannelFactory {
           props(kj::mv(props)) {}
     kj::Own<WorkerInterface> startRequest(SubrequestMetadata metadata) override {
       KJ_IF_SOME(id, object) {
-        auto permit = std::make_shared<SubrequestPermit>(owner->server, owner->subrequests);
-        return kj::heap<SubrequestWorker>(std::move(permit),
-            newPromisedWorkerInterface(
-                openBinding(owner->state, kj::str(owner->server.bindingAddress.c_str()),
-                    owner->objectEnvelope(channel, id))));
+        return newPromisedWorkerInterface(
+            owner->queuedRequest(false, owner->objectEnvelope(channel, id)).attach(owner.addRef()));
       }
       return owner->startRequest(
-          channel, kj::mv(metadata), props.map([](Frankenvalue& value) { return value.clone(); }));
+          channel, kj::mv(metadata), props.map([](Frankenvalue &value) { return value.clone(); }));
     }
     void requireAllowsTransfer() override {}
     kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
@@ -2628,7 +2737,7 @@ struct Channels final: IoChannelFactory {
   kj::Own<CacheClient> getCache() override {
     return kj::heap<Cache>();
   }
-  TimerChannel& getTimer() override {
+  TimerChannel &getTimer() override {
     return state.timer;
   }
   kj::Promise<void> writeLogfwdr(
@@ -2636,7 +2745,7 @@ struct Channels final: IoChannelFactory {
     unsupported("log forwarding binding");
   }
   kj::Rc<ActorChannel> getGlobalActor(uint channel,
-      const ActorIdFactory::ActorId& id,
+      const ActorIdFactory::ActorId &id,
       kj::Maybe<kj::String>,
       ActorGetMode,
       bool,
@@ -2644,7 +2753,7 @@ struct Channels final: IoChannelFactory {
       SpanParent,
       kj::Maybe<ActorVersion>,
       Persistent) override {
-    auto& object = kj::downcast<const ObjectIdFactory::Id>(id);
+    auto &object = kj::downcast<const ObjectIdFactory::Id>(id);
     auto route = objectRoute(channel);
     JSG_REQUIRE(
         object.space == route.space, TypeError, "ID is not for this Durable Object namespace.");
@@ -2653,16 +2762,27 @@ struct Channels final: IoChannelFactory {
   kj::Rc<ActorChannel> getColoLocalActor(uint, kj::StringPtr, SpanParent) override {
     unsupported("local actor");
   }
+  ~Channels() noexcept(false) {
+    slot->reservation->releaseLogs(logCharge);
+  }
+  uint64_t logCharge = 0;
   void log(kj::StringPtr level, kj::StringPtr message) {
-    if (!logBudget.accept(message.size())) {
-      dropLog(1, message.size());
-      return;
-    }
     capnp::MallocMessageBuilder arena;
     auto value = arena.initRoot<Json>();
     auto bounded = kj::str(message.first(kj::min(message.size(), size_t(4096))));
     value.setString(bounded);
-    lines.add(kj::str("{\"level\":\"", level, "\",\"message\":", encode(value.asReader()), "}"));
+    auto row = kj::str("{\"level\":\"", level, "\",\"message\":", encode(value.asReader()), "}");
+    if (!logBudget.accept(row.size())) {
+      dropLog(1, row.size());
+      return;
+    }
+    auto charge = row.size() * 3 + 256;
+    if (!slot->reservation->retainLogs(charge)) {
+      dropLog(1, row.size());
+      return;
+    }
+    logCharge += charge;
+    lines.add(kj::mv(row));
     queuedLogBytes += lines.back().size();
     server.logAccepted.fetch_add(1);
     auto peak = server.logPeakQueuedBytes.load();
@@ -2674,6 +2794,7 @@ struct Channels final: IoChannelFactory {
           [self = kj::addRef(*this)]() mutable { return self->flushLogs().attach(kj::mv(self)); }));
     }
   }
+
   void dropLog(uint64_t count, uint64_t bytes) {
     server.logDroppedLines.fetch_add(count);
     server.logDroppedBytes.fetch_add(bytes);
@@ -2720,7 +2841,7 @@ struct Channels final: IoChannelFactory {
 class TenantTracer final: public BaseTracer {
  public:
   explicit TenantTracer(kj::Rc<Channels> channels): channels(kj::mv(channels)) {}
-  void addLog(const tracing::InvocationSpanContext&,
+  void addLog(const tracing::InvocationSpanContext &,
       kj::Date,
       LogLevel level,
       kj::String message,
@@ -2762,11 +2883,12 @@ class TenantTracer final: public BaseTracer {
     channels->log(name, joined);
   }
   void addSpanOpen(tracing::SpanId, tracing::SpanId, kj::ConstString, kj::Date) override {}
-  void addSpanClose(tracing::SpanEndData&&, kj::Maybe<kj::Date>) override {}
-  void addSpanUpdate(tracing::SpanId, tracing::SpanUpdate&&) override {}
+  void addSpanClose(tracing::SpanEndData &&, kj::Maybe<kj::Date>) override {}
+  void addSpanUpdate(tracing::SpanId, tracing::SpanUpdate &&) override {}
   void addSpanAttribute(
-      const tracing::InvocationSpanContext&, kj::ConstString, tracing::Attribute::Value) override {}
-  void addException(const tracing::InvocationSpanContext&,
+      const tracing::InvocationSpanContext &, kj::ConstString, tracing::Attribute::Value) override {
+  }
+  void addException(const tracing::InvocationSpanContext &,
       kj::Date,
       kj::String,
       kj::String,
@@ -2778,15 +2900,15 @@ class TenantTracer final: public BaseTracer {
       kj::String,
       kj::Maybe<kj::String>) override {}
   void addDiagnosticChannelEvent(
-      const tracing::InvocationSpanContext&, kj::Date, kj::String, kj::Array<kj::byte>) override {}
-  void setEventInfo(IoContext::IncomingRequest&, tracing::EventInfo&&) override {}
+      const tracing::InvocationSpanContext &, kj::Date, kj::String, kj::Array<kj::byte>) override {}
+  void setEventInfo(IoContext::IncomingRequest &, tracing::EventInfo &&) override {}
   void setReturn(kj::Maybe<kj::Date>, kj::Maybe<tracing::FetchResponseInfo>) override {}
   void setOutcome(EventOutcome, kj::Duration, kj::Duration) override {}
   void recordTimestamp(kj::Date value) override {
     completeTime = value;
   }
   void setJsRpcInfo(
-      const tracing::InvocationSpanContext&, kj::Date, const kj::ConstString&) override {}
+      const tracing::InvocationSpanContext &, kj::Date, const kj::ConstString &) override {}
   void markUnused() override {}
 
  private:
@@ -2828,17 +2950,17 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
     bound = true;
     struct External final: jsg::Serializer::ExternalHandler {
       void serializeFunction(
-          jsg::Lock&, jsg::Serializer& serializer, v8::Local<v8::Function>) override {
+          jsg::Lock &, jsg::Serializer &serializer, v8::Local<v8::Function>) override {
         serializer.writeRawUint32(static_cast<uint>(rpc::SerializationTag::JS_RPC_STUB));
       }
     } external;
     auto results = context.getResults().initAs<rpc::JsRpcTarget::CallResults>();
-    auto& worker = *KJ_REQUIRE_NONNULL(slot->worker);
+    auto &worker = *KJ_REQUIRE_NONNULL(slot->worker);
     auto asyncLock = co_await worker.takeAsyncLockWithoutRequest(SpanParent(nullptr));
-    worker.runInLockScope(asyncLock, [&](Worker::Lock& lock) {
-      JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock& js) {
+    worker.runInLockScope(asyncLock, [&](Worker::Lock &lock) {
+      JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock &js) {
         auto placeholder = jsg::check(
-            v8::Function::New(js.v8Context(), [](const v8::FunctionCallbackInfo<v8::Value>&) {}));
+            v8::Function::New(js.v8Context(), [](const v8::FunctionCallbackInfo<v8::Value> &) {}));
         jsg::Serializer serializer(js,
             {.version = 15,
               .omitHeader = false,
@@ -2858,8 +2980,8 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
   bool bound = false;
 };
 
-PreparedInvocation prepareInvocation(ThreadState& state,
-    ThreadedServer& server,
+PreparedInvocation prepareInvocation(ThreadState &state,
+    ThreadedServer &server,
     std::shared_ptr<Slot> slot,
     Json::Reader input,
     kj::StringPtr raw,
@@ -2911,18 +3033,29 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
   std::shared_ptr<ResourcePreparation> preparation;
   std::shared_ptr<TenantPermit> tenant;
   bool capacity = false;
+  kj::Maybe<kj::Exception> loadFailure;
   try {
     if (state.rejectOnly) kj::throwRecoverableException(capacityError());
     tenant = server.admitTenant(input);
     slot = co_await server.getWorker(input, state, coldLoaded);
     preparation = server.prepareSlot(slot);
-  } catch (const kj::Exception& error) {
-    if (error.getDetail(CAPACITY_DETAIL) == kj::none) throw;
-    capacity = true;
+  } catch (const kj::Exception &error) {
+    if (error.getDetail(CAPACITY_DETAIL) != kj::none)
+      capacity = true;
+    else
+      loadFailure = error.clone();
   }
   if (capacity) {
     co_await server.confirmCapacity(input, state);
     kj::throwRecoverableException(capacityError());
+  }
+  KJ_IF_SOME(error, loadFailure) {
+    auto stage = threaded::LoadStage::LOAD;
+    KJ_IF_SOME(detail, error.getDetail(LOAD_STAGE_DETAIL)) {
+      if (detail.size() == 1) stage = static_cast<threaded::LoadStage>(detail[0]);
+    }
+    co_await server.confirmDecision(input, state, "load-rejected", error.getDescription(), stage);
+    kj::throwRecoverableException(error.clone());
   }
   auto prepared = kj::heap<PreparedInvocation>(prepareInvocation(state, server, slot, input,
       descriptor, kj::mv(props), std::move(preparation), std::move(tenant)));
@@ -2938,9 +3071,9 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
 
 kj::Promise<void> Invocation::request(kj::HttpMethod method,
     kj::StringPtr url,
-    const kj::HttpHeaders& headers,
-    kj::AsyncInputStream& body,
-    Response& response) {
+    const kj::HttpHeaders &headers,
+    kj::AsyncInputStream &body,
+    Response &response) {
   KJ_REQUIRE(!used, "NOT_SUPPORTED: one request per invocation");
   used = true;
   JsonDoc document(descriptor);
@@ -2958,11 +3091,8 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
     tenant = server.admitTenant(input);
     slot = co_await server.getWorker(input, state, coldLoaded);
     if (!trial) preparation = server.prepareSlot(slot);
-  } catch (const kj::Exception& error) {
-    if (error.getDetail(CAPACITY_DETAIL) != kj::none)
-      capacity = true;
-    else if (!trial)
-      throw;
+  } catch (const kj::Exception &error) {
+    if (error.getDetail(CAPACITY_DETAIL) != kj::none) capacity = true;
     loadError = kj::str(error.getDescription());
     KJ_IF_SOME(stage, error.getDetail(LOAD_STAGE_DETAIL)) {
       if (stage.size() == 1 && stage[0] <= static_cast<kj::byte>(threaded::LoadStage::EVALUATION))
@@ -2970,10 +3100,9 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
     }
   }
   if (capacity) {
-    auto report = trial
-        ? kj::str(
-              "{\"ok\":false,\"capacityRejected\":true,\"message\":\"process admission budget is full\"}")
-        : co_await server.confirmCapacity(input, state);
+    auto report = trial ? kj::str("{\"ok\":false,\"capacityRejected\":true,\"message\":"
+                                  "\"process admission budget is full\"}")
+                        : co_await server.confirmCapacity(input, state);
     auto output = response.send(trial ? 200 : 503, trial ? "OK" : "Service Unavailable",
         kj::HttpHeaders(*state.headers), report.size());
     co_await output->write(report.asBytes());
@@ -2988,7 +3117,10 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
         kj::str("{\"ok\":false,\"stage\":\"", kj::heapString(info.stage.data(), info.stage.size()),
             "\",\"codeStage\":\"", kj::heapString(info.codeStage.data(), info.codeStage.size()),
             "\",\"name\":\"Error\",\"message\":", encode(value), "}");
-    auto output = response.send(200, "OK", kj::HttpHeaders(*state.headers), report.size());
+    if (!trial)
+      report = co_await server.confirmDecision(input, state, "load-rejected", message, loadStage);
+    auto output = response.send(trial ? 200 : 503, trial ? "OK" : "Service Unavailable",
+        kj::HttpHeaders(*state.headers), report.size());
     co_await output->write(report.asBytes());
     co_return;
   }
@@ -2998,7 +3130,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
   if (trial) {
     auto names = kj::str("[");
     bool first = true;
-    for (auto& name: slot->httpEntrypoints) {
+    for (auto &name: slot->httpEntrypoints) {
       if (name == "default") continue;
       capnp::MallocMessageBuilder arena;
       auto value = arena.initRoot<Json>();
@@ -3033,12 +3165,12 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
   }
   auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props),
       std::move(preparation), std::move(tenant));
-  auto& invocation = prepared.invocation;
-  auto& entry = prepared.entry;
+  auto &invocation = prepared.invocation;
+  auto &entry = prepared.entry;
   kj::Maybe<kj::Exception> failure;
   try {
     co_await entry->request(method, url, headers, body, response);
-  } catch (const kj::Exception& error) {
+  } catch (const kj::Exception &error) {
     failure = error.clone();
   }
   KJ_IF_SOME(error, failure) {
@@ -3051,10 +3183,10 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
   }
   co_await state.io.provider->getTimer()
       .timeoutAfter(state.backgroundAllowance(), state.tasks.onEmpty())
-      .catch_([&state = this->state](kj::Exception&&) { state.tasks.clear(); });
+      .catch_([&state = this->state](kj::Exception &&) { state.tasks.clear(); });
 }
 
-void acceptLoop(ThreadedServer& server, int listener, int parent) {
+void acceptLoop(ThreadedServer &server, int listener, int parent) {
   int epoll = epoll_create1(EPOLL_CLOEXEC);
   KJ_REQUIRE(epoll >= 0);
   auto add = [&](int fd) {
@@ -3127,7 +3259,7 @@ void acceptLoop(ThreadedServer& server, int listener, int parent) {
       }
       auto found = connections.find(fd);
       if (found == connections.end()) continue;
-      auto& connection = found->second;
+      auto &connection = found->second;
       bool close = false;
       if (connection.input.empty() && connection.output.empty()) {
         char prefix;
@@ -3159,7 +3291,7 @@ void acceptLoop(ThreadedServer& server, int listener, int parent) {
           if (connection.input.starts_with("GET /__coworkerd/threaded ")) {
             uint busy = 0;
             if (server.ready.load(std::memory_order_acquire))
-              for (auto& thread: server.threads)
+              for (auto &thread: server.threads)
                 if (!thread->control && thread->invocation.load()) ++busy;
             body = "{\"threadLimit\":" + std::to_string(server.limit) +
                 ",\"busyThreads\":" + std::to_string(busy) +
@@ -3184,8 +3316,8 @@ void acceptLoop(ThreadedServer& server, int listener, int parent) {
           if (!connection.input.starts_with("GET /__coworkerd/probe ") &&
               !connection.input.starts_with("GET /__coworkerd/threaded ")) {
             status = "501 Not Implemented";
-            body =
-                "{\"code\":\"NOT_SUPPORTED\",\"message\":\"threaded lifecycle controls require S1c\"}";
+            body = "{\"code\":\"NOT_SUPPORTED\",\"message\":\"threaded "
+                   "lifecycle controls require S1c\"}";
           }
           connection.output = "HTTP/1.1 " + std::string(status) +
               "\r\nX-Coworkerd-Threaded-Protocol: 3\r\nContent-Length: " +
@@ -3219,13 +3351,15 @@ void acceptLoop(ThreadedServer& server, int listener, int parent) {
 }  // namespace
 }  // namespace workerd
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   using namespace workerd;
   if (argc != 5) {
-    fprintf(stderr, "usage: coworkerd-threaded LISTEN_FD SOURCE_ADDRESS IDENTITY INFLIGHT\n");
+    fprintf(stderr,
+        "usage: coworkerd-threaded LISTEN_FD SOURCE_ADDRESS "
+        "IDENTITY INFLIGHT\n");
     return 64;
   }
-  char* end = nullptr;
+  char *end = nullptr;
   auto limit = strtoul(argv[4], &end, 10);
   if (!*argv[4] || !end || *end || limit == 0 || limit > 16384) return 64;
   if (!prepareDescriptors(limit)) return 78;
@@ -3234,7 +3368,8 @@ int main(int argc, char** argv) {
     auto flags = fcntl(event, F_GETFL);
     if (flags < 0 || fcntl(event, F_SETFL, flags | O_NONBLOCK) != 0) {
       fprintf(stderr,
-          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"event-channel\"}\n");
+          "[threaded-start] "
+          "{\"event\":\"startup-rejected\",\"resource\":\"event-channel\"}\n");
       return 78;
     }
   }
@@ -3249,21 +3384,24 @@ int main(int argc, char** argv) {
     }
   } catch (...) {
     fprintf(stderr,
-        "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"v8-configuration\"}\n");
+        "[threaded-start] "
+        "{\"event\":\"startup-rejected\",\"resource\":\"v8-configuration\"}\n");
     return 78;
   }
   signal(SIGPIPE, SIG_IGN);
   util::Autogate::initAutogateNamesForTest({}, util::IgnoreAllAutogatesEnv(true));
   setenv("COWORKERD_THREADED", "1", 1);
-  ThreadedServer* server;
+  ThreadedServer *server;
   try {
     server = new ThreadedServer(limit, argv[2], argv[3]);
   } catch (...) {
     fprintf(stderr,
-        "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"server-initialization\"}\n");
+        "[threaded-start] "
+        "{\"event\":\"startup-rejected\",\"resource\":\"server-"
+        "initialization\"}\n");
     return 78;
   }
-  const char* parent = getenv("COWORKERD_PARENT_FD");
+  const char *parent = getenv("COWORKERD_PARENT_FD");
   acceptLoop(
       *server, strtol(argv[1], nullptr, 10), parent == nullptr ? -1 : strtol(parent, nullptr, 10));
 }
