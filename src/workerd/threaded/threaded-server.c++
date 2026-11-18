@@ -1199,7 +1199,8 @@ struct ThreadedServer {
     auto name = kj::str(text(descriptor, "workerId"), "@", text(descriptor, "versionId"));
     auto isolate =
         kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), kj::atomicRefcounted<IsolateObserver>(),
-            name, kj::mv(limits), Worker::Isolate::InspectorPolicy::DISALLOW);
+            name, kj::mv(limits), Worker::Isolate::InspectorPolicy::DISALLOW,
+            Worker::LoggingOptions(Worker::ConsoleMode::STDOUT));
     slot.loadStage = threaded::LoadStage::LOAD;
     auto compiled = kj::atomicRefcounted<Worker::Script>(kj::mv(isolate), name,
         server::WorkerdApi::extractSource(name, config, flags.asReader(), reporter),
