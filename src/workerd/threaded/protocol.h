@@ -14,6 +14,19 @@ inline constexpr uint64_t descriptorBudget(uint32_t callThreads) {
   return uint64_t(callThreads) * 8 + 256;
 }
 
+// The existing trace budget is 256 KiB per event. A separate line bound also
+// covers empty console calls, whose native objects still occupy memory.
+struct InvocationLogBudget {
+  static constexpr uint64_t MAX_BYTES = 256 * 1024, MAX_LINES = 1023;
+  uint64_t bytes = 0, lines = 0;
+  bool accept(uint64_t length) {
+    if (lines == MAX_LINES || length > MAX_BYTES - bytes) return false;
+    bytes += length;
+    ++lines;
+    return true;
+  }
+};
+
 // A descriptor has already passed JSON decoding. These views retain the exact
 // wire spelling of values that must be forwarded without another float conversion.
 inline std::string_view trim(std::string_view value) {

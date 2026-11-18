@@ -950,6 +950,10 @@ struct ThreadedServer {
   std::atomic<bool> ready{false};
   std::atomic<uint> compilations{0};
   std::atomic<uint> canceledLoads{0};
+  std::atomic<uint> subrequestsActive{0};
+  std::atomic<uint64_t> subrequestsRejected{0}, acceptFailures{0};
+  std::atomic<uint64_t> logAccepted{0}, logDroppedLines{0}, logDroppedBytes{0}, logFlushFailures{0};
+  std::atomic<uint64_t> logPeakQueuedBytes{0};
   std::atomic<bool> delayedSourceForTest{false};
   std::thread manager;
 
@@ -1655,6 +1659,74 @@ kj::Promise<kj::Own<WorkerInterface>> openEgress(
   co_return kj::heap<EgressWorker>(state, kj::mv(address), kj::mv(identity));
 }
 
+// Hold the permit for the entire interface lifetime, including response bodies,
+// RPC capabilities and cancellation. No connection is opened before admission.
+struct SubrequestPermit {
+  SubrequestPermit(ThreadedServer& server, std::shared_ptr<uint32_t> invocation)
+      : server(server),
+        invocation(std::move(invocation)) {
+    if (*this->invocation >= 32) reject();
+    auto active = server.subrequestsActive.load();
+    for (;;) {
+      if (active >= server.limit) reject();
+      if (server.subrequestsActive.compare_exchange_weak(active, active + 1)) break;
+    }
+    ++*this->invocation;
+  }
+  ~SubrequestPermit() {
+    --*invocation;
+    server.subrequestsActive.fetch_sub(1);
+  }
+  [[noreturn]] void reject() {
+    server.subrequestsRejected.fetch_add(1);
+    kj::throwRecoverableException(
+        KJ_EXCEPTION(OVERLOADED, "jsg.Error: too many concurrent subrequests"));
+    KJ_UNREACHABLE;
+  }
+  ThreadedServer& server;
+  std::shared_ptr<uint32_t> invocation;  // Used only by this invocation's thread.
+};
+
+class SubrequestWorker final: public WorkerInterface {
+ public:
+  SubrequestWorker(std::shared_ptr<SubrequestPermit> permit, kj::Own<WorkerInterface> target)
+      : permit(std::move(permit)),
+        target(kj::mv(target)) {}
+  kj::Promise<void> request(kj::HttpMethod method,
+      kj::StringPtr url,
+      const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& body,
+      Response& response) override {
+    return target->request(method, url, headers, body, response);
+  }
+  kj::Promise<void> connect(kj::StringPtr host,
+      const kj::HttpHeaders& headers,
+      kj::AsyncIoStream& connection,
+      ConnectResponse& response,
+      kj::HttpConnectSettings settings) override {
+    return target->connect(host, headers, connection, response, kj::mv(settings));
+  }
+  kj::Promise<void> prewarm(kj::StringPtr url) override {
+    return target->prewarm(url);
+  }
+  kj::Promise<ScheduledResult> runScheduled(kj::Date time, kj::StringPtr cron) override {
+    return target->runScheduled(time, cron);
+  }
+  kj::Promise<AlarmResult> runAlarm(kj::Date time, uint32_t retry) override {
+    return target->runAlarm(time, retry);
+  }
+  kj::Promise<kj::Maybe<kj::Date>> abandonAlarm(kj::Date time) override {
+    return target->abandonAlarm(time);
+  }
+  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
+    return target->customEvent(kj::mv(event));
+  }
+
+ private:
+  std::shared_ptr<SubrequestPermit> permit;
+  kj::Own<WorkerInterface> target;
+};
+
 struct Channels final: IoChannelFactory {
   Channels(
       ThreadState& state, ThreadedServer& server, std::shared_ptr<Slot> slot, kj::StringPtr input)
@@ -1667,7 +1739,10 @@ struct Channels final: IoChannelFactory {
   ThreadedServer& server;
   std::shared_ptr<Slot> slot;
   uint64_t sequence = 0;
+  std::shared_ptr<uint32_t> subrequests = std::make_shared<uint32_t>(0);
+  threaded::InvocationLogBudget logBudget;
   kj::Vector<kj::String> lines;
+  uint64_t queuedLogBytes = 0, inFlightLogLines = 0, inFlightLogBytes = 0;
   bool flushing = false;
 
   Json::Reader input() {
@@ -1765,12 +1840,14 @@ struct Channels final: IoChannelFactory {
   }
   kj::Own<WorkerInterface> startRequest(
       uint channel, SubrequestMetadata metadata, kj::Maybe<Frankenvalue> props) {
+    auto permit = std::make_shared<SubrequestPermit>(server, subrequests);
     if (channel < IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT) {
       auto identity =
           kj::str(server.egressToken.c_str(), " {\"workerId\":", encode(field(input(), "workerId")),
               ",\"versionId\":", encode(field(input(), "versionId")), "}");
-      return newPromisedWorkerInterface(
-          openEgress(state, kj::str(server.egressAddress.c_str()), kj::mv(identity)));
+      return kj::heap<SubrequestWorker>(std::move(permit),
+          newPromisedWorkerInterface(
+              openEgress(state, kj::str(server.egressAddress.c_str()), kj::mv(identity))));
     }
     auto serviceCount = count(services());
     auto objectCount = count(objects());
@@ -1798,8 +1875,9 @@ struct Channels final: IoChannelFactory {
     KJ_IF_SOME(value, props) {
       serialized = writeNativeProps(state, value);
     }
-    return newPromisedWorkerInterface(openBinding(
-        state, kj::str(server.bindingAddress.c_str()), kj::mv(descriptor), kj::mv(serialized)));
+    return kj::heap<SubrequestWorker>(std::move(permit),
+        newPromisedWorkerInterface(openBinding(state, kj::str(server.bindingAddress.c_str()),
+            kj::mv(descriptor), kj::mv(serialized))));
   }
   struct Bound final: SubrequestChannel {
     Bound(kj::Rc<Channels> owner,
@@ -1812,8 +1890,11 @@ struct Channels final: IoChannelFactory {
           props(kj::mv(props)) {}
     kj::Own<WorkerInterface> startRequest(SubrequestMetadata metadata) override {
       KJ_IF_SOME(id, object) {
-        return newPromisedWorkerInterface(openBinding(owner->state,
-            kj::str(owner->server.bindingAddress.c_str()), owner->objectEnvelope(channel, id)));
+        auto permit = std::make_shared<SubrequestPermit>(owner->server, owner->subrequests);
+        return kj::heap<SubrequestWorker>(std::move(permit),
+            newPromisedWorkerInterface(
+                openBinding(owner->state, kj::str(owner->server.bindingAddress.c_str()),
+                    owner->objectEnvelope(channel, id))));
       }
       return owner->startRequest(
           channel, kj::mv(metadata), props.map([](Frankenvalue& value) { return value.clone(); }));
@@ -1870,19 +1951,46 @@ struct Channels final: IoChannelFactory {
     unsupported("local actor");
   }
   void log(kj::StringPtr level, kj::StringPtr message) {
+    if (!logBudget.accept(message.size())) {
+      dropLog(1, message.size());
+      return;
+    }
     capnp::MallocMessageBuilder arena;
     auto value = arena.initRoot<Json>();
-    value.setString(message);
+    auto bounded = kj::str(message.first(kj::min(message.size(), size_t(4096))));
+    value.setString(bounded);
     lines.add(kj::str("{\"level\":\"", level, "\",\"message\":", encode(value.asReader()), "}"));
+    queuedLogBytes += lines.back().size();
+    server.logAccepted.fetch_add(1);
+    auto peak = server.logPeakQueuedBytes.load();
+    while (peak < queuedLogBytes &&
+        !server.logPeakQueuedBytes.compare_exchange_weak(peak, queuedLogBytes)) {}
     if (!flushing) {
       flushing = true;
       IoContext::current().addWaitUntil(kj::evalLater(
           [self = kj::addRef(*this)]() mutable { return self->flushLogs().attach(kj::mv(self)); }));
     }
   }
+  void dropLog(uint64_t count, uint64_t bytes) {
+    server.logDroppedLines.fetch_add(count);
+    server.logDroppedBytes.fetch_add(bytes);
+  }
   kj::Promise<void> flushLogs() {
+    bool success = false;
+    KJ_DEFER({
+      flushing = false;
+      if (!success) {
+        server.logFlushFailures.fetch_add(1);
+        dropLog(lines.size() + inFlightLogLines, queuedLogBytes + inFlightLogBytes);
+        lines.clear();
+        queuedLogBytes = inFlightLogLines = inFlightLogBytes = 0;
+      }
+    });
     while (lines.size() != 0) {
       auto batch = lines.releaseAsArray();
+      inFlightLogLines = batch.size();
+      inFlightLogBytes = queuedLogBytes;
+      queuedLogBytes = 0;
       auto body = kj::str("{\"workerId\":", encode(field(input(), "workerId")),
           ",\"versionId\":", encode(field(input(), "versionId")),
           ",\"invocationId\":", encode(field(input(), "invocationId")), ",\"lines\":[",
@@ -1898,9 +2006,11 @@ struct Channels final: IoChannelFactory {
       auto request = client->request(kj::HttpMethod::POST, url, headers, body.size());
       co_await request.body->write(body.asBytes());
       auto response = co_await request.response;
+      KJ_REQUIRE(response.statusCode == 200, "tenant log flush failed");
       co_await response.body->readAllBytes(1u << 20);
+      inFlightLogLines = inFlightLogBytes = 0;
     }
-    flushing = false;
+    success = true;
   }
 };
 
@@ -1912,6 +2022,10 @@ class TenantTracer final: public BaseTracer {
       LogLevel level,
       kj::String message,
       tracing::LogErrorInfo) override {
+    if (message.size() > threaded::InvocationLogBudget::MAX_BYTES) {
+      channels->dropLog(1, message.size());
+      return;
+    }
     JsonDoc parsed(message);
     auto parts = parsed.get();
     auto joined = kj::str("");
@@ -2200,20 +2314,43 @@ void acceptLoop(ThreadedServer& server, int listener, int parent) {
     epoll_event event{};
     event.events = EPOLLIN | EPOLLRDHUP;
     event.data.fd = fd;
-    KJ_SYSCALL(epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &event));
+    int result;
+    do {
+      result = epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &event);
+    } while (result < 0 && errno == EINTR);
+    return result == 0;
   };
   fcntl(listener, F_SETFL, fcntl(listener, F_GETFL) | O_NONBLOCK);
-  add(listener);
-  if (parent >= 0) add(parent);
+  bool listening = add(listener);
+  uint64_t retryAt = 0;
+  if (parent >= 0) {
+    KJ_REQUIRE(add(parent), "could not monitor parent during startup");
+  }
+  auto pauseListener = [&]() {
+    server.acceptFailures.fetch_add(1);
+    if (listening) epoll_ctl(epoll, EPOLL_CTL_DEL, listener, nullptr);
+    listening = false;
+    retryAt = nowNs() + 25000000;
+  };
   struct Connection {
     std::string input, output;
     size_t sent = 0;
   };
   std::map<int, Connection> connections;
   for (;;) {
+    if (!listening && nowNs() >= retryAt) {
+      listening = add(listener);
+      if (!listening) pauseListener();
+    }
     epoll_event events[256];
-    int count;
-    KJ_SYSCALL(count = epoll_wait(epoll, events, 256, -1));
+    int count = epoll_wait(epoll, events, 256, listening ? -1 : 25);
+    if (count < 0) {
+      if (errno != EINTR) {
+        server.acceptFailures.fetch_add(1);
+        usleep(25000);
+      }
+      continue;
+    }
     for (int i = 0; i < count; ++i) {
       auto fd = events[i].data.fd;
       if (fd == parent) {
@@ -2226,9 +2363,18 @@ void acceptLoop(ThreadedServer& server, int listener, int parent) {
           auto accepted = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
           if (accepted < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
           if (accepted < 0 && errno == EINTR) continue;
-          KJ_REQUIRE(accepted >= 0);
+          if (accepted < 0) {
+            // A transient descriptor/socket/epoll shortage must never discard
+            // invocations already executing on the other call threads.
+            pauseListener();
+            break;
+          }
+          if (!add(accepted)) {
+            ::close(accepted);
+            pauseListener();
+            break;
+          }
           connections.emplace(accepted, Connection{});
-          add(accepted);
         }
         continue;
       }
@@ -2267,7 +2413,15 @@ void acceptLoop(ThreadedServer& server, int listener, int parent) {
                 ",\"busyThreads\":" + std::to_string(busy) +
                 ",\"idleConnections\":" + std::to_string(connections.size() - 1) +
                 ",\"compilations\":" + std::to_string(server.compilations.load()) +
-                ",\"canceledLoads\":" + std::to_string(server.canceledLoads.load()) + "}";
+                ",\"canceledLoads\":" + std::to_string(server.canceledLoads.load()) +
+                ",\"acceptFailures\":" + std::to_string(server.acceptFailures.load()) +
+                ",\"subrequestsActive\":" + std::to_string(server.subrequestsActive.load()) +
+                ",\"subrequestsRejected\":" + std::to_string(server.subrequestsRejected.load()) +
+                ",\"logAccepted\":" + std::to_string(server.logAccepted.load()) +
+                ",\"logDroppedLines\":" + std::to_string(server.logDroppedLines.load()) +
+                ",\"logDroppedBytes\":" + std::to_string(server.logDroppedBytes.load()) +
+                ",\"logFlushFailures\":" + std::to_string(server.logFlushFailures.load()) +
+                ",\"logPeakQueuedBytes\":" + std::to_string(server.logPeakQueuedBytes.load()) + "}";
           }
           auto status = server.ready.load(std::memory_order_acquire) ? "200 OK" : "503 Starting";
           if (!connection.input.starts_with("GET /__coworkerd/probe ") &&
