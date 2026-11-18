@@ -37,6 +37,7 @@
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -78,6 +79,26 @@ uint64_t nowNs(clockid_t clock = CLOCK_MONOTONIC) {
   timespec t;
   KJ_SYSCALL(clock_gettime(clock, &t));
   return uint64_t(t.tv_sec) * 1000000000 + t.tv_nsec;
+}
+
+bool prepareDescriptors(uint32_t threads) {
+  rlimit current;
+  auto required = threaded::descriptorBudget(threads);
+  if (getrlimit(RLIMIT_NOFILE, &current) != 0 || current.rlim_max < required) {
+    fprintf(stderr,
+        "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"descriptors\",\"required\":%llu}\n",
+        (unsigned long long)required);
+    return false;
+  }
+  if (current.rlim_cur < required) {
+    current.rlim_cur = required;
+    if (setrlimit(RLIMIT_NOFILE, &current) != 0) {
+      fprintf(stderr,
+          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"descriptor-soft-limit\"}\n");
+      return false;
+    }
+  }
+  return true;
 }
 
 struct Entropy final: kj::EntropySource {
@@ -959,11 +980,18 @@ struct ThreadedServer {
     pthread_setname_np(pthread_self(), "cwkd-pool");
     // The initial high watermark is the in-flight limit. Readiness waits for all
     // native loops, so a cold burst never makes the accept thread initialize one.
-    for (uint i = 0; i < limit; ++i) {
-      auto item = std::make_unique<Thread>();
-      auto* pointer = item.get();
-      item->thread = std::thread([this, pointer]() { runThread(*pointer); });
-      threads.push_back(std::move(item));
+    try {
+      threads.reserve(limit);
+      for (uint i = 0; i < limit; ++i) {
+        auto item = std::make_unique<Thread>();
+        auto* pointer = item.get();
+        item->thread = std::thread([this, pointer]() { runThread(*pointer); });
+        threads.push_back(std::move(item));
+      }
+    } catch (...) {
+      fprintf(stderr,
+          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"call-thread-pool\"}\n");
+      _exit(78);
     }
     for (auto& item: threads)
       while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
@@ -996,7 +1024,15 @@ struct ThreadedServer {
   }
   void runThread(Thread& thread) {
     pthread_setname_np(pthread_self(), "cwkd-call");
-    ThreadState state;
+    std::unique_ptr<ThreadState> storage;
+    try {
+      storage = std::make_unique<ThreadState>();
+    } catch (...) {
+      fprintf(stderr,
+          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"call-event-loop\"}\n");
+      _exit(78);
+    }
+    auto& state = *storage;
     thread.descriptor.store(-1, std::memory_order_release);
     for (;;) {
       uint64_t count;
@@ -2273,11 +2309,25 @@ void acceptLoop(ThreadedServer& server, int listener, int parent) {
 
 int main(int argc, char** argv) {
   using namespace workerd;
-  KJ_REQUIRE(argc == 5, "usage: coworkerd-threaded LISTEN_FD SOURCE_ADDRESS IDENTITY INFLIGHT");
+  if (argc != 5) {
+    fprintf(stderr, "usage: coworkerd-threaded LISTEN_FD SOURCE_ADDRESS IDENTITY INFLIGHT\n");
+    return 64;
+  }
+  char* end = nullptr;
+  auto limit = strtoul(argv[4], &end, 10);
+  if (!*argv[4] || !end || *end || limit == 0 || limit > 16384) return 64;
+  if (!prepareDescriptors(limit)) return 78;
   signal(SIGPIPE, SIG_IGN);
   util::Autogate::initAutogateNamesForTest({}, util::IgnoreAllAutogatesEnv(true));
   setenv("COWORKERD_THREADED", "1", 1);
-  auto* server = new ThreadedServer(strtoul(argv[4], nullptr, 10), argv[2], argv[3]);
+  ThreadedServer* server;
+  try {
+    server = new ThreadedServer(limit, argv[2], argv[3]);
+  } catch (...) {
+    fprintf(stderr,
+        "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"server-initialization\"}\n");
+    return 78;
+  }
   const char* parent = getenv("COWORKERD_PARENT_FD");
   acceptLoop(
       *server, strtol(argv[1], nullptr, 10), parent == nullptr ? -1 : strtol(parent, nullptr, 10));

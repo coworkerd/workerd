@@ -1,11 +1,18 @@
 #pragma once
 
 #include <cctype>
+#include <cstdint>
 #include <initializer_list>
 #include <stdexcept>
 #include <string_view>
 
 namespace workerd::threaded {
+
+// A call loop owns its mailbox, event port and invocation channels. Leave room
+// for probes, the platform and the node's prepared connections as well.
+inline constexpr uint64_t descriptorBudget(uint32_t callThreads) {
+  return uint64_t(callThreads) * 8 + 256;
+}
 
 // A descriptor has already passed JSON decoding. These views retain the exact
 // wire spelling of values that must be forwarded without another float conversion.
