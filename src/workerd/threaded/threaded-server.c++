@@ -2826,7 +2826,7 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
     auto inherited = threaded::rawField(
         std::string_view(document.original.begin(), document.original.size()), "orderSequence");
     auto order = threaded::childOrderSequence(next != 0, inherited, next);
-    add("orderSequence", kj::str(order));
+    add("orderSequence", kj::str(order.c_str()));
     add("sequenceMapSize", kj::str(next == 0 ? 0 : 1));
     auto deadline =
         threaded::rawPath(std::string_view(document.original.begin(), document.original.size()),
