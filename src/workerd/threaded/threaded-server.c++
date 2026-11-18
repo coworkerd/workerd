@@ -1697,29 +1697,37 @@ class SubrequestWorker final: public WorkerInterface {
       const kj::HttpHeaders& headers,
       kj::AsyncInputStream& body,
       Response& response) override {
-    return target->request(method, url, headers, body, response);
+    auto active = std::move(permit);
+    return target->request(method, url, headers, body, response).attach(std::move(active));
   }
   kj::Promise<void> connect(kj::StringPtr host,
       const kj::HttpHeaders& headers,
       kj::AsyncIoStream& connection,
       ConnectResponse& response,
       kj::HttpConnectSettings settings) override {
-    return target->connect(host, headers, connection, response, kj::mv(settings));
+    auto active = std::move(permit);
+    return target->connect(host, headers, connection, response, kj::mv(settings))
+        .attach(std::move(active));
   }
   kj::Promise<void> prewarm(kj::StringPtr url) override {
-    return target->prewarm(url);
+    auto active = std::move(permit);
+    return target->prewarm(url).attach(std::move(active));
   }
   kj::Promise<ScheduledResult> runScheduled(kj::Date time, kj::StringPtr cron) override {
-    return target->runScheduled(time, cron);
+    auto active = std::move(permit);
+    return target->runScheduled(time, cron).attach(std::move(active));
   }
   kj::Promise<AlarmResult> runAlarm(kj::Date time, uint32_t retry) override {
-    return target->runAlarm(time, retry);
+    auto active = std::move(permit);
+    return target->runAlarm(time, retry).attach(std::move(active));
   }
   kj::Promise<kj::Maybe<kj::Date>> abandonAlarm(kj::Date time) override {
-    return target->abandonAlarm(time);
+    auto active = std::move(permit);
+    return target->abandonAlarm(time).attach(std::move(active));
   }
   kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
-    return target->customEvent(kj::mv(event));
+    auto active = std::move(permit);
+    return target->customEvent(kj::mv(event)).attach(std::move(active));
   }
 
  private:
