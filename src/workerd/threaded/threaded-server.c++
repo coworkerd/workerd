@@ -218,7 +218,8 @@ struct ResourceBudget {
   static constexpr uint64_t MiB = 1ull << 20;
   ResourceBudget(uint64_t maximum, uint32_t residents, uint32_t callThreads)
       : memoryMaximum(maximum),
-        admissionMaximum(maximum - kj::min(maximum / 10, 64 * MiB)),
+        admissionMaximum(maximum -
+            kj::min(maximum / 10, kj::max<uint64_t>(8 * MiB, uint64_t(callThreads) * MiB))),
         addressMaximum(v8::IsolateGroup::CanCreateNewGroups()
                 ? UINT64_MAX
                 : (4ull << 30) - MAX_SINGLE_HEAP_OBJECT - (256ull << 20)),
@@ -236,6 +237,43 @@ struct ResourceBudget {
   std::atomic<uint64_t> memoryReserved{0}, addressReserved{0};
   std::atomic<uint32_t> residents{0};
   std::atomic<uint64_t> rejections{0}, evictions{0}, pressureTerminations{0};
+  std::condition_variable reclaimed;
+  std::atomic<bool> reclaimRequested{false};
+  int reclaimWake = -1;  // assigned before the server starts any threads
+  uint64_t reclaimEpoch = 0, targetMemory = UINT64_MAX, targetAddress = UINT64_MAX;
+  bool noIdleAtLastReclaim = false;
+  void requestReclaimLocked(uint64_t additionalMemory = 0) {
+    targetMemory = kj::min(targetMemory,
+        kj::min(admissionMaximum, memoryMaximum - kj::min(memoryMaximum, additionalMemory)));
+    targetAddress = kj::min(targetAddress, addressMaximum);
+    reclaimRequested.store(true);
+    if (reclaimWake >= 0) {
+      uint64_t one = 1;
+      (void)!write(reclaimWake, &one, sizeof(one));
+    }
+  }
+  bool reclaim(uint64_t additionalMemory = 0) {
+    std::unique_lock lock(mutex);
+    auto epoch = reclaimEpoch;
+    requestReclaimLocked(additionalMemory);
+    reclaimed.wait(lock, [&] { return reclaimEpoch != epoch; });
+    return !noIdleAtLastReclaim;
+  }
+  bool needsReclaim() {
+    std::lock_guard lock(mutex);
+    return memoryReserved.load() > targetMemory || addressReserved.load() > targetAddress;
+  }
+  bool withinMaximum() const {
+    return memoryReserved.load() <= memoryMaximum && addressReserved.load() <= addressMaximum;
+  }
+  void finishReclaim(bool noIdle) {
+    std::lock_guard lock(mutex);
+    noIdleAtLastReclaim = noIdle;
+    ++reclaimEpoch;
+    if (!reclaimRequested.load()) targetMemory = targetAddress = UINT64_MAX;
+    reclaimed.notify_all();
+  }
+
   bool change(uint64_t oldMemory,
       uint64_t newMemory,
       uint64_t oldAddress,
@@ -252,6 +290,8 @@ struct ResourceBudget {
     if (!fits && !observe) return false;
     memoryReserved.store(memory + newMemory);
     addressReserved.store(address + newAddress);
+    if (memory + newMemory > admissionMaximum || address + newAddress > addressMaximum)
+      requestReclaimLocked();
     return fits;
   }
 };
@@ -534,10 +574,17 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
       }
       if (external.compare_exchange_weak(used, used + size)) break;
     }
-    if (reservation && !reservation->allocateExternal(size)) {
-      external.fetch_sub(size);
-      pressure();
-      return false;
+    if (reservation) {
+      while (!reservation->allocateExternal(size)) {
+        // The reservation lock has been released before waiting. Only the
+        // maintenance loop disposes idle Workers, including during a GC callback.
+        if (!reservation->budget->reclaim(size)) {
+          if (reservation->allocateExternal(size)) break;
+          external.fetch_sub(size);
+          pressure();
+          return false;
+        }
+      }
     }
     return true;
   }
@@ -576,7 +623,12 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     // unreclaimed garbage from an ordinary turn is not an isolate violation.
     if (afterGc) heap.store(stats.used_heap_size() + other);
     if (reservation && !reservation->observe(stats, owned)) {
-      pressure();
+      while (!reservation->budget->withinMaximum()) {
+        if (!reservation->budget->reclaim() && !reservation->budget->withinMaximum()) {
+          pressure();
+          break;
+        }
+      }
     }
     if (pendingPressure.load() ||
         (currentCause && currentCause->load() == LimitCause::PROCESS_MEMORY))
@@ -1476,6 +1528,8 @@ struct ThreadedServer {
   std::atomic<uint> subrequestsActive{0};
   std::mutex subrequestMutex;
   std::map<std::string, uint32_t> tenantSubrequests;
+  uint64_t nextSubrequestWaiter = 0;
+  std::map<uint64_t, kj::Own<kj::CrossThreadPromiseFulfiller<void>>> subrequestWaiters;
   std::atomic<uint64_t> subrequestsRejected{0}, acceptFailures{0};
   std::atomic<uint64_t> logAccepted{0}, logDroppedLines{0}, logDroppedBytes{0}, logFlushFailures{0};
   std::atomic<uint64_t> logPeakQueuedBytes{0};
@@ -1494,6 +1548,7 @@ struct ThreadedServer {
         tenantBudget(std::make_shared<TenantBudget>(
             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 16))) {
     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
+    resources->reclaimWake = managerWake;
     server::coworkerdServing();
     fprintf(stderr, "[threaded-start] {\"event\":\"steady-start\",\"threadLimit\":%u}\n", limit);
     manager = std::thread([this]() { manage(); });
@@ -1507,6 +1562,18 @@ struct ThreadedServer {
   }
 
   void maintain() {
+    if (resources->reclaimRequested.exchange(false)) {
+      bool noIdle = false;
+      KJ_DEFER(resources->finishReclaim(noIdle));
+      while (resources->needsReclaim()) {
+        if (!evictOne()) {
+          noIdle = true;
+          break;
+        }
+      }
+    }
+    // Publish only after waking growers; a publisher must never wait on a
+    // reservation whose owner is itself waiting for this maintenance pass.
     reapRetired();
     for (uint32_t i = 0; i < 8 && evictOne(nullptr, true); ++i) {}
     std::vector<std::shared_ptr<Slot>> snapshot;
@@ -1903,7 +1970,12 @@ struct ThreadedServer {
         response.statusCode == 200, kj::str("Trusted source fetch failed: ", response.statusCode));
     auto length =
         KJ_REQUIRE_NONNULL(response.body->tryGetLength(), "Trusted source omitted its length");
-    if (!slot.reservation->retainSource(length)) kj::throwRecoverableException(capacityError());
+    while (!slot.reservation->retainSource(length)) {
+      if (!resources->reclaim(length * 5)) {
+        if (slot.reservation->retainSource(length)) break;
+        kj::throwRecoverableException(capacityError());
+      }
+    }
     auto content = co_await response.body->readAllText(256u << 20);
     JsonDoc source(content);
     KJ_REQUIRE(text(source.get(), "workerId") == text(descriptor, "workerId") &&
@@ -2532,36 +2604,73 @@ kj::Promise<kj::Own<WorkerInterface>> openEgress(
 // Hold the permit for the entire interface lifetime, including response bodies,
 // RPC capabilities and cancellation. No connection is opened before admission.
 struct SubrequestPermit {
-  SubrequestPermit(ThreadedServer &server, std::shared_ptr<uint32_t> invocation, std::string tenant)
+  SubrequestPermit(ThreadedServer &server,
+      std::shared_ptr<uint32_t> invocation,
+      std::string tenant,
+      bool tenantShare)
       : server(server),
         invocation(std::move(invocation)),
-        tenant(std::move(tenant)) {}
-  bool acquire() {
-    std::lock_guard lock(server.subrequestMutex);
+        tenant(std::move(tenant)),
+        tenantShare(tenantShare) {}
+  bool acquireLocked() {
     auto perTenant = kj::min(server.limit, kj::max<uint32_t>(1, server.tenantBudget->limit - 1));
     auto found = server.tenantSubrequests.find(tenant);
     if (*invocation >= 32 || server.subrequestsActive.load() >= server.limit ||
-        (found != server.tenantSubrequests.end() && found->second >= perTenant))
+        (tenantShare && found != server.tenantSubrequests.end() && found->second >= perTenant))
       return false;
-    ++server.tenantSubrequests[tenant];
+    // Bindings retain the invocation and global connection limits, but never
+    // consume the external-egress tenant share a recursive child may need.
+    if (tenantShare) ++server.tenantSubrequests[tenant];
     ++*invocation;
     server.subrequestsActive.fetch_add(1);
     acquired = true;
     return true;
   }
+  kj::Promise<void> acquire() {
+    bool counted = false;
+    for (;;) {
+      auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
+      uint64_t id;
+      {
+        std::lock_guard lock(server.subrequestMutex);
+        if (acquireLocked()) co_return;
+        if (!counted) {
+          server.subrequestsRejected.fetch_add(1);
+          counted = true;
+        }
+        id = ++server.nextSubrequestWaiter;
+        server.subrequestWaiters.emplace(id, kj::mv(signal.fulfiller));
+      }
+      // Cancellation removes its waiter immediately. Registration and the
+      // capacity check use the release mutex, so no release wakeup is lost.
+      KJ_DEFER({
+        std::lock_guard lock(server.subrequestMutex);
+        server.subrequestWaiters.erase(id);
+      });
+      co_await signal.promise;
+    }
+  }
   ~SubrequestPermit() {
     if (!acquired) return;
-    std::lock_guard lock(server.subrequestMutex);
-    --*invocation;
-    server.subrequestsActive.fetch_sub(1);
-    auto found = server.tenantSubrequests.find(tenant);
-    KJ_ASSERT(found != server.tenantSubrequests.end() && found->second > 0);
-    if (--found->second == 0) server.tenantSubrequests.erase(found);
+    decltype(server.subrequestWaiters) wake;
+    {
+      std::lock_guard lock(server.subrequestMutex);
+      --*invocation;
+      server.subrequestsActive.fetch_sub(1);
+      if (tenantShare) {
+        auto found = server.tenantSubrequests.find(tenant);
+        KJ_ASSERT(found != server.tenantSubrequests.end() && found->second > 0);
+        if (--found->second == 0) server.tenantSubrequests.erase(found);
+      }
+      wake.swap(server.subrequestWaiters);
+    }
+    for (auto &[id, waiter]: wake)
+      if (waiter->isWaiting()) waiter->fulfill();
   }
   ThreadedServer &server;
   std::shared_ptr<uint32_t> invocation;
   std::string tenant;
-  bool acquired = false;
+  bool tenantShare, acquired = false;
 };
 
 class SubrequestWorker final: public WorkerInterface {
@@ -2725,16 +2834,9 @@ struct Channels final: IoChannelFactory {
   kj::Promise<kj::Own<WorkerInterface>> queuedRequest(
       bool egress, kj::String descriptor, PropsMessage props = {}) {
     auto worker = str(input(), "workerId");
-    auto permit =
-        std::make_shared<SubrequestPermit>(server, subrequests, worker.substr(0, worker.find('/')));
-    // Waiting stays on the invocation's event loop and cancellation drops the
-    // queued operation before a private or external connection is opened.
-    if (!permit->acquire()) {
-      server.subrequestsRejected.fetch_add(1);
-      do {
-        co_await state.io.provider->getTimer().afterDelay(1 * kj::MILLISECONDS);
-      } while (!permit->acquire());
-    }
+    auto permit = std::make_shared<SubrequestPermit>(
+        server, subrequests, worker.substr(0, worker.find('/')), egress);
+    co_await permit->acquire();
     auto target = egress
         ? co_await openEgress(state, kj::str(server.egressAddress.c_str()), kj::mv(descriptor))
         : co_await openBinding(
@@ -3279,7 +3381,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
     auto report = kj::str("{\"ok\":true,\"nativeHttpValidated\":",
         slot->httpEntrypoints.contains(entrypoint) ? "true" : "false",
         ",\"durableObjectClasses\":", classes,
-        ",\"rootBridgeChecked\":true,\"coldLoad\":", coldLoaded ? "true" : "false",
+        ",\"rootBridgeChecked\":false,\"coldLoad\":", coldLoaded ? "true" : "false",
         ",\"defaultKind\":\"native\",\"namedEntrypoints\":", names,
         ",\"hasDefault\":", slot->entrypoints.contains("default") ? "true" : "false",
         ",\"entrypointUsable\":", slot->entrypoints.contains(entrypoint) ? "true" : "false", "}");
