@@ -469,6 +469,7 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     if (isolate) isolate->TerminateExecution();
   }
   bool reserve(size_t size) {
+    if (currentCause && currentCause->load() == LimitCause::PROCESS_MEMORY) return false;
     auto used = external.load();
     for (;;) {
       auto base = heap.load();
@@ -523,6 +524,7 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     if (reservation && !reservation->observe(stats, owned)) {
       pressure();
     }
+    if (currentCause && currentCause->load() == LimitCause::PROCESS_MEMORY) return;
     if (maximum != 0 && stats.used_heap_size() + other + owned >= maximum) {
       if (!afterGc) {
         isolate->LowMemoryNotification();
@@ -537,7 +539,8 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     isolate = value;
     value->AddNearHeapLimitCallback([](void *opaque, size_t current, size_t initial) {
       auto &self = *static_cast<MemoryBudget *>(opaque);
-      self.cause->store(LimitCause::MEMORY);
+      if (!self.currentCause || self.currentCause->load() != LimitCause::PROCESS_MEMORY)
+        self.cause->store(LimitCause::MEMORY);
       self.isolate->TerminateExecution();
       if (self.reservation) self.reservation->heapEmergency(8u << 20);
       return current + (8u << 20);
