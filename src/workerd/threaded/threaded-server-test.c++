@@ -116,19 +116,32 @@ KJ_TEST("tenant admission releases counts on errors and cancellation") {
   auto budget = std::make_shared<TenantBudget>(1);
   {
     TenantPermit active(budget, "a");
-    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
-        "process admission budget is full", TenantPermit(budget, "a"));
+    TenantPermit borrowed(budget, "a");
+    KJ_EXPECT(budget->active["a"] == 2);
     {
       TenantPermit other(budget, "b");
       KJ_EXPECT(budget->active.size() == 2);
+      KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+          "tenant execution concurrency limit reached in process", TenantPermit(budget, "a"));
+      KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+          "tenant execution concurrency limit reached in process", TenantPermit(budget, "b"));
+      KJ_EXPECT(budget->active["a"] == 2 && budget->active["b"] == 1);
     }
     KJ_EXPECT(budget->active.size() == 1);
+    TenantPermit borrowedAgain(budget, "a");
+    KJ_EXPECT(budget->active["a"] == 3);
   }
   KJ_EXPECT(budget->active.empty());
   auto pair = kj::newPromiseAndFulfiller<void>();
   auto canceled = pair.promise.attach(std::make_shared<TenantPermit>(budget, "a"));
   canceled = nullptr;
   KJ_EXPECT(budget->active.empty());
+  auto disabled = std::make_shared<TenantBudget>(0);
+  TenantPermit a(disabled, "a"), b(disabled, "b"), a2(disabled, "a");
+  KJ_EXPECT(disabled->active["a"] == 2 && disabled->active["b"] == 1);
+  const auto refusal = capacityError(CapacityScope::TENANT);
+  const auto detail = KJ_REQUIRE_NONNULL(refusal.getDetail(CAPACITY_DETAIL));
+  KJ_EXPECT(detail.size() == 1 && detail[0] == 1);
 }
 
 KJ_TEST("subrequest quotas, recursive bindings, release wakeup and cancellation") {
