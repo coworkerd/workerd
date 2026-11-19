@@ -620,6 +620,8 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   v8::ArrayBuffer::Allocator *inner;
   v8::Isolate *isolate = nullptr;
   std::atomic<bool> pendingPressure{false};
+  // Whether this isolate's ceiling was raised once already (install()).
+  std::atomic<bool> ceilingRaised{false};
   std::atomic<LimitCause> *currentCause = nullptr;  // isolate-lock protected
   void pressure() {
     if (currentCause) {
@@ -716,10 +718,27 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   void install(v8::Isolate *value) {
     isolate = value;
     // Soft tenant checks run after collection. The fixed hard reserve covers
-    // one maximum-sized V8 object; repeated callbacks never enlarge this limit.
+    // one maximum-sized V8 object.
     value->SetOOMErrorHandler(&nativeOom);
     value->AddGCEpilogueCallback([](v8::Isolate *, v8::GCType, v8::GCCallbackFlags, void *opaque) {
       static_cast<MemoryBudget *>(opaque)->observe(true);
+    }, this);
+    // V8 takes the first object of the young large-object space without a
+    // collection, so no tenant check sees it until the next one, and the next
+    // large allocation can then meet the fixed ceiling with that object live
+    // (cwkd-p40: a 500 MB string, then a maximum string, ended the process,
+    // raw/s27-x500). Near the ceiling the isolate is over its limit: it is
+    // terminated as such, and its ceiling is raised once by one maximum
+    // object so that the allocation in progress finishes; its call ends with
+    // MEMORY_LIMIT_EXCEEDED and the isolate is retired, as any isolate over
+    // its limit. A second time in the same isolate the ceiling stays and V8's
+    // OOM ends the process, as before.
+    value->AddNearHeapLimitCallback([](void *opaque, size_t current, size_t) -> size_t {
+      auto &budget = *static_cast<MemoryBudget *>(opaque);
+      budget.cause->store(LimitCause::MEMORY);
+      budget.isolate->TerminateExecution();
+      if (budget.ceilingRaised.exchange(true)) return current;
+      return current + MAX_SINGLE_HEAP_OBJECT;
     }, this);
   }
 };

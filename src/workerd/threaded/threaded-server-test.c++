@@ -367,6 +367,14 @@ constexpr kj::StringPtr LIVE126_THEN_STRING =
 constexpr kj::StringPtr LIVE126_86K_THEN_STRING =
     "globalThis.kept = []; for (let i = 0; i < 1501; ++i) kept.push(new Array(11000).fill(1.5));"
     "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
+// A 500 MB one-byte string first: V8 takes the first object of the young
+// large-object space without checking its capacity or collecting, so the
+// tenant check (after a collection) does not see it; then one maximum string.
+// Before the near-heap-limit callback this ended the process (exit 74,
+// raw/s27-x500).
+constexpr kj::StringPtr YOUNG500_THEN_STRING =
+    "const a = ' '.repeat(5e8); a.indexOf('z'); globalThis.kept = a;"
+    "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
 constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
     "globalThis.kept = []; for (let i = 0; i < 1013; ++i) kept.push(new Array(16300).fill(1.5));"
     "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
@@ -485,16 +493,18 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
   auto selected = getenv("COWORKERD_THREADED_ALLOCATION_CHILD");
   if (selected == nullptr) return;
   kj::StringPtr spec(selected);
-  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array|live126|live86k|live128k>");
+  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array|live126|live86k|live128k|young500>");
   auto count = kj::str(spec.first(colon)).parseAs<uint>();
   auto kind = spec.slice(colon + 1);
   KJ_REQUIRE(count > 0 && count <= 8 &&
-      (kind == "string" || kind == "array" || kind == "live126" || kind == "live86k" || kind == "live128k"));
+      (kind == "string" || kind == "array" || kind == "live126" || kind == "live86k" || kind == "live128k" ||
+          kind == "young500"));
   simultaneousAllocations(count,
       kind == "array"          ? NEAR_GIB_ARRAY
           : kind == "live126"  ? LIVE126_THEN_STRING
           : kind == "live86k"  ? LIVE126_86K_THEN_STRING
           : kind == "live128k" ? LIVE126_128K_THEN_STRING
+          : kind == "young500" ? YOUNG500_THEN_STRING
                                : NEAR_GIB_STRING);
   fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
   fflush(stdout);
@@ -572,6 +582,12 @@ KJ_TEST("126 MiB live in 86 KiB objects then one near-GiB object preserves the p
 
 KJ_TEST("126 MiB live in objects near 128 KiB then one near-GiB object preserves the process") {
   auto child = runAllocationChild("1:live128k");
+  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
+  KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
+}
+
+KJ_TEST("a 500 MB young object then one near-GiB object preserves the process") {
+  auto child = runAllocationChild("1:young500");
   KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
   KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
 }
