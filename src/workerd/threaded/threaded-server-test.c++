@@ -510,7 +510,8 @@ KJ_TEST("HTTP entry evidence comes from delivered requests, not canceled probes"
   httpEntryObserver(input.get(), "", headers, callId, fds[1])->delivered();
   auto count = read(fds[0], buffer, sizeof(buffer));
   KJ_ASSERT(count > 0);
-  auto line = kj::StringPtr(buffer, count);
+  auto stored = kj::str(kj::arrayPtr(buffer, count));
+  auto line = stored.asPtr();
   KJ_ASSERT(line.startsWith("[tenant-entry] ") && line.endsWith("\n"));
   JsonDoc row(kj::str(line.slice(strlen("[tenant-entry] "), line.size() - 1)));
   KJ_EXPECT(text(row.get(), "serverId") == "s2");
