@@ -80,6 +80,13 @@ class V8PlatformWrapper: public v8::Platform {
     return inner.GetThreadIsolatedAllocator();
   }
 
+  // Forward to the inner platform: with the V8 sandbox, a reserved zero segment (the first 4 GiB
+  // and the padding past them) is what lets V8 classify the sandbox as secure
+  // (v8::V8::GetSandboxMode()).
+  size_t GetZeroSegmentSize() override {
+    return inner.GetZeroSegmentSize();
+  }
+
  private:
   v8::Platform& inner;
 

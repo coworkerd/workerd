@@ -23,10 +23,13 @@ struct MemoryExecution {
 };
 
 // V8 retains shared allocator ownership until the last backing store is freed.
+// `group` is the isolate's group: with the V8 sandbox and one sandbox per group, backing stores
+// must lie in that group's sandbox (V8 checks it), so the allocator allocates there and keeps the
+// group, and with it the sandbox, alive.
 class IsolateMemoryLimit final: public v8::ArrayBuffer::Allocator, public std::enable_shared_from_this<IsolateMemoryLimit> {
  public:
   static constexpr size_t HEADROOM = 8ull << 20;
-  IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state);
+  IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state, const v8::IsolateGroup& group);
   ~IsolateMemoryLimit() noexcept override;
   void* Allocate(size_t length) override;
   void* AllocateUninitialized(size_t length) override;
@@ -52,6 +55,7 @@ class IsolateMemoryLimit final: public v8::ArrayBuffer::Allocator, public std::e
   static void gc(v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void* data);
   static void oom(const char*, const v8::OOMDetails&);
   IsolateLimitState state;
+  v8::IsolateGroup group;
   v8::ArrayBuffer::Allocator* inner;
   v8::Isolate* isolate = nullptr;
 };

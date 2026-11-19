@@ -14,7 +14,7 @@
 
 #include <v8-cppgc.h>
 
-#ifdef V8_ENABLE_SANDBOX
+#if defined(V8_ENABLE_SANDBOX) && defined(WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY)
 #include <sys/mman.h>
 #endif
 
@@ -719,7 +719,10 @@ void ContextGlobal::setSchemaLoader(const capnp::SchemaLoader& schemaLoader) {
   this->schemaLoader = schemaLoader;
 }
 
-#ifdef V8_ENABLE_SANDBOX
+// v8::Isolate::GetMemoryProtectionKey() is not part of upstream V8: with upstream V8 and the
+// sandbox, MemoryProtectionKeyScope stays the no-op it is without the sandbox. Define
+// WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY only with a V8 that has that API.
+#if defined(V8_ENABLE_SANDBOX) && defined(WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY)
 // These are disabled by default in workerd. We do not build workerd with
 // the V8_ENABLED_SANDBOX flag. If we do decide to enable it, we will need
 // additional setup to ensure that these are handled correctly on all platforms.

@@ -21,7 +21,7 @@ class WorkerdPlatform final: public v8::Platform {
  public:
   // This takes a reference to its wrapped platform because otherwise we would have to destroy a
   // kj::Own in our noexcept destructor (feasible but ugly).
-  explicit WorkerdPlatform(v8::Platform& inner): inner(inner) {}
+  explicit WorkerdPlatform(v8::Platform& inner);
 
   ~WorkerdPlatform() noexcept {}
 
@@ -77,6 +77,14 @@ class WorkerdPlatform final: public v8::Platform {
     return inner.GetTracingController();
   }
 
+  // With the V8 sandbox, V8 counts the sandbox as configured securely only when the first 4 GiB of
+  // the address space and 1 MiB past them can never be mapped, so that a Smi taken for a pointer
+  // faults. The constructor makes sure of that before V8 is initialized; this reports the size of
+  // that range, or 0.
+  size_t GetZeroSegmentSize() noexcept override {
+    return zeroSegmentSize;
+  }
+
   v8::ThreadIsolatedAllocator* GetThreadIsolatedAllocator() noexcept override {
     // Forward to the inner platform so that V8's ThreadIsolation can use PKU
     // (Memory Protection Keys) to enforce W^X on JIT code pages and
@@ -88,6 +96,7 @@ class WorkerdPlatform final: public v8::Platform {
 
  private:
   v8::Platform& inner;
+  size_t zeroSegmentSize = 0;
 };
 
 }  // namespace workerd::server

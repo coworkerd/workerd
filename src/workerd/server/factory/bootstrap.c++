@@ -6,6 +6,7 @@
 #include "coworkerd-wal-shipper.h"
 #include "coworkerd-parent-death.h"
 #include "coworkerd-channels.h"
+#include "coworkerd-sandbox.h"
 
 #include "worker-factory.h"
 
@@ -187,6 +188,8 @@ class Bootstrap {
     v8Platform = kj::heap<WorkerdPlatform>(*platform);
     v8System = kj::heap<jsg::V8System>(*v8Platform,
         KJ_MAP(flag, config.getV8Flags()) -> kj::StringPtr { return flag; }, platform.get());
+    // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker.
+    requireSecureSandbox();
   }
 
   // Ends the --async-trace file. The factory is destroyed first, ending every context, so the exit
