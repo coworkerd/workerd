@@ -192,9 +192,14 @@ static_assert(MAX_SINGLE_HEAP_OBJECT < (2ull << 30));
 
 int limitEventFd();
 thread_local const char *currentOomReport = nullptr;
+// The executing isolate's heap at its last collection. V8 collects before a
+// fatal OOM, so this is the heap of the isolate whose allocation failed.
+thread_local const std::atomic<uint64_t> *currentOomHeap = nullptr;
 struct OomReportScope {
-  explicit OomReportScope(kj::StringPtr identity, uint32_t memoryMiB)
+  explicit OomReportScope(
+      kj::StringPtr identity, uint32_t memoryMiB, const std::atomic<uint64_t> *heap = nullptr)
       : previous(currentOomReport),
+        previousHeap(currentOomHeap),
         report(kj::str("{\"event\":\"memory-culprit\",\"pid\":",
             getpid(),
             ",",
@@ -204,11 +209,14 @@ struct OomReportScope {
             "}\n")) {
     (void)limitEventFd();
     currentOomReport = report.cStr();
+    currentOomHeap = heap;
   }
   ~OomReportScope() {
     currentOomReport = previous;
+    currentOomHeap = previousHeap;
   }
   const char *previous;
+  const std::atomic<uint64_t> *previousHeap;
   kj::String report;
 };
 
@@ -554,7 +562,21 @@ bool writeLimitRow(kj::StringPtr event,
     }
   };
   if (length > 0 && size_t(length) < sizeof(unknown)) emit(unknown, size_t(length));
-  if (currentOomReport) emit(currentOomReport, strlen(currentOomReport));
+  if (currentOomReport) {
+    // Every isolate's heap shares one pointer cage: the isolate whose
+    // allocation failed may be far below its own limit while others filled the
+    // cage. The node attributes the exit only to an isolate at its limit.
+    auto size = strlen(currentOomReport);
+    char row[4096];
+    int written = currentOomHeap && size >= 2 && size < sizeof(row) - 64
+        ? snprintf(row, sizeof(row), "%.*s,\"oomIsolateHeapBytes\":%llu}\n", int(size - 2),
+              currentOomReport, (unsigned long long)currentOomHeap->load())
+        : -1;
+    if (written > 0 && size_t(written) < sizeof(row))
+      emit(row, size_t(written));
+    else
+      emit(currentOomReport, size);
+  }
   _exit(74);
 }
 
@@ -778,7 +800,7 @@ struct CpuExecution {
       : cause(cause),
         memory(std::move(memory)),
         previousCause(this->memory ? this->memory->currentCause : nullptr),
-        oom(identity, memoryMiB),
+        oom(identity, memoryMiB, this->memory ? &this->memory->heap : nullptr),
         entry{.isolate = isolate,
           .cause = cause,
           .memory = std::move(memoryState),
@@ -1265,7 +1287,7 @@ kj::Maybe<kj::String> sourceJsonFailure(kj::StringPtr input, IsolateLimits &limi
   // Run the same JSON decoder as a Worker, only after the protocol decoder
   // rejected the source response. Its temporary validation isolate belongs
   // to this load and uses its CPU, heap and process reservation.
-  OomReportScope oom(limits.identity, limits.memoryMiB);
+  OomReportScope oom(limits.identity, limits.memoryMiB, limits.memory ? &limits.memory->heap : nullptr);
   auto *isolate = v8::Isolate::New(limits.getCreateParams());
   KJ_DEFER(isolate->Dispose());
   limits.customizeIsolate(isolate);
@@ -2179,7 +2201,8 @@ struct ThreadedServer {
         slot.reservation);
     slot.limits = limits.get();
     slot.limitsOwner = kj::addRef(*limits);
-    OomReportScope oom(limits->identity, limits->memoryMiB);
+    OomReportScope oom(
+        limits->identity, limits->memoryMiB, limits->memory ? &limits->memory->heap : nullptr);
     isolateCreationAttempts.fetch_add(1);
     auto group = jsg::newIsolateGroup();
     const api::pyodide::PythonConfig python{
@@ -3273,7 +3296,8 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
     auto results = context.getResults().initAs<rpc::JsRpcTarget::CallResults>();
     auto &worker = *KJ_REQUIRE_NONNULL(slot->worker);
     auto asyncLock = co_await worker.takeAsyncLockWithoutRequest(SpanParent(nullptr));
-    OomReportScope oom(identity, slot->limits->memoryMiB);
+    OomReportScope oom(identity, slot->limits->memoryMiB,
+        slot->limits->memory ? &slot->limits->memory->heap : nullptr);
     worker.runInLockScope(asyncLock, [&](Worker::Lock &lock) {
       JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock &js) {
         auto placeholder = jsg::check(

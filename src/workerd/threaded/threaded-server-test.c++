@@ -458,12 +458,24 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
   fflush(stdout);
 }
 
-int runAllocationChild(kj::StringPtr spec) {
+struct ChildResult {
+  int status;
+  std::string events;  // the rows the child wrote to its limit event descriptor
+};
+ChildResult runAllocationChild(kj::StringPtr spec) {
   auto filter = kj::str("--filter=threaded-server-test.c++:", ALLOCATION_CHILD_LINE);
   auto selector = kj::str("COWORKERD_THREADED_ALLOCATION_CHILD=", spec);
+  // The child's limit event descriptor, as the node passes one to the server.
+  int events[2];
+  KJ_REQUIRE(pipe2(events, O_CLOEXEC) == 0);
+  int childEvents = fcntl(events[1], F_DUPFD, 100);
+  KJ_REQUIRE(childEvents >= 0);
+  auto eventFd = kj::str("COWORKERD_EVENT_FD=", childEvents);
   kj::Vector<char*> env;
-  for (char** at = environ; *at != nullptr; ++at) env.add(*at);
+  for (char** at = environ; *at != nullptr; ++at)
+    if (!kj::StringPtr(*at).startsWith("COWORKERD_EVENT_FD=")) env.add(*at);
   env.add(selector.begin());
+  env.add(eventFd.begin());
   env.add(nullptr);
   char program[] = "/proc/self/exe";
   char* argv[] = {program, filter.begin(), nullptr};
@@ -471,6 +483,8 @@ int runAllocationChild(kj::StringPtr spec) {
   fflush(stderr);
   pid_t pid;
   KJ_REQUIRE(posix_spawn(&pid, program, nullptr, nullptr, argv, env.begin()) == 0);
+  close(childEvents);
+  close(events[1]);
   // A child that neither finishes nor exits within a minute is a failure of
   // its own kind (reported as killed by SIGKILL), never a silent pass.
   int status = 0;
@@ -482,16 +496,26 @@ int runAllocationChild(kj::StringPtr spec) {
     if (waited == 600) kill(pid, SIGKILL);
     usleep(100000);
   }
+  std::string rows;
+  char buffer[4096];
+  for (ssize_t n; (n = read(events[0], buffer, sizeof(buffer))) != 0;) {
+    if (n < 0 && errno == EINTR) continue;
+    KJ_REQUIRE(n > 0);
+    rows.append(buffer, n);
+  }
+  close(events[0]);
   fprintf(stdout, "ALLOCATION_CHILD spec=%s exited=%d code=%d signal=%d\n", spec.cStr(),
       WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
       WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+  fprintf(stdout, "ALLOCATION_CHILD_EVENTS %zu bytes\n%s", rows.size(), rows.c_str());
   fflush(stdout);
-  return status;
+  return {status, kj::mv(rows)};
 }
 
 KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
-  auto status = runAllocationChild("1:string");
-  KJ_EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0, status);
+  auto child = runAllocationChild("1:string");
+  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
+  KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
 }
 
 // KNOWN FAILURE until each isolate has its own pointer cage (S3): every heap
@@ -500,11 +524,24 @@ KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker
 // V8's fatal OOM then ends the process (exit 74). This test passes while the
 // failure reproduces and fails when it stops, so the status is updated.
 KJ_TEST("four simultaneous near-GiB heap objects end the process (known failure until S3)") {
-  auto status = runAllocationChild("4:string");
-  bool reproduced = WIFEXITED(status) && WEXITSTATUS(status) == 74;
+  auto child = runAllocationChild("4:string");
+  bool reproduced = WIFEXITED(child.status) && WEXITSTATUS(child.status) == 74;
   fprintf(stdout, "KNOWN_FAILURE four-simultaneous-near-GiB reproduced=%d\n", reproduced);
   fflush(stdout);
-  KJ_EXPECT(reproduced, "the known failure changed; update its status", status);
+  KJ_EXPECT(reproduced, "the known failure changed; update its status", child.status);
+  // The OOM row names the execution whose allocation failed and carries its
+  // isolate's heap: far below that Worker's 128 MiB limit, because the other
+  // isolates filled the shared cage. The node must not blame it.
+  if (reproduced) {
+    auto at = child.events.find("\"event\":\"memory-culprit\"");
+    KJ_ASSERT(child.events.find("\"event\":\"memory-oom-undetermined\"") != std::string::npos);
+    KJ_ASSERT(at != std::string::npos, "the OOM thread was executing a Worker");
+    auto line = child.events.substr(at, child.events.find('\n', at) - at);
+    auto field = line.find("\"oomIsolateHeapBytes\":");
+    KJ_ASSERT(field != std::string::npos, line.c_str());
+    auto heap = strtoull(line.c_str() + field + strlen("\"oomIsolateHeapBytes\":"), nullptr, 10);
+    KJ_EXPECT(heap > 0 && heap < (128ull << 20), heap, line.c_str());
+  }
 }
 
 KJ_TEST("deadline decimal spelling and native refusal mappings") {
