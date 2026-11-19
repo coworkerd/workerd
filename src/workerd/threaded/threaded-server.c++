@@ -1238,6 +1238,45 @@ CompatibilityFlags::Builder compileTenantFlags(
   return flags;
 }
 
+kj::Maybe<kj::String> sourceJsonFailure(kj::StringPtr input, IsolateLimits &limits) {
+  // Run the same JSON decoder as a Worker, only after the protocol decoder
+  // rejected the source response. Its temporary validation isolate belongs
+  // to this load and uses its CPU, heap and process reservation.
+  OomReportScope oom(limits.identity, limits.memoryMiB);
+  auto *isolate = v8::Isolate::New(limits.getCreateParams());
+  KJ_DEFER(isolate->Dispose());
+  limits.customizeIsolate(isolate);
+  v8::Locker locker(isolate);
+  v8::Isolate::Scope entered(isolate);
+  v8::HandleScope handles(isolate);
+  auto context = v8::Context::New(isolate);
+  v8::Context::Scope inContext(context);
+  std::atomic<LimitCause> cause{LimitCause::NONE};
+  CpuExecution execution(isolate, cause, limits.memoryState, limits.memory, 0, limits.cpuMs,
+      limits.memoryMiB, limits.identity);
+  v8::TryCatch caught(isolate);
+  v8::Local<v8::String> text;
+  v8::Local<v8::Value> value;
+  kj::Maybe<kj::String> failure = kj::none;
+  if (!v8::String::NewFromUtf8(isolate, input.begin(), v8::NewStringType::kNormal, input.size())
+           .ToLocal(&text) ||
+      !v8::JSON::Parse(context, text).ToLocal(&value)) {
+    if (limits.memoryState->load() == LimitCause::MEMORY)
+      failure = kj::str("MEMORY_LIMIT_EXCEEDED");
+    else if (cause.load() == LimitCause::CPU)
+      failure = kj::str("CPU_LIMIT_EXCEEDED");
+    else if (cause.load() == LimitCause::PROCESS_MEMORY) {
+      execution.finish();
+      kj::throwRecoverableException(capacityError());
+    } else {
+      v8::String::Utf8Value description(isolate, caught.Exception());
+      if (*description) failure = kj::str(kj::StringPtr(*description, description.length()));
+    }
+  }
+  execution.finish();
+  return failure;
+}
+
 void ThreadState::acceptDeadline(kj::StringPtr descriptor) {
   JsonDoc document(descriptor);
   auto value = field(field(document.get(), "lease"), "expiresAtMonotonicMs");
@@ -1605,7 +1644,7 @@ struct ThreadedServer {
             configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
             limit)),
         tenantBudget(std::make_shared<TenantBudget>(
-            configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 16))),
+            configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 13))),
         subrequestBudget(limit, tenantBudget->limit) {
     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
     resources->reclaimWake = managerWake;
@@ -2038,13 +2077,26 @@ struct ThreadedServer {
     }
     auto content = co_await response.body->readAllText(256u << 20);
     slot.loadStage = threaded::LoadStage::DECODE;
-    JsonDoc source(content);
+    std::unique_ptr<JsonDoc> source;
+    try {
+      source = std::make_unique<JsonDoc>(content);
+    } catch (kj::Exception &error) {
+      IsolateLimits limits(workerLimit(descriptor, "cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
+          workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"),
+          invocationIdentity(slot, descriptor), slot.reservation);
+      isolateCreationAttempts.fetch_add(1);
+      KJ_IF_SOME(failure, sourceJsonFailure(content, limits)) {
+        kj::throwRecoverableException(
+            kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::mv(failure)));
+      }
+      kj::throwRecoverableException(kj::mv(error));
+    }
     slot.loadStage = threaded::LoadStage::PACKAGE;
-    KJ_REQUIRE(text(source.get(), "workerId") == text(descriptor, "workerId") &&
-            text(source.get(), "versionId") == text(descriptor, "versionId") &&
-            text(source.get(), "contentHash") == text(descriptor, "contentHash"),
+    KJ_REQUIRE(text(source->get(), "workerId") == text(descriptor, "workerId") &&
+            text(source->get(), "versionId") == text(descriptor, "versionId") &&
+            text(source->get(), "contentHash") == text(descriptor, "contentHash"),
         "Trusted source identity mismatch");
-    co_return text(source.get(), "source");
+    co_return text(source->get(), "source");
   }
 
   kj::Own<Worker> compile(Slot &slot, Json::Reader descriptor, kj::StringPtr source) {
@@ -3274,7 +3326,6 @@ PreparedInvocation prepareInvocation(ThreadState &state,
       true, kj::mv(tracer), kj::mv(cf), kj::none);
   return {kj::mv(entry), kj::mv(invocation)};
 }
-
 
 kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
   KJ_REQUIRE(!used, "one event per invocation");

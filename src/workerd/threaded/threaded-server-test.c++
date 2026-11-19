@@ -430,6 +430,19 @@ KJ_TEST("validation reports retain the original JavaScript exception") {
   KJ_EXPECT(rejected);
 }
 
+KJ_TEST("source JSON failures preserve the actual Worker decoder exception") {
+  initializeV8();
+  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr);
+  bool failed = false;
+  KJ_IF_SOME(error, sourceJsonFailure("not JSON", limits)) {
+    failed = true;
+    KJ_EXPECT(error == "SyntaxError: Unexpected token 'o', \"not JSON\" is not valid JSON");
+  }
+  KJ_EXPECT(failed);
+  IsolateLimits valid(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr);
+  KJ_EXPECT(sourceJsonFailure("{}", valid) == kj::none);
+}
+
 KJ_TEST("compatibility refusals are tenant validation before package decoding") {
   Slot slot;
   Reporter reporter;
