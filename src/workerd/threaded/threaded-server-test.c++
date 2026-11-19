@@ -4,9 +4,16 @@
 #include "threaded-server.c++"
 #undef main
 
+#include <spawn.h>
 #include <sys/wait.h>
 
 #include <kj/test.h>
+#include <kj/timer.h>
+
+#include <barrier>
+#include <future>
+
+extern char** environ;
 
 namespace workerd {
 namespace {
@@ -341,6 +348,165 @@ KJ_TEST("continuous heap growth preserves the process") {
       "globalThis.retained=[]; while(true) retained.push(new Array(50000).fill(7))");
 }
 
+// One V8 heap object of about 1 GiB (a flattened two-byte string of the
+// maximum length) with almost nothing else live, and the dictionary-to-array
+// growth of a 128 Mi-element array (about 0.6 GiB live while it asks for 1 GiB).
+constexpr kj::StringPtr NEAR_GIB_STRING =
+    "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
+constexpr kj::StringPtr NEAR_GIB_ARRAY =
+    "globalThis.retained = new Array(128*1024*1024-8192).fill(1.5)"_kj;
+
+// `count` isolates allocate at the same moment while a neighbor isolate keeps
+// answering. Every heap of this build shares one pointer cage.
+void simultaneousAllocations(size_t count, kj::StringPtr code) {
+  initializeV8();
+  auto budget = std::make_shared<ResourceBudget>(16ull << 30, 8, count + 1);
+  std::vector<kj::Own<IsolateLimits>> limits;
+  std::vector<v8::Isolate*> isolates;
+  std::vector<uint64_t> peaks(count);
+  std::vector<char> refused(count);
+  for (size_t i = 0; i < count; ++i) {
+    auto reservation = std::make_shared<ResourceReservation>(budget, 128);
+    KJ_ASSERT(reservation->registerPreparation());
+    limits.push_back(kj::refcounted<IsolateLimits>(
+        10000, 128, kj::str("\"workerId\":\"a/large-", i, "\","), reservation));
+    isolates.push_back(v8::Isolate::New(jsg::newIsolateGroup(), limits[i]->getCreateParams()));
+    limits[i]->customizeIsolate(isolates[i]);
+  }
+  KJ_DEFER(for (auto* isolate : isolates) isolate->Dispose());
+  // No resident is idle during this test. Wake growers just as a maintenance
+  // pass with no eviction candidate does, without holding their reservation lock.
+  std::atomic<bool> finished{false};
+  std::thread maintenance([&] {
+    while (!finished.load()) {
+      if (budget->reclaimRequested.exchange(false)) budget->finishReclaim(true);
+      std::this_thread::yield();
+    }
+  });
+  KJ_DEFER(finished.store(true); maintenance.join());
+  IsolateLimits neighborLimits(1000, 32, kj::str("\"workerId\":\"a/neighbor\","), nullptr);
+  auto* neighbor = v8::Isolate::New(jsg::newIsolateGroup(), neighborLimits.getCreateParams());
+  KJ_DEFER(neighbor->Dispose());
+  neighborLimits.customizeIsolate(neighbor);
+  auto checkNeighbor = [&] {
+    v8::Locker lock(neighbor);
+    v8::Isolate::Scope scope(neighbor);
+    v8::HandleScope handles(neighbor);
+    auto context = v8::Context::New(neighbor);
+    v8::Context::Scope entered(context);
+    auto source = v8::String::NewFromUtf8Literal(neighbor, "6 * 7");
+    auto script = v8::Script::Compile(context, source).ToLocalChecked();
+    KJ_EXPECT(script->Run(context).ToLocalChecked()->Int32Value(context).FromJust() == 42);
+  };
+  checkNeighbor();
+  const auto participants = static_cast<std::ptrdiff_t>(count + 1);
+  std::barrier start(participants), completed(participants), release(participants);
+  std::vector<std::thread> workers;
+  for (size_t i = 0; i < count; ++i)
+    workers.emplace_back([&, i] {
+      auto* isolate = isolates[i];
+      v8::Locker lock(isolate);
+      v8::Isolate::Scope scope(isolate);
+      v8::HandleScope handles(isolate);
+      auto context = v8::Context::New(isolate);
+      v8::Context::Scope entered(context);
+      auto source =
+          v8::String::NewFromUtf8(isolate, code.begin(), v8::NewStringType::kNormal, code.size())
+              .ToLocalChecked();
+      auto script = v8::Script::Compile(context, source).ToLocalChecked();
+      start.arrive_and_wait();
+      std::atomic<LimitCause> cause{LimitCause::NONE};
+      CpuExecution execution(isolate, cause, limits[i]->memoryState, limits[i]->memory, 0, 10000,
+          128, limits[i]->identity);
+      v8::TryCatch caught(isolate);
+      auto result = script->Run(context);
+      completed.arrive_and_wait();
+      release.arrive_and_wait();
+      caught.Reset();
+      execution.finish();
+      peaks[i] = limits[i]->memory->peakUsedBytes.load();
+      refused[i] = limits[i]->memoryState->load() == LimitCause::MEMORY ||
+          cause.load() == LimitCause::PROCESS_MEMORY;
+    });
+  start.arrive_and_wait();
+  checkNeighbor();
+  completed.arrive_and_wait();
+  checkNeighbor();
+  release.arrive_and_wait();
+  for (auto& worker: workers) worker.join();
+  for (size_t i = 0; i < count; ++i) {
+    KJ_EXPECT(refused[i] && peaks[i] >= (128ull << 20), i, peaks[i]);
+    fprintf(stdout, "CONCURRENT_HEAP worker=%zu peak=%llu separateCages=%d\n", i,
+        static_cast<unsigned long long>(peaks[i]), v8::IsolateGroup::CanCreateNewGroups());
+  }
+  checkNeighbor();
+}
+
+// Scenarios that can end the process run in a fresh copy of this binary,
+// selected by the parent through the environment; otherwise this is a no-op.
+constexpr uint ALLOCATION_CHILD_LINE = __LINE__ + 1;
+KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a parent test") {
+  auto selected = getenv("COWORKERD_THREADED_ALLOCATION_CHILD");
+  if (selected == nullptr) return;
+  kj::StringPtr spec(selected);
+  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array>");
+  auto count = kj::str(spec.first(colon)).parseAs<uint>();
+  auto kind = spec.slice(colon + 1);
+  KJ_REQUIRE(count > 0 && count <= 8 && (kind == "string" || kind == "array"));
+  simultaneousAllocations(count, kind == "array" ? NEAR_GIB_ARRAY : NEAR_GIB_STRING);
+  fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
+  fflush(stdout);
+}
+
+int runAllocationChild(kj::StringPtr spec) {
+  auto filter = kj::str("--filter=threaded-server-test.c++:", ALLOCATION_CHILD_LINE);
+  auto selector = kj::str("COWORKERD_THREADED_ALLOCATION_CHILD=", spec);
+  kj::Vector<char*> env;
+  for (char** at = environ; *at != nullptr; ++at) env.add(*at);
+  env.add(selector.begin());
+  env.add(nullptr);
+  char program[] = "/proc/self/exe";
+  char* argv[] = {program, filter.begin(), nullptr};
+  fflush(stdout);
+  fflush(stderr);
+  pid_t pid;
+  KJ_REQUIRE(posix_spawn(&pid, program, nullptr, nullptr, argv, env.begin()) == 0);
+  // A child that neither finishes nor exits within a minute is a failure of
+  // its own kind (reported as killed by SIGKILL), never a silent pass.
+  int status = 0;
+  for (unsigned waited = 0;; ++waited) {
+    auto done = waitpid(pid, &status, WNOHANG);
+    if (done < 0 && errno == EINTR) continue;
+    KJ_REQUIRE(done == pid || done == 0);
+    if (done == pid) break;
+    if (waited == 600) kill(pid, SIGKILL);
+    usleep(100000);
+  }
+  fprintf(stdout, "ALLOCATION_CHILD spec=%s exited=%d code=%d signal=%d\n", spec.cStr(),
+      WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+      WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+  fflush(stdout);
+  return status;
+}
+
+KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
+  auto status = runAllocationChild("1:string");
+  KJ_EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0, status);
+}
+
+// KNOWN FAILURE until each isolate has its own pointer cage (S3): every heap
+// of this V8 build shares one 4 GiB cage, and the hard reserve that lets one
+// isolate finish a maximum-sized object cannot be granted to four at once.
+// V8's fatal OOM then ends the process (exit 74). This test passes while the
+// failure reproduces and fails when it stops, so the status is updated.
+KJ_TEST("four simultaneous near-GiB heap objects end the process (known failure until S3)") {
+  auto status = runAllocationChild("4:string");
+  bool reproduced = WIFEXITED(status) && WEXITSTATUS(status) == 74;
+  fprintf(stdout, "KNOWN_FAILURE four-simultaneous-near-GiB reproduced=%d\n", reproduced);
+  fflush(stdout);
+  KJ_EXPECT(reproduced, "the known failure changed; update its status", status);
+}
+
 KJ_TEST("deadline decimal spelling and native refusal mappings") {
   for (auto literal: {"123456789.12345679", "123456789.12345678", "9007199254740991",
          "1.2345678901234567e+12", "1e+09", "0.00100", "0"}) {
@@ -476,18 +642,92 @@ KJ_TEST("compatibility refusals are tenant validation before package decoding") 
   KJ_EXPECT(!compileTenantFlags(validSlot, valid.get(), validReporter).getPreciseTimers());
 }
 
-KJ_TEST("waitUntil drain preserves work after child-call authority expires") {
+KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after the response") {
   initializeV8();
-  auto io = kj::setupAsyncIo();
-  Timer timer(io.provider->getTimer());
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+  Timer timer(clock);
   IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/background\","), nullptr);
   Slot slot;
   slot.limits = &isolateLimits;
   Measurement measurement;
   RequestLimits limits(slot, measurement, timer, kj::str("\"workerId\":\"a/background\","));
+  KJ_EXPECT(WAIT_UNTIL_LIMIT == 30 * kj::SECONDS);
+  // limitDrain() is called when the response has ended. A 2 s child-call
+  // lease and later waitUntil work (the 2.4 s legacy trigger) stay inside it.
   auto drain = limits.limitDrain();
-  io.provider->getTimer().afterDelay(2 * kj::MILLISECONDS).wait(io.waitScope);
-  KJ_EXPECT(!drain.poll(io.waitScope));
+  clock.advanceTo(clock.now() + 2400 * kj::MILLISECONDS);
+  KJ_EXPECT(!drain.poll(waitScope));
+  clock.advanceTo(kj::origin<kj::TimePoint>() + WAIT_UNTIL_LIMIT - 1 * kj::MILLISECONDS);
+  KJ_EXPECT(!drain.poll(waitScope));
+  clock.advanceTo(kj::origin<kj::TimePoint>() + WAIT_UNTIL_LIMIT);
+  bool ended = drain.poll(waitScope);
+  KJ_EXPECT(ended, "waitUntil work must end at the drain limit");
+  if (ended) drain.wait(waitScope);
+}
+
+KJ_TEST("a call thread cancels background work that outlives the drain limit") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+  Errors errors;
+  kj::TaskSet tasks(errors);
+  // Work that ends in time is awaited, not canceled.
+  auto finished = kj::newPromiseAndFulfiller<void>();
+  tasks.add(kj::mv(finished.promise));
+  auto settled = settleBackground(clock, tasks);
+  clock.advanceTo(clock.now() + WAIT_UNTIL_LIMIT);
+  KJ_EXPECT(!settled.poll(waitScope));
+  finished.fulfiller->fulfill();
+  bool awaited = settled.poll(waitScope);
+  KJ_EXPECT(awaited);
+  if (awaited) settled.wait(waitScope);
+  KJ_EXPECT(tasks.isEmpty());
+  // A task that never ends (a timer loop the drain failed to cancel) holds
+  // the thread only until the backstop, then it is canceled.
+  bool canceled = false;
+  tasks.add(kj::Promise<void>(kj::NEVER_DONE).attach(kj::defer([&canceled] { canceled = true; })));
+  auto start = clock.now();
+  auto backstop = settleBackground(clock, tasks);
+  clock.advanceTo(start + BACKGROUND_BACKSTOP - 1 * kj::MILLISECONDS);
+  KJ_EXPECT(!backstop.poll(waitScope) && !canceled);
+  clock.advanceTo(start + BACKGROUND_BACKSTOP);
+  bool returned = backstop.poll(waitScope);
+  KJ_EXPECT(returned, "the call thread must return at the backstop");
+  if (returned) backstop.wait(waitScope);
+  KJ_EXPECT(canceled && tasks.isEmpty());
+  KJ_EXPECT(BACKGROUND_BACKSTOP > WAIT_UNTIL_LIMIT);
+}
+
+KJ_TEST("a reclaim requested during maintenance never waits for that pass") {
+  initializeV8();
+  auto budget = std::make_shared<ResourceBudget>(2ull << 30, 4, 1);
+  std::promise<bool> result;
+  auto future = result.get_future();
+  // An eviction inside the pass can reach reserve()/observe(); simulate that
+  // call on the maintenance thread itself.
+  std::thread maintenance([&] {
+    ResourceBudget::maintaining = true;
+    result.set_value(budget->reclaim(1));
+    ResourceBudget::maintaining = false;
+  });
+  bool returned = future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  KJ_EXPECT(returned, "the maintenance thread waited for its own reclaim pass");
+  if (!returned) budget->finishReclaim(true);
+  maintenance.join();
+  KJ_EXPECT(!future.get() && budget->reclaimRequested.load());
+  // Any other thread still waits for a completed pass.
+  std::atomic<bool> stop{false};
+  std::thread pass([&] {
+    while (!stop.load()) {
+      if (budget->reclaimRequested.exchange(false)) budget->finishReclaim(false);
+      std::this_thread::yield();
+    }
+  });
+  KJ_EXPECT(budget->reclaim(1));
+  stop.store(true);
+  pass.join();
 }
 
 KJ_TEST("HTTP entry evidence comes from delivered requests, not canceled probes") {

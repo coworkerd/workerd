@@ -178,6 +178,10 @@ struct Channels;
 
 enum class LimitCause { NONE, CPU, MEMORY, PROCESS_MEMORY };
 using LimitState = std::shared_ptr<std::atomic<LimitCause>>;
+// waitUntil work may run this long after its response ended (as on
+// Cloudflare); the backstop adds a margin for cancellation to complete.
+constexpr kj::Duration WAIT_UNTIL_LIMIT = 30 * kj::SECONDS;
+constexpr kj::Duration BACKGROUND_BACKSTOP = WAIT_UNTIL_LIMIT + 5 * kj::SECONDS;
 constexpr uint64_t MAX_FIXED_ARRAY_ELEMENTS = 128ull * 1024 * 1024;
 constexpr uint64_t MAX_SINGLE_HEAP_OBJECT =
     (uint64_t(v8::String::kMaxLength) * sizeof(uint16_t) > MAX_FIXED_ARRAY_ELEMENTS * sizeof(double)
@@ -251,10 +255,16 @@ struct ResourceBudget {
       (void)!write(reclaimWake, &one, sizeof(one));
     }
   }
+  // Set while this thread runs a maintenance pass, the only place a reclaim
+  // completes. An eviction there can enter GC callbacks and the allocator.
+  static inline thread_local bool maintaining = false;
   bool reclaim(uint64_t additionalMemory = 0) {
     std::unique_lock lock(mutex);
     auto epoch = reclaimEpoch;
     requestReclaimLocked(additionalMemory);
+    // Never wait for the pass this thread is running; the request stays
+    // pending for the next pass and this caller sees no idle Worker.
+    if (maintaining) return false;
     reclaimed.wait(lock, [&] { return reclaimEpoch != epoch; });
     return !noIdleAtLastReclaim;
   }
@@ -1068,9 +1078,10 @@ struct RequestLimits final: LimitEnforcer {
     unsupported("analytics");
   }
   kj::Promise<void> limitDrain() override {
-    // A lease expires the authority to make child calls. It does not cancel
-    // this invocation's waitUntil work, which still has its CPU/heap limits.
-    return kj::NEVER_DONE;
+    // Called when the response has ended. A lease expires the authority to
+    // make child calls, not this invocation's waitUntil work, which keeps its
+    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT later.
+    return timer.afterLimitTimeout(WAIT_UNTIL_LIMIT);
   }
   kj::Promise<void> limitScheduled() override {
     return kj::NEVER_DONE;
@@ -1149,6 +1160,14 @@ struct Errors final: kj::TaskSet::ErrorHandler {
     KJ_LOG(ERROR, "threaded background task failed");
   }
 };
+
+// The drain limit above normally ends every waitUntil task. A call thread
+// still never waits longer for background work after its invocation ended:
+// past this bound the remaining tasks are canceled and the thread returns.
+kj::Promise<void> settleBackground(kj::Timer &timer, kj::TaskSet &tasks) {
+  return timer.timeoutAfter(BACKGROUND_BACKSTOP, tasks.onEmpty())
+      .catch_([&tasks](kj::Exception &&) { tasks.clear(); });
+}
 
 struct ThreadState {
   kj::AsyncIoContext io = kj::setupAsyncIo();
@@ -1653,6 +1672,8 @@ struct ThreadedServer {
   }
 
   void maintain() {
+    ResourceBudget::maintaining = true;
+    KJ_DEFER(ResourceBudget::maintaining = false);
     if (resources->reclaimRequested.exchange(false)) {
       bool noIdle = false;
       KJ_DEFER(resources->finishReclaim(noIdle));
@@ -2013,8 +2034,9 @@ struct ThreadedServer {
         if (exception.getType() != kj::Exception::Type::DISCONNECTED)
           KJ_LOG(INFO, "threaded invocation connection failed");
       }
-      auto backgroundError =
-          kj::runCatchingExceptions([&]() { state.tasks.onEmpty().wait(state.io.waitScope); });
+      auto backgroundError = kj::runCatchingExceptions([&]() {
+        settleBackground(state.io.provider->getTimer(), state.tasks).wait(state.io.waitScope);
+      });
       if (backgroundError != kj::none) state.tasks.clear();
       thread.invocation.store(false);
       thread.idleSince.store(nowNs());
@@ -3570,7 +3592,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
     }
     kj::throwRecoverableException(kj::mv(error));
   }
-  co_await state.tasks.onEmpty();
+  co_await settleBackground(state.io.provider->getTimer(), state.tasks);
 }
 
 void acceptLoop(ThreadedServer &server, int listener, int parent) {
