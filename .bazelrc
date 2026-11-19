@@ -102,6 +102,21 @@ build --@v8//:v8_temporal_capi=//deps/rust:temporal_capi
 # Room for every jsg::ContextDataSlot; V8 does not grow a context's embedder-data array.
 build --@v8//:v8_embedder_data_array_size=10
 
+# Coworkerd: the V8 sandbox with one sandbox per isolate group (--config=coworkerd-sandbox). Every
+# isolate gets its own pointer-compression cage, and with it its own 8 GiB sandbox: the 4 GiB cage
+# followed by 4 GiB for ArrayBuffer backing stores and Wasm memories. Without memory protection
+# keys the sandbox keeps V8's guard regions: 64 GiB in front and 64 GiB behind
+# (kSandboxGuardRegionSize: a 32-bit index scaled by 8 plus a bounded-size offset), without V8's
+# additional 224 GiB trailing guard, whose job V8's TypedArray access masks take over, as V8
+# does on Android (patches/v8/0055). One isolate then reserves 136 GiB of address space.
+# Every target compilation unit needs the same defines: V8's Bazel build has no sandbox option,
+# and the layout of V8's inline API depends on them. V8 requires libc++ hardening with its sandbox.
+build:coworkerd-sandbox --copt=-DV8_ENABLE_SANDBOX
+build:coworkerd-sandbox --copt=-DV8_SANDBOX_SIZE_LOG2=33
+build:coworkerd-sandbox --copt=-DV8_SANDBOX_TYPED_ARRAY_ACCESS_MASKS
+build:coworkerd-sandbox --@v8//:v8_enable_pointer_compression_shared_cage=False
+build:coworkerd-sandbox --cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST
+
 # Increasing the optimization level of V8 significantly speeds up tests using V8 a lot, especially
 # python tests. This is useful for both CI and local development and enabled by default, but still
 # kept in a separate configuration to make it easy to disable.

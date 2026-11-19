@@ -1783,8 +1783,11 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
   // The isolate of the Worker, or of the zygote that snapshots its startup.
   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
+    // The isolate's group first: with the V8 sandbox, each group has its own sandbox, in which the
+    // isolate's memory limit allocates its backing stores.
+    auto group = jsg::newIsolateGroup();
     impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
-        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->coworkerdIdentity,
+        kj::refcounted<NullIsolateLimitEnforcer>(), group, isolateName, impl->coworkerdIdentity,
         kj::str(spec.load_identity.startup_identity), impl->idleWorker,
         spec.runtime_config.size() != 0 ? &factory.timer : nullptr,
         spec.runtime_config.size() != 0 ? &factory.tasks : nullptr);
@@ -1797,7 +1800,7 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
       };
     };
     auto api = kj::heap<WorkerdApi>(factory.v8System, featureFlags, extensions,
-        limitEnforcer->getCreateParams(), jsg::newIsolateGroup(),
+        limitEnforcer->getCreateParams(), kj::mv(group),
         kj::atomicRefcounted<JsgIsolateObserver>(), *factory.memoryCacheProvider,
         options.pythonConfig, kj::mv(listeners), kj::mv(snapshotConfig));
     Worker::LoggingOptions isolateLoggingOptions = options.loggingOptions;

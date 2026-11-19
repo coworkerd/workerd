@@ -1,3 +1,4 @@
+load("//:build/kj_test.bzl", "kj_test")
 load("//:build/linking.bzl", "CC_LIBRARY_LINKSTATIC")
 load("//:build/wd_cc_library.bzl", "wd_cc_library")
 
@@ -32,6 +33,7 @@ wd_cc_library(
         "coworkerd-cpu-limit.h",
         "coworkerd-memory-limit.c++",
         "coworkerd-memory-limit.h",
+        "coworkerd-sandbox.c++",
         "coworkerd-steady.c++",
         "coworkerd-steady.h",
         "coworkerd-gc.c++",
@@ -44,7 +46,7 @@ wd_cc_library(
         "worker-factory-listen.c++",
         "worker-factory-rpc.c++",
     ],
-    hdrs = ["coworkerd-channels.h", "coworkerd-wal-shipper.h"],
+    hdrs = ["coworkerd-channels.h", "coworkerd-sandbox.h", "coworkerd-wal-shipper.h"],
     linkstatic = CC_LIBRARY_LINKSTATIC,
     deps = [
         ":worker-factory-hdrs",
@@ -124,4 +126,17 @@ wd_cc_library(
     # keeps when two libraries carry different ones: V8 is built without exceptions, and its copy
     # of libc++'s std::regex parser aborts where workerd's throws.
     alwayslink = True,
+)
+
+# The V8 sandbox of --config=coworkerd-sandbox: its layout, V8's secure mode for the process and for
+# every isolate group, and the embedder's placement of bytes in each group's sandbox.
+kj_test(
+    src = "coworkerd-sandbox-test.c++",
+    deps = [
+        ":worker-factory",
+        "//src/workerd/jsg",
+        "//src/workerd/server:v8-platform-impl",
+        # The factory's bridge reaches the Rust server, which links the bootstrap.
+        "//src/workerd/server/server:workerd-server",
+    ],
 )

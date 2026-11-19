@@ -18,10 +18,12 @@ namespace workerd::jsg {
 
 // A non-owning view of ArrayBuffer bytes. With the V8 sandbox enabled, the address is a 32-bit
 // offset into the 4 GiB immediately after the JS pointer cage. Backing-store allocators must
-// place the bytes in this second cage, with sandbox guard regions disabled. Construction
+// place the bytes in this second cage, with or without sandbox guard regions (the cage follows
+// the front guard region when V8 reserves one). Construction
 // aborts if a nonempty view cannot be encoded. Decoding uses the supplied isolate's cage base, so even
 // a corrupted offset cannot select another isolate group's memory. The 32-bit length bounds
-// overrun distance; it does not guarantee that the entire range remains inside the cage.
+// overrun distance; it does not guarantee that the entire range remains inside the cage. With
+// guard regions, an overrun past the cage ends in the sandbox's back guard region.
 // Without the sandbox, the view stores an ordinary pointer.
 class SandboxedBytes {
  public:
