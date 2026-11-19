@@ -462,6 +462,12 @@ struct TenantPermit {
   std::string tenant;
 };
 
+std::shared_ptr<TenantPermit> makeTenantPermit(
+    const std::shared_ptr<TenantBudget> &budget, std::string_view tenant) {
+  if (budget->limit == 0) return nullptr;
+  return std::make_shared<TenantPermit>(budget, std::string(tenant));
+}
+
 uint64_t configuredCount(const char *name, uint64_t fallback) {
   auto text = getenv(name);
   if (!text) return fallback;
@@ -1664,7 +1670,7 @@ struct ThreadedServer {
     auto worker = str(descriptor, "workerId");
     auto separator = worker.find('/');
     KJ_REQUIRE(separator != std::string::npos && separator > 0, "invalid trusted Worker tenant");
-    return std::make_shared<TenantPermit>(tenantBudget, worker.substr(0, separator));
+    return makeTenantPermit(tenantBudget, std::string_view(worker).substr(0, separator));
   }
 
   void maintain() {

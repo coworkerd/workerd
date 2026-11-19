@@ -137,8 +137,10 @@ KJ_TEST("tenant admission releases counts on errors and cancellation") {
   canceled = nullptr;
   KJ_EXPECT(budget->active.empty());
   auto disabled = std::make_shared<TenantBudget>(0);
-  TenantPermit a(disabled, "a"), b(disabled, "b"), a2(disabled, "a");
-  KJ_EXPECT(disabled->active["a"] == 2 && disabled->active["b"] == 1);
+  auto a = makeTenantPermit(disabled, "a");
+  auto b = makeTenantPermit(disabled, "b");
+  auto a2 = makeTenantPermit(disabled, "a");
+  KJ_EXPECT(!a && !b && !a2 && disabled->active.empty());
   const auto refusal = capacityError(CapacityScope::TENANT);
   const auto detail = KJ_REQUIRE_NONNULL(refusal.getDetail(CAPACITY_DETAIL));
   KJ_EXPECT(detail.size() == 1 && detail[0] == 1);
