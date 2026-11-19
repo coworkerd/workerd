@@ -381,7 +381,13 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
 
 // `count` isolates allocate at the same moment while a neighbor isolate keeps
 // answering. Every heap of this build shares one pointer cage.
-void simultaneousAllocations(size_t count, kj::StringPtr code) {
+// `raised`: whether each isolate's ceiling must have been raised by the
+// near-heap-limit callback (-1: not checked). The fragmentation reserve alone
+// must let one maximum object finish after up to 126 MiB live, so those
+// shapes never need the callback; only an object V8 placed without a
+// collection (the 500 MB young one) does. Without this check the callback
+// would hide a missing reserve.
+void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1) {
   initializeV8();
   auto budget = std::make_shared<ResourceBudget>(16ull << 30, 8, count + 1);
   std::vector<kj::Own<IsolateLimits>> limits;
@@ -480,8 +486,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code) {
   for (auto& worker: workers) worker.join();
   for (size_t i = 0; i < count; ++i) {
     KJ_EXPECT(refused[i] && peaks[i] >= (128ull << 20), i, peaks[i]);
-    fprintf(stdout, "CONCURRENT_HEAP worker=%zu peak=%llu separateCages=%d\n", i,
-        static_cast<unsigned long long>(peaks[i]), v8::IsolateGroup::CanCreateNewGroups());
+    const int ceilingRaised = limits[i]->memory->ceilingRaised.load();
+    if (raised >= 0) KJ_EXPECT(ceilingRaised == raised, i, ceilingRaised, raised);
+    fprintf(stdout, "CONCURRENT_HEAP worker=%zu peak=%llu separateCages=%d ceilingRaised=%d\n", i,
+        static_cast<unsigned long long>(peaks[i]), v8::IsolateGroup::CanCreateNewGroups(), ceilingRaised);
   }
   checkNeighbor();
 }
@@ -505,7 +513,8 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
           : kind == "live86k"  ? LIVE126_86K_THEN_STRING
           : kind == "live128k" ? LIVE126_128K_THEN_STRING
           : kind == "young500" ? YOUNG500_THEN_STRING
-                               : NEAR_GIB_STRING);
+                               : NEAR_GIB_STRING,
+      count == 1 ? int(kind == "young500") : -1);
   fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
   fflush(stdout);
 }
