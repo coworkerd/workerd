@@ -504,7 +504,7 @@ KJ_TEST("HTTP entry evidence comes from delivered requests, not canceled probes"
   char buffer[2048];
   httpEntryObserver(input.get(), "", headers, callId, fds[1])->delivered();
   KJ_EXPECT(read(fds[0], buffer, sizeof(buffer)) == -1 && errno == EAGAIN);
-  headers.set(callId, "probe-7");
+  headers.setPtr(callId, "probe-7");
   { auto canceled = httpEntryObserver(input.get(), "", headers, callId, fds[1]); }
   KJ_EXPECT(read(fds[0], buffer, sizeof(buffer)) == -1 && errno == EAGAIN);
   httpEntryObserver(input.get(), "", headers, callId, fds[1])->delivered();
@@ -512,7 +512,7 @@ KJ_TEST("HTTP entry evidence comes from delivered requests, not canceled probes"
   KJ_ASSERT(count > 0);
   auto line = kj::StringPtr(buffer, count);
   KJ_ASSERT(line.startsWith("[tenant-entry] ") && line.endsWith("\n"));
-  JsonDoc row(line.slice(strlen("[tenant-entry] "), line.size() - 1));
+  JsonDoc row(kj::str(line.slice(strlen("[tenant-entry] "), line.size() - 1)));
   KJ_EXPECT(text(row.get(), "serverId") == "s2");
   KJ_EXPECT(text(row.get(), "processId") == "p1");
   KJ_EXPECT(field(row.get(), "processGeneration").getNumber() == 3);
