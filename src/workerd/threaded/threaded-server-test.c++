@@ -476,5 +476,51 @@ KJ_TEST("compatibility refusals are tenant validation before package decoding") 
   KJ_EXPECT(!compileTenantFlags(validSlot, valid.get(), validReporter).getPreciseTimers());
 }
 
+KJ_TEST("waitUntil drain preserves work after child-call authority expires") {
+  initializeV8();
+  auto io = kj::setupAsyncIo();
+  Timer timer(io.provider->getTimer());
+  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/background\","), nullptr);
+  Slot slot;
+  slot.limits = &isolateLimits;
+  Measurement measurement;
+  RequestLimits limits(slot, measurement, timer, kj::str("\"workerId\":\"a/background\","));
+  auto drain = limits.limitDrain();
+  io.provider->getTimer().afterDelay(2 * kj::MILLISECONDS).wait(io.waitScope);
+  KJ_EXPECT(!drain.poll(io.waitScope));
+}
+
+KJ_TEST("HTTP entry evidence comes from delivered requests, not canceled probes") {
+  int fds[2];
+  KJ_ASSERT(pipe2(fds, O_NONBLOCK | O_CLOEXEC) == 0);
+  KJ_DEFER(close(fds[0]); close(fds[1]));
+  kj::HttpHeaderTable::Builder builder;
+  auto callId = builder.add("x-placement-call-id");
+  auto table = builder.build();
+  kj::HttpHeaders headers(*table);
+  JsonDoc input(kj::str("{\"serverId\":\"s2\",\"processId\":\"p1\","
+                        "\"processGeneration\":\"3\",\"workerId\":\"caller\",\"versionId\":\"v1\","
+                        "\"invocationId\":\"i7\",\"treeId\":\"t1\"}"));
+  char buffer[2048];
+  httpEntryObserver(input.get(), "", headers, callId, fds[1])->delivered();
+  KJ_EXPECT(read(fds[0], buffer, sizeof(buffer)) == -1 && errno == EAGAIN);
+  headers.set(callId, "probe-7");
+  { auto canceled = httpEntryObserver(input.get(), "", headers, callId, fds[1]); }
+  KJ_EXPECT(read(fds[0], buffer, sizeof(buffer)) == -1 && errno == EAGAIN);
+  httpEntryObserver(input.get(), "", headers, callId, fds[1])->delivered();
+  auto count = read(fds[0], buffer, sizeof(buffer));
+  KJ_ASSERT(count > 0);
+  auto line = kj::StringPtr(buffer, count);
+  KJ_ASSERT(line.startsWith("[tenant-entry] ") && line.endsWith("\n"));
+  JsonDoc row(line.slice(strlen("[tenant-entry] "), line.size() - 1));
+  KJ_EXPECT(text(row.get(), "serverId") == "s2");
+  KJ_EXPECT(text(row.get(), "processId") == "p1");
+  KJ_EXPECT(field(row.get(), "processGeneration").getNumber() == 3);
+  KJ_EXPECT(text(row.get(), "invocationId") == "i7");
+  KJ_EXPECT(text(row.get(), "target") == "caller@v1");
+  KJ_EXPECT(text(row.get(), "entrypoint") == "default");
+  KJ_EXPECT(text(row.get(), "callId") == "probe-7");
+}
+
 }  // namespace
 }  // namespace workerd
