@@ -350,11 +350,17 @@ KJ_TEST("continuous heap growth preserves the process") {
 
 // One V8 heap object of about 1 GiB (a flattened two-byte string of the
 // maximum length) with almost nothing else live, and the dictionary-to-array
-// growth of a 128 Mi-element array (about 0.6 GiB live while it asks for 1 GiB).
+// growth of a 128 Mi-element array (the first reproduction's shape; one alone
+// peaks at about 1.75 GiB and survives).
 constexpr kj::StringPtr NEAR_GIB_STRING =
     "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
 constexpr kj::StringPtr NEAR_GIB_ARRAY =
     "globalThis.retained = new Array(128*1024*1024-8192).fill(1.5)"_kj;
+// About 126 MiB live in small arrays (old-space pages, with their
+// fragmentation), just under the 128 MiB limit, then one maximum string.
+constexpr kj::StringPtr LIVE126_THEN_STRING =
+    "globalThis.kept = []; for (let i = 0; i < 126 * 128; ++i) kept.push(new Array(1024).fill(1.5));"
+    "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
 
 // `count` isolates allocate at the same moment while a neighbor isolate keeps
 // answering. Every heap of this build shares one pointer cage.
@@ -384,20 +390,38 @@ void simultaneousAllocations(size_t count, kj::StringPtr code) {
     }
   });
   KJ_DEFER(finished.store(true); maintenance.join());
-  IsolateLimits neighborLimits(1000, 32, kj::str("\"workerId\":\"a/neighbor\","), nullptr);
+  // The neighbor is an ordinary resident: its own reservation in the same
+  // budget and the default 128 MiB limit.
+  auto neighborReservation = std::make_shared<ResourceReservation>(budget, 128);
+  KJ_ASSERT(neighborReservation->registerPreparation());
+  IsolateLimits neighborLimits(
+      10000, 128, kj::str("\"workerId\":\"a/neighbor\","), neighborReservation);
   auto* neighbor = v8::Isolate::New(jsg::newIsolateGroup(), neighborLimits.getCreateParams());
   KJ_DEFER(neighbor->Dispose());
   neighborLimits.customizeIsolate(neighbor);
-  auto checkNeighbor = [&] {
+  auto runNeighbor = [&](kj::StringPtr code, int32_t expected) {
     v8::Locker lock(neighbor);
     v8::Isolate::Scope scope(neighbor);
     v8::HandleScope handles(neighbor);
     auto context = v8::Context::New(neighbor);
     v8::Context::Scope entered(context);
-    auto source = v8::String::NewFromUtf8Literal(neighbor, "6 * 7");
-    auto script = v8::Script::Compile(context, source).ToLocalChecked();
-    KJ_EXPECT(script->Run(context).ToLocalChecked()->Int32Value(context).FromJust() == 42);
+    std::atomic<LimitCause> cause{LimitCause::NONE};
+    CpuExecution execution(neighbor, cause, neighborLimits.memoryState, neighborLimits.memory, 0,
+        10000, 128, neighborLimits.identity);
+    v8::TryCatch caught(neighbor);
+    auto source =
+        v8::String::NewFromUtf8(neighbor, code.begin(), v8::NewStringType::kNormal, code.size())
+            .ToLocalChecked();
+    auto result = v8::Script::Compile(context, source).ToLocalChecked()->Run(context);
+    bool answered =
+        !result.IsEmpty() && result.ToLocalChecked()->Int32Value(context).FromJust() == expected;
+    caught.Reset();
+    execution.finish();
+    KJ_EXPECT(answered && cause.load() == LimitCause::NONE &&
+            neighborLimits.memoryState->load() == LimitCause::NONE,
+        code);
   };
+  auto checkNeighbor = [&] { runNeighbor("6 * 7"_kj, 42); };
   checkNeighbor();
   const auto participants = static_cast<std::ptrdiff_t>(count + 1);
   std::barrier start(participants), completed(participants), release(participants);
@@ -431,7 +455,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code) {
   start.arrive_and_wait();
   checkNeighbor();
   completed.arrive_and_wait();
+  // While the large objects are alive the neighbor still allocates 32 MiB.
   checkNeighbor();
+  runNeighbor("globalThis.kept = new Array(4 * 1024 * 1024).fill(1.5); kept.length"_kj,
+      4 * 1024 * 1024);
   release.arrive_and_wait();
   for (auto& worker: workers) worker.join();
   for (size_t i = 0; i < count; ++i) {
@@ -449,11 +476,14 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
   auto selected = getenv("COWORKERD_THREADED_ALLOCATION_CHILD");
   if (selected == nullptr) return;
   kj::StringPtr spec(selected);
-  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array>");
+  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array|live126>");
   auto count = kj::str(spec.first(colon)).parseAs<uint>();
   auto kind = spec.slice(colon + 1);
-  KJ_REQUIRE(count > 0 && count <= 8 && (kind == "string" || kind == "array"));
-  simultaneousAllocations(count, kind == "array" ? NEAR_GIB_ARRAY : NEAR_GIB_STRING);
+  KJ_REQUIRE(count > 0 && count <= 8 && (kind == "string" || kind == "array" || kind == "live126"));
+  simultaneousAllocations(count,
+      kind == "array"         ? NEAR_GIB_ARRAY
+          : kind == "live126" ? LIVE126_THEN_STRING
+                              : NEAR_GIB_STRING);
   fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
   fflush(stdout);
 }
@@ -512,6 +542,14 @@ ChildResult runAllocationChild(kj::StringPtr spec) {
   return {status, kj::mv(rows)};
 }
 
+KJ_TEST("126 MiB live then one near-GiB object preserves the process and a neighboring Worker") {
+  // Without the fragmentation reserve this child ended with V8's fatal OOM
+  // (exit 74) at 1150.5 MiB live in 1154.8 MiB of pages.
+  auto child = runAllocationChild("1:live126");
+  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
+  KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
+}
+
 KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
   auto child = runAllocationChild("1:string");
   KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
@@ -539,6 +577,7 @@ KJ_TEST("four simultaneous near-GiB heap objects end the process (known failure 
     auto line = child.events.substr(at, child.events.find('\n', at) - at);
     auto field = line.find("\"oomIsolateHeapBytes\":");
     KJ_ASSERT(field != std::string::npos, line.c_str());
+    KJ_EXPECT(line.find("\"oomIsolateHeapReported\":true") != std::string::npos, line.c_str());
     auto heap = strtoull(line.c_str() + field + strlen("\"oomIsolateHeapBytes\":"), nullptr, 10);
     KJ_EXPECT(heap > 0 && heap < (128ull << 20), heap, line.c_str());
   }
@@ -683,7 +722,10 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
   initializeV8();
   kj::EventLoop loop;
   kj::WaitScope waitScope(loop);
-  kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+  // The timer's cached time lags the monotonic clock by the last JavaScript
+  // turn; the deadline must come from the clock, not from the cached time.
+  auto lagging = kj::systemPreciseMonotonicClock().now() - 5 * kj::SECONDS;
+  kj::TimerImpl clock(lagging);
   Timer timer(clock);
   IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/background\","), nullptr);
   Slot slot;
@@ -693,12 +735,17 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
   KJ_EXPECT(WAIT_UNTIL_LIMIT == 30 * kj::SECONDS);
   // limitDrain() is called when the response has ended. A 2 s child-call
   // lease and later waitUntil work (the 2.4 s legacy trigger) stay inside it.
+  auto before = kj::systemPreciseMonotonicClock().now();
   auto drain = limits.limitDrain();
-  clock.advanceTo(clock.now() + 2400 * kj::MILLISECONDS);
+  auto after = kj::systemPreciseMonotonicClock().now();
+  clock.advanceTo(before + 2400 * kj::MILLISECONDS);
   KJ_EXPECT(!drain.poll(waitScope));
-  clock.advanceTo(kj::origin<kj::TimePoint>() + WAIT_UNTIL_LIMIT - 1 * kj::MILLISECONDS);
+  // A delay from the cached time would have ended here, 5 s early.
+  clock.advanceTo(lagging + WAIT_UNTIL_LIMIT);
+  KJ_EXPECT(!drain.poll(waitScope), "the deadline must not lose the last JavaScript turn");
+  clock.advanceTo(before + WAIT_UNTIL_LIMIT - 1 * kj::MILLISECONDS);
   KJ_EXPECT(!drain.poll(waitScope));
-  clock.advanceTo(kj::origin<kj::TimePoint>() + WAIT_UNTIL_LIMIT);
+  clock.advanceTo(after + WAIT_UNTIL_LIMIT);
   bool ended = drain.poll(waitScope);
   KJ_EXPECT(ended, "waitUntil work must end at the drain limit");
   if (ended) drain.wait(waitScope);
@@ -742,18 +789,30 @@ KJ_TEST("a reclaim requested during maintenance never waits for that pass") {
   auto budget = std::make_shared<ResourceBudget>(2ull << 30, 4, 1);
   std::promise<bool> result;
   auto future = result.get_future();
-  // An eviction inside the pass can reach reserve()/observe(); simulate that
-  // call on the maintenance thread itself.
+  // An eviction inside the pass can reach reserve()/observe(). The pass entry
+  // point the server's maintain() uses sets the flag itself.
   std::thread maintenance([&] {
-    ResourceBudget::maintaining = true;
-    result.set_value(budget->reclaim(1));
-    ResourceBudget::maintaining = false;
+    KJ_EXPECT(!ResourceBudget::maintaining);
+    budget->runMaintenance([&] {
+      KJ_EXPECT(ResourceBudget::maintaining, "the maintenance pass must mark its own thread");
+      result.set_value(budget->reclaim(1));
+    });
+    KJ_EXPECT(!ResourceBudget::maintaining);
   });
   bool returned = future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
   KJ_EXPECT(returned, "the maintenance thread waited for its own reclaim pass");
   if (!returned) budget->finishReclaim(true);
   maintenance.join();
   KJ_EXPECT(!future.get() && budget->reclaimRequested.load());
+  // The server's own entry (ThreadedServer::maintain()) marks the pass it runs.
+  struct StandIn {
+    std::shared_ptr<ResourceBudget> resources;
+    bool marked = false;
+    void maintainPass() { marked = ResourceBudget::maintaining; }
+  } standIn{budget};
+  runMaintenanceOf(standIn);
+  KJ_EXPECT(standIn.marked, "the server's maintenance entry must mark its own pass");
+  KJ_EXPECT(!ResourceBudget::maintaining);
   // Any other thread still waits for a completed pass.
   std::atomic<bool> stop{false};
   std::thread pass([&] {

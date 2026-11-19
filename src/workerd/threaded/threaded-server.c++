@@ -150,6 +150,13 @@ bool traceForTest() {
   return enabled;
 }
 
+// Tests of the call threads' background backstop only: with the drain limit
+// off, nothing but the backstop ends waitUntil work that never finishes.
+bool drainLimitDisabledForTest() {
+  static const bool disabled = getenv("COWORKERD_THREADED_NO_DRAIN_LIMIT_FOR_TEST") != nullptr;
+  return disabled;
+}
+
 void noteUnsupported(kj::StringPtr feature);
 
 kj::Exception unsupportedError(kj::StringPtr feature) {
@@ -189,6 +196,13 @@ constexpr uint64_t MAX_SINGLE_HEAP_OBJECT =
             : MAX_FIXED_ARRAY_ELEMENTS * sizeof(double)) +
     (1ull << 20);
 static_assert(MAX_SINGLE_HEAP_OBJECT < (2ull << 30));
+// Old-space pages are not filled exactly: an isolate just under its limit can
+// hold several MiB more than its live bytes (4.3 MiB at 126 MiB live, measured
+// on cwkd-p40). Its V8 ceiling keeps a quarter of the limit, at least 32 MiB,
+// on top of one maximum object, so finishing that object never ends the process.
+constexpr uint64_t fragmentationReserve(uint64_t maximum) {
+  return maximum / 4 > (32ull << 20) ? maximum / 4 : (32ull << 20);
+}
 
 int limitEventFd();
 thread_local const char *currentOomReport = nullptr;
@@ -266,6 +280,12 @@ struct ResourceBudget {
   // Set while this thread runs a maintenance pass, the only place a reclaim
   // completes. An eviction there can enter GC callbacks and the allocator.
   static inline thread_local bool maintaining = false;
+  template <typename Pass>
+  void runMaintenance(Pass &&pass) {
+    maintaining = true;
+    KJ_DEFER(maintaining = false);
+    pass();
+  }
   bool reclaim(uint64_t additionalMemory = 0) {
     std::unique_lock lock(mutex);
     auto epoch = reclaimEpoch;
@@ -569,7 +589,7 @@ bool writeLimitRow(kj::StringPtr event,
     auto size = strlen(currentOomReport);
     char row[4096];
     int written = currentOomHeap && size >= 2 && size < sizeof(row) - 64
-        ? snprintf(row, sizeof(row), "%.*s,\"oomIsolateHeapBytes\":%llu}\n", int(size - 2),
+        ? snprintf(row, sizeof(row), "%.*s,\"oomIsolateHeapReported\":true,\"oomIsolateHeapBytes\":%llu}\n", int(size - 2),
               currentOomReport, (unsigned long long)currentOomHeap->load())
         : -1;
     if (written > 0 && size_t(written) < sizeof(row))
@@ -872,7 +892,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
   v8::Isolate::CreateParams getCreateParams() override {
     v8::Isolate::CreateParams params;
     if (memory) {
-      auto hard = memory->maximum + MAX_SINGLE_HEAP_OBJECT;
+      auto hard = memory->maximum + MAX_SINGLE_HEAP_OBJECT + fragmentationReserve(memory->maximum);
       params.constraints.ConfigureDefaultsFromHeapSize(0, hard);
       params.constraints.set_max_old_generation_size_in_bytes(hard);
       params.array_buffer_allocator_shared = memory;
@@ -1102,8 +1122,11 @@ struct RequestLimits final: LimitEnforcer {
   kj::Promise<void> limitDrain() override {
     // Called when the response has ended. A lease expires the authority to
     // make child calls, not this invocation's waitUntil work, which keeps its
-    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT later.
-    return timer.afterLimitTimeout(WAIT_UNTIL_LIMIT);
+    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT later. KJ's timer
+    // does not advance while JavaScript runs, so the deadline is taken from the
+    // monotonic clock now, not as a delay from the timer's cached time.
+    if (drainLimitDisabledForTest()) return kj::NEVER_DONE;
+    return timer.timer.atTime(kj::systemPreciseMonotonicClock().now() + WAIT_UNTIL_LIMIT);
   }
   kj::Promise<void> limitScheduled() override {
     return kj::NEVER_DONE;
@@ -1506,6 +1529,13 @@ class DescriptorQueue {
 };
 
 struct ThreadedServer;
+
+// The server's maintenance entry: its pass runs inside the budget's maintenance
+// mark, so that a reclaim the pass itself triggers never waits for that pass.
+template <typename Server>
+void runMaintenanceOf(Server &server) {
+  server.resources->runMaintenance([&] { server.maintainPass(); });
+}
 struct InvocationState: kj::Refcounted {
   explicit InvocationState(std::shared_ptr<Slot> slot, std::shared_ptr<TenantPermit> tenant)
       : slot(std::move(slot)),
@@ -1694,8 +1724,9 @@ struct ThreadedServer {
   }
 
   void maintain() {
-    ResourceBudget::maintaining = true;
-    KJ_DEFER(ResourceBudget::maintaining = false);
+    runMaintenanceOf(*this);
+  }
+  void maintainPass() {
     if (resources->reclaimRequested.exchange(false)) {
       bool noIdle = false;
       KJ_DEFER(resources->finishReclaim(noIdle));
