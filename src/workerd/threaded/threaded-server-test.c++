@@ -361,6 +361,15 @@ constexpr kj::StringPtr NEAR_GIB_ARRAY =
 constexpr kj::StringPtr LIVE126_THEN_STRING =
     "globalThis.kept = []; for (let i = 0; i < 126 * 128; ++i) kept.push(new Array(1024).fill(1.5));"
     "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
+// The same with large regular objects, which pack worst into V8's 256 KiB
+// pages: double arrays of 88,016 bytes (two per page, about a third wasted) and
+// of 130,416 bytes (one per page, about half wasted), about 126 MiB of them.
+constexpr kj::StringPtr LIVE126_86K_THEN_STRING =
+    "globalThis.kept = []; for (let i = 0; i < 1501; ++i) kept.push(new Array(11000).fill(1.5));"
+    "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
+constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
+    "globalThis.kept = []; for (let i = 0; i < 1013; ++i) kept.push(new Array(16300).fill(1.5));"
+    "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
 
 // `count` isolates allocate at the same moment while a neighbor isolate keeps
 // answering. Every heap of this build shares one pointer cage.
@@ -476,14 +485,17 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
   auto selected = getenv("COWORKERD_THREADED_ALLOCATION_CHILD");
   if (selected == nullptr) return;
   kj::StringPtr spec(selected);
-  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array|live126>");
+  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array|live126|live86k|live128k>");
   auto count = kj::str(spec.first(colon)).parseAs<uint>();
   auto kind = spec.slice(colon + 1);
-  KJ_REQUIRE(count > 0 && count <= 8 && (kind == "string" || kind == "array" || kind == "live126"));
+  KJ_REQUIRE(count > 0 && count <= 8 &&
+      (kind == "string" || kind == "array" || kind == "live126" || kind == "live86k" || kind == "live128k"));
   simultaneousAllocations(count,
-      kind == "array"         ? NEAR_GIB_ARRAY
-          : kind == "live126" ? LIVE126_THEN_STRING
-                              : NEAR_GIB_STRING);
+      kind == "array"          ? NEAR_GIB_ARRAY
+          : kind == "live126"  ? LIVE126_THEN_STRING
+          : kind == "live86k"  ? LIVE126_86K_THEN_STRING
+          : kind == "live128k" ? LIVE126_128K_THEN_STRING
+                               : NEAR_GIB_STRING);
   fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
   fflush(stdout);
 }
@@ -546,6 +558,20 @@ KJ_TEST("126 MiB live then one near-GiB object preserves the process and a neigh
   // Without the fragmentation reserve this child ended with V8's fatal OOM
   // (exit 74) at 1150.5 MiB live in 1154.8 MiB of pages.
   auto child = runAllocationChild("1:live126");
+  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
+  KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
+}
+
+KJ_TEST("126 MiB live in 86 KiB objects then one near-GiB object preserves the process") {
+  // With a reserve of a quarter of the limit this child ended with V8's fatal
+  // OOM (exit 74) at 1150.1 MB live in 1212.0 MB of pages.
+  auto child = runAllocationChild("1:live86k");
+  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
+  KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
+}
+
+KJ_TEST("126 MiB live in objects near 128 KiB then one near-GiB object preserves the process") {
+  auto child = runAllocationChild("1:live128k");
   KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
   KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
 }

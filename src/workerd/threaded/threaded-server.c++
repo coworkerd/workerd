@@ -196,12 +196,15 @@ constexpr uint64_t MAX_SINGLE_HEAP_OBJECT =
             : MAX_FIXED_ARRAY_ELEMENTS * sizeof(double)) +
     (1ull << 20);
 static_assert(MAX_SINGLE_HEAP_OBJECT < (2ull << 30));
-// Old-space pages are not filled exactly: an isolate just under its limit can
-// hold several MiB more than its live bytes (4.3 MiB at 126 MiB live, measured
-// on cwkd-p40). Its V8 ceiling keeps a quarter of the limit, at least 32 MiB,
-// on top of one maximum object, so finishing that object never ends the process.
+// The tenant limit counts live bytes, but V8's ceiling counts pages, and pages
+// are not filled exactly: regular objects never span a 256 KiB page, so large
+// ones waste up to half of it (cwkd-p40: 126 MiB live in 88 KB double arrays
+// took 1212.0 MB of pages with the maximum string, 1150.1 MB live). Pages stay
+// under twice the limit, so the ceiling keeps the limit itself plus 32 MiB for
+// the other spaces on top of one maximum object: finishing that object never
+// ends the process, whatever the object sizes.
 constexpr uint64_t fragmentationReserve(uint64_t maximum) {
-  return maximum / 4 > (32ull << 20) ? maximum / 4 : (32ull << 20);
+  return maximum + (32ull << 20);
 }
 
 int limitEventFd();
