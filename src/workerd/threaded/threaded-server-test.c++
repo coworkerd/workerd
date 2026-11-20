@@ -187,6 +187,13 @@ KJ_TEST("subrequest quotas, recursive bindings, release wakeup and cancellation"
   abandoned = nullptr;
   KJ_EXPECT(small.waiters.empty());
 
+  // Without a per-tenant limit no per-tenant count is kept (v138 section 1).
+  SubrequestBudget unlimited(512, 0);
+  auto calls = std::make_shared<uint32_t>(0);
+  SubrequestPermit egress(unlimited, calls, "a", true);
+  egress.acquire().wait(waitScope);
+  KJ_EXPECT(unlimited.tenants.empty() && unlimited.active.load() == 1 && egress.tenant.empty());
+
   SubrequestBudget perCall(512, 128);
   auto one = std::make_shared<uint32_t>(0);
   std::vector<std::unique_ptr<SubrequestPermit>> held;

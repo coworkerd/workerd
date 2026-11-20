@@ -2896,8 +2896,10 @@ struct SubrequestPermit {
       bool tenantShare)
       : budget(budget),
         invocation(std::move(invocation)),
-        tenant(std::move(tenant)),
-        tenantShare(tenantShare) {}
+        // Without a per-tenant limit the share is the whole budget, which the
+        // global count already bounds: keep no tenant and no per-tenant count.
+        tenant(tenantShare && budget.tenantLimit != 0 ? std::move(tenant) : std::string()),
+        tenantShare(tenantShare && budget.tenantLimit != 0) {}
   bool acquireLocked() {
     auto perTenant = budget.tenantLimit == 0
         ? budget.limit
