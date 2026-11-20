@@ -4,6 +4,7 @@
 
 #include "sandbox.h"
 
+#include <v8-array-buffer.h>
 #include <v8-internal.h>
 #include <v8-isolate.h>
 #include <v8-platform.h>
@@ -42,6 +43,44 @@ uintptr_t backingStoreCageBase(v8::Isolate* isolate) {
 }
 
 }  // namespace
+#endif
+
+namespace {
+
+#ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
+class GroupArrayBufferAllocator final: public v8::ArrayBuffer::Allocator {
+ public:
+  explicit GroupArrayBufferAllocator(const v8::IsolateGroup& group)
+      : group(group),
+        inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator(this->group)) {}
+  void* Allocate(size_t length) override {
+    return inner->Allocate(length);
+  }
+  void* AllocateUninitialized(size_t length) override {
+    return inner->AllocateUninitialized(length);
+  }
+  void Free(void* data, size_t length) override {
+    inner->Free(data, length);
+  }
+  size_t MaxAllocationSize() const override {
+    return inner->MaxAllocationSize();
+  }
+  v8::PageAllocator* GetPageAllocator() override {
+    return inner->GetPageAllocator();
+  }
+
+ private:
+  v8::IsolateGroup group;  // destroyed after `inner`
+  std::unique_ptr<v8::ArrayBuffer::Allocator> inner;
+};
+#endif
+
+}  // namespace
+
+#ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
+std::shared_ptr<v8::ArrayBuffer::Allocator> newGroupArrayBufferAllocator(const v8::IsolateGroup& group) {
+  return std::make_shared<GroupArrayBufferAllocator>(group);
+}
 #endif
 
 SandboxedBytes::SandboxedBytes(v8::Isolate* isolate, kj::ArrayPtr<const kj::byte> bytes) {

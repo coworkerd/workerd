@@ -3,7 +3,9 @@
 #include <kj/common.h>
 #include <kj/string.h>
 #include <v8-isolate.h>
+#include <v8-platform.h>
 #include <cstddef>
+#include <memory>
 
 namespace workerd::server {
 
@@ -19,6 +21,11 @@ struct SandboxFacts {
   size_t sandboxBytes = 0;       // v8::V8::GetSandboxSizeInBytes()
   size_t addressSpaceBytes = 0;  // the sandbox's address space, its guard regions included
   bool groupPerIsolate = false;  // v8::IsolateGroup::CanCreateNewGroups()
+  // Addresses inside the zero segment (1 GiB and 4 GiB + 512 KiB) cannot be mapped: probed, not
+  // taken from what the platform reports to V8.
+  bool zeroSegmentHeld = true;
+  // An isolate's check: the isolate is not in the default group (which the process itself uses).
+  bool ownGroup = true;
 };
 
 // Why `facts` do not describe a secure sandbox laid out as this build configured it, or none.
@@ -43,8 +50,22 @@ void requireSecureIsolateSandbox(v8::Isolate* isolate, kj::StringPtr name);
 
 // A new isolate group for one isolate, or none when the address space has no room left for its
 // sandbox and the reservations around it (V8's IsolateGroup::TryCreate(), fork patch
-// patches/v8/0057): the caller refuses that isolate instead of losing the process. The default
+// patches/v8/0057): the caller refuses that isolate instead of losing the process. The group gets
+// newSandboxPoolAllocator() as its in-sandbox allocator before any isolate exists. The default
 // group in a build with one shared pointer-compression cage.
 kj::Maybe<v8::IsolateGroup> tryNewIsolateGroup();
+
+// The in-sandbox allocator of a group's ArrayBuffer backing stores. V8's default reserves its pool
+// on the first allocation, trying 8, 4, 2 and 1 GiB, and ends the process when none fits: in an
+// 8 GiB sandbox only the second half's 4 GiB hold buffers, and a resizable ArrayBuffer or a Wasm
+// memory reserved there before that first allocation can leave less than 1 GiB. This one reserves
+// its pool at once (the largest of 2 GiB, 1 GiB, ... 256 MiB that fits in `space`) and returns
+// null from Allocate() instead of ending the process when the pool is full. None when no pool fits.
+std::shared_ptr<v8::Allocator> newSandboxPoolAllocator(v8::VirtualAddressSpace& space);
+constexpr size_t SANDBOX_POOL_BYTES = size_t(2) << 30;
+
+// Whether the zero segment is really held: MAP_FIXED_NOREPLACE at 1 GiB and at 4 GiB + 512 KiB
+// fails with EEXIST. True where it cannot be probed (not Linux).
+bool zeroSegmentHeld();
 
 }  // namespace workerd::server

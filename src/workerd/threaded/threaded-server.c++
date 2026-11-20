@@ -640,6 +640,14 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   ~MemoryBudget() noexcept override {
     delete inner;
   }
+  // No single buffer, and no resizable buffer's reservation, beyond the Worker's limit (V8's
+  // default is 32 GiB, more than the buffer half of an 8 GiB sandbox).
+  size_t MaxAllocationSize() const override {
+    return std::min<size_t>(maximum, inner->MaxAllocationSize());
+  }
+  v8::PageAllocator *GetPageAllocator() override {
+    return inner->GetPageAllocator();
+  }
   const uint64_t maximum;
   LimitState cause;
   std::shared_ptr<ResourceReservation> reservation;

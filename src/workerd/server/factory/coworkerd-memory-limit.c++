@@ -93,6 +93,8 @@ void* IsolateMemoryLimit::allocate(size_t length, Initialization initialization)
 }
 void* IsolateMemoryLimit::Allocate(size_t length) { return allocate(length, Initialization::ZERO); }
 void* IsolateMemoryLimit::AllocateUninitialized(size_t length) { return allocate(length, Initialization::UNINITIALIZED); }
+size_t IsolateMemoryLimit::MaxAllocationSize() const { return std::min<size_t>(limitBytes, inner->MaxAllocationSize()); }
+v8::PageAllocator* IsolateMemoryLimit::GetPageAllocator() { return inner->GetPageAllocator(); }
 void IsolateMemoryLimit::Free(void* address, size_t length) { inner->Free(address, length); bufferBytes.fetch_sub(length); release(length); }
 
 void IsolateMemoryLimit::customize(v8::Isolate* value) {

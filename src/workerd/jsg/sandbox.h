@@ -10,9 +10,10 @@
 
 #include <cstdint>
 
-namespace v8 {
-class Isolate;
-}
+#include <v8-array-buffer.h>
+#include <v8-isolate.h>
+
+#include <memory>
 
 namespace workerd::jsg {
 
@@ -46,5 +47,11 @@ class SandboxedBytes {
 #endif
   uint32_t length = 0;
 };
+
+// V8's default ArrayBuffer allocator for `group` (v8::ArrayBuffer::Allocator::NewDefaultAllocator),
+// holding a reference to the group: V8 keeps an allocator for as long as any of its backing stores
+// lives, which can be longer than the isolate and the group, and V8's own keeps only bare pointers
+// to the group's sandbox and pool. Builds with one pointer cage per group only.
+std::shared_ptr<v8::ArrayBuffer::Allocator> newGroupArrayBufferAllocator(const v8::IsolateGroup& group);
 
 }  // namespace workerd::jsg
