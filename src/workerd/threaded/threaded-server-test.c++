@@ -244,7 +244,7 @@ KJ_TEST("saturation: 90% of the window to enter, below 80% to leave, idle ends i
   KJ_EXPECT(run(3, 8'500'000) == std::pair(0, 0) && window.saturated.load(), "85% stays saturated");
   KJ_EXPECT(run(3, 7'000'000) == std::pair(0, 1) && !window.saturated.load(), "70% is not, once");
   KJ_EXPECT(run(3, 10'000'000) == std::pair(1, 0));
-  KJ_EXPECT(window.decay(at + 500'000'000, limits) == 0, "half a second idle keeps it");
+  KJ_EXPECT(window.decay(at + 100'000'000, limits) == 0, "a tenth of a second idle keeps it (busy 1 s of 1.1 s)");
   KJ_EXPECT(window.decay(at + 3 * second, limits) == -1 && !window.saturated.load(), "a window idle ends it");
 }
 
