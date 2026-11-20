@@ -77,7 +77,9 @@ PATCHES = [
     "0052-Keep-functions-created-by-v8-Function-New-in-the-context-snapshot.patch",
     "0053-Leave-the-SharedFunctionInfo-id-out-of-the-read-only-heap-checksum.patch",
     "0054-Add-SnapshotCreator-HasSuspendedGenerators.patch",
+    "0055-Make-the-sandbox-size-and-the-additional-trailing-guard-build-parameters.patch",
     "0056-Let-JSON-parse-and-split-take-interrupts.patch",
+    "0057-Add-IsolateGroup-TryCreate-which-can-fail-instead-of-aborting.patch",
 ]
 
 http_archive(

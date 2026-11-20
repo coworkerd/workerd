@@ -5,6 +5,7 @@
 #include "coworkerd-idle-eviction.h"
 #include "coworkerd-channels.h"
 #include "coworkerd-memory-limit.h"
+#include "coworkerd-sandbox.h"
 
 #include <workerd/io/actor-cache.h>
 #include <workerd/io/io-channels.h>
@@ -148,15 +149,17 @@ class RootLimitFailures final: public kj::Refcounted {
 
 class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
  public:
-  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name,
-      const kj::Maybe<CoworkerdWorkerIdentity>& identity, kj::StringPtr startupIdentity = "",
-      IdleWorkerRef idleWorker = {}, kj::Timer* rootTimer = nullptr, kj::TaskSet* rootTasks = nullptr)
+  // `group` is the isolate group the isolate will be created in (its memory limit allocates there).
+  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, const v8::IsolateGroup& group,
+      kj::StringPtr name, const kj::Maybe<CoworkerdWorkerIdentity>& identity,
+      kj::StringPtr startupIdentity = "", IdleWorkerRef idleWorker = {},
+      kj::Timer* rootTimer = nullptr, kj::TaskSet* rootTasks = nullptr)
       : fallback(kj::mv(fallback)), name(kj::str(name)),
         cpuNs(0), tenantWorker(identity != kj::none), startupIdentity(kj::str(startupIdentity)), idleWorker(kj::mv(idleWorker)) {
     KJ_IF_SOME(record, identity) {
       cpuNs = uint64_t(record.cpuLimitMs ? record.cpuLimitMs : cpuLimitFromEnvironment()) * 1000000;
       auto limit = record.memoryLimitMiB ? record.memoryLimitMiB : memoryLimitFromEnvironment();
-      if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
+      if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded, group);
     }
     // The isolate's GC callbacks account for excluded CPU and long pauses.
     if (gcSettings().observes()) {
@@ -218,6 +221,8 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   const TrackedWasmInstanceList& getTrackedWasmInstances() const override { return fallback->getTrackedWasmInstances(); }
   void markPerfEvent(kj::LiteralStringConst name) const override { fallback->markPerfEvent(name); }
   void customizeIsolate(v8::Isolate* value) override {
+    // With the V8 sandbox, the isolate's own sandbox must be secure before it runs any code.
+    requireSecureIsolateSandbox(value, name);
     isolate = value;
     if (memory) memory->customize(value);
     if (gc) gc->install(value);

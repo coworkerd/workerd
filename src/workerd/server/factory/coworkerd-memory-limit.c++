@@ -1,4 +1,5 @@
 #include "coworkerd-memory-limit.h"
+#include "coworkerd-sandbox.h"
 
 #include <kj/debug.h>
 #include <v8-statistics.h>
@@ -29,6 +30,17 @@ void raisePeak(std::atomic<size_t>& peak, size_t value) {
   while (old < value && !peak.compare_exchange_weak(old, value)) {}
 }
 
+// V8's allocator for `group`, as jsg gives an isolate without an allocator of its own: with the
+// sandbox and one pointer-compression cage per group, the default allocator would place every
+// backing store in the default group's sandbox, and V8 aborts the process on the first one.
+v8::ArrayBuffer::Allocator* newGroupAllocator(const v8::IsolateGroup& group) {
+#ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
+  return v8::ArrayBuffer::Allocator::NewDefaultAllocator(group);
+#else
+  return v8::ArrayBuffer::Allocator::NewDefaultAllocator();
+#endif
+}
+
 }  // namespace
 
 uint32_t memoryLimitFromEnvironment() {
@@ -45,8 +57,8 @@ uint32_t memoryLimitFromEnvironment() {
 }
 void setLimitStateObserver(void (*observer)()) { limitStateObserver.store(observer); }
 
-IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state)
-    : limitBytes(uint64_t(limitMiB) << 20), state(kj::mv(state)), inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {
+IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state, const v8::IsolateGroup& group)
+    : limitBytes(uint64_t(limitMiB) << 20), state(kj::mv(state)), group(group), inner(newGroupAllocator(this->group)) {
   // Everything the fatal path needs is prepared here: the descriptor and the bare OOM row.
   if (cpuEventsDescriptor() < 0) return;
   if (!oomReportReady.load(std::memory_order_acquire)) {
@@ -82,6 +94,8 @@ void* IsolateMemoryLimit::allocate(size_t length, Initialization initialization)
 }
 void* IsolateMemoryLimit::Allocate(size_t length) { return allocate(length, Initialization::ZERO); }
 void* IsolateMemoryLimit::AllocateUninitialized(size_t length) { return allocate(length, Initialization::UNINITIALIZED); }
+size_t IsolateMemoryLimit::MaxAllocationSize() const { return sandboxMaxAllocationSize(inner->MaxAllocationSize()); }
+v8::PageAllocator* IsolateMemoryLimit::GetPageAllocator() { return inner->GetPageAllocator(); }
 void IsolateMemoryLimit::Free(void* address, size_t length) { inner->Free(address, length); bufferBytes.fetch_sub(length); release(length); }
 
 void IsolateMemoryLimit::customize(v8::Isolate* value) {

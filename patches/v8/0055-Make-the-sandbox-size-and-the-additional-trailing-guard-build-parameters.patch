@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 23:34:34 +0000
+Subject: [PATCH] Make the sandbox size and the additional trailing guard build
+ parameters
+
+The sandbox size is a compile-time constant chosen per target OS (1 TB on
+Linux x64), which leaves room for only about a hundred sandboxes in a
+47-bit user address space. An embedder that gives every isolate group its
+own sandbox (V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES) needs a smaller one.
+
+V8_SANDBOX_SIZE_LOG2 sets kSandboxSizeLog2 (33 to 40). With 33 the sandbox
+is 8 GB: the 4 GB pointer compression cage followed by 4 GB for ArrayBuffer
+backing stores and Wasm memories. It equals kSandboxMinimumReservationSize,
+so such a sandbox is always fully reserved.
+
+V8_SANDBOX_TYPED_ARRAY_ACCESS_MASKS sets kAdditionalTrailingGuardRegionSize
+to 0, the configuration V8 already uses on Android, ARM64 ChromeOS and
+Loong64: kRequiresTypedArrayAccessMasks then masks the offsets of TypedArray
+accesses computed from an element count, so that the regular guard regions
+(32 GB for a 32-bit index scaled by 8 plus 32 GB for a bounded-size offset,
+kSandboxGuardRegionSize) still cover every access.
+
+Neither define changes anything when it is not set.
+
+diff --git a/include/v8-internal.h b/include/v8-internal.h
+index 4ff0b56f072a56a4f60dd9386c4cd6944fe592c5..729d0d4fad730fe40bb5298430660d88ed85b810 100644
+--- a/include/v8-internal.h
++++ b/include/v8-internal.h
+@@ -218,7 +218,15 @@ using SandboxedPointer_t = Address;
+ #ifdef V8_ENABLE_SANDBOX
+ 
+ // Size of the sandbox, excluding the guard regions surrounding it.
+-#if defined(V8_TARGET_OS_ANDROID)
++#if defined(V8_SANDBOX_SIZE_LOG2)
++// Chosen by the embedder's build, for example 33 (8 GB: the 4 GB pointer
++// compression cage followed by 4 GB for ArrayBuffer backing stores and Wasm
++// memories) when every isolate group has its own sandbox
++// (V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES).
++constexpr size_t kSandboxSizeLog2 = V8_SANDBOX_SIZE_LOG2;
++static_assert(kSandboxSizeLog2 >= 33 && kSandboxSizeLog2 <= 40,
++              "V8_SANDBOX_SIZE_LOG2 must be between 33 (8 GB) and 40 (1 TB)");
++#elif defined(V8_TARGET_OS_ANDROID)
+ // On Android, most 64-bit devices seem to be configured with only 39 bits of
+ // virtual address space for userspace. As such, limit the sandbox to 128GB (a
+ // quarter of the total available address space).
+@@ -308,7 +316,13 @@ static_assert(kMaxSafeBufferSizeForSandbox <= kSandboxGuardRegionSize,
+               "The maximum allowed buffer size must not be larger than the "
+               "sandbox's guard regions");
+ 
+-#if defined(V8_TARGET_OS_ANDROID)
++#if defined(V8_SANDBOX_TYPED_ARRAY_ACCESS_MASKS)
++// Chosen by the embedder's build where many sandboxes share one address space:
++// no additional trailing guard region. TypedArray accesses whose offset is
++// computed from an element count are then masked to at most
++// kMaxSafeBufferSizeForSandbox (kRequiresTypedArrayAccessMasks), as on Android.
++constexpr size_t kAdditionalTrailingGuardRegionSize = 0;
++#elif defined(V8_TARGET_OS_ANDROID)
+ // On Android, we often won't have sufficient virtual address space available.
+ constexpr size_t kAdditionalTrailingGuardRegionSize = 0;
+ #elif defined(V8_TARGET_ARCH_ARM64) && defined(V8_TARGET_OS_CHROMEOS)

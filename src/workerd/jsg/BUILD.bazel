@@ -133,6 +133,7 @@ wd_cc_library(
         "wrappable-tag.h",
     ],
     implementation_deps = [
+        ":sandbox",
         "//src/workerd/util:entropy",
         "@simdutf",
         "@ssl",

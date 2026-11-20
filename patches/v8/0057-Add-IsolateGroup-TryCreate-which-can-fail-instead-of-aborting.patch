@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 02:12:14 +0000
+Subject: [PATCH] Add IsolateGroup::TryCreate(), which can fail instead of
+ aborting
+
+With one sandbox per isolate group, every group reserves its sandbox with
+guard regions (136 GB for an 8 GB sandbox with
+V8_SANDBOX_TYPED_ARRAY_ACCESS_MASKS). When the address space has no room for
+another one, IsolateGroup::Create() aborts the process: an 8 GB sandbox is
+kSandboxMinimumReservationSize, so there is no partially reserved fallback,
+and Sandbox::Initialize() calls FatalProcessOutOfMemory. An embedder that
+creates a group per isolate wants to refuse that one isolate instead.
+
+TryCreate() returns no group in that case. Sandbox::TryNew() and
+TryInitialize() are Sandbox::New() and Initialize() without the final OOM
+crash. After the sandbox, IsolateGroup::TryNew() makes sure that a 4 GB
+aligned 4 GB region can still be reserved, room for what the group and its
+first isolate reserve outside the sandbox and would abort on (the 1 GB
+trusted range, the code range, the tables of the isolate); otherwise it
+releases the sandbox and returns nullptr. Create() is unchanged.
+
+diff --git a/include/v8-isolate.h b/include/v8-isolate.h
+index f7caba35ce648955337463ed8b4af47a15dfcf85..a383886b13f38f36adfea2669f808c43e64eb3d5 100644
+--- a/include/v8-isolate.h
++++ b/include/v8-isolate.h
+@@ -10,6 +10,7 @@
+ 
+ #include <functional>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <utility>
+ 
+@@ -251,6 +252,16 @@ class V8_EXPORT IsolateGroup {
+    */
+   static IsolateGroup Create();
+ 
++  /**
++   * Like Create(), but returns no group instead of aborting the process when
++   * the address space has no room left for the group's reservations: its
++   * sandbox with the guard regions, and outside the sandbox its trusted range
++   * and its first isolate's tables. An embedder that creates a group per
++   * isolate can then refuse that isolate and keep the process. If this V8's
++   * build configuration only supports a single group, abort.
++   */
++  static std::optional<IsolateGroup> TryCreate();
++
+   IsolateGroup(IsolateGroup&& other);
+   IsolateGroup& operator=(IsolateGroup&& other);
+ 
+diff --git a/src/api/api.cc b/src/api/api.cc
+index b65302af06294fb1e45baea617f4f0df0c1c08a0..b132498c4f63dead0b577f9a172de61515653b45 100644
+--- a/src/api/api.cc
++++ b/src/api/api.cc
+@@ -10062,6 +10062,13 @@ IsolateGroup IsolateGroup::Create() {
+   return IsolateGroup(i::IsolateGroup::New());
+ }
+ 
++// static
++std::optional<IsolateGroup> IsolateGroup::TryCreate() {
++  i::IsolateGroup* group = i::IsolateGroup::TryNew();
++  if (group == nullptr) return std::nullopt;
++  return IsolateGroup(std::move(group));
++}
++
+ IsolateGroup::IsolateGroup(IsolateGroup&& other) {
+   isolate_group_ = other.isolate_group_;
+   other.isolate_group_ = nullptr;
+diff --git a/src/init/isolate-group.cc b/src/init/isolate-group.cc
+index 9ca26dbd6c082c63faeaeb3df93ff152659d510a..55dc58a850db58a1aa780cc45315439a9d46b968 100644
+--- a/src/init/isolate-group.cc
++++ b/src/init/isolate-group.cc
+@@ -429,6 +429,52 @@ size_t IsolateGroup::GetIsolateCount() {
+   return isolates_.size();
+ }
+ 
++namespace {
++
++// Whether the address space still has room for what a new group and its first
++// isolate reserve outside the sandbox and abort on failure: the 1 GB trusted
++// range (4 GB aligned), the code range and the isolate's tables, together well
++// under 4 GB. Probed by reserving and releasing a 4 GB aligned region of 4 GB
++// (plus `extra`).
++bool HasReservationHeadroom(size_t extra) {
++  v8::PageAllocator* allocator = GetPlatformPageAllocator();
++  const size_t size = size_t{4} * GB + extra;
++  void* probe = allocator->AllocatePages(nullptr, size, size_t{4} * GB,
++                                         PageAllocator::kNoAccess);
++  if (probe == nullptr) return false;
++  CHECK(allocator->FreePages(probe, size));
++  return true;
++}
++
++}  // namespace
++
++// static
++IsolateGroup* IsolateGroup::TryNew() {
++  if (!CanCreateNewGroups()) {
++    FATAL(
++        "Creation of new isolate groups requires enabling "
++        "multiple pointer compression cages at build-time");
++  }
++
++#ifdef V8_ENABLE_SANDBOX
++  Sandbox* sandbox = Sandbox::TryNew(V8::GetCurrentPlatform(),
++                                     GetPlatformVirtualAddressSpace());
++  if (sandbox == nullptr) return nullptr;
++  if (!HasReservationHeadroom(0)) {
++    sandbox->TearDown();
++    delete sandbox;
++    return nullptr;
++  }
++  IsolateGroup* group = new IsolateGroup;
++  group->Initialize(false, sandbox);
++#else
++  if (!HasReservationHeadroom(kPtrComprCageReservationSize)) return nullptr;
++  IsolateGroup* group = new IsolateGroup;
++  group->Initialize(false);
++#endif
++  return FinishNew(group);
++}
++
+ // static
+ IsolateGroup* IsolateGroup::New() {
+   if (!CanCreateNewGroups()) {
+@@ -445,6 +491,11 @@ IsolateGroup* IsolateGroup::New() {
+ #else
+   group->Initialize(false);
+ #endif
++  return FinishNew(group);
++}
++
++// static
++IsolateGroup* IsolateGroup::FinishNew(IsolateGroup* group) {
+   CHECK_NOT_NULL(group->page_allocator_);
+ 
+   // We need to set this early, because it is needed while initializing the
+diff --git a/src/init/isolate-group.h b/src/init/isolate-group.h
+index c92cebdaff42c7f72807794d8eb789315864b0a5..8b1416b2ad08077e26ffbe575752174a67c5f5f4 100644
+--- a/src/init/isolate-group.h
++++ b/src/init/isolate-group.h
+@@ -124,6 +124,10 @@ class V8_EXPORT_PRIVATE IsolateGroup final {
+   // group's refcount drops to zero.  The group's initial refcount is 1.
+   static IsolateGroup* New();
+ 
++  // Like New(), but returns nullptr instead of aborting when the address space
++  // has no room for the group's reservations.
++  static IsolateGroup* TryNew();
++
+   static void InitializeOncePerProcess();
+   static void TearDownOncePerProcess();
+ 
+@@ -287,6 +291,9 @@ class V8_EXPORT_PRIVATE IsolateGroup final {
+   // Only used for testing.
+   static void ReleaseDefault();
+ 
++  // The common end of New() and TryNew() for an initialized group.
++  static IsolateGroup* FinishNew(IsolateGroup* group);
++
+ #ifdef V8_ENABLE_SANDBOX
+   void Initialize(bool process_wide, Sandbox* sandbox);
+ #else   // V8_ENABLE_SANDBOX
+diff --git a/src/sandbox/sandbox.cc b/src/sandbox/sandbox.cc
+index 717b7213ffb0fc39b95dc04f8756b45ca8b46323..ab1d7aa1a652dc00c765b7d1826447e0a760982a 100644
+--- a/src/sandbox/sandbox.cc
++++ b/src/sandbox/sandbox.cc
+@@ -346,6 +346,15 @@ static Address DetermineAddressSpaceLimit() {
+ }
+ 
+ void Sandbox::Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas) {
++  if (!TryInitialize(platform, vas)) {
++    V8::FatalProcessOutOfMemory(
++        nullptr,
++        "Failed to reserve the virtual address space for the V8 sandbox");
++  }
++}
++
++bool Sandbox::TryInitialize(v8::Platform* platform,
++                            v8::VirtualAddressSpace* vas) {
+   // Take the size of the virtual address space into account when determining
+   // the size of the address space reservation backing the sandbox. For
+   // example, if we only have a 40-bit address space, split evenly between
+@@ -409,11 +418,7 @@ void Sandbox::Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas) {
+                                                    reservation_size);
+   }
+ 
+-  if (!success) {
+-    V8::FatalProcessOutOfMemory(
+-        nullptr,
+-        "Failed to reserve the virtual address space for the V8 sandbox");
+-  }
++  if (!success) return false;
+ 
+   CHECK(IsTaggingMaskCompatible(kCodeEntrypointTagMask));
+ 
+@@ -443,6 +448,7 @@ void Sandbox::Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas) {
+ #endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+ 
+   DCHECK(initialized_);
++  return true;
+ }
+ 
+ bool Sandbox::Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas,
+@@ -687,6 +693,21 @@ Sandbox* Sandbox::New(v8::Platform* platform, v8::VirtualAddressSpace* vas) {
+   return sandbox;
+ }
+ 
++Sandbox* Sandbox::TryNew(v8::Platform* platform, v8::VirtualAddressSpace* vas) {
++  if (!COMPRESS_POINTERS_IN_MULTIPLE_CAGES_BOOL) {
++    FATAL(
++        "Creation of new sandboxes requires enabling "
++        "multiple pointer compression cages at build-time");
++  }
++  Sandbox* sandbox = new Sandbox;
++  if (!sandbox->TryInitialize(platform, vas)) {
++    delete sandbox;
++    return nullptr;
++  }
++  CHECK(!v8_flags.sandbox_testing && !v8_flags.sandbox_fuzzing);
++  return sandbox;
++}
++
+ void Sandbox::set_in_sandbox_allocator(std::shared_ptr<Allocator> allocator) {
+   in_sandbox_allocator_ = std::move(allocator);
+ }
+diff --git a/src/sandbox/sandbox.h b/src/sandbox/sandbox.h
+index 860dc2be54fd82469ea35565a2fc5280fa63ea9e..6913faaa3487ae84ff3fcfd24ca5f260950a5765 100644
+--- a/src/sandbox/sandbox.h
++++ b/src/sandbox/sandbox.h
+@@ -99,6 +99,12 @@ class V8_EXPORT_PRIVATE Sandbox {
+    */
+   void Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas);
+ 
++  /**
++   * Like Initialize(), but returns false instead of crashing when not enough
++   * virtual address space can be allocated.
++   */
++  bool TryInitialize(v8::Platform* platform, v8::VirtualAddressSpace* vas);
++
+   /**
+    * Tear down this sandbox.
+    *
+@@ -251,6 +257,10 @@ class V8_EXPORT_PRIVATE Sandbox {
+   //
+   static Sandbox* New(v8::Platform* platform, v8::VirtualAddressSpace* vas);
+ 
++  // Like New(), but returns nullptr instead of crashing when not enough virtual
++  // address space can be allocated for the sandbox.
++  static Sandbox* TryNew(v8::Platform* platform, v8::VirtualAddressSpace* vas);
++
+ #ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
+ #ifdef USING_V8_SHARED_PRIVATE
+   static Sandbox* current() { return current_non_inlined(); }

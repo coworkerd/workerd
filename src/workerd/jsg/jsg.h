@@ -2746,14 +2746,14 @@ class MemoryProtectionKeyScope final {
   MemoryProtectionKeyScope& operator=(MemoryProtectionKeyScope&&) = default;
 
   auto runWithKey(auto func) {
-#ifdef V8_ENABLE_SANDBOX
+#if defined(V8_ENABLE_SANDBOX) && defined(WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY)
     PkeyScope scope(pkey);
 #endif
     return func();
   }
 
  private:
-#ifdef V8_ENABLE_SANDBOX
+#if defined(V8_ENABLE_SANDBOX) && defined(WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY)
   int pkey;
   MemoryProtectionKeyScope(Lock&);
 

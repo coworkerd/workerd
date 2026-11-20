@@ -9,6 +9,8 @@
 
 #include "setup.h"
 
+#include "sandbox.h"
+
 #include "libplatform/libplatform.h"
 #include "modules-new.h"
 
@@ -436,8 +438,10 @@ IsolateWithSnapshotCreator newIsolateWithSnapshotCreator(v8::Isolate::CreatePara
     if (params.array_buffer_allocator == nullptr &&
         params.array_buffer_allocator_shared == nullptr) {
 #ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
-      params.array_buffer_allocator_shared = std::shared_ptr<v8::ArrayBuffer::Allocator>(
-          v8::ArrayBuffer::Allocator::NewDefaultAllocator(group));
+      // V8's allocator for the group keeps bare pointers to the group's sandbox and pool; V8 keeps
+      // the allocator for as long as any backing store lives, which can be longer than the isolate
+      // and the group. Keep the group (and with it the sandbox) alive as long.
+      params.array_buffer_allocator_shared = newGroupArrayBufferAllocator(group);
 #else
       params.array_buffer_allocator_shared = std::shared_ptr<v8::ArrayBuffer::Allocator>(
           v8::ArrayBuffer::Allocator::NewDefaultAllocator());

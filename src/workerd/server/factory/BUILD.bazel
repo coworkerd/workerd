@@ -1,3 +1,4 @@
+load("//:build/kj_test.bzl", "kj_test")
 load("//:build/linking.bzl", "CC_LIBRARY_LINKSTATIC")
 load("//:build/wd_cc_library.bzl", "wd_cc_library")
 
@@ -47,6 +48,7 @@ wd_cc_library(
     hdrs = ["coworkerd-channels.h", "coworkerd-wal-shipper.h"],
     linkstatic = CC_LIBRARY_LINKSTATIC,
     deps = [
+        ":coworkerd-sandbox",
         ":worker-factory-hdrs",
         "@sqlite3",
         "//src/rust/worker:bridge",
@@ -98,6 +100,7 @@ wd_cc_library(
     linkstatic = CC_LIBRARY_LINKSTATIC,
     deps = [
         ":bootstrap-hdrs",
+        ":coworkerd-sandbox",
         ":worker-factory",
         "//src/pyodide:pyodide_extra_capnp",
         "//src/rust/cxx/kj-rs",
@@ -133,4 +136,34 @@ wd_cc_library(
     hdrs = ["coworkerd-steady.h"],
     deps = ["@capnp-cpp//src/kj"],
     visibility = ["//src/workerd/threaded:__pkg__"],
+)
+
+# The V8 sandbox of --config=coworkerd-sandbox: the startup and per-isolate checks, and isolate
+# groups that can fail. Used by the factory and the threaded server.
+wd_cc_library(
+    name = "coworkerd-sandbox",
+    srcs = ["coworkerd-sandbox.c++"],
+    hdrs = ["coworkerd-sandbox.h"],
+    visibility = [
+        "//src/workerd/server:__subpackages__",
+        "//src/workerd/threaded:__pkg__",
+    ],
+    deps = [
+        "//src/workerd/jsg",
+        "@capnp-cpp//src/kj",
+    ],
+)
+
+# The V8 sandbox of --config=coworkerd-sandbox: its layout, V8's secure mode for the process and for
+# every isolate group, and the embedder's placement of bytes in each group's sandbox.
+kj_test(
+    src = "coworkerd-sandbox-test.c++",
+    deps = [
+        ":coworkerd-sandbox",
+        ":worker-factory",
+        "//src/workerd/jsg",
+        "//src/workerd/server:v8-platform-impl",
+        # The factory's bridge reaches the Rust server, which links the bootstrap.
+        "//src/workerd/server/server:workerd-server",
+    ],
 )

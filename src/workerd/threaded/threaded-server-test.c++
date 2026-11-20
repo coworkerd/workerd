@@ -27,6 +27,17 @@ void initializeV8() {
   static auto* platform = new TestPlatform;
   (void)platform;
 }
+// A group of its own for a test isolate, as the server creates one per Worker.
+v8::IsolateGroup newGroup() {
+  initializeV8();
+  return KJ_ASSERT_NONNULL(server::tryNewIsolateGroup());
+}
+// customizeIsolate() runs with the isolate entered, as Worker::Isolate and sourceJsonFailure do.
+void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
+  v8::Locker locker(isolate);
+  v8::Isolate::Scope entered(isolate);
+  limits.customizeIsolate(isolate);
+}
 
 KJ_TEST("descriptor queue: empty, full, FIFO, SPSC handoff and close") {
   DescriptorQueue queue(2);
@@ -262,10 +273,10 @@ KJ_TEST("log quotas and a failed flush reset pending and in-flight buffers") {
 // it again at every entry; the watchdog entry points at the owner's identity.
 KJ_TEST("JavaScript entries reuse the call's OOM report and identity") {
   initializeV8();
-  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/oom-report\","), nullptr);
-  auto* isolate = v8::Isolate::New(limits.getCreateParams());
+  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/oom-report\","), nullptr, newGroup());
+  auto* isolate = v8::Isolate::New(limits.group, limits.getCreateParams());
   KJ_DEFER(isolate->Dispose());
-  limits.customizeIsolate(isolate);
+  customizeEntered(limits, isolate);
   v8::Locker locker(isolate);
   v8::Isolate::Scope entered(isolate);
   v8::HandleScope handles(isolate);
@@ -286,10 +297,10 @@ KJ_TEST("JavaScript entries reuse the call's OOM report and identity") {
 
 KJ_TEST("CPU remaining budget, previous CPU, nested attribution and late termination") {
   initializeV8();
-  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/cpu\","), nullptr);
-  auto* isolate = v8::Isolate::New(limits.getCreateParams());
+  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/cpu\","), nullptr, newGroup());
+  auto* isolate = v8::Isolate::New(limits.group, limits.getCreateParams());
   KJ_DEFER(isolate->Dispose());
-  limits.customizeIsolate(isolate);
+  customizeEntered(limits, isolate);
   v8::Locker locker(isolate);
   v8::Isolate::Scope entered(isolate);
   v8::HandleScope handles(isolate);
@@ -353,10 +364,10 @@ KJ_TEST("CPU remaining budget, previous CPU, nested attribution and late termina
 
 void allocationComponent(kj::StringPtr code) {
   initializeV8();
-  IsolateLimits neighborLimits(1000, 32, kj::str("\"workerId\":\"a/neighbor\","), nullptr);
-  auto* neighbor = v8::Isolate::New(neighborLimits.getCreateParams());
+  IsolateLimits neighborLimits(1000, 32, kj::str("\"workerId\":\"a/neighbor\","), nullptr, newGroup());
+  auto* neighbor = v8::Isolate::New(neighborLimits.group, neighborLimits.getCreateParams());
   KJ_DEFER(neighbor->Dispose());
-  neighborLimits.customizeIsolate(neighbor);
+  customizeEntered(neighborLimits, neighbor);
   auto checkNeighbor = [&] {
     v8::Locker lock(neighbor);
     v8::Isolate::Scope scope(neighbor);
@@ -371,12 +382,12 @@ void allocationComponent(kj::StringPtr code) {
   auto budget = std::make_shared<ResourceBudget>(1ull << 30, 4, 1);
   auto reservation = std::make_shared<ResourceReservation>(budget, 32);
   KJ_ASSERT(reservation->registerPreparation());
-  IsolateLimits limits(1000, 32, kj::str("\"workerId\":\"a/heap\","), reservation);
+  IsolateLimits limits(1000, 32, kj::str("\"workerId\":\"a/heap\","), reservation, newGroup());
   auto params = limits.getCreateParams();
   KJ_EXPECT(params.constraints.max_old_generation_size_in_bytes() > (1ull << 30));
-  auto* isolate = v8::Isolate::New(params);
+  auto* isolate = v8::Isolate::New(limits.group, params);
   KJ_DEFER(isolate->Dispose());
-  limits.customizeIsolate(isolate);
+  customizeEntered(limits, isolate);
   v8::Locker locker(isolate);
   v8::Isolate::Scope entered(isolate);
   v8::HandleScope handles(isolate);
@@ -400,6 +411,86 @@ void allocationComponent(kj::StringPtr code) {
   KJ_EXPECT(threaded::rawField(metrics, "heapPhysicalBytes") ==
       std::to_string(reservation->heapPhysical));
   checkNeighbor();
+}
+
+KJ_TEST("a Worker's ArrayBuffers lie in its own isolate group's sandbox") {
+  // MemoryBudget allocates in the group it was given: with a V8 sandbox per group, V8 ends the
+  // process on the first backing store outside the isolate's own sandbox.
+  initializeV8();
+  auto budget = std::make_shared<ResourceBudget>(1ull << 30, 4, 1);
+  auto reservation = std::make_shared<ResourceReservation>(budget, 32);
+  KJ_ASSERT(reservation->registerPreparation());
+  auto other = newGroup();
+  IsolateLimits limits(1000, 32, kj::str("\"workerId\":\"a/buffers\","), reservation, newGroup());
+  auto* isolate = v8::Isolate::New(limits.group, limits.getCreateParams());
+  KJ_DEFER(isolate->Dispose());
+  customizeEntered(limits, isolate);
+  v8::Locker locker(isolate);
+  v8::Isolate::Scope entered(isolate);
+  auto store = v8::ArrayBuffer::NewBackingStore(isolate, 1 << 20);
+  KJ_EXPECT(limits.group.SandboxContains(store->Data()));
+  KJ_EXPECT(!other.SandboxContains(store->Data()) || !v8::IsolateGroup::CanCreateNewGroups());
+  // V8 refuses a buffer above the group's pool before reserving anything; the Worker's own limit
+  // (32 MiB here) is not V8's maximum (r50 §6.5 B2: the next test).
+  if (v8::IsolateGroup::CanCreateNewGroups()) {
+    KJ_EXPECT(limits.memory->MaxAllocationSize() == server::SANDBOX_POOL_BYTES);
+  } else {
+    KJ_EXPECT(limits.memory->MaxAllocationSize() > (32ull << 20));
+  }
+}
+
+KJ_TEST("one ArrayBuffer above the memory limit ends the execution as MEMORY_LIMIT_EXCEEDED") {
+  // With or without the V8 sandbox: the buffer reaches the budget, which marks MEMORY and ends
+  // the execution, never a RangeError the Worker could catch (r50 §6.5 B2).
+  allocationComponent(
+      "try { globalThis.retained = new ArrayBuffer(64 * 1024 * 1024); } catch (e) { globalThis.caught = e; }");
+}
+
+KJ_TEST("a refused isolate group is retried, not kept as the Worker's failure") {
+  // compile() throws capacityError() when tryNewIsolateGroup() refuses (no room in the address
+  // space for another V8 sandbox). Kept in the slot, every request for that Worker answered 503
+  // in this process until the slot idled out (r50 §6.5 B1).
+  kj::Maybe<kj::Exception> refused = capacityError();
+  KJ_EXPECT(loadFailureRetryable(refused, true, false));
+  KJ_EXPECT(isCapacityError(KJ_ASSERT_NONNULL(refused)));
+  // A tenant's own failure stays the Worker's failure, unless the source was never fetched.
+  kj::Maybe<kj::Exception> script = KJ_EXCEPTION(FAILED, "jsg.Error: the Worker's script threw");
+  KJ_EXPECT(!loadFailureRetryable(script, true, false));
+  KJ_EXPECT(loadFailureRetryable(script, false, false));
+  kj::Maybe<kj::Exception> canceled = KJ_EXCEPTION(DISCONNECTED, "canceled before publication");
+  KJ_EXPECT(loadFailureRetryable(canceled, true, false));
+  // Memory pressure at startup becomes a capacity refusal, even of a load that succeeded.
+  kj::Maybe<kj::Exception> loaded;
+  KJ_EXPECT(!loadFailureRetryable(loaded, true, false) && loaded == kj::none);
+  KJ_EXPECT(loadFailureRetryable(loaded, true, true));
+  KJ_EXPECT(isCapacityError(KJ_ASSERT_NONNULL(loaded)));
+}
+
+KJ_TEST("a refused isolate group lowers the process's resident limit to its residents") {
+  // r50 §6.5 B3: the next Worker then evicts an idle one instead of being refused again.
+  auto budget = std::make_shared<ResourceBudget>(1ull << 30, 1840, 1);
+  std::vector<std::shared_ptr<ResourceReservation>> residents;
+  for (int i = 0; i < 4; i++) {
+    residents.push_back(std::make_shared<ResourceReservation>(budget, 32));
+    KJ_ASSERT(residents.back()->registerPreparation());
+  }
+  // The fourth one's group was refused: three residents besides it.
+  noSandboxRoom(*budget);
+  KJ_EXPECT(budget->residentMaximum.load() == 3 && budget->configuredResidentMaximum == 1840,
+      budget->residentMaximum.load());
+  residents.pop_back();
+  auto next = std::make_shared<ResourceReservation>(budget, 32);
+  KJ_EXPECT(!next->registerPreparation());
+  // Lowered again to fewer residents, never raised back.
+  residents.pop_back();
+  noSandboxRoom(*budget);
+  KJ_EXPECT(budget->residentMaximum.load() == 1, budget->residentMaximum.load());
+  for (int i = 0; i < 2; i++) {
+    residents.push_back(std::make_shared<ResourceReservation>(budget, 32));
+    (void)residents.back()->registerPreparation();
+  }
+  noSandboxRoom(*budget);
+  KJ_EXPECT(budget->residentMaximum.load() == 1, budget->residentMaximum.load());
 }
 
 KJ_TEST("single large heap allocation preserves the process") {
@@ -579,9 +670,9 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1,
     auto reservation = std::make_shared<ResourceReservation>(budget, childLimits.memoryMiB);
     KJ_ASSERT(reservation->registerPreparation());
     limits.push_back(kj::refcounted<IsolateLimits>(childLimits.cpuMs, childLimits.memoryMiB,
-        kj::str("\"workerId\":\"a/large-", i, "\","), reservation));
-    isolates.push_back(v8::Isolate::New(jsg::newIsolateGroup(), limits[i]->getCreateParams()));
-    limits[i]->customizeIsolate(isolates[i]);
+        kj::str("\"workerId\":\"a/large-", i, "\","), reservation, newGroup()));
+    isolates.push_back(v8::Isolate::New(limits[i]->group, limits[i]->getCreateParams()));
+    customizeEntered(*limits[i], isolates[i]);
   }
   KJ_DEFER(for (auto* isolate : isolates) isolate->Dispose());
   // No resident is idle during this test. Wake growers just as a maintenance
@@ -599,10 +690,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1,
   auto neighborReservation = std::make_shared<ResourceReservation>(budget, 128);
   KJ_ASSERT(neighborReservation->registerPreparation());
   IsolateLimits neighborLimits(
-      10000, 128, kj::str("\"workerId\":\"a/neighbor\","), neighborReservation);
-  auto* neighbor = v8::Isolate::New(jsg::newIsolateGroup(), neighborLimits.getCreateParams());
+      10000, 128, kj::str("\"workerId\":\"a/neighbor\","), neighborReservation, newGroup());
+  auto* neighbor = v8::Isolate::New(neighborLimits.group, neighborLimits.getCreateParams());
   KJ_DEFER(neighbor->Dispose());
-  neighborLimits.customizeIsolate(neighbor);
+  customizeEntered(neighborLimits, neighbor);
   auto runNeighbor = [&](kj::StringPtr code, int32_t expected) {
     v8::Locker lock(neighbor);
     v8::Isolate::Scope scope(neighbor);
@@ -871,10 +962,10 @@ KJ_TEST("the raised heap ceiling counts from the heap in use and later stays wit
   auto budget = std::make_shared<ResourceBudget>(2ull << 30, 4, 2);
   auto reservation = std::make_shared<ResourceReservation>(budget, 128);
   KJ_ASSERT(reservation->registerPreparation());
-  IsolateLimits limits(10000, 128, kj::str("\"workerId\":\"a/raise\","), reservation);
-  auto* isolate = v8::Isolate::New(limits.getCreateParams());
+  IsolateLimits limits(10000, 128, kj::str("\"workerId\":\"a/raise\","), reservation, newGroup());
+  auto* isolate = v8::Isolate::New(limits.group, limits.getCreateParams());
   KJ_DEFER(isolate->Dispose());
-  limits.customizeIsolate(isolate);
+  customizeEntered(limits, isolate);
   v8::Locker locker(isolate);
   v8::Isolate::Scope entered(isolate);
   v8::HandleScope handles(isolate);
@@ -903,10 +994,11 @@ KJ_TEST("the raised heap ceiling counts from the heap in use and later stays wit
   // was lent is not left for its later one, until that call's execution ends.
   auto otherReservation = std::make_shared<ResourceReservation>(budget, 128);
   KJ_ASSERT(otherReservation->registerPreparation());
-  IsolateLimits otherLimits(10000, 128, kj::str("\"workerId\":\"a/raise-other\","), otherReservation);
-  auto* other = v8::Isolate::New(otherLimits.getCreateParams());
+  IsolateLimits otherLimits(
+      10000, 128, kj::str("\"workerId\":\"a/raise-other\","), otherReservation, newGroup());
+  auto* other = v8::Isolate::New(otherLimits.group, otherLimits.getCreateParams());
   KJ_DEFER(other->Dispose());
-  otherLimits.customizeIsolate(other);
+  customizeEntered(otherLimits, other);
   {
     v8::Locker otherLocker(other);
     v8::Isolate::Scope otherEntered(other);
@@ -983,17 +1075,22 @@ KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker
   KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
 }
 
-// KNOWN FAILURE until each isolate has its own pointer cage (S3): every heap
-// of this V8 build shares one 4 GiB cage, and the hard reserve that lets one
-// isolate finish a maximum-sized object cannot be granted to four at once.
-// V8's fatal OOM then ends the process (exit 74). This test passes while the
-// failure reproduces and fails when it stops, so the status is updated.
-KJ_TEST("four simultaneous near-GiB heap objects end the process (known failure until S3)") {
+// Four isolates each finish an object of about 1 GiB at the same moment while a neighbor keeps
+// answering. With a pointer cage (and a V8 sandbox) per isolate (--config=coworkerd-sandbox), each
+// heap has its own 4 GiB, so the process survives. With one shared 4 GiB cage this ended the
+// process with V8's fatal OOM (exit 74; the known failure until S3, v137 §6.24), which a build
+// without per-isolate cages still reproduces: that branch keeps the old expectation.
+KJ_TEST("four simultaneous near-GiB heap objects preserve the process and a neighboring Worker") {
   auto child = runAllocationChild("4:string");
+  if (v8::IsolateGroup::CanCreateNewGroups()) {
+    KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
+    KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
+    return;
+  }
   bool reproduced = WIFEXITED(child.status) && WEXITSTATUS(child.status) == 74;
   fprintf(stdout, "KNOWN_FAILURE four-simultaneous-near-GiB reproduced=%d\n", reproduced);
   fflush(stdout);
-  KJ_EXPECT(reproduced, "the known failure changed; update its status", child.status);
+  KJ_EXPECT(reproduced, "the shared-cage failure changed; update its status", child.status);
   // The OOM row names the execution whose allocation failed and carries its
   // isolate's heap: far below that Worker's 128 MiB limit, because the other
   // isolates filled the shared cage. The node must not blame it.
@@ -1116,14 +1213,14 @@ KJ_TEST("validation reports retain the original JavaScript exception") {
 
 KJ_TEST("source JSON failures preserve the actual Worker decoder exception") {
   initializeV8();
-  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr);
+  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr, newGroup());
   bool failed = false;
   KJ_IF_SOME(error, sourceJsonFailure("not JSON", limits)) {
     failed = true;
     KJ_EXPECT(error == "SyntaxError: Unexpected token 'o', \"not JSON\" is not valid JSON");
   }
   KJ_EXPECT(failed);
-  IsolateLimits valid(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr);
+  IsolateLimits valid(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr, newGroup());
   KJ_EXPECT(sourceJsonFailure("{}", valid) == kj::none);
 }
 
@@ -1154,7 +1251,7 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
   auto lagging = kj::systemPreciseMonotonicClock().now() - 5 * kj::SECONDS;
   kj::TimerImpl clock(lagging);
   Timer timer(clock);
-  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/background\","), nullptr);
+  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/background\","), nullptr, newGroup());
   Slot slot;
   slot.limits = &isolateLimits;
   Measurement measurement;
@@ -1188,7 +1285,7 @@ KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handl
   const auto start = kj::systemPreciseMonotonicClock().now();
   kj::TimerImpl clock(start);
   Timer timer(clock);
-  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/stream\","), nullptr);
+  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/stream\","), nullptr, newGroup());
   Slot slot;
   slot.limits = &isolateLimits;
   Measurement measurement;
