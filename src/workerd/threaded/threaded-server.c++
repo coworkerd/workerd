@@ -620,8 +620,8 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   v8::ArrayBuffer::Allocator *inner;
   v8::Isolate *isolate = nullptr;
   std::atomic<bool> pendingPressure{false};
-  // Whether this isolate's ceiling was raised once already (install()).
-  std::atomic<bool> ceilingRaised{false};
+  // How many times this isolate's ceiling was raised (install()).
+  std::atomic<uint32_t> ceilingRaised{0};
   std::atomic<LimitCause> *currentCause = nullptr;  // isolate-lock protected
   void pressure() {
     if (currentCause) {
@@ -728,18 +728,45 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     // large allocation can then meet the fixed ceiling with that object live
     // (cwkd-p40: a 500 MB string, then a maximum string, ended the process,
     // raw/s27-x500). Near the ceiling the isolate is over its limit: it is
-    // terminated as such, and its ceiling is raised once by one maximum
-    // object so that the allocation in progress finishes; its call ends with
+    // terminated as such, and its ceiling is raised by one maximum object so
+    // that the allocation in progress finishes; its call ends with
     // MEMORY_LIMIT_EXCEEDED and the isolate is retired, as any isolate over
-    // its limit. A second time in the same isolate the ceiling stays and V8's
-    // OOM ends the process, as before.
+    // its limit.
+    //
+    // The termination takes effect at V8's next interrupt check. Code that
+    // reaches none keeps allocating meanwhile: straight-line code making one
+    // large string after another, or one long builtin (V8's JSON.parse and
+    // String.prototype.split check interrupts with patch 0056). So while it is
+    // pending the ceiling may rise again (raise()), within what the process
+    // can still give; only past that does V8's OOM end the process.
     value->AddNearHeapLimitCallback([](void *opaque, size_t current, size_t) -> size_t {
       auto &budget = *static_cast<MemoryBudget *>(opaque);
       budget.cause->store(LimitCause::MEMORY);
       budget.isolate->TerminateExecution();
-      if (budget.ceilingRaised.exchange(true)) return current;
-      return current + MAX_SINGLE_HEAP_OBJECT;
+      return current + budget.raise();
     }, this);
+  }
+  // The first raise is one maximum object, whatever else is in use. A later
+  // one (the termination requested at the first is still pending) is at most
+  // one maximum object and at most what is left under the process memory
+  // maximum and, with one pointer cage for every isolate of the process, in
+  // that cage (less the 256 MiB its other isolates keep); 0 when nothing is.
+  // Reservations are read without their lock: the counters are atomic, and an
+  // estimate made at a collection is all this needs.
+  uint64_t raise() {
+    uint64_t room = MAX_SINGLE_HEAP_OBJECT;
+    if (ceilingRaised.load() > 0) {
+      if (!reservation) return 0;
+      const auto &resources = *reservation->budget;
+      const auto memory = resources.memoryReserved.load();
+      room = kj::min(room, resources.memoryMaximum - kj::min(memory, resources.memoryMaximum));
+      if (resources.addressMaximum != UINT64_MAX) {
+        const auto cage = resources.addressMaximum + MAX_SINGLE_HEAP_OBJECT;
+        room = kj::min(room, cage - kj::min(resources.addressReserved.load(), cage));
+      }
+    }
+    if (room > 0) ceilingRaised.fetch_add(1);
+    return room;
   }
 };
 
