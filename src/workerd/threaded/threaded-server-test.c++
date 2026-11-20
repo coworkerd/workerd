@@ -735,7 +735,9 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
     {"cpu-json-reviver"_kj, CPU_JSON_REVIVER, -1, Outcome::CPU, cpu},
     {"sort-string"_kj, SORT_STRING, -1, Outcome::MEMORY},
     {"replace-function"_kj, REPLACE_FUNCTION, -1, Outcome::MEMORY},
-    {"replace-function-high"_kj, REPLACE_FUNCTION, -1, Outcome::RANGE, {.memoryMiB = 1024}},
+    // About 8.5 s of CPU to collect 2^27 matches: a CPU limit well above it, so that only the RangeError ends it
+    // (a busy machine took it past the default 10 s once).
+    {"replace-function-high"_kj, REPLACE_FUNCTION, -1, Outcome::RANGE, {.memoryMiB = 1024, .cpuMs = 60000}},
     {"match-atom"_kj, MATCH_ATOM, -1, Outcome::MEMORY_OR_RANGE},
     {"cpu-sort-length"_kj, CPU_SORT_LENGTH, -1, Outcome::CPU, cpu},
     {"cpu-to-sorted-length"_kj, CPU_TO_SORTED_LENGTH, -1, Outcome::CPU, cpu},
