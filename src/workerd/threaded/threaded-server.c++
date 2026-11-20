@@ -743,30 +743,40 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
       auto &budget = *static_cast<MemoryBudget *>(opaque);
       budget.cause->store(LimitCause::MEMORY);
       budget.isolate->TerminateExecution();
-      return current + budget.raise();
+      return budget.raise(current);
     }, this);
   }
-  // The first raise is one maximum object, whatever else is in use. A later
-  // one (the termination requested at the first is still pending) is at most
-  // one maximum object and at most what is left under the process memory
-  // maximum and, with one pointer cage for every isolate of the process, in
-  // that cage (less the 256 MiB its other isolates keep); 0 when nothing is.
+  // The new ceiling. The heap can already be past the old one: young large
+  // objects are promoted without a limit check (cwkd-p40, v138: a structured
+  // clone of three maximum strings had 2.0 GiB live at a 1313 MiB ceiling, so
+  // raising the ceiling itself by one maximum object left no room for the
+  // third and V8's OOM ended the process). So the room is counted from what is
+  // in use. The first raise is one maximum object, whatever else is in use. A
+  // later one (the termination requested at the first is still pending) grants
+  // at most what is left under the process memory maximum and, with one
+  // pointer cage for every isolate of the process, in that cage (less the
+  // 256 MiB its other isolates keep); with nothing left the ceiling stays.
   // Reservations are read without their lock: the counters are atomic, and an
   // estimate made at a collection is all this needs.
-  uint64_t raise() {
-    uint64_t room = MAX_SINGLE_HEAP_OBJECT;
+  size_t raise(size_t current) {
+    v8::HeapStatistics stats;
+    isolate->GetHeapStatistics(&stats);
+    const uint64_t used = stats.total_heap_size();
+    uint64_t ceiling = kj::max(uint64_t(current), used) + MAX_SINGLE_HEAP_OBJECT;
     if (ceilingRaised.load() > 0) {
-      if (!reservation) return 0;
+      if (!reservation) return current;
       const auto &resources = *reservation->budget;
-      const auto memory = resources.memoryReserved.load();
-      room = kj::min(room, resources.memoryMaximum - kj::min(memory, resources.memoryMaximum));
+      uint64_t room = resources.memoryMaximum -
+          kj::min(resources.memoryReserved.load(), resources.memoryMaximum);
       if (resources.addressMaximum != UINT64_MAX) {
         const auto cage = resources.addressMaximum + MAX_SINGLE_HEAP_OBJECT;
         room = kj::min(room, cage - kj::min(resources.addressReserved.load(), cage));
       }
+      ceiling = kj::min(ceiling, used + room);
     }
-    if (room > 0) ceilingRaised.fetch_add(1);
-    return room;
+    if (ceiling <= current) return current;
+    ceilingRaised.fetch_add(1);
+    return ceiling;
   }
 };
 
