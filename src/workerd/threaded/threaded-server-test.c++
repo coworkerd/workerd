@@ -490,7 +490,8 @@ constexpr kj::StringPtr JSON_REVIVER =
     "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**26) + '1]', (k, v) => v); retained.length"_kj;
 constexpr kj::StringPtr JSON_PROPERTIES =
     "globalThis.retained = JSON.parse('{' + '\"a\":1,'.repeat(2**24) + '\"a\":1}'); 1"_kj;
-// The same object with a reviver takes the iterative parser and its own check.
+// The same object with a reviver takes the iterative parser and its own check. Both must throw the RangeError:
+// without the limit the repeated key collapses into one property and the parse completes.
 constexpr kj::StringPtr JSON_PROPERTIES_REVIVER =
     "globalThis.retained = JSON.parse('{' + '\"a\":1,'.repeat(2**24) + '\"a\":1}', (k, v) => v); 1"_kj;
 // The verifier's sweep of V8 builtins (v138 §8.4), the shapes that ended the
@@ -730,8 +731,8 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
     {"replace-all"_kj, REPLACE_ALL, -1, Outcome::MEMORY},
     {"json-mixed"_kj, JSON_MIXED, -1, Outcome::MEMORY_OR_RANGE},
     {"json-reviver"_kj, JSON_REVIVER, -1, Outcome::MEMORY_OR_RANGE},
-    {"json-properties"_kj, JSON_PROPERTIES, -1, Outcome::MEMORY_OR_RANGE},
-    {"json-properties-reviver"_kj, JSON_PROPERTIES_REVIVER, -1, Outcome::MEMORY_OR_RANGE},
+    {"json-properties"_kj, JSON_PROPERTIES, -1, Outcome::RANGE},
+    {"json-properties-reviver"_kj, JSON_PROPERTIES_REVIVER, -1, Outcome::RANGE},
     {"cpu-json-numbers"_kj, CPU_JSON_NUMBERS, -1, Outcome::CPU, cpu},
     {"cpu-json-slow"_kj, CPU_JSON_SLOW, -1, Outcome::CPU, cpu},
     {"cpu-json-reviver"_kj, CPU_JSON_REVIVER, -1, Outcome::CPU, cpu},
