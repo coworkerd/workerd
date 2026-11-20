@@ -251,6 +251,10 @@ kj::Exception limitException(LimitCause cause);
 // Each resident owns its measured heap, external allocations and native
 // overhead. Invocation ownership survives yields; only new admission uses the
 // lower watermark. Growth over the upper watermark belongs to the growing call.
+// The heap one isolate's own pointer cage holds when each isolate group has a cage of its own (the
+// V8 sandbox build): the 4 GiB cage less what V8 keeps in it, as for the shared cage below.
+constexpr uint64_t OWN_CAGE_HEAP = (4ull << 30) - (256ull << 20);
+
 struct ResourceBudget {
   static constexpr uint64_t MiB = 1ull << 20;
   ResourceBudget(uint64_t maximum, uint32_t residents, uint32_t callThreads)
@@ -853,7 +857,10 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     v8::HeapStatistics stats;
     isolate->GetHeapStatistics(&stats);
     const uint64_t used = stats.total_heap_size();
-    const uint64_t wanted = kj::max(uint64_t(current), used) + MAX_SINGLE_HEAP_OBJECT;
+    // With a V8 sandbox per isolate group the isolate's heap has a pointer cage of its own, which
+    // bounds every raise whatever the process budget has left (with one shared cage its remainder
+    // over all isolates does, below: v138 §8.1's interface with r50's S3a).
+    const uint64_t wanted = ownCageCeiling(kj::max(uint64_t(current), used) + MAX_SINGLE_HEAP_OBJECT);
     const bool first = ceilingRaised.load() == 0;
     if (!first && !reservation) return current;
     if (!reservation) {
@@ -884,6 +891,9 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     }
     ceilingRaised.fetch_add(1);
     return ceiling;
+  }
+  static uint64_t ownCageCeiling(uint64_t ceiling) {
+    return v8::IsolateGroup::CanCreateNewGroups() ? kj::min(ceiling, OWN_CAGE_HEAP) : ceiling;
   }
   void returnLent() {
     if (lentHere == 0 || !reservation) return;

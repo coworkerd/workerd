@@ -1018,6 +1018,30 @@ KJ_TEST("the raised heap ceiling counts from the heap in use and later stays wit
   isolate->CancelTerminateExecution();
 }
 
+// With a V8 sandbox per isolate group each isolate's heap has a pointer cage of its own: a raise
+// reaches at most that cage less what V8 keeps in it, however much the process budget has left
+// (v138 §8.1's interface with r50's S3a). A build with one shared cage bounds it by that cage's
+// remainder over all isolates instead (the test above), and skips this one.
+KJ_TEST("with a sandbox per isolate, a raised ceiling stays within the isolate's own cage") {
+  initializeV8();
+  if (!v8::IsolateGroup::CanCreateNewGroups()) return;
+  auto budget = std::make_shared<ResourceBudget>(64ull << 30, 4, 2);
+  auto reservation = std::make_shared<ResourceReservation>(budget, 128);
+  KJ_ASSERT(reservation->registerPreparation());
+  IsolateLimits limits(10000, 128, kj::str("\"workerId\":\"a/raise-own-cage\","), reservation, newGroup());
+  auto* isolate = v8::Isolate::New(limits.group, limits.getCreateParams());
+  KJ_DEFER(isolate->Dispose());
+  customizeEntered(limits, isolate);
+  v8::Locker locker(isolate);
+  v8::Isolate::Scope entered(isolate);
+  auto& memory = *limits.memory;
+  const auto first = memory.raise(OWN_CAGE_HEAP - (256ull << 20));
+  KJ_EXPECT(first == OWN_CAGE_HEAP, first);
+  KJ_EXPECT(memory.raise(first) == first, "the isolate's own cage has nothing left");
+  memory.returnLent();
+  KJ_EXPECT(budget->lent.load() == 0);
+}
+
 // Each long operation below ended the process before v138 (exit 74 at the
 // raised ceiling, or V8's fatal invalid size): the child must survive, its
 // call end with the memory limit (or, where noted, a RangeError), and the
