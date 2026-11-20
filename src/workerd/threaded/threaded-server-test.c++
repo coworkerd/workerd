@@ -507,8 +507,9 @@ constexpr kj::StringPtr MATCH_ATOM =
     "globalThis.retained = 'x'.repeat(2**27 + 1).match(/x/g); retained.length"_kj;
 // Loops that allocate nothing while they run: their interrupt checks are what
 // lets a short CPU limit end the call (each takes about a second unchecked).
-// The numbers' fast path: long decimals, so that the unchecked parse (about 2 s on cwkd-p40) is far past the limit
-// (small integers parsed so fast that an unchecked parse still ended within it).
+// The numbers' fast path: long decimals, about 2 s of parsing on cwkd-p40 after about 0.15 s of flattening the text.
+// Its CPU limit (500 ms, below) expires inside the number loop, so only that loop's check can end the call in time;
+// with the 50 ms of the others the limit expired while the text was flattened and the first value's check ended it.
 constexpr kj::StringPtr CPU_JSON_NUMBERS =
     "globalThis.retained = JSON.parse('[' + '1.2345678901234567890123e10,'.repeat(2**23) + '1]'); retained.length"_kj;
 constexpr kj::StringPtr CPU_JSON_SLOW =
@@ -737,7 +738,7 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
     {"json-reviver"_kj, JSON_REVIVER, -1, Outcome::MEMORY_OR_RANGE},
     {"json-properties"_kj, JSON_PROPERTIES, -1, Outcome::RANGE},
     {"json-properties-reviver"_kj, JSON_PROPERTIES_REVIVER, -1, Outcome::RANGE},
-    {"cpu-json-numbers"_kj, CPU_JSON_NUMBERS, -1, Outcome::CPU, cpu},
+    {"cpu-json-numbers"_kj, CPU_JSON_NUMBERS, -1, Outcome::CPU, {.memoryMiB = 1024, .cpuMs = 500, .maxSeconds = 1.2}},
     {"cpu-json-slow"_kj, CPU_JSON_SLOW, -1, Outcome::CPU, cpu},
     {"cpu-json-reviver"_kj, CPU_JSON_REVIVER, -1, Outcome::CPU, cpu},
     {"sort-string"_kj, SORT_STRING, -1, Outcome::MEMORY},
