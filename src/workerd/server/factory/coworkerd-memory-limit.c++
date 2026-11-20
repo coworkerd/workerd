@@ -1,4 +1,5 @@
 #include "coworkerd-memory-limit.h"
+#include "coworkerd-sandbox.h"
 
 #include <kj/debug.h>
 #include <v8-statistics.h>
@@ -93,7 +94,7 @@ void* IsolateMemoryLimit::allocate(size_t length, Initialization initialization)
 }
 void* IsolateMemoryLimit::Allocate(size_t length) { return allocate(length, Initialization::ZERO); }
 void* IsolateMemoryLimit::AllocateUninitialized(size_t length) { return allocate(length, Initialization::UNINITIALIZED); }
-size_t IsolateMemoryLimit::MaxAllocationSize() const { return std::min<size_t>(limitBytes, inner->MaxAllocationSize()); }
+size_t IsolateMemoryLimit::MaxAllocationSize() const { return sandboxMaxAllocationSize(inner->MaxAllocationSize()); }
 v8::PageAllocator* IsolateMemoryLimit::GetPageAllocator() { return inner->GetPageAllocator(); }
 void IsolateMemoryLimit::Free(void* address, size_t length) { inner->Free(address, length); bufferBytes.fetch_sub(length); release(length); }
 

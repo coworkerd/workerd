@@ -34,9 +34,9 @@ class IsolateMemoryLimit final: public v8::ArrayBuffer::Allocator, public std::e
   void* Allocate(size_t length) override;
   void* AllocateUninitialized(size_t length) override;
   void Free(void* address, size_t length) override;
-  // No single buffer, and no resizable buffer's reservation, beyond the limit: V8 refuses those
-  // before reserving anything (otherwise its default is 32 GiB, and a resizable ArrayBuffer could
-  // reserve the whole buffer half of an 8 GiB sandbox).
+  // sandboxMaxAllocationSize(): with a V8 sandbox per isolate group, no single buffer and no
+  // resizable buffer's reservation beyond the group's pool (V8's default is 32 GiB, more than the
+  // buffer half of an 8 GiB sandbox); the limit itself stays with allocate() (r50 §6.5 B2).
   size_t MaxAllocationSize() const override;
   v8::PageAllocator* GetPageAllocator() override;
   void customize(v8::Isolate* isolate);

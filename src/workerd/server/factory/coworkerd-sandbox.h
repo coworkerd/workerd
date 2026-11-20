@@ -64,6 +64,13 @@ kj::Maybe<v8::IsolateGroup> tryNewIsolateGroup();
 std::shared_ptr<v8::Allocator> newSandboxPoolAllocator(v8::VirtualAddressSpace& space);
 constexpr size_t SANDBOX_POOL_BYTES = size_t(2) << 30;
 
+// MaxAllocationSize() for the ArrayBuffer allocator of an isolate (`inner`: V8's own allocator's).
+// With a V8 sandbox per isolate group no buffer can be larger than the group's pool, so V8 refuses
+// one above SANDBOX_POOL_BYTES before reserving anything; otherwise, and in a build without the
+// sandbox, V8's own value. Never the Worker's memory limit: a buffer above it still reaches the
+// allocator, which ends the execution with the limit's own cause (r50 §6.5 B2).
+size_t sandboxMaxAllocationSize(size_t inner);
+
 // How many isolate groups this process can still create: creates them until tryNewIsolateGroup()
 // refuses, then releases them. V8 places each sandbox at a random address, so the address space
 // holds about three quarters of what its size divided by one reservation suggests (random

@@ -341,6 +341,13 @@ bool zeroSegmentHeld() {
 #endif
 }
 
+size_t sandboxMaxAllocationSize(size_t inner) {
+#ifdef V8_ENABLE_SANDBOX
+  if (v8::IsolateGroup::CanCreateNewGroups()) return std::min(inner, SANDBOX_POOL_BYTES);
+#endif
+  return inner;
+}
+
 size_t measureGroupCapacity(size_t limit) {
   if (!v8::IsolateGroup::CanCreateNewGroups()) return 0;
   kj::Vector<v8::IsolateGroup> groups;

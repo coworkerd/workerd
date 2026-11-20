@@ -253,6 +253,7 @@ struct ResourceBudget {
                 ? UINT64_MAX
                 : (4ull << 30) - MAX_SINGLE_HEAP_OBJECT - (256ull << 20)),
         baselineMemory(64 * MiB + uint64_t(callThreads + 16) * (256ull << 10)),
+        configuredResidentMaximum(residents),
         residentMaximum(residents),
         memoryReserved(baselineMemory) {
     KJ_REQUIRE(admissionMaximum > baselineMemory + 2 * MiB,
@@ -264,7 +265,12 @@ struct ResourceBudget {
         "invalid resident budget for this build");
   }
   const uint64_t memoryMaximum, admissionMaximum, addressMaximum, baselineMemory;
-  const uint32_t residentMaximum;
+  // The node's per-process limit, and the one in force: the first time the address space has no
+  // room for another isolate's V8 sandbox, the limit is lowered to the residents it does hold
+  // (lowerResidentMaximum(), r50 §6.5 B3), so that the next Worker evicts an idle one instead of
+  // being refused again.
+  const uint32_t configuredResidentMaximum;
+  std::atomic<uint32_t> residentMaximum;
   std::mutex mutex;
   std::atomic<uint64_t> memoryReserved{0}, addressReserved{0};
   std::atomic<uint32_t> residents{0};
@@ -384,7 +390,7 @@ struct ResourceReservation {
   }
   bool registerPreparation() {
     std::lock_guard lock(mutex);
-    if (budget->residents.fetch_add(1) >= budget->residentMaximum) {
+    if (budget->residents.fetch_add(1) >= budget->residentMaximum.load()) {
       budget->residents.fetch_sub(1);
       return false;
     }
@@ -461,16 +467,30 @@ struct ResourcePreparation {
 };
 
 // Workers refused because the address space had no room for another isolate's V8 sandbox
-// (tryNewIsolateGroup()); one [coworkerd-sandbox] row each.
+// (tryNewIsolateGroup()); one [coworkerd-sandbox] row each. The refused Worker is not resident:
+// the process's resident limit is lowered to the residents besides it (never raised again), and
+// the row says so.
 std::atomic<uint64_t> sandboxRefusals{0};
-void noSandboxRoom() {
+void noSandboxRoom(ResourceBudget &budget) {
   auto refusals = sandboxRefusals.fetch_add(1) + 1;
-  fprintf(stderr, "[coworkerd-sandbox] {\"event\":\"group-refused\",\"refusals\":%llu}\n",
-      static_cast<unsigned long long>(refusals));
+  // The refused Worker was counted when its load registered.
+  const uint32_t residents = budget.residents.load();
+  const uint32_t others = residents > 1 ? residents - 1 : 1;
+  auto previous = budget.residentMaximum.load();
+  while (others < previous && !budget.residentMaximum.compare_exchange_weak(previous, others)) {
+  }
+  fprintf(stderr,
+      "[coworkerd-sandbox] {\"event\":\"group-refused\",\"refusals\":%llu,\"residents\":%u,"
+      "\"residentMaximum\":%u,\"configuredResidentMaximum\":%u}\n",
+      static_cast<unsigned long long>(refusals), residents > 0 ? residents - 1 : 0,
+      budget.residentMaximum.load(), budget.configuredResidentMaximum);
 }
 
 constexpr kj::Exception::DetailTypeId CAPACITY_DETAIL = 0x9f232974b0ac7143ull;
 enum class CapacityScope { PROCESS, TENANT };
+bool isCapacityError(const kj::Exception &error) {
+  return error.getDetail(CAPACITY_DETAIL) != kj::none;
+}
 kj::Exception capacityError(CapacityScope scope = CapacityScope::PROCESS) {
   const auto tenant = scope == CapacityScope::TENANT;
   auto error = jsg::tagCoworkerdRpcError(tenant
@@ -482,6 +502,22 @@ kj::Exception capacityError(CapacityScope scope = CapacityScope::PROCESS) {
   if (tenant) detail[0] = 1;
   error.setDetail(CAPACITY_DETAIL, kj::mv(detail));
   return error;
+}
+
+// Whether a finished load's failure stays out of the registry, so that the next request loads
+// the Worker again instead of receiving this failure: one before the source was fetched, a caller
+// failure (DISCONNECTED), memory pressure at startup (which becomes capacityError()), and any
+// capacity refusal -- in particular no room for another isolate's V8 sandbox. Kept, a refused
+// group answered 503 for this Worker in this process until its slot idled out (r50 §6.5 B1).
+// A tenant's own failure (its script throws, a binding is invalid) stays the Worker's failure.
+bool loadFailureRetryable(kj::Maybe<kj::Exception> &error, bool fetched, bool memoryPressure) {
+  if (memoryPressure) error = capacityError();
+  bool retryable = !fetched || memoryPressure;
+  KJ_IF_SOME(failure, error) {
+    retryable = retryable || failure.getType() == kj::Exception::Type::DISCONNECTED ||
+        isCapacityError(failure);
+  }
+  return retryable;
 }
 
 struct TenantBudget {
@@ -640,10 +676,12 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   ~MemoryBudget() noexcept override {
     delete inner;
   }
-  // No single buffer, and no resizable buffer's reservation, beyond the Worker's limit (V8's
-  // default is 32 GiB, more than the buffer half of an 8 GiB sandbox).
+  // With a V8 sandbox per isolate group, no single buffer and no resizable buffer's reservation
+  // beyond the group's pool (V8's default is 32 GiB, more than the buffer half of an 8 GiB
+  // sandbox). Not the Worker's limit: a buffer above it reaches reserve(), which marks MEMORY and
+  // ends the execution (r50 §6.5 B2).
   size_t MaxAllocationSize() const override {
-    return std::min<size_t>(maximum, inner->MaxAllocationSize());
+    return server::sandboxMaxAllocationSize(inner->MaxAllocationSize());
   }
   v8::PageAllocator *GetPageAllocator() override {
     return inner->GetPageAllocator();
@@ -1856,6 +1894,8 @@ struct ThreadedServer {
         ",\"addressBytes\":" + std::to_string(resources->addressReserved.load()) +
         ",\"addressMaximum\":" + std::to_string(resources->addressMaximum) +
         ",\"residents\":" + std::to_string(resources->residents.load()) +
+        ",\"residentMaximum\":" + std::to_string(resources->residentMaximum.load()) +
+        ",\"configuredResidentMaximum\":" + std::to_string(resources->configuredResidentMaximum) +
         ",\"rejected\":" + std::to_string(resources->rejections.load()) +
         ",\"sandboxRefused\":" + std::to_string(sandboxRefusals.load()) +
         ",\"evicted\":" + std::to_string(resources->evictions.load()) +
@@ -2218,7 +2258,7 @@ struct ThreadedServer {
       source = std::make_unique<JsonDoc>(content);
     } catch (kj::Exception &error) {
       auto group = KJ_UNWRAP_OR(server::tryNewIsolateGroup(), {
-        noSandboxRoom();
+        noSandboxRoom(*resources);
         kj::throwFatalException(capacityError());
       });
       IsolateLimits limits(workerLimit(descriptor, "cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
@@ -2305,7 +2345,7 @@ struct ThreadedServer {
     // With a V8 sandbox per isolate, an address space without room for another one refuses this
     // Worker (the node's per-process limit normally refuses first), never ends the process.
     auto group = KJ_UNWRAP_OR(server::tryNewIsolateGroup(), {
-      noSandboxRoom();
+      noSandboxRoom(*resources);
       kj::throwFatalException(capacityError());
     });
     auto limits = kj::refcounted<IsolateLimits>(
@@ -2585,17 +2625,10 @@ struct ThreadedServer {
           error.setDetail(LOAD_STAGE_DETAIL, kj::mv(stage));
           slot->error = kj::mv(error);
         }
-        bool callerFailure = false;
-        KJ_IF_SOME(error, slot->error) {
-          callerFailure = error.getType() == kj::Exception::Type::DISCONNECTED;
-        }
-        if (slot->limits &&
+        const bool pressure = slot->limits &&
             (slot->limits->startupCause.load() == LimitCause::PROCESS_MEMORY ||
-                slot->limits->memory->pendingPressure.load())) {
-          slot->error = capacityError();
-          callerFailure = true;
-        }
-        if (!fetched || callerFailure) {
+                slot->limits->memory->pendingPressure.load());
+        if (loadFailureRetryable(slot->error, fetched, pressure)) {
           slot->retryableLoad.store(true);
           remove();
         }

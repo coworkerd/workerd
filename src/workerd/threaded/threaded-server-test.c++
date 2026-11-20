@@ -368,8 +368,67 @@ KJ_TEST("a Worker's ArrayBuffers lie in its own isolate group's sandbox") {
   auto store = v8::ArrayBuffer::NewBackingStore(isolate, 1 << 20);
   KJ_EXPECT(limits.group.SandboxContains(store->Data()));
   KJ_EXPECT(!other.SandboxContains(store->Data()) || !v8::IsolateGroup::CanCreateNewGroups());
-  // A buffer above the Worker's limit is refused before anything is reserved.
-  KJ_EXPECT(limits.memory->MaxAllocationSize() == (32ull << 20));
+  // V8 refuses a buffer above the group's pool before reserving anything; the Worker's own limit
+  // (32 MiB here) is not V8's maximum (r50 §6.5 B2: the next test).
+  if (v8::IsolateGroup::CanCreateNewGroups()) {
+    KJ_EXPECT(limits.memory->MaxAllocationSize() == server::SANDBOX_POOL_BYTES);
+  } else {
+    KJ_EXPECT(limits.memory->MaxAllocationSize() > (32ull << 20));
+  }
+}
+
+KJ_TEST("one ArrayBuffer above the memory limit ends the execution as MEMORY_LIMIT_EXCEEDED") {
+  // With or without the V8 sandbox: the buffer reaches the budget, which marks MEMORY and ends
+  // the execution, never a RangeError the Worker could catch (r50 §6.5 B2).
+  allocationComponent(
+      "try { globalThis.retained = new ArrayBuffer(64 * 1024 * 1024); } catch (e) { globalThis.caught = e; }");
+}
+
+KJ_TEST("a refused isolate group is retried, not kept as the Worker's failure") {
+  // compile() throws capacityError() when tryNewIsolateGroup() refuses (no room in the address
+  // space for another V8 sandbox). Kept in the slot, every request for that Worker answered 503
+  // in this process until the slot idled out (r50 §6.5 B1).
+  kj::Maybe<kj::Exception> refused = capacityError();
+  KJ_EXPECT(loadFailureRetryable(refused, true, false));
+  KJ_EXPECT(isCapacityError(KJ_ASSERT_NONNULL(refused)));
+  // A tenant's own failure stays the Worker's failure, unless the source was never fetched.
+  kj::Maybe<kj::Exception> script = KJ_EXCEPTION(FAILED, "jsg.Error: the Worker's script threw");
+  KJ_EXPECT(!loadFailureRetryable(script, true, false));
+  KJ_EXPECT(loadFailureRetryable(script, false, false));
+  kj::Maybe<kj::Exception> canceled = KJ_EXCEPTION(DISCONNECTED, "canceled before publication");
+  KJ_EXPECT(loadFailureRetryable(canceled, true, false));
+  // Memory pressure at startup becomes a capacity refusal, even of a load that succeeded.
+  kj::Maybe<kj::Exception> loaded;
+  KJ_EXPECT(!loadFailureRetryable(loaded, true, false) && loaded == kj::none);
+  KJ_EXPECT(loadFailureRetryable(loaded, true, true));
+  KJ_EXPECT(isCapacityError(KJ_ASSERT_NONNULL(loaded)));
+}
+
+KJ_TEST("a refused isolate group lowers the process's resident limit to its residents") {
+  // r50 §6.5 B3: the next Worker then evicts an idle one instead of being refused again.
+  auto budget = std::make_shared<ResourceBudget>(1ull << 30, 1840, 1);
+  std::vector<std::shared_ptr<ResourceReservation>> residents;
+  for (int i = 0; i < 4; i++) {
+    residents.push_back(std::make_shared<ResourceReservation>(budget, 32));
+    KJ_ASSERT(residents.back()->registerPreparation());
+  }
+  // The fourth one's group was refused: three residents besides it.
+  noSandboxRoom(*budget);
+  KJ_EXPECT(budget->residentMaximum.load() == 3 && budget->configuredResidentMaximum == 1840,
+      budget->residentMaximum.load());
+  residents.pop_back();
+  auto next = std::make_shared<ResourceReservation>(budget, 32);
+  KJ_EXPECT(!next->registerPreparation());
+  // Lowered again to fewer residents, never raised back.
+  residents.pop_back();
+  noSandboxRoom(*budget);
+  KJ_EXPECT(budget->residentMaximum.load() == 1, budget->residentMaximum.load());
+  for (int i = 0; i < 2; i++) {
+    residents.push_back(std::make_shared<ResourceReservation>(budget, 32));
+    (void)residents.back()->registerPreparation();
+  }
+  noSandboxRoom(*budget);
+  KJ_EXPECT(budget->residentMaximum.load() == 1, budget->residentMaximum.load());
 }
 
 KJ_TEST("single large heap allocation preserves the process") {
