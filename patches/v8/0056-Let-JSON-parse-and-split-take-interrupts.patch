@@ -28,9 +28,11 @@ Array.prototype.sort and toSorted sized their work array by the length
 alone when the receiver had no own elements (an array-like object, a
 string, a proxy): a length past the largest array ended the process
 before an element was read. Start such a work array at 1,024 entries and
-let it grow with the elements found; collecting them visits every index
-up to the length, so handle interrupts once per 1,024 indices there. A
-global regexp replace with a function collects every match first: handle
+let it grow with the elements found (Torque's GrowableFixedArray now
+stops at the largest array and throws a RangeError when that is full,
+instead of ending the process); collecting them visits every index up to
+the length, so handle interrupts once per 1,024 indices there. A global
+regexp replace with a function collects every match first: handle
 interrupts every 1,024 matches, throw a RangeError before the builder
 outgrows the largest array. A global atom match throws a RangeError when
 it counts more matches than the largest array holds.
@@ -50,6 +52,40 @@ index d282fa8..570d937 100644
  
      ToDirectStringAssembler to_direct(state(), subject_string);
      to_direct.TryToDirect(&call_runtime);
+diff --git a/src/builtins/growable-fixed-array.tq b/src/builtins/growable-fixed-array.tq
+index aa288b7..b16ec42 100644
+--- a/src/builtins/growable-fixed-array.tq
++++ b/src/builtins/growable-fixed-array.tq
+@@ -5,7 +5,7 @@
+ namespace growable_fixed_array {
+ // TODO(pwong): Support FixedTypedArrays.
+ struct GrowableFixedArray {
+-  macro Push(obj: Object): void {
++  macro Push(implicit context: Context)(obj: Object): void {
+     this.EnsureCapacity();
+     this.array.objects[this.length++] = obj;
+   }
+@@ -17,12 +17,18 @@ struct GrowableFixedArray {
+     return ExtractFixedArray(
+         this.array, first, this.length, newCapacity, TheHole);
+   }
+-  macro EnsureCapacity(): void {
++  macro EnsureCapacity(implicit context: Context)(): void {
+     dcheck(this.length <= this.capacity);
+     if (this.capacity == this.length) {
++      // Never past the largest FixedArray (allocating one would end the
++      // process): a full array of that length throws a RangeError instead.
++      if (this.capacity >= kFixedArrayMaxLength) {
++        ThrowRangeError(MessageTemplate::kInvalidArrayLength);
++      }
+       // Growth rate is analog to JSObject::NewElementsCapacity:
+       // new_capacity = (current_capacity + (current_capacity >> 1)) + 16.
+-      this.capacity = this.capacity + (this.capacity >> 1) + 16;
++      this.capacity = IntPtrMin(
++          this.capacity + (this.capacity >> 1) + 16, kFixedArrayMaxLength);
+       this.array = this.ResizeFixedArray(this.capacity);
+     }
+   }
 diff --git a/src/builtins/string-replaceall.tq b/src/builtins/string-replaceall.tq
 index 250aa88..ad2d7b2 100644
 --- a/src/builtins/string-replaceall.tq

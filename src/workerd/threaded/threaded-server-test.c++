@@ -592,6 +592,14 @@ constexpr kj::StringPtr JSON_PROPERTIES_REVIVER =
 // every match it counted.
 constexpr kj::StringPtr SORT_STRING =
     "Array.prototype.sort.call('x'.repeat(2**28)); 1"_kj;
+// The work array of such a sort grows as it collects (v138 §8.5): past 89,989,624 elements its next
+// growth went beyond the largest FixedArray and ended the process for a tenant whose memory limit
+// lets it get there; it stops at the largest now, and one element more throws a RangeError.
+constexpr kj::StringPtr SORT_STRING_90M = "Array.prototype.sort.call('x'.repeat(9e7)); 1"_kj;
+constexpr kj::StringPtr TO_SORTED_STRING_90M =
+    "globalThis.retained = Array.prototype.toSorted.call('x'.repeat(9e7)); retained.length"_kj;
+constexpr kj::StringPtr SORT_STRING_PAST_LARGEST =
+    "Array.prototype.sort.call('x'.repeat(2**27 + 1)); 1"_kj;
 constexpr kj::StringPtr REPLACE_FUNCTION =
     "globalThis.retained = 'x'.repeat(2**27 + 1).replace(/x/g, () => ''); retained.length"_kj;
 constexpr kj::StringPtr MATCH_ATOM =
@@ -840,6 +848,9 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
     // (a busy machine took it past the default 10 s once).
     {"replace-function-high"_kj, REPLACE_FUNCTION, -1, Outcome::RANGE, {.memoryMiB = 1024, .cpuMs = 60000}},
     {"match-atom"_kj, MATCH_ATOM, -1, Outcome::MEMORY_OR_RANGE},
+    {"sort-string-90m"_kj, SORT_STRING_90M, -1, Outcome::ANY, {.memoryMiB = 1024, .cpuMs = 60000}},
+    {"to-sorted-string-90m"_kj, TO_SORTED_STRING_90M, -1, Outcome::ANY, {.memoryMiB = 1024, .cpuMs = 60000}},
+    {"sort-string-past-largest"_kj, SORT_STRING_PAST_LARGEST, -1, Outcome::RANGE, {.memoryMiB = 2048, .cpuMs = 60000}},
     {"cpu-sort-length"_kj, CPU_SORT_LENGTH, -1, Outcome::CPU, cpu},
     {"cpu-to-sorted-length"_kj, CPU_TO_SORTED_LENGTH, -1, Outcome::CPU, cpu},
   };
@@ -1089,6 +1100,9 @@ KJ_TEST("sort of an array-like object or a string, global replace with a functio
   expectChildSurvives("1:replace-function");
   expectChildSurvives("1:replace-function-high");
   expectChildSurvives("1:match-atom");
+  expectChildSurvives("1:sort-string-90m");
+  expectChildSurvives("1:to-sorted-string-90m");
+  expectChildSurvives("1:sort-string-past-largest");
   expectChildSurvives("1:cpu-sort-length");
   expectChildSurvives("1:cpu-to-sorted-length");
 }
