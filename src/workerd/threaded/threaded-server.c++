@@ -1159,7 +1159,7 @@ struct SaturationWindow {
   uint32_t permilleAt(uint64_t atNs, const Thresholds &limits) const {
     const uint64_t into = atNs / limits.bucketNs == bucket ? atNs % limits.bucketNs : limits.bucketNs;
     const uint64_t span = limits.bucketNs + into;
-    return uint32_t(kj::min<uint64_t>(1000, (previous + current) * 1000 / kj::max<uint64_t>(span, 1)));
+    return uint32_t(kj::min(uint64_t(1000), (previous + current) * 1000 / kj::max(span, uint64_t(1))));
   }
   int flip(uint32_t permille, const Thresholds &limits) {
     if (!saturated.load() && permille >= limits.enter) {
@@ -1181,7 +1181,7 @@ const SaturationWindow::Thresholds &SaturationWindow::configured() {
       const char *text = getenv(name);
       return text && *text ? strtoull(text, nullptr, 10) : fallback;
     };
-    result.bucketNs = kj::max<uint64_t>(1, read("COWORKERD_THREADED_SATURATION_WINDOW_MS", 2000) / 2) * 1000000;
+    result.bucketNs = kj::max(uint64_t(1), read("COWORKERD_THREADED_SATURATION_WINDOW_MS", 2000) / 2) * 1000000;
     result.enter = uint32_t(read("COWORKERD_THREADED_SATURATION_ENTER_PERMILLE", 900));
     result.exit = uint32_t(read("COWORKERD_THREADED_SATURATION_EXIT_PERMILLE", 800));
     return result;
