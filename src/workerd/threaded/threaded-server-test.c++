@@ -153,6 +153,16 @@ KJ_TEST("tenant admission releases counts on errors and cancellation") {
   KJ_EXPECT(detail.size() == 1 && detail[0] == 1);
 }
 
+// A console line past 4,096 bytes reaches the node cut, with its size, so that
+// the node marks it truncated and counts it (b50 log-quota-isolation).
+KJ_TEST("a console line past 4,096 bytes carries its size to the node") {
+  auto longLine = consoleLogRow("log", kj::str(kj::repeat('x', 5000)));
+  KJ_EXPECT(longLine.endsWith(",\"messageBytes\":5000}"), longLine.slice(longLine.size() - 40));
+  KJ_EXPECT(longLine.size() == kj::str("{\"level\":\"log\",\"message\":\"\",\"messageBytes\":5000}").size() + 4096);
+  auto shortLine = consoleLogRow("warn", "hello");
+  KJ_EXPECT(shortLine == "{\"level\":\"warn\",\"message\":\"hello\"}", shortLine);
+}
+
 // The maintenance pass formats every resident into its lifecycle row outside
 // the registry lock; holding them meanwhile must not make an idle Worker look
 // in use, or a load past the resident limit is refused instead of evicting

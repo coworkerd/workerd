@@ -1756,6 +1756,22 @@ struct SubrequestBudget {
   std::map<uint64_t, kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
 };
 
+// One console line for the node's log post: at most LOG_MESSAGE_BYTES of the
+// message, and when it was longer its size, so that the node marks the line
+// truncated and counts it as it does for any line past its own limit (a cut
+// here without the size reached the node as an ordinary line, v138).
+constexpr size_t LOG_MESSAGE_BYTES = 4096;
+kj::String consoleLogRow(kj::StringPtr level, kj::StringPtr message) {
+  capnp::MallocMessageBuilder arena;
+  auto value = arena.initRoot<Json>();
+  const auto kept = kj::min(message.size(), LOG_MESSAGE_BYTES);
+  value.setString(kj::str(message.first(kept)));
+  if (kept == message.size())
+    return kj::str("{\"level\":\"", level, "\",\"message\":", encode(value.asReader()), "}");
+  return kj::str("{\"level\":\"", level, "\",\"message\":", encode(value.asReader()),
+      ",\"messageBytes\":", message.size(), "}");
+}
+
 bool canEvict(const std::shared_ptr<Slot> &slot, Slot *exclude) {
   return slot.get() != exclude && slot->complete.load() && slot.use_count() == 1 &&
       slot->contexts.load() == 0;
@@ -3274,11 +3290,7 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
   }
   uint64_t logCharge = 0;
   void log(kj::StringPtr level, kj::StringPtr message) {
-    capnp::MallocMessageBuilder arena;
-    auto value = arena.initRoot<Json>();
-    auto bounded = kj::str(message.first(kj::min(message.size(), size_t(4096))));
-    value.setString(bounded);
-    auto row = kj::str("{\"level\":\"", level, "\",\"message\":", encode(value.asReader()), "}");
+    auto row = consoleLogRow(level, message);
     if (!logBudget.accept(row.size())) {
       dropLog(1, row.size());
       return;
