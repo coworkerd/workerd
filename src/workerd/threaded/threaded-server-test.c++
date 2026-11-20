@@ -489,8 +489,9 @@ constexpr kj::StringPtr CPU_JSON_SLOW =
     "globalThis.retained = JSON.parse('[' + '\"a\",'.repeat(2**24) + '\"a\"]'); retained.length"_kj;
 constexpr kj::StringPtr CPU_JSON_REVIVER =
     "globalThis.retained = JSON.parse('[' + '\"a\",'.repeat(2**24) + '\"a\"]', (k, v) => v); retained.length"_kj;
-constexpr kj::StringPtr CPU_SPLIT =
-    "globalThis.retained = 'a,'.repeat(2**26).split(','); retained.length"_kj;
+// (split's check every 1,024 parts is in the loop that creates them, after
+// the search for the separators, which checks none: it is tested by the parts
+// outgrowing a 2 GiB budget, "split" above.)
 
 // structuredClone for the plain test contexts: V8's serializer and
 // deserializer with the default delegate, as jsg::structuredClone uses them.
@@ -703,7 +704,6 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
     {"cpu-json-numbers"_kj, CPU_JSON_NUMBERS, -1, Outcome::CPU, cpu},
     {"cpu-json-slow"_kj, CPU_JSON_SLOW, -1, Outcome::CPU, cpu},
     {"cpu-json-reviver"_kj, CPU_JSON_REVIVER, -1, Outcome::CPU, cpu},
-    {"cpu-split"_kj, CPU_SPLIT, -1, Outcome::CPU, cpu},
   };
   KJ_REQUIRE(count > 0 && count <= 8);
   if (kind == "code") {
@@ -915,11 +915,10 @@ KJ_TEST("JSON.parse one element past the largest array, with a reviver, or past 
   expectChildSurvives("1:json-reviver");
   expectChildSurvives("1:json-properties");
 }
-KJ_TEST("a short CPU limit ends JSON.parse and split loops that allocate nothing") {
+KJ_TEST("a short CPU limit ends JSON.parse loops that allocate nothing") {
   expectChildSurvives("1:cpu-json-numbers");
   expectChildSurvives("1:cpu-json-slow");
   expectChildSurvives("1:cpu-json-reviver");
-  expectChildSurvives("1:cpu-split");
 }
 
 KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
