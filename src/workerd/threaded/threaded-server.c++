@@ -1114,6 +1114,9 @@ struct Measurement {
   std::atomic<LimitCause> limitCause{LimitCause::NONE};
   std::shared_ptr<ResourcePreparation> preparation;
   kj::Maybe<kj::String> unsupportedFeature;
+  // An HTTP call's response end: its body sent to the end, or the client gone
+  // (Invocation::request). Without it the drain limit runs from its call.
+  kj::Maybe<kj::ForkedPromise<void>> responseEnded;
 };
 
 struct RequestLimits final: LimitEnforcer {
@@ -1192,13 +1195,23 @@ struct RequestLimits final: LimitEnforcer {
     unsupported("analytics");
   }
   kj::Promise<void> limitDrain() override {
-    // Called when the response has ended. A lease expires the authority to
+    // Called when the handler has returned. A lease expires the authority to
     // make child calls, not this invocation's waitUntil work, which keeps its
-    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT later. KJ's timer
-    // does not advance while JavaScript runs, so the deadline is taken from the
-    // monotonic clock now, not as a delay from the timer's cached time.
+    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT after the
+    // response ended: as on Cloudflare, once the response is sent -- a
+    // streamed body to its end -- or the client disconnected, not when the
+    // handler returned the response (v138 section 4). KJ's timer does not
+    // advance while JavaScript runs, so the deadline is taken from the
+    // monotonic clock (or the timer, if that is ahead), not as a delay from the
+    // timer's cached time.
     if (drainLimitDisabledForTest()) return kj::NEVER_DONE;
-    return timer.timer.atTime(kj::systemPreciseMonotonicClock().now() + WAIT_UNTIL_LIMIT);
+    auto deadline = [this]() {
+      return timer.timer.atTime(kj::max(kj::systemPreciseMonotonicClock().now(), timer.timer.now()) + WAIT_UNTIL_LIMIT);
+    };
+    KJ_IF_SOME(ended, measurement.responseEnded) {
+      return ended.addBranch().then(kj::mv(deadline));
+    }
+    return deadline();
   }
   kj::Promise<void> limitScheduled() override {
     return kj::NEVER_DONE;
@@ -3707,11 +3720,18 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
   auto &entry = prepared.entry;
   kj::Maybe<kj::Exception> failure;
   LimitedResponse checkedResponse(response, *invocation);
+  // workerd's request() returns once the response body is sent; a client that
+  // goes away cancels this coroutine. Either ends the response for the drain
+  // limit (RequestLimits::limitDrain).
+  auto responseEnd = kj::newPromiseAndFulfiller<void>();
+  invocation->measurement.responseEnded = responseEnd.promise.fork();
+  KJ_DEFER(if (responseEnd.fulfiller->isWaiting()) responseEnd.fulfiller->fulfill());
   try {
     co_await entry->request(method, url, headers, body, checkedResponse);
   } catch (const kj::Exception &error) {
     failure = error.clone();
   }
+  responseEnd.fulfiller->fulfill();
   KJ_IF_SOME(error, failure) {
     // The library converts native refusals to JS errors. Preserve the refusal
     // recorded by our own channels, without interpreting application messages.

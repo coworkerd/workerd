@@ -996,6 +996,37 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
   if (ended) drain.wait(waitScope);
 }
 
+// A streamed body keeps the call's response open: the 30 seconds of waitUntil
+// work start when it ends (or the client goes away), not when the handler
+// returned (Cloudflare's Context page; v138 section 4).
+KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handler returns") {
+  initializeV8();
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  const auto start = kj::systemPreciseMonotonicClock().now();
+  kj::TimerImpl clock(start);
+  Timer timer(clock);
+  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/stream\","), nullptr);
+  Slot slot;
+  slot.limits = &isolateLimits;
+  Measurement measurement;
+  auto responseEnd = kj::newPromiseAndFulfiller<void>();
+  measurement.responseEnded = responseEnd.promise.fork();
+  RequestLimits limits(slot, measurement, timer, kj::str("\"workerId\":\"a/stream\","));
+  auto drain = limits.limitDrain();  // the handler returned; the body streams for 40 s
+  clock.advanceTo(start + 35 * kj::SECONDS);
+  KJ_EXPECT(!drain.poll(waitScope), "a 35 s waitUntil task must outlive the handler while the body streams");
+  clock.advanceTo(start + 40 * kj::SECONDS);
+  responseEnd.fulfiller->fulfill();
+  KJ_EXPECT(!drain.poll(waitScope));
+  clock.advanceTo(start + 70 * kj::SECONDS - 1 * kj::MILLISECONDS);
+  KJ_EXPECT(!drain.poll(waitScope), "the 30 s start at the response's end");
+  clock.advanceTo(start + 70 * kj::SECONDS + 1 * kj::MILLISECONDS);
+  bool ended = drain.poll(waitScope);
+  KJ_EXPECT(ended, "waitUntil work must end 30 s after the response ended");
+  if (ended) drain.wait(waitScope);
+}
+
 KJ_TEST("a call thread cancels background work that outlives the drain limit") {
   kj::EventLoop loop;
   kj::WaitScope waitScope(loop);
