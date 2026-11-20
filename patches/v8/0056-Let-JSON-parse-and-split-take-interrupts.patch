@@ -219,7 +219,7 @@ index 7175792..20813bc 100644
          return ThrowIfOutOfMemory();
        } else if (InstanceTypeChecker::IsJSReceiver(instance_type)) {
 diff --git a/src/runtime/runtime-regexp.cc b/src/runtime/runtime-regexp.cc
-index ec17453..7f2ac5e 100644
+index ec17453..7e13d4a 100644
 --- a/src/runtime/runtime-regexp.cc
 +++ b/src/runtime/runtime-regexp.cc
 @@ -884,13 +884,23 @@ RUNTIME_FUNCTION(Runtime_StringSplit) {
@@ -265,7 +265,7 @@ index ec17453..7f2ac5e 100644
        int part_end = indices->at(i);
        DirectHandle<String> substring =
            isolate->factory()->NewProperSubString(subject, part_start, part_end);
-@@ -1410,9 +1430,28 @@ static Tagged<UnionOf<ExceptionHole, Null, FixedArray>> SearchRegExpMultiple(
+@@ -1410,9 +1430,29 @@ static Tagged<UnionOf<ExceptionHole, Null, FixedArray>> SearchRegExpMultiple(
    const bool has_named_captures =
        has_capture && re_data->has_capture_name_map();
  
@@ -288,13 +288,14 @@ index ec17453..7f2ac5e 100644
 +    if (V8_UNLIKELY(builder.length().value() +
 +                        kMaxBuilderEntriesPerRegExpMatch >
 +                    FixedArray::kMaxLength)) {
-+      THROW_NEW_ERROR_RETURN_FAILURE(
-+          isolate, NewRangeError(MessageTemplate::kInvalidArrayLength));
++      isolate->Throw(*isolate->factory()->NewRangeError(
++          MessageTemplate::kInvalidArrayLength));
++      return ReadOnlyRoots(isolate).exception();
 +    }
      match_start = current_match[0];
      builder.EnsureCapacity(isolate, kMaxBuilderEntriesPerRegExpMatch);
      if (match_end < match_start) {
-@@ -2542,7 +2581,12 @@ RUNTIME_FUNCTION(Runtime_RegExpMatchGlobalAtom) {
+@@ -2542,7 +2582,12 @@ RUNTIME_FUNCTION(Runtime_RegExpMatchGlobalAtom) {
    RegExp::SetLastMatchInfo(isolate, last_match_info, subject_handle,
                             kNumberOfCaptures, match_indices);
  
