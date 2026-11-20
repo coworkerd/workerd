@@ -379,6 +379,63 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
     "globalThis.kept = []; for (let i = 0; i < 1013; ++i) kept.push(new Array(16300).fill(1.5));"
     "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
 
+// Long operations that check no interrupt while they allocate: after the
+// near-heap-limit callback has raised the ceiling and requested the
+// termination, they keep allocating until they meet the raised ceiling (v137
+// §6.28-§6.29, v138 §4).
+// JSON.parse of 120 million empty objects (about 3.4 GB) from a 360 MB text.
+constexpr kj::StringPtr JSON_OBJECTS =
+    "globalThis.retained = JSON.parse('[' + '{},'.repeat(1.2e8) + '{}]'); retained.length"_kj;
+// JSON.parse of one number more than the largest array: no V8 allocation
+// while parsing, then a backing store V8 cannot allocate.
+constexpr kj::StringPtr JSON_NUMBERS =
+    "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**27) + '1]'); retained.length"_kj;
+// Straight-line code: no loop and no JavaScript call, so no interrupt check,
+// six flattened 500 MB strings one after another (the shape of the §6.29
+// verifier).
+constexpr kj::StringPtr STRAIGHT_LINE =
+    "const a = ' '.repeat(5e8); a.indexOf('z'); const b = a + '1'; b.indexOf('z');"
+    "const c = b + '2'; c.indexOf('z'); const d = c + '3'; d.indexOf('z');"
+    "const e = d + '4'; e.indexOf('z'); const f = e + '5'; f.indexOf('z');"
+    "globalThis.kept = [a, b, c, d, e, f]; kept.length"_kj;
+// A structured clone (ValueSerializer and ValueDeserializer, as
+// jsg::structuredClone) of three maximum two-byte strings.
+constexpr kj::StringPtr CLONE_STRINGS =
+    "globalThis.retained = clone([0, 1, 2].map(i => String.fromCharCode(256 + i).repeat(2**29 - 24)));"
+    "retained.length"_kj;
+// String.prototype.split into 120 million three-character strings (about
+// 1.9 GB) and their array.
+constexpr kj::StringPtr SPLIT_PARTS =
+    "globalThis.retained = 'abc,'.repeat(1.2e8).split(','); retained.length"_kj;
+// Splits into one part more than the largest array, by a separator and into
+// characters.
+constexpr kj::StringPtr SPLIT_TOO_MANY =
+    "globalThis.retained = 'a,'.repeat(2**27).split(','); retained.length"_kj;
+constexpr kj::StringPtr SPLIT_CHARACTERS =
+    "const s = ' '.repeat(2**27 + 8); s.indexOf('z'); globalThis.retained = s.split(''); retained.length"_kj;
+
+// structuredClone for the plain test contexts: V8's serializer and
+// deserializer with the default delegate, as jsg::structuredClone uses them.
+void cloneForTest(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  auto* isolate = info.GetIsolate();
+  auto context = isolate->GetCurrentContext();
+  v8::ValueSerializer serializer(isolate);
+  serializer.WriteHeader();
+  if (serializer.WriteValue(context, info[0]).IsNothing()) return;
+  auto released = serializer.Release();
+  KJ_DEFER(free(released.first));
+  v8::ValueDeserializer deserializer(isolate, released.first, released.second);
+  v8::Local<v8::Value> result;
+  if (deserializer.ReadHeader(context).FromMaybe(false) &&
+      deserializer.ReadValue(context).ToLocal(&result))
+    info.GetReturnValue().Set(result);
+}
+
+// What a child's allocating call must end with: the memory limit, or the
+// memory limit or a RangeError (an array V8 cannot allocate), or anything
+// (an exploration run).
+enum class Outcome { MEMORY, MEMORY_OR_RANGE, ANY };
+
 // `count` isolates allocate at the same moment while a neighbor isolate keeps
 // answering. Every heap of this build shares one pointer cage.
 // `raised`: whether each isolate's ceiling must have been raised by the
@@ -387,13 +444,14 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
 // shapes never need the callback; only an object V8 placed without a
 // collection (the 500 MB young one) does. Without this check the callback
 // would hide a missing reserve.
-void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1) {
+void simultaneousAllocations(
+    size_t count, kj::StringPtr code, int raised = -1, Outcome outcome = Outcome::MEMORY) {
   initializeV8();
   auto budget = std::make_shared<ResourceBudget>(16ull << 30, 8, count + 1);
   std::vector<kj::Own<IsolateLimits>> limits;
   std::vector<v8::Isolate*> isolates;
   std::vector<uint64_t> peaks(count);
-  std::vector<char> refused(count);
+  std::vector<char> refused(count), rangeError(count);
   for (size_t i = 0; i < count; ++i) {
     auto reservation = std::make_shared<ResourceReservation>(budget, 128);
     KJ_ASSERT(reservation->registerPreparation());
@@ -457,6 +515,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1) 
       v8::HandleScope handles(isolate);
       auto context = v8::Context::New(isolate);
       v8::Context::Scope entered(context);
+      KJ_ASSERT(context->Global()
+              ->Set(context, v8::String::NewFromUtf8Literal(isolate, "clone"),
+                  v8::Function::New(context, cloneForTest).ToLocalChecked())
+              .FromJust());
       auto source =
           v8::String::NewFromUtf8(isolate, code.begin(), v8::NewStringType::kNormal, code.size())
               .ToLocalChecked();
@@ -467,6 +529,15 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1) 
           128, limits[i]->identity);
       v8::TryCatch caught(isolate);
       auto result = script->Run(context);
+      std::string thrown;
+      if (result.IsEmpty() && caught.HasCaught() && !caught.HasTerminated()) {
+        v8::String::Utf8Value text(isolate, caught.Exception());
+        if (*text != nullptr) thrown = *text;
+      }
+      rangeError[i] = thrown.starts_with("RangeError");
+      fprintf(stdout, "ALLOCATION_RESULT worker=%zu completed=%d terminated=%d thrown=\"%s\"\n", i,
+          !result.IsEmpty(), caught.HasTerminated(), thrown.c_str());
+      fflush(stdout);
       completed.arrive_and_wait();
       release.arrive_and_wait();
       caught.Reset();
@@ -485,7 +556,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1) 
   release.arrive_and_wait();
   for (auto& worker: workers) worker.join();
   for (size_t i = 0; i < count; ++i) {
-    KJ_EXPECT(refused[i] && peaks[i] >= (128ull << 20), i, peaks[i]);
+    const bool limited = refused[i] && peaks[i] >= (128ull << 20);
+    if (outcome == Outcome::MEMORY) KJ_EXPECT(limited, i, peaks[i]);
+    if (outcome == Outcome::MEMORY_OR_RANGE)
+      KJ_EXPECT(limited || rangeError[i], i, peaks[i], int(refused[i]));
     const int ceilingRaised = limits[i]->memory->ceilingRaised.load();
     if (raised >= 0) KJ_EXPECT(ceilingRaised == raised, i, ceilingRaised, raised);
     fprintf(stdout, "CONCURRENT_HEAP worker=%zu peak=%llu separateCages=%d ceilingRaised=%d\n", i,
@@ -501,20 +575,44 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
   auto selected = getenv("COWORKERD_THREADED_ALLOCATION_CHILD");
   if (selected == nullptr) return;
   kj::StringPtr spec(selected);
-  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array|live126|live86k|live128k|young500>");
+  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<kind>");
   auto count = kj::str(spec.first(colon)).parseAs<uint>();
   auto kind = spec.slice(colon + 1);
-  KJ_REQUIRE(count > 0 && count <= 8 &&
-      (kind == "string" || kind == "array" || kind == "live126" || kind == "live86k" || kind == "live128k" ||
-          kind == "young500"));
-  simultaneousAllocations(count,
-      kind == "array"          ? NEAR_GIB_ARRAY
-          : kind == "live126"  ? LIVE126_THEN_STRING
-          : kind == "live86k"  ? LIVE126_86K_THEN_STRING
-          : kind == "live128k" ? LIVE126_128K_THEN_STRING
-          : kind == "young500" ? YOUNG500_THEN_STRING
-                               : NEAR_GIB_STRING,
-      count == 1 ? int(kind == "young500") : -1);
+  struct Shape {
+    kj::StringPtr name, code;
+    int raised;
+    Outcome outcome;
+  };
+  // `raised` only for one isolate: -1 is not checked.
+  const Shape shapes[] = {
+    {"string"_kj, NEAR_GIB_STRING, 0, Outcome::MEMORY},
+    {"array"_kj, NEAR_GIB_ARRAY, 0, Outcome::MEMORY},
+    {"live126"_kj, LIVE126_THEN_STRING, 0, Outcome::MEMORY},
+    {"live86k"_kj, LIVE126_86K_THEN_STRING, 0, Outcome::MEMORY},
+    {"live128k"_kj, LIVE126_128K_THEN_STRING, 0, Outcome::MEMORY},
+    {"young500"_kj, YOUNG500_THEN_STRING, 1, Outcome::MEMORY},
+    {"json"_kj, JSON_OBJECTS, -1, Outcome::MEMORY},
+    {"json-numbers"_kj, JSON_NUMBERS, -1, Outcome::MEMORY_OR_RANGE},
+    {"straight"_kj, STRAIGHT_LINE, -1, Outcome::MEMORY},
+    {"clone"_kj, CLONE_STRINGS, -1, Outcome::MEMORY},
+    {"split"_kj, SPLIT_PARTS, -1, Outcome::MEMORY},
+    {"split-many"_kj, SPLIT_TOO_MANY, -1, Outcome::MEMORY_OR_RANGE},
+    {"split-chars"_kj, SPLIT_CHARACTERS, -1, Outcome::MEMORY_OR_RANGE},
+  };
+  KJ_REQUIRE(count > 0 && count <= 8);
+  if (kind == "code") {
+    // Exploration of other shapes (not a test): the code comes from the
+    // environment, the outcome is only printed.
+    const char* code = getenv("COWORKERD_THREADED_ALLOCATION_CODE");
+    KJ_REQUIRE(code != nullptr, "COWORKERD_THREADED_ALLOCATION_CODE is not set");
+    simultaneousAllocations(count, kj::StringPtr(code), -1, Outcome::ANY);
+  } else {
+    const Shape* found = nullptr;
+    for (auto& shape: shapes)
+      if (shape.name == kind) found = &shape;
+    KJ_REQUIRE(found != nullptr, "unknown allocation shape", kind);
+    simultaneousAllocations(count, found->code, count == 1 ? found->raised : -1, found->outcome);
+  }
   fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
   fflush(stdout);
 }
@@ -599,6 +697,35 @@ KJ_TEST("a 500 MB young object then one near-GiB object preserves the process") 
   auto child = runAllocationChild("1:young500");
   KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
   KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
+}
+
+// Each long operation below ended the process before v138 (exit 74 at the
+// raised ceiling, or V8's fatal invalid size): the child must survive, its
+// call end with the memory limit (or, where noted, a RangeError), and the
+// neighbor keep answering and allocating.
+void expectChildSurvives(kj::StringPtr spec) {
+  auto child = runAllocationChild(spec);
+  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, spec, child.status);
+  KJ_EXPECT(child.events.find("memory-oom") == std::string::npos, spec);
+}
+KJ_TEST("JSON.parse of 120 million objects ends at the memory limit and preserves the process") {
+  expectChildSurvives("1:json");
+}
+KJ_TEST("JSON.parse of an array past the largest one ends with a RangeError or the limit") {
+  expectChildSurvives("1:json-numbers");
+}
+KJ_TEST("straight-line code making 500 MB strings one after another preserves the process") {
+  expectChildSurvives("1:straight");
+}
+KJ_TEST("a structured clone of three maximum strings preserves the process") {
+  expectChildSurvives("1:clone");
+}
+KJ_TEST("splitting into 120 million strings ends at the memory limit and preserves the process") {
+  expectChildSurvives("1:split");
+}
+KJ_TEST("splits past the largest array end with a RangeError or the limit") {
+  expectChildSurvives("1:split-many");
+  expectChildSurvives("1:split-chars");
 }
 
 KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
