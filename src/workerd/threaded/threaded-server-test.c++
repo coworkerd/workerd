@@ -455,6 +455,9 @@ constexpr kj::StringPtr JSON_REVIVER =
     "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**26) + '1]', (k, v) => v); retained.length"_kj;
 constexpr kj::StringPtr JSON_PROPERTIES =
     "globalThis.retained = JSON.parse('{' + '\"a\":1,'.repeat(2**24) + '\"a\":1}'); 1"_kj;
+// The same object with a reviver takes the iterative parser and its own check.
+constexpr kj::StringPtr JSON_PROPERTIES_REVIVER =
+    "globalThis.retained = JSON.parse('{' + '\"a\":1,'.repeat(2**24) + '\"a\":1}', (k, v) => v); 1"_kj;
 // Loops that allocate nothing while they run: their interrupt checks are what
 // lets a short CPU limit end the call (each takes about a second unchecked).
 constexpr kj::StringPtr CPU_JSON_NUMBERS =
@@ -675,6 +678,7 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
     {"json-mixed"_kj, JSON_MIXED, -1, Outcome::MEMORY_OR_RANGE},
     {"json-reviver"_kj, JSON_REVIVER, -1, Outcome::MEMORY_OR_RANGE},
     {"json-properties"_kj, JSON_PROPERTIES, -1, Outcome::MEMORY_OR_RANGE},
+    {"json-properties-reviver"_kj, JSON_PROPERTIES_REVIVER, -1, Outcome::MEMORY_OR_RANGE},
     {"cpu-json-numbers"_kj, CPU_JSON_NUMBERS, -1, Outcome::CPU, cpu},
     {"cpu-json-slow"_kj, CPU_JSON_SLOW, -1, Outcome::CPU, cpu},
     {"cpu-json-reviver"_kj, CPU_JSON_REVIVER, -1, Outcome::CPU, cpu},
@@ -888,6 +892,7 @@ KJ_TEST("JSON.parse one element past the largest array, with a reviver, or past 
   expectChildSurvives("1:json-mixed");
   expectChildSurvives("1:json-reviver");
   expectChildSurvives("1:json-properties");
+  expectChildSurvives("1:json-properties-reviver");
 }
 KJ_TEST("a short CPU limit ends JSON.parse loops that allocate nothing") {
   expectChildSurvives("1:cpu-json-numbers");
