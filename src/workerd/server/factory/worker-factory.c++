@@ -1784,8 +1784,14 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
     // The isolate's group first: with the V8 sandbox, each group has its own sandbox, in which the
-    // isolate's memory limit allocates its backing stores.
-    auto group = jsg::newIsolateGroup();
+    // isolate's memory limit allocates its backing stores. When the address space has no room
+    // for another sandbox, this Worker is refused and the process keeps its other Workers.
+    auto group = KJ_UNWRAP_OR(tryNewIsolateGroup(), {
+      kj::throwFatalException(jsg::tagCoworkerdRpcError(
+          KJ_EXCEPTION(OVERLOADED,
+              "jsg.Error: OVERLOADED: no address space for another isolate's V8 sandbox in process"),
+          "OVERLOADED"));
+    });
     impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
         kj::refcounted<NullIsolateLimitEnforcer>(), group, isolateName, impl->coworkerdIdentity,
         kj::str(spec.load_identity.startup_identity), impl->idleWorker,

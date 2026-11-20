@@ -1,12 +1,12 @@
 #include "coworkerd-sandbox.h"
 
-#include "coworkerd-cpu-limit.h"
-
 #include <kj/debug.h>
 #include <v8-initialization.h>
 #include <v8-internal.h>
 #include <v8-isolate.h>
 #include <v8-platform.h>
+
+#include <kj/vector.h>
 
 #include <cerrno>
 #include <unistd.h>
@@ -15,7 +15,6 @@ namespace workerd::server {
 
 namespace {
 
-#ifdef V8_ENABLE_SANDBOX
 void writeStderr(kj::StringPtr line) {
   size_t done = 0;
   while (done < line.size()) {
@@ -26,6 +25,29 @@ void writeStderr(kj::StringPtr line) {
   }
 }
 
+// A JSON string: the text quoted, with quotes, backslashes and control characters escaped.
+[[maybe_unused]] kj::String jsonString(kj::StringPtr text) {
+  static const char HEX[] = "0123456789abcdef";
+  kj::Vector<char> out(text.size() + 3);
+  out.add('"');
+  for (char c: text) {
+    if (c == '"' || c == '\\') {
+      out.add('\\');
+      out.add(c);
+    } else if (static_cast<unsigned char>(c) < 0x20) {
+      out.addAll(kj::StringPtr("\\u00"));
+      out.add(HEX[(c >> 4) & 0xf]);
+      out.add(HEX[c & 0xf]);
+    } else {
+      out.add(c);
+    }
+  }
+  out.add('"');
+  out.add('\0');
+  return kj::String(out.releaseAsArray());
+}
+
+#ifdef V8_ENABLE_SANDBOX
 using v8::internal::kAdditionalTrailingGuardRegionSize;
 using v8::internal::kRequiresTypedArrayAccessMasks;
 using v8::internal::kSandboxGuardRegionSize;
@@ -51,7 +73,7 @@ SandboxFacts currentFacts() {
 // this build's layout and the problem, if any.
 void writeRow(kj::StringPtr subject, const SandboxFacts& facts, kj::Maybe<kj::StringPtr> problem) {
   auto problemMember = problem.map([](kj::StringPtr text) {
-    return kj::str(",\"problem\":", escapeCpuJsonString(text));
+    return kj::str(",\"problem\":", jsonString(text));
   }).orDefault(kj::String());
   writeStderr(kj::str("[coworkerd-sandbox] {", subject, ",\"mode\":\"", sandboxModeName(facts.mode),
       "\",\"sandboxBytes\":", facts.sandboxBytes, ",\"reservationBytes\":", facts.addressSpaceBytes,
@@ -131,7 +153,17 @@ void requireSecureSandbox() {
     writeStderr(kj::str("workerd: refusing to start: ", text, "\n"));
     _exit(SANDBOX_REFUSED_EXIT);
   }
+#else
+  writeStderr(kj::str("[coworkerd-sandbox] {\"process\":true,\"mode\":\"off\",\"groupPerIsolate\":",
+      v8::IsolateGroup::CanCreateNewGroups() ? "true" : "false", "}\n"));
 #endif
+}
+
+kj::Maybe<v8::IsolateGroup> tryNewIsolateGroup() {
+  if (!v8::IsolateGroup::CanCreateNewGroups()) return v8::IsolateGroup::GetDefault();
+  auto group = v8::IsolateGroup::TryCreate();
+  if (!group.has_value()) return kj::none;
+  return kj::mv(*group);
 }
 
 void requireSecureIsolateSandbox(v8::Isolate* isolate, kj::StringPtr name) {
@@ -141,7 +173,7 @@ void requireSecureIsolateSandbox(v8::Isolate* isolate, kj::StringPtr name) {
       "the isolate's sandbox is not the current one; is the isolate entered?", name);
   auto facts = currentFacts();
   auto problem = sandboxProblem(facts);
-  writeRow(kj::str("\"isolate\":", escapeCpuJsonString(name)), facts,
+  writeRow(kj::str("\"isolate\":", jsonString(name)), facts,
       problem.map([](kj::String& text) -> kj::StringPtr { return text; }));
   KJ_IF_SOME(text, problem) {
     KJ_FAIL_REQUIRE("the V8 sandbox of this isolate is not usable", name, text);

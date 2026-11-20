@@ -16,6 +16,7 @@
 #include <v8-isolate.h>
 #include <v8-locker.h>
 
+#include <cstdio>
 #include <cstring>
 
 namespace workerd::server {
@@ -159,6 +160,26 @@ KJ_TEST("sandboxProblem names what is wrong with a sandbox") {
   auto defaultTrailingGuard = good;
   defaultTrailingGuard.addressSpaceBytes = 360 * GiB;
   KJ_EXPECT(mentions(sandboxProblem(defaultTrailingGuard), "reserves"));
+}
+// Last: it uses up the address space for a moment.
+KJ_TEST("isolate groups run out as a refusal, not as the end of the process") {
+  // Every group reserves its sandbox with the guard regions (136 GiB) and, outside it, its
+  // trusted range: a 47-bit user address space (128 TiB) holds fewer than a thousand. Past that,
+  // tryNewIsolateGroup() returns none (V8's IsolateGroup::TryCreate()) and the process goes on.
+  kj::Vector<v8::IsolateGroup> groups;
+  while (groups.size() < 4096) {
+    KJ_IF_SOME(group, tryNewIsolateGroup()) {
+      groups.add(kj::mv(group));
+    } else {
+      break;
+    }
+  }
+  fprintf(stdout, "SANDBOX_GROUPS created=%zu\n", groups.size());
+  fflush(stdout);
+  KJ_EXPECT(groups.size() > 100 && groups.size() < 4096, groups.size());
+  // Released groups give their address space back.
+  for (auto i KJ_UNUSED: kj::zeroTo(8)) groups.removeLast();
+  KJ_EXPECT(tryNewIsolateGroup() != kj::none);
 }
 #else
 KJ_TEST("without the sandbox nothing is checked") {

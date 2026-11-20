@@ -2,11 +2,8 @@
 
 #include <kj/common.h>
 #include <kj/string.h>
+#include <v8-isolate.h>
 #include <cstddef>
-
-namespace v8 {
-class Isolate;
-}
 
 namespace workerd::server {
 
@@ -33,9 +30,9 @@ kj::Maybe<kj::String> sandboxProblem(const SandboxFacts& facts);
 kj::StringPtr sandboxModeName(int mode);
 
 // Checks the process-wide sandbox once V8 is initialized, on the thread that initialized it, and
-// writes one [coworkerd-sandbox] row to stderr. Unless the sandbox is secure and laid out as this
-// build configured it, the row carries the problem and the process exits with status
-// SANDBOX_REFUSED_EXIT before it loads any Worker.
+// writes one [coworkerd-sandbox] row to stderr (`"mode":"off"` in a build without the sandbox).
+// Unless the sandbox is secure and laid out as this build configured it, the row carries the
+// problem and the process exits with status SANDBOX_REFUSED_EXIT before it loads any Worker.
 void requireSecureSandbox();
 constexpr int SANDBOX_REFUSED_EXIT = 78;
 
@@ -43,5 +40,11 @@ constexpr int SANDBOX_REFUSED_EXIT = 78;
 // isolate runs any code; the row names the isolate. Throws instead of exiting, so that only this
 // Worker is not created.
 void requireSecureIsolateSandbox(v8::Isolate* isolate, kj::StringPtr name);
+
+// A new isolate group for one isolate, or none when the address space has no room left for its
+// sandbox and the reservations around it (V8's IsolateGroup::TryCreate(), fork patch
+// patches/v8/0057): the caller refuses that isolate instead of losing the process. The default
+// group in a build with one shared pointer-compression cage.
+kj::Maybe<v8::IsolateGroup> tryNewIsolateGroup();
 
 }  // namespace workerd::server
