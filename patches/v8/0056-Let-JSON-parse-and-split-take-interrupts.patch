@@ -24,6 +24,17 @@ one after the numbers' fast path as well, and with a reviver the limit is
 half the largest array (its parse nodes take twice its length). The split
 stops collecting indices one past the maximum.
 
+Array.prototype.sort and toSorted sized their work array by the length
+alone when the receiver had no own elements (an array-like object, a
+string, a proxy): a length past the largest array ended the process
+before an element was read. Start such a work array at 1,024 entries and
+let it grow with the elements found; collecting them visits every index
+up to the length, so handle interrupts once per 1,024 indices there. A
+global regexp replace with a function collects every match first: handle
+interrupts every 1,024 matches, throw a RangeError before the builder
+outgrows the largest array. A global atom match throws a RangeError when
+it counts more matches than the largest array holds.
+
 diff --git a/src/builtins/builtins-string-gen.cc b/src/builtins/builtins-string-gen.cc
 index d282fa8..570d937 100644
 --- a/src/builtins/builtins-string-gen.cc
@@ -208,7 +219,7 @@ index 7175792..20813bc 100644
          return ThrowIfOutOfMemory();
        } else if (InstanceTypeChecker::IsJSReceiver(instance_type)) {
 diff --git a/src/runtime/runtime-regexp.cc b/src/runtime/runtime-regexp.cc
-index ec17453..edf9c70 100644
+index ec17453..7f2ac5e 100644
 --- a/src/runtime/runtime-regexp.cc
 +++ b/src/runtime/runtime-regexp.cc
 @@ -884,13 +884,23 @@ RUNTIME_FUNCTION(Runtime_StringSplit) {
@@ -254,6 +265,49 @@ index ec17453..edf9c70 100644
        int part_end = indices->at(i);
        DirectHandle<String> substring =
            isolate->factory()->NewProperSubString(subject, part_start, part_end);
+@@ -1410,9 +1430,28 @@ static Tagged<UnionOf<ExceptionHole, Null, FixedArray>> SearchRegExpMultiple(
+   const bool has_named_captures =
+       has_capture && re_data->has_capture_name_map();
+ 
++  // Every match is collected before the replace function is first called:
++  // handle interrupts every 1,024 matches, so that a termination requested
++  // meanwhile (a CPU or memory limit) takes effect, and throw a RangeError
++  // instead of growing the builder past the largest array (V8 would end the
++  // process; the builder doubles from 16, so it reaches the largest exactly).
++  uint32_t matches = 0;
+   while (true) {
+     int32_t* current_match = runner.FetchNext();
+     if (current_match == nullptr) break;
++    if (V8_UNLIKELY((++matches & 0x3FF) == 0)) {
++      StackLimitCheck interrupt_check(isolate);
++      if (V8_UNLIKELY(interrupt_check.InterruptRequested()) &&
++          IsExceptionHole(isolate->stack_guard()->HandleInterrupts())) {
++        return ReadOnlyRoots(isolate).exception();
++      }
++    }
++    if (V8_UNLIKELY(builder.length().value() +
++                        kMaxBuilderEntriesPerRegExpMatch >
++                    FixedArray::kMaxLength)) {
++      THROW_NEW_ERROR_RETURN_FAILURE(
++          isolate, NewRangeError(MessageTemplate::kInvalidArrayLength));
++    }
+     match_start = current_match[0];
+     builder.EnsureCapacity(isolate, kMaxBuilderEntriesPerRegExpMatch);
+     if (match_end < match_start) {
+@@ -2542,7 +2581,12 @@ RUNTIME_FUNCTION(Runtime_RegExpMatchGlobalAtom) {
+   RegExp::SetLastMatchInfo(isolate, last_match_info, subject_handle,
+                            kNumberOfCaptures, match_indices);
+ 
+-  // Create the result array.
++  // Create the result array. More matches than the largest array cannot be
++  // stored (V8 would end the process): throw a RangeError instead.
++  if (V8_UNLIKELY(number_of_matches > FixedArray::kMaxLength)) {
++    THROW_NEW_ERROR_RETURN_FAILURE(
++        isolate, NewRangeError(MessageTemplate::kInvalidArrayLength));
++  }
+   auto elems = isolate->factory()->NewFixedArray(number_of_matches);
+   ObjectSlot dst_slot = elems->RawFieldOfFirstElement();
+   MemsetTagged(dst_slot, *pattern_handle, number_of_matches);
 diff --git a/src/runtime/runtime-strings.cc b/src/runtime/runtime-strings.cc
 index 9d2ef19..bc17198 100644
 --- a/src/runtime/runtime-strings.cc
@@ -272,3 +326,48 @@ index 9d2ef19..bc17198 100644
    s = String::Flatten(isolate, s);
    const int length =
        static_cast<int>(std::min(static_cast<uint32_t>(s->length()), limit));
+diff --git a/third_party/v8/builtins/array-sort.tq b/third_party/v8/builtins/array-sort.tq
+index 90e36b5..5b94c23 100644
+--- a/third_party/v8/builtins/array-sort.tq
++++ b/third_party/v8/builtins/array-sort.tq
+@@ -123,6 +123,18 @@ macro ResetToGenericAccessor(
+ // The 'length' property is an upper bound (as per spec),
+ // while the actual size of the backing store is a good guess.
+ // After the pre-processing step, the workarray won't change in length.
++// Without own elements the length is all there is to go by, and the length of
++// an array-like object can be anything up to 2^53-1: allocating a work array
++// of that length ends the process (past the largest FixedArray) or takes
++// hundreds of MiB before a single element is read. Start with this many and
++// let the work array grow with the elements actually found.
++const kWorkArrayLengthWithoutElements: constexpr int31 = 1024;
++// Collecting the elements of such a receiver visits every index up to the
++// length (an absent index calls no JavaScript) and grows the work array:
++// handle interrupts once per 1,024 indices, so that a termination requested
++// meanwhile (a CPU or memory limit) takes effect.
++const kSortInterruptMask: constexpr int31 = 0x3FF;
++
+ macro CalculateWorkArrayLength(
+     receiver: JSReceiver, initialReceiverLength: Number): intptr {
+   // TODO(szuend): Implement full range sorting, not only up to MaxSmi.
+@@ -149,8 +161,12 @@ macro CalculateWorkArrayLength(
+     // {length} property.
+     if (elementsLength != 0) {
+       workArrayLength = IntPtrMin(workArrayLength, elementsLength);
++    } else {
++      workArrayLength = IntPtrMin(workArrayLength, kWorkArrayLengthWithoutElements);
+     }
+-  } label NoJsObject {}
++  } label NoJsObject {
++    workArrayLength = IntPtrMin(workArrayLength, kWorkArrayLengthWithoutElements);
++  }
+ 
+   return workArrayLength;
+ }
+@@ -1461,6 +1477,7 @@ transitioning macro CompactReceiverElementsIntoWorkArray(
+     }
+ 
+     for (let i: Smi = 0; i < receiverLength; ++i) {
++      if ((i & kSortInterruptMask) == kSortInterruptMask) PerformStackCheck();
+       const element: JSAny|TheHole = loadFn(context, sortState, i);
+ 
+       if (element == TheHole) {

@@ -458,6 +458,17 @@ constexpr kj::StringPtr JSON_PROPERTIES =
 // The same object with a reviver takes the iterative parser and its own check.
 constexpr kj::StringPtr JSON_PROPERTIES_REVIVER =
     "globalThis.retained = JSON.parse('{' + '\"a\":1,'.repeat(2**24) + '\"a\":1}', (k, v) => v); 1"_kj;
+// The verifier's sweep of V8 builtins (v138 §8.4), the shapes that ended the
+// process on cwkd-p40: a sort of an array-like object or a string sized its
+// work array by the length; a global replace with a function collected every
+// match before the first call; a global atom match allocated one array for
+// every match it counted.
+constexpr kj::StringPtr SORT_STRING =
+    "Array.prototype.sort.call('x'.repeat(2**28)); 1"_kj;
+constexpr kj::StringPtr REPLACE_FUNCTION =
+    "globalThis.retained = 'x'.repeat(2**27 + 1).replace(/x/g, () => ''); retained.length"_kj;
+constexpr kj::StringPtr MATCH_ATOM =
+    "globalThis.retained = 'x'.repeat(2**27 + 1).match(/x/g); retained.length"_kj;
 // Loops that allocate nothing while they run: their interrupt checks are what
 // lets a short CPU limit end the call (each takes about a second unchecked).
 constexpr kj::StringPtr CPU_JSON_NUMBERS =
@@ -466,6 +477,11 @@ constexpr kj::StringPtr CPU_JSON_SLOW =
     "globalThis.retained = JSON.parse('[' + '\"a\",'.repeat(2**24) + '\"a\"]'); retained.length"_kj;
 constexpr kj::StringPtr CPU_JSON_REVIVER =
     "globalThis.retained = JSON.parse('[' + '\"a\",'.repeat(2**24) + '\"a\"]', (k, v) => v); retained.length"_kj;
+// An array-like object's length alone: a work array of that length ended the
+// process at once; now the loop over its indices takes interrupts.
+constexpr kj::StringPtr CPU_SORT_LENGTH = "Array.prototype.sort.call({length: 2**30}); 1"_kj;
+constexpr kj::StringPtr CPU_TO_SORTED_LENGTH =
+    "Array.prototype.toSorted.call({length: 2**28}).length"_kj;
 // (split's check every 1,024 parts is in the loop that creates them, after
 // the search for the separators, which checks none: it is tested by the parts
 // outgrowing a 2 GiB budget, "split" above.)
@@ -682,6 +698,12 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
     {"cpu-json-numbers"_kj, CPU_JSON_NUMBERS, -1, Outcome::CPU, cpu},
     {"cpu-json-slow"_kj, CPU_JSON_SLOW, -1, Outcome::CPU, cpu},
     {"cpu-json-reviver"_kj, CPU_JSON_REVIVER, -1, Outcome::CPU, cpu},
+    {"sort-string"_kj, SORT_STRING, -1, Outcome::MEMORY},
+    {"replace-function"_kj, REPLACE_FUNCTION, -1, Outcome::MEMORY},
+    {"replace-function-high"_kj, REPLACE_FUNCTION, -1, Outcome::RANGE, {.memoryMiB = 1024}},
+    {"match-atom"_kj, MATCH_ATOM, -1, Outcome::MEMORY_OR_RANGE},
+    {"cpu-sort-length"_kj, CPU_SORT_LENGTH, -1, Outcome::CPU, cpu},
+    {"cpu-to-sorted-length"_kj, CPU_TO_SORTED_LENGTH, -1, Outcome::CPU, cpu},
   };
   KJ_REQUIRE(count > 0 && count <= 8);
   if (kind == "code") {
@@ -898,6 +920,14 @@ KJ_TEST("a short CPU limit ends JSON.parse loops that allocate nothing") {
   expectChildSurvives("1:cpu-json-numbers");
   expectChildSurvives("1:cpu-json-slow");
   expectChildSurvives("1:cpu-json-reviver");
+}
+KJ_TEST("sort of an array-like object or a string, global replace with a function and global match") {
+  expectChildSurvives("1:sort-string");
+  expectChildSurvives("1:replace-function");
+  expectChildSurvives("1:replace-function-high");
+  expectChildSurvives("1:match-atom");
+  expectChildSurvives("1:cpu-sort-length");
+  expectChildSurvives("1:cpu-to-sorted-length");
 }
 
 KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
