@@ -212,18 +212,26 @@ thread_local const char *currentOomReport = nullptr;
 // The executing isolate's heap at its last collection. V8 collects before a
 // fatal OOM, so this is the heap of the isolate whose allocation failed.
 thread_local const std::atomic<uint64_t> *currentOomHeap = nullptr;
+kj::String oomReportText(kj::StringPtr identity, uint32_t memoryMiB) {
+  static const auto pid = getpid();
+  return kj::str("{\"event\":\"memory-culprit\",\"pid\":", pid, ",", identity,
+      "\"memoryLimitMiB\":", memoryMiB, "}\n");
+}
 struct OomReportScope {
   explicit OomReportScope(
       kj::StringPtr identity, uint32_t memoryMiB, const std::atomic<uint64_t> *heap = nullptr)
       : previous(currentOomReport),
         previousHeap(currentOomHeap),
-        report(kj::str("{\"event\":\"memory-culprit\",\"pid\":",
-            getpid(),
-            ",",
-            identity,
-            "\"memoryLimitMiB\":",
-            memoryMiB,
-            "}\n")) {
+        owned(oomReportText(identity, memoryMiB)) {
+    (void)limitEventFd();
+    currentOomReport = owned.cStr();
+    currentOomHeap = heap;
+  }
+  // A report formatted once for a whole call (RequestLimits), not at every
+  // JavaScript entry; it outlives this scope.
+  OomReportScope(const kj::String &report, const std::atomic<uint64_t> *heap)
+      : previous(currentOomReport),
+        previousHeap(currentOomHeap) {
     (void)limitEventFd();
     currentOomReport = report.cStr();
     currentOomHeap = heap;
@@ -234,7 +242,7 @@ struct OomReportScope {
   }
   const char *previous;
   const std::atomic<uint64_t> *previousHeap;
-  kj::String report;
+  kj::String owned;
 };
 
 kj::Exception limitException(LimitCause cause);
@@ -791,7 +799,8 @@ class CpuWatchdog {
     std::atomic<LimitCause> &cause;
     LimitState memory;
     uint64_t started, allowance, due, terminatedAt = 0, previousCpu = 0;
-    kj::String identity;
+    // The execution's identity, owned by the call or startup that outlives the entry.
+    kj::StringPtr identity;
     uint32_t cpuMs, memoryMiB;
     bool culpritReported = false;
   };
@@ -875,11 +884,13 @@ struct CpuExecution {
       uint64_t used,
       uint32_t cpuMs,
       uint32_t memoryMiB,
-      kj::StringPtr identity)
+      kj::StringPtr identity,
+      const kj::String *oomReport = nullptr)
       : cause(cause),
         memory(std::move(memory)),
         previousCause(this->memory ? this->memory->currentCause : nullptr),
-        oom(identity, memoryMiB, this->memory ? &this->memory->heap : nullptr),
+        oom(oomReport ? OomReportScope(*oomReport, this->memory ? &this->memory->heap : nullptr)
+                      : OomReportScope(identity, memoryMiB, this->memory ? &this->memory->heap : nullptr)),
         entry{.isolate = isolate,
           .cause = cause,
           .memory = std::move(memoryState),
@@ -887,7 +898,7 @@ struct CpuExecution {
               : uint64_t(cpuMs) * 1000000 > used ? uint64_t(cpuMs) * 1000000 - used
                                                  : 0,
           .previousCpu = used,
-          .identity = kj::str(identity),
+          .identity = identity,
           .cpuMs = cpuMs,
           .memoryMiB = memoryMiB},
         registered(cpuMs != 0 || memoryMiB != 0) {
@@ -1111,6 +1122,7 @@ struct RequestLimits final: LimitEnforcer {
         measurement(measurement),
         timer(timer),
         identity(kj::mv(identity)),
+        oomReport(oomReportText(this->identity, slot.limits->memoryMiB)),
         failure(failurePair.promise.fork()) {}
   ~RequestLimits() noexcept(false) {
     writeLimitRow("completed", identity, measurement.totalCpu, slot.limits->cpuMs,
@@ -1132,7 +1144,8 @@ struct RequestLimits final: LimitEnforcer {
               measurement.totalCpu,
               slot.limits->cpuMs,
               slot.limits->memoryMiB,
-              owner.identity) {
+              owner.identity,
+              &owner.oomReport) {
       uint expected = 0;
       KJ_REQUIRE(slot.active.compare_exchange_strong(expected, 1), "overlapping JS entries");
       slot.maxActive.store(1);
@@ -1240,6 +1253,7 @@ struct RequestLimits final: LimitEnforcer {
   Measurement &measurement;
   Timer &timer;
   kj::String identity;
+  kj::String oomReport;  // formatted once for the call's every JavaScript entry
   kj::PromiseFulfillerPair<void> failurePair = kj::newPromiseAndFulfiller<void>();
   kj::ForkedPromise<void> failure;
   bool published = false;
