@@ -551,6 +551,9 @@ struct ChildLimits {
   uint64_t budgetBytes = 16ull << 30;
   uint32_t memoryMiB = 128, cpuMs = 10000;
   double maxSeconds = 0;
+  // When set, the largest heap the isolate may reach: a limit that took effect late (an interrupt check missing)
+  // still ends the call at the memory limit, only far above it.
+  uint64_t maxPeakBytes = 0;
 };
 
 // `count` isolates allocate at the same moment while a neighbor isolate keeps
@@ -683,6 +686,7 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1,
     if (outcome == Outcome::MEMORY_OR_RANGE)
       KJ_EXPECT(limited || rangeError[i], i, peaks[i], int(refused[i]));
     if (outcome == Outcome::RANGE) KJ_EXPECT(rangeError[i], i, peaks[i]);
+    if (childLimits.maxPeakBytes != 0) KJ_EXPECT(peaks[i] <= childLimits.maxPeakBytes, i, peaks[i]);
     if (outcome == Outcome::CPU)
       KJ_EXPECT(cpuEnded[i] && seconds[i] <= childLimits.maxSeconds, i, seconds[i], int(cpuEnded[i]));
     const int ceilingRaised = limits[i]->memory->ceilingRaised.load();
@@ -737,7 +741,9 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
     {"cpu-json-slow"_kj, CPU_JSON_SLOW, -1, Outcome::CPU, cpu},
     {"cpu-json-reviver"_kj, CPU_JSON_REVIVER, -1, Outcome::CPU, cpu},
     {"sort-string"_kj, SORT_STRING, -1, Outcome::MEMORY},
-    {"replace-function"_kj, REPLACE_FUNCTION, -1, Outcome::MEMORY},
+    // The matches' collection takes interrupts: it ends near the limit (about 135 MB), not after the builder's
+    // last doubling past 1 GB.
+    {"replace-function"_kj, REPLACE_FUNCTION, -1, Outcome::MEMORY, {.maxPeakBytes = 512ull << 20}},
     // About 8.5 s of CPU to collect 2^27 matches: a CPU limit well above it, so that only the RangeError ends it
     // (a busy machine took it past the default 10 s once).
     {"replace-function-high"_kj, REPLACE_FUNCTION, -1, Outcome::RANGE, {.memoryMiB = 1024, .cpuMs = 60000}},
