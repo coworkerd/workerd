@@ -699,6 +699,46 @@ KJ_TEST("a 500 MB young object then one near-GiB object preserves the process") 
   KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
 }
 
+// The near-heap-limit callback's ceilings (MemoryBudget::raise), against a
+// real isolate with 64 MiB live in a 2 GiB process budget: the first is one
+// maximum object above the heap in use even when the heap is already past the
+// old ceiling (young large objects are promoted without a check); a later one,
+// while the termination is pending, reaches at most what the process budget has
+// left; with nothing left the ceiling stays and V8's OOM path follows.
+KJ_TEST("the raised heap ceiling counts from the heap in use and later stays within the process budget") {
+  initializeV8();
+  auto budget = std::make_shared<ResourceBudget>(2ull << 30, 4, 2);
+  auto reservation = std::make_shared<ResourceReservation>(budget, 128);
+  KJ_ASSERT(reservation->registerPreparation());
+  IsolateLimits limits(10000, 128, kj::str("\"workerId\":\"a/raise\","), reservation);
+  auto* isolate = v8::Isolate::New(limits.getCreateParams());
+  KJ_DEFER(isolate->Dispose());
+  limits.customizeIsolate(isolate);
+  v8::Locker locker(isolate);
+  v8::Isolate::Scope entered(isolate);
+  v8::HandleScope handles(isolate);
+  auto context = v8::Context::New(isolate);
+  v8::Context::Scope inContext(context);
+  auto source = v8::String::NewFromUtf8Literal(isolate, "globalThis.kept = new Array(8 * 1024 * 1024).fill(1.5); 1");
+  KJ_ASSERT(!v8::Script::Compile(context, source).ToLocalChecked()->Run(context).IsEmpty());
+  isolate->LowMemoryNotification();  // the reservation now holds this heap (observe() after the collection)
+  v8::HeapStatistics stats;
+  isolate->GetHeapStatistics(&stats);
+  const uint64_t used = stats.total_heap_size();
+  KJ_ASSERT(used >= (64ull << 20) && used < (256ull << 20), used);
+  auto& memory = *limits.memory;
+  const auto first = memory.raise(used / 2);
+  KJ_EXPECT(first == used + MAX_SINGLE_HEAP_OBJECT, first, used);
+  const auto left = budget->memoryMaximum - budget->memoryReserved.load();
+  KJ_ASSERT(left > MAX_SINGLE_HEAP_OBJECT && left < 2 * MAX_SINGLE_HEAP_OBJECT, left);
+  const auto second = memory.raise(first);
+  KJ_EXPECT(second == used + left, second, used, left);
+  const auto third = memory.raise(second);
+  KJ_EXPECT(third == second, third, second);
+  KJ_EXPECT(memory.ceilingRaised.load() == 2);
+  isolate->CancelTerminateExecution();
+}
+
 // Each long operation below ended the process before v138 (exit 74 at the
 // raised ceiling, or V8's fatal invalid size): the child must survive, its
 // call end with the memory limit (or, where noted, a RangeError), and the
