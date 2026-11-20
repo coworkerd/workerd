@@ -351,6 +351,27 @@ void allocationComponent(kj::StringPtr code) {
   checkNeighbor();
 }
 
+KJ_TEST("a Worker's ArrayBuffers lie in its own isolate group's sandbox") {
+  // MemoryBudget allocates in the group it was given: with a V8 sandbox per group, V8 ends the
+  // process on the first backing store outside the isolate's own sandbox.
+  initializeV8();
+  auto budget = std::make_shared<ResourceBudget>(1ull << 30, 4, 1);
+  auto reservation = std::make_shared<ResourceReservation>(budget, 32);
+  KJ_ASSERT(reservation->registerPreparation());
+  auto other = newGroup();
+  IsolateLimits limits(1000, 32, kj::str("\"workerId\":\"a/buffers\","), reservation, newGroup());
+  auto* isolate = v8::Isolate::New(limits.group, limits.getCreateParams());
+  KJ_DEFER(isolate->Dispose());
+  customizeEntered(limits, isolate);
+  v8::Locker locker(isolate);
+  v8::Isolate::Scope entered(isolate);
+  auto store = v8::ArrayBuffer::NewBackingStore(isolate, 1 << 20);
+  KJ_EXPECT(limits.group.SandboxContains(store->Data()));
+  KJ_EXPECT(!other.SandboxContains(store->Data()) || !v8::IsolateGroup::CanCreateNewGroups());
+  // A buffer above the Worker's limit is refused before anything is reserved.
+  KJ_EXPECT(limits.memory->MaxAllocationSize() == (32ull << 20));
+}
+
 KJ_TEST("single large heap allocation preserves the process") {
   allocationComponent("globalThis.retained = new Array(12*1024*1024).fill(7)");
 }
