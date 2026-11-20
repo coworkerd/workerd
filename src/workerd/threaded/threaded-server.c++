@@ -2219,7 +2219,7 @@ struct ThreadedServer {
     } catch (kj::Exception &error) {
       auto group = KJ_UNWRAP_OR(server::tryNewIsolateGroup(), {
         noSandboxRoom();
-        kj::throwRecoverableException(capacityError());
+        kj::throwFatalException(capacityError());
       });
       IsolateLimits limits(workerLimit(descriptor, "cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
           workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"),
@@ -2306,7 +2306,7 @@ struct ThreadedServer {
     // Worker (the node's per-process limit normally refuses first), never ends the process.
     auto group = KJ_UNWRAP_OR(server::tryNewIsolateGroup(), {
       noSandboxRoom();
-      kj::throwRecoverableException(capacityError());
+      kj::throwFatalException(capacityError());
     });
     auto limits = kj::refcounted<IsolateLimits>(
         workerLimit(descriptor, "cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
