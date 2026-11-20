@@ -341,6 +341,19 @@ bool zeroSegmentHeld() {
 #endif
 }
 
+size_t measureGroupCapacity(size_t limit) {
+  if (!v8::IsolateGroup::CanCreateNewGroups()) return 0;
+  kj::Vector<v8::IsolateGroup> groups;
+  while (groups.size() < limit) {
+    KJ_IF_SOME(group, tryNewIsolateGroup()) {
+      groups.add(kj::mv(group));
+    } else {
+      break;
+    }
+  }
+  return groups.size();
+}
+
 kj::Maybe<v8::IsolateGroup> tryNewIsolateGroup() {
   if (!v8::IsolateGroup::CanCreateNewGroups()) return v8::IsolateGroup::GetDefault();
   auto group = v8::IsolateGroup::TryCreate();

@@ -64,6 +64,13 @@ kj::Maybe<v8::IsolateGroup> tryNewIsolateGroup();
 std::shared_ptr<v8::Allocator> newSandboxPoolAllocator(v8::VirtualAddressSpace& space);
 constexpr size_t SANDBOX_POOL_BYTES = size_t(2) << 30;
 
+// How many isolate groups this process can still create: creates them until tryNewIsolateGroup()
+// refuses, then releases them. V8 places each sandbox at a random address, so the address space
+// holds about three quarters of what its size divided by one reservation suggests (random
+// sequential packing; 720 on a 47-bit user address space with 136 GiB reservations, cwkd-p40).
+// 0 in a build with one shared pointer-compression cage.
+size_t measureGroupCapacity(size_t limit = 65536);
+
 // Whether the zero segment is really held: MAP_FIXED_NOREPLACE at 1 GiB and at 4 GiB + 512 KiB
 // fails with EEXIST. True where it cannot be probed (not Linux).
 bool zeroSegmentHeld();

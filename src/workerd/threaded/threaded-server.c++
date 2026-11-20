@@ -3908,6 +3908,9 @@ int main(int argc, char **argv) {
     server::WorkerdPlatform platform{*basePlatform};
     jsg::V8System v8{platform, {}, basePlatform.get()};
     server::requireSecureSandbox();
+    // How many isolates' sandboxes fit in this machine's address space (the node's plan).
+    if (v8::IsolateGroup::CanCreateNewGroups())
+      fprintf(stderr, "[coworkerd-sandbox] {\"capacity\":true,\"groups\":%zu}\n", server::measureGroupCapacity());
     return 0;
   }
   if (argc != 5) {

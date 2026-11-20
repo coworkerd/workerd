@@ -350,20 +350,13 @@ KJ_TEST("isolate groups run out as a refusal, not as the end of the process") {
   // Every group reserves its sandbox with the guard regions (136 GiB) and, outside it, its
   // trusted range: a 47-bit user address space (128 TiB) holds fewer than a thousand. Past that,
   // tryNewIsolateGroup() returns none (V8's IsolateGroup::TryCreate()) and the process goes on.
-  kj::Vector<v8::IsolateGroup> groups;
-  while (groups.size() < 4096) {
-    KJ_IF_SOME(group, tryNewIsolateGroup()) {
-      groups.add(kj::mv(group));
-    } else {
-      break;
-    }
-  }
-  fprintf(stdout, "SANDBOX_GROUPS created=%zu\n", groups.size());
+  auto created = measureGroupCapacity(4096);
+  fprintf(stdout, "SANDBOX_GROUPS created=%zu\n", created);
   fflush(stdout);
-  KJ_EXPECT(groups.size() > 100 && groups.size() < 4096, groups.size());
+  KJ_EXPECT(created > 100 && created < 4096, created);
   // Released groups give their address space back.
-  for (auto i KJ_UNUSED: kj::zeroTo(8)) groups.removeLast();
   KJ_EXPECT(tryNewIsolateGroup() != kj::none);
+  KJ_EXPECT(measureGroupCapacity(4096) + 50 > created);
 }
 #else
 KJ_TEST("without the sandbox nothing is checked") {
