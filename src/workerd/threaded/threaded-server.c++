@@ -271,6 +271,10 @@ struct ResourceBudget {
   const uint32_t residentMaximum;
   std::mutex mutex;
   std::atomic<uint64_t> memoryReserved{0}, addressReserved{0};
+  // Heap headroom near-heap-limit raises granted above what their isolates
+  // used, until each call's termination takes effect (MemoryBudget::raise()):
+  // two isolates raised at once never both count on the same remainder.
+  std::atomic<uint64_t> lent{0};
   std::atomic<uint32_t> residents{0};
   std::atomic<uint64_t> rejections{0}, evictions{0}, pressureTerminations{0};
   std::condition_variable reclaimed;
@@ -618,6 +622,7 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
         reservation(std::move(reservation)),
         inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
   ~MemoryBudget() noexcept override {
+    returnLent();
     delete inner;
   }
   const uint64_t maximum;
@@ -766,26 +771,51 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   // 256 MiB its other isolates keep); with nothing left the ceiling stays.
   // Reservations are read without their lock: the counters are atomic, and an
   // estimate made at a collection is all this needs.
+  // What other isolates' raises hold (ResourceBudget::lent) is not left. The
+  // headroom granted above this isolate's heap is lent (taken atomically from
+  // the shared count) until returnLent(), when its call's execution ends.
   size_t raise(size_t current) {
     v8::HeapStatistics stats;
     isolate->GetHeapStatistics(&stats);
     const uint64_t used = stats.total_heap_size();
-    uint64_t ceiling = kj::max(uint64_t(current), used) + MAX_SINGLE_HEAP_OBJECT;
-    if (ceilingRaised.load() > 0) {
-      if (!reservation) return current;
-      const auto &resources = *reservation->budget;
-      uint64_t room = resources.memoryMaximum -
-          kj::min(resources.memoryReserved.load(), resources.memoryMaximum);
-      if (resources.addressMaximum != UINT64_MAX) {
-        const auto cage = resources.addressMaximum + MAX_SINGLE_HEAP_OBJECT;
-        room = kj::min(room, cage - kj::min(resources.addressReserved.load(), cage));
-      }
-      ceiling = kj::min(ceiling, used + room);
+    const uint64_t wanted = kj::max(uint64_t(current), used) + MAX_SINGLE_HEAP_OBJECT;
+    const bool first = ceilingRaised.load() == 0;
+    if (!first && !reservation) return current;
+    if (!reservation) {
+      ceilingRaised.fetch_add(1);
+      return wanted;
     }
-    if (ceiling <= current) return current;
+    auto &resources = *reservation->budget;
+    auto lentNow = resources.lent.load();
+    uint64_t ceiling;
+    for (;;) {
+      ceiling = wanted;
+      if (!first) {
+        const uint64_t others = lentNow - kj::min(lentHere, lentNow);
+        uint64_t room = resources.memoryMaximum -
+            kj::min(resources.memoryReserved.load() + others, resources.memoryMaximum);
+        if (resources.addressMaximum != UINT64_MAX) {
+          const auto cage = resources.addressMaximum + MAX_SINGLE_HEAP_OBJECT;
+          room = kj::min(room, cage - kj::min(resources.addressReserved.load() + others, cage));
+        }
+        ceiling = kj::min(ceiling, used + room);
+      }
+      if (ceiling <= current) return current;
+      const uint64_t grant = ceiling - used;
+      if (resources.lent.compare_exchange_weak(lentNow, lentNow - kj::min(lentHere, lentNow) + grant)) {
+        lentHere = grant;
+        break;
+      }
+    }
     ceilingRaised.fetch_add(1);
     return ceiling;
   }
+  void returnLent() {
+    if (lentHere == 0 || !reservation) return;
+    reservation->budget->lent.fetch_sub(lentHere);
+    lentHere = 0;
+  }
+  uint64_t lentHere = 0;  // this isolate's share of ResourceBudget::lent (its lock's thread only)
 };
 
 // Only native state, a thread CPU clock and V8's thread-safe termination API
@@ -931,6 +961,9 @@ struct CpuExecution {
         entry.isolate->CancelTerminateExecution();
         entry.isolate->LowMemoryNotification();
       }
+      // The termination (or the call) has taken effect: what a raise lent is
+      // given back.
+      memory->returnLent();
       memory->observe();
       memory->currentCause = previousCause;
     }

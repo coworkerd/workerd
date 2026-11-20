@@ -1,22 +1,28 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
 Date: Fri, 20 Nov 2026 12:00:00 +0800
-Subject: Let JSON.parse and String.prototype.split take interrupts, and
- throw instead of ending the process past the largest array
+Subject: Let long allocating builtins take interrupts, and throw instead of
+ ending the process past the largest array
 
 JSON.parse only checked for stack overflow: a termination requested while
 it parses (a CPU or memory limit of the embedder) took effect only after
 the whole text, however much it allocated meanwhile. Handle interrupts
 once per value, as JSON.stringify does. String.prototype.split creates
 every part in one runtime call; handle interrupts every 1,024 parts.
+String.prototype.replaceAll with a string replacement builds a ConsString
+per match without calling JavaScript; check the stack (and so interrupts)
+per match. ValueSerializer checked for termination once per object only;
+check before each string it flattens as well.
 
 A JSON array or a split with more elements than FixedArray::kMaxLength,
 and a JSON object with more properties than its dictionary can hold,
 ended the process ("Fatal JavaScript invalid size error", "invalid array
 length", "invalid table size"), reachable from a script with one text of
 a few hundred megabytes. Throw a RangeError instead (Invalid array length,
-Too many properties to enumerate). The split stops collecting indices one
-past the maximum.
+Too many properties to enumerate); every element pushed counts, the first
+one after the numbers' fast path as well, and with a reviver the limit is
+half the largest array (its parse nodes take twice its length). The split
+stops collecting indices one past the maximum.
 
 diff --git a/src/builtins/builtins-string-gen.cc b/src/builtins/builtins-string-gen.cc
 index d282fa8..570d937 100644
@@ -33,8 +39,23 @@ index d282fa8..570d937 100644
  
      ToDirectStringAssembler to_direct(state(), subject_string);
      to_direct.TryToDirect(&call_runtime);
+diff --git a/src/builtins/string-replaceall.tq b/src/builtins/string-replaceall.tq
+index 250aa88..ad2d7b2 100644
+--- a/src/builtins/string-replaceall.tq
++++ b/src/builtins/string-replaceall.tq
+@@ -100,6 +100,10 @@ transitioning javascript builtin StringPrototypeReplaceAll(
+   let result: String = kEmptyString;
+   let position = AbstractStringIndexOf(string, searchString, 0);
+   while (position != -1) {
++    // Every match allocates (a ConsString), and with a string replacement no
++    // JavaScript runs: handle interrupts, so that a termination requested
++    // meanwhile (a CPU or memory limit) takes effect.
++    PerformStackCheck();
+     // a. If functionalReplace is true, then
+     // b. Else,
+     let replacement: String;
 diff --git a/src/json/json-parser.cc b/src/json/json-parser.cc
-index cc719ef..87d3f02 100644
+index cc719ef..66aec05 100644
 --- a/src/json/json-parser.cc
 +++ b/src/json/json-parser.cc
 @@ -146,6 +146,26 @@ static const constexpr uint8_t character_json_scan_flags[256] = {
@@ -104,19 +125,38 @@ index cc719ef..87d3f02 100644
      if (Check<JsonToken::COMMA>()) {
        GetNextNonWhitespaceToken();
        continue;
-@@ -1456,6 +1495,11 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonArray() {
+@@ -1439,9 +1478,20 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonArray() {
+   }
+   double_elements_.resize(0);
+ 
++  // Every element pushed is counted against the largest array, the first one
++  // after the numbers above as well.
++  auto push = [&](Handle<Object> element) {
++    element_stack_.emplace_back(element);
++    if (V8_LIKELY(element_stack_.size() - start <= kMaxJsonArrayLength)) {
++      return true;
++    }
++    isolate_->Throw(
++        *factory()->NewRangeError(MessageTemplate::kInvalidArrayLength));
++    return false;
++  };
+   Handle<Object> value;
+   if (V8_UNLIKELY(!ParseJsonValueRecursive().ToHandle(&value))) return {};
+-  element_stack_.emplace_back(value);
++  if (V8_UNLIKELY(!push(value))) return {};
+   while (Check<JsonToken::COMMA>()) {
+     Handle<Map> feedback;
+     if (IsJSObject(*value)) {
+@@ -1455,7 +1505,7 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonArray() {
+     if (V8_UNLIKELY(!ParseJsonValueRecursive(feedback).ToHandle(&value))) {
        return {};
      }
-     element_stack_.emplace_back(value);
-+    if (V8_UNLIKELY(element_stack_.size() - start > kMaxJsonArrayLength)) {
-+      isolate_->Throw(
-+          *factory()->NewRangeError(MessageTemplate::kInvalidArrayLength));
-+      return {};
-+    }
+-    element_stack_.emplace_back(value);
++    if (V8_UNLIKELY(!push(value))) return {};
    }
  
    EXPECT_RETURN_ON_ERROR(JsonToken::RBRACK,
-@@ -1519,6 +1563,7 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
+@@ -1519,6 +1569,7 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
      // objects and arrays will cause the loop to continue until a first member
      // is completed.
      while (true) {
@@ -124,7 +164,7 @@ index cc719ef..87d3f02 100644
        GetNextNonWhitespaceToken();
        // The switch is immediately followed by 'break' so we can use 'break' to
        // break out of the loop, and 'continue' to continue the loop.
-@@ -1668,6 +1713,11 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
+@@ -1668,6 +1719,11 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
                  {});
  
              property_stack_.emplace_back(ScanJsonPropertyKey(&cont.current()));
@@ -136,12 +176,15 @@ index cc719ef..87d3f02 100644
              if constexpr (should_track_json_source) {
                property_val_node_stack.emplace_back(Handle<Object>());
              }
-@@ -1730,6 +1780,12 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
+@@ -1730,6 +1786,15 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
          case JsonContinuation::kArrayElement: {
            // Store the previous element on the stack.
            element_stack_.emplace_back(value);
++          // With the source tracked (a reviver), the array's parse nodes and
++          // snapshots take twice its length.
 +          if (V8_UNLIKELY(element_stack_.size() - cont.current().index() >
-+                          kMaxJsonArrayLength)) {
++                          (should_track_json_source ? kMaxJsonArrayLength / 2
++                                                    : kMaxJsonArrayLength))) {
 +            isolate_->Throw(*factory()->NewRangeError(
 +                MessageTemplate::kInvalidArrayLength));
 +            return MaybeHandle<Object>();
@@ -149,6 +192,21 @@ index cc719ef..87d3f02 100644
            if constexpr (should_track_json_source) {
              element_val_node_stack.emplace_back(val_node);
            }
+diff --git a/src/objects/value-serializer.cc b/src/objects/value-serializer.cc
+index 7175792..20813bc 100644
+--- a/src/objects/value-serializer.cc
++++ b/src/objects/value-serializer.cc
+@@ -557,6 +557,10 @@ Maybe<bool> ValueSerializer::WriteObject(DirectHandle<Object> object) {
+ #endif  // V8_ENABLE_WEBASSEMBLY
+     default:
+       if (InstanceTypeChecker::IsString(instance_type)) {
++        // Flattening a string allocates up to its length: a termination
++        // requested meanwhile (a memory limit) takes effect before the next
++        // one, as it does before the next object.
++        STACK_CHECK(isolate_, Nothing<bool>());
+         WriteString(Cast<String>(object));
+         return ThrowIfOutOfMemory();
+       } else if (InstanceTypeChecker::IsJSReceiver(instance_type)) {
 diff --git a/src/runtime/runtime-regexp.cc b/src/runtime/runtime-regexp.cc
 index ec17453..edf9c70 100644
 --- a/src/runtime/runtime-regexp.cc
