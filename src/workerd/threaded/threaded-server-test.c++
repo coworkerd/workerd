@@ -506,8 +506,10 @@ constexpr kj::StringPtr MATCH_ATOM =
     "globalThis.retained = 'x'.repeat(2**27 + 1).match(/x/g); retained.length"_kj;
 // Loops that allocate nothing while they run: their interrupt checks are what
 // lets a short CPU limit end the call (each takes about a second unchecked).
+// The numbers' fast path: long decimals, so that the unchecked parse (about 2 s on cwkd-p40) is far past the limit
+// (small integers parsed so fast that an unchecked parse still ended within it).
 constexpr kj::StringPtr CPU_JSON_NUMBERS =
-    "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**25) + '1]'); retained.length"_kj;
+    "globalThis.retained = JSON.parse('[' + '1.2345678901234567890123e10,'.repeat(2**23) + '1]'); retained.length"_kj;
 constexpr kj::StringPtr CPU_JSON_SLOW =
     "globalThis.retained = JSON.parse('[' + '\"a\",'.repeat(2**24) + '\"a\"]'); retained.length"_kj;
 constexpr kj::StringPtr CPU_JSON_REVIVER =
