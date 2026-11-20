@@ -1114,6 +1114,81 @@ struct Reporter final: Worker::ValidationErrorReporter {
   void addWorkflowClass(kj::StringPtr, kj::Array<kj::String>) override {}
 };
 
+// How busy a Worker's isolate has been (v138 section 2): the share of the last
+// window (2 s by default, two buckets) a thread ran JavaScript in it, from the
+// thread CPU time each JavaScript entry already measures, attributed to the
+// bucket of the entry's start (no clock read of its own). Saturated from
+// `enter` per mille on, saturated no more below `exit`, so it does not flip on
+// one value; each change is reported once. Its writers are the isolate's
+// JavaScript exits (one at a time) and the maintenance pass, which ends the
+// saturation of an isolate nothing has entered for a window.
+struct SaturationWindow {
+  struct Thresholds {
+    uint64_t bucketNs = 1'000'000'000;
+    uint32_t enter = 900, exit = 800;
+  };
+  static const Thresholds &configured();
+  std::mutex mutex;
+  uint64_t bucket = 0, current = 0, previous = 0;
+  std::atomic<bool> saturated{false};
+  // +1 when this made it saturated, -1 when it ended the saturation, else 0.
+  int note(uint64_t atNs, uint64_t cpuNs, const Thresholds &limits = configured()) {
+    std::lock_guard lock(mutex);
+    roll(atNs, limits);
+    current += cpuNs;
+    return flip(permilleAt(atNs, limits), limits);
+  }
+  int decay(uint64_t nowNs, const Thresholds &limits = configured()) {
+    std::lock_guard lock(mutex);
+    roll(nowNs, limits);
+    return flip(permilleAt(nowNs, limits), limits);
+  }
+  uint64_t busyNs() {
+    std::lock_guard lock(mutex);
+    return current + previous;
+  }
+
+ private:
+  void roll(uint64_t atNs, const Thresholds &limits) {
+    const auto at = atNs / limits.bucketNs;
+    if (at <= bucket) return;  // the same bucket, or an entry that began before the last one counted
+    previous = at == bucket + 1 ? current : 0;
+    current = 0;
+    bucket = at;
+  }
+  uint32_t permilleAt(uint64_t atNs, const Thresholds &limits) const {
+    const uint64_t into = atNs / limits.bucketNs == bucket ? atNs % limits.bucketNs : limits.bucketNs;
+    const uint64_t span = limits.bucketNs + into;
+    return uint32_t(kj::min<uint64_t>(1000, (previous + current) * 1000 / kj::max<uint64_t>(span, 1)));
+  }
+  int flip(uint32_t permille, const Thresholds &limits) {
+    if (!saturated.load() && permille >= limits.enter) {
+      saturated.store(true);
+      return 1;
+    }
+    if (saturated.load() && permille < limits.exit) {
+      saturated.store(false);
+      return -1;
+    }
+    return 0;
+  }
+};
+
+const SaturationWindow::Thresholds &SaturationWindow::configured() {
+  static const Thresholds value = [] {
+    Thresholds result;
+    auto read = [](const char *name, uint64_t fallback) {
+      const char *text = getenv(name);
+      return text && *text ? strtoull(text, nullptr, 10) : fallback;
+    };
+    result.bucketNs = kj::max<uint64_t>(1, read("COWORKERD_THREADED_SATURATION_WINDOW_MS", 2000) / 2) * 1000000;
+    result.enter = uint32_t(read("COWORKERD_THREADED_SATURATION_ENTER_PERMILLE", 900));
+    result.exit = uint32_t(read("COWORKERD_THREADED_SATURATION_EXIT_PERMILLE", 800));
+    return result;
+  }();
+  return value;
+}
+
 struct Slot {
   capnp::MallocMessageBuilder configArena, flagsArena;
   api::MemoryCacheProvider cache;
@@ -1134,6 +1209,14 @@ struct Slot {
   std::set<std::string> httpEntrypoints, entrypoints, actorClasses;
   std::vector<std::string> loopbacks, loopbackActors;
   std::atomic<uint> active{0}, maxActive{0}, creates{0};
+  SaturationWindow saturation;
+  // Writes the node's row of a saturation change of this Worker (the limit
+  // event pipe; the node refuses its new calls while it is saturated).
+  void reportSaturation(int change) {
+    if (change == 0) return;
+    (void)writeLimitRow(change > 0 ? "worker-saturated"_kj : "worker-unsaturated"_kj,
+        kj::str("\"workerId\":\"", workerId.c_str(), "\","), saturation.busyNs(), 0, 0);
+  }
 };
 
 struct Entry {
@@ -1190,6 +1273,7 @@ struct RequestLimits final: LimitEnforcer {
       execution.finish();
       auto used = nowNs(CLOCK_THREAD_CPUTIME_ID) - cpu;
       measurement.totalCpu += used;
+      slot.reportSaturation(slot.saturation.note(start, used));
       if (traceForTest()) {
         char row[320];
         int size = snprintf(row, sizeof(row),
@@ -1875,6 +1959,10 @@ struct ThreadedServer {
     std::string json = "{\"ordinaryServer\":\"threaded\",\"residentWorkers\":[";
     uint64_t active = 0, background = 0, unknown = 0;
     bool first = true;
+    // An isolate nothing has entered for a window is saturated no more.
+    const auto passNs = nowNs();
+    for (auto &slot: snapshot)
+      if (slot->saturation.saturated.load()) slot->reportSaturation(slot->saturation.decay(passNs));
     for (auto &slot: snapshot) {
       auto complete = slot->complete.load();
       if (!complete) ++unknown;

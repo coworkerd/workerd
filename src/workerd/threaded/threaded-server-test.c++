@@ -222,6 +222,32 @@ KJ_TEST("log quotas and a failed flush reset pending and in-flight buffers") {
   KJ_EXPECT(buffer.lines.size() == 1);
 }
 
+// A Worker is saturated from 90% of its last two seconds on, not below 80%
+// (so it does not flip on one value), and an isolate nothing entered for a
+// window is saturated no more; each change is reported once.
+KJ_TEST("saturation: 90% of the window to enter, below 80% to leave, idle ends it") {
+  SaturationWindow window;
+  const SaturationWindow::Thresholds limits;
+  const uint64_t second = 1'000'000'000, step = 10'000'000;
+  uint64_t at = 100 * second;
+  auto run = [&](uint64_t seconds, uint64_t busyPerStep) {
+    int entered = 0, left = 0;
+    for (const auto end = at + seconds * second; at < end; at += step) {
+      const auto change = window.note(at, busyPerStep, limits);
+      entered += change > 0;
+      left += change < 0;
+    }
+    return std::pair{entered, left};
+  };
+  KJ_EXPECT(run(3, 8'500'000) == std::pair(0, 0) && !window.saturated.load(), "85% is not saturated");
+  KJ_EXPECT(run(3, 9'500'000) == std::pair(1, 0) && window.saturated.load(), "95% is, once");
+  KJ_EXPECT(run(3, 8'500'000) == std::pair(0, 0) && window.saturated.load(), "85% stays saturated");
+  KJ_EXPECT(run(3, 7'000'000) == std::pair(0, 1) && !window.saturated.load(), "70% is not, once");
+  KJ_EXPECT(run(3, 10'000'000) == std::pair(1, 0));
+  KJ_EXPECT(window.decay(at + 500'000'000, limits) == 0, "half a second idle keeps it");
+  KJ_EXPECT(window.decay(at + 3 * second, limits) == -1 && !window.saturated.load(), "a window idle ends it");
+}
+
 // A call's JavaScript entries point at the OOM report its RequestLimits
 // formatted once (the row, the pid and the identity), instead of formatting
 // it again at every entry; the watchdog entry points at the owner's identity.
