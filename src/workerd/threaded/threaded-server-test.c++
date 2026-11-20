@@ -222,6 +222,33 @@ KJ_TEST("log quotas and a failed flush reset pending and in-flight buffers") {
   KJ_EXPECT(buffer.lines.size() == 1);
 }
 
+// A call's JavaScript entries point at the OOM report its RequestLimits
+// formatted once (the row, the pid and the identity), instead of formatting
+// it again at every entry; the watchdog entry points at the owner's identity.
+KJ_TEST("JavaScript entries reuse the call's OOM report and identity") {
+  initializeV8();
+  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/oom-report\","), nullptr);
+  auto* isolate = v8::Isolate::New(limits.getCreateParams());
+  KJ_DEFER(isolate->Dispose());
+  limits.customizeIsolate(isolate);
+  v8::Locker locker(isolate);
+  v8::Isolate::Scope entered(isolate);
+  v8::HandleScope handles(isolate);
+  auto identity = kj::str("\"workerId\":\"a/oom-report\",\"invocationId\":\"i1\",");
+  auto report = oomReportText(identity, 32);
+  KJ_EXPECT(report == kj::str("{\"event\":\"memory-culprit\",\"pid\":", getpid(), ",", identity,
+      "\"memoryLimitMiB\":32}\n"));
+  for (int turn = 0; turn < 2; ++turn) {
+    std::atomic<LimitCause> cause{LimitCause::NONE};
+    CpuExecution execution(
+        isolate, cause, limits.memoryState, limits.memory, 0, 100, 32, identity, &report);
+    KJ_EXPECT(currentOomReport == report.cStr());
+    KJ_EXPECT(execution.entry.identity.begin() == identity.begin());
+    execution.finish();
+  }
+  KJ_EXPECT(currentOomReport == nullptr);
+}
+
 KJ_TEST("CPU remaining budget, previous CPU, nested attribution and late termination") {
   initializeV8();
   IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/cpu\","), nullptr);
