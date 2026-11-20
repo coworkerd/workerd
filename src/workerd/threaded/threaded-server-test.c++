@@ -153,6 +153,24 @@ KJ_TEST("tenant admission releases counts on errors and cancellation") {
   KJ_EXPECT(detail.size() == 1 && detail[0] == 1);
 }
 
+// The maintenance pass formats every resident into its lifecycle row outside
+// the registry lock; holding them meanwhile must not make an idle Worker look
+// in use, or a load past the resident limit is refused instead of evicting
+// one (r50's fill cells: about four loads in ten refused).
+KJ_TEST("the maintenance pass's snapshot leaves an idle resident evictable") {
+  std::map<std::string, std::shared_ptr<Slot>> registry;
+  auto idle = std::make_shared<Slot>();
+  idle->complete.store(true);
+  registry.emplace("a", idle);
+  std::vector<std::shared_ptr<Slot>> retired{std::make_shared<Slot>()};
+  idle.reset();
+  auto snapshot = residentSnapshot(registry, retired);
+  KJ_EXPECT(snapshot.size() == 2);
+  KJ_EXPECT(canEvict(registry.at("a"), nullptr), "a snapshot must not make an idle Worker look in use");
+  registry.clear();
+  KJ_EXPECT(snapshot[0].expired(), "an evicted resident leaves the snapshot");
+}
+
 KJ_TEST("subrequest quotas, recursive bindings, release wakeup and cancellation") {
   kj::EventLoop loop;
   kj::WaitScope waitScope(loop);

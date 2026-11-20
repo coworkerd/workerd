@@ -1761,6 +1761,20 @@ bool canEvict(const std::shared_ptr<Slot> &slot, Slot *exclude) {
       slot->contexts.load() == 0;
 }
 
+// The maintenance pass's view of the residents, which it formats into the
+// lifecycle row outside the registry lock (tens of milliseconds with hundreds
+// of residents, every 100 ms). Weak references: a strong one made every idle
+// Worker look in use to canEvict() for that whole time, and a load past the
+// resident limit was refused instead of evicting one.
+template <typename Registry, typename Retired>
+std::vector<std::weak_ptr<Slot>> residentSnapshot(const Registry &registry, const Retired &retired) {
+  std::vector<std::weak_ptr<Slot>> snapshot;
+  snapshot.reserve(registry.size() + retired.size());
+  for (auto &[key, slot]: registry) snapshot.push_back(slot);
+  for (auto &slot: retired) snapshot.push_back(slot);
+  return snapshot;
+}
+
 struct ThreadedServer {
   kj::Own<v8::Platform> basePlatform = jsg::defaultPlatform(16);
   server::WorkerdPlatform platform{*basePlatform};
@@ -1860,11 +1874,10 @@ struct ThreadedServer {
     // reservation whose owner is itself waiting for this maintenance pass.
     reapRetired();
     for (uint32_t i = 0; i < 8 && evictOne(nullptr, true); ++i) {}
-    std::vector<std::shared_ptr<Slot>> snapshot;
+    std::vector<std::weak_ptr<Slot>> snapshot;
     {
       std::lock_guard lock(registryMutex);
-      for (auto &[key, slot]: registry) snapshot.push_back(slot);
-      for (auto &slot: retiredSlots) snapshot.push_back(slot);
+      snapshot = residentSnapshot(registry, retiredSlots);
     }
     auto quote = [](const std::string &value) {
       capnp::MallocMessageBuilder arena;
@@ -1875,7 +1888,10 @@ struct ThreadedServer {
     std::string json = "{\"ordinaryServer\":\"threaded\",\"residentWorkers\":[";
     uint64_t active = 0, background = 0, unknown = 0;
     bool first = true;
-    for (auto &slot: snapshot) {
+    for (auto &held: snapshot) {
+      // Evicted since the snapshot: gone from the row as well.
+      auto slot = held.lock();
+      if (!slot) continue;
       auto complete = slot->complete.load();
       if (!complete) ++unknown;
       if (complete && slot->worker == kj::none) continue;
