@@ -344,6 +344,10 @@ void IoContext::IncomingRequest::delivered(kj::SourceLocation location) {
   delivered(location.function, DropQueuedCrossContextActions::NO, location);
 }
 
+kj::Own<void> IoContext::IncomingRequest::enterActorEvent(jsg::Lock& lock) {
+  return context->limitEnforcer->enterActorEvent(lock, *this);
+}
+
 void IoContext::IncomingRequest::delivered(kj::StringPtr eventType,
     DropQueuedCrossContextActions dropQueuedActions,
     kj::SourceLocation location) {
@@ -393,7 +397,7 @@ void IoContext::IncomingRequest::delivered(kj::StringPtr eventType,
     context->limitEnforcer->topUpActor();
 
     // Run the Actor's constructor if it hasn't been run already.
-    a.ensureConstructed(*context);
+    a.ensureConstructed(*context, *this);
 
     // Record a new incoming request to actor metrics.
     a.getMetrics().startRequest();

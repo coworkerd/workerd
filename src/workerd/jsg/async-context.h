@@ -138,6 +138,29 @@ class AsyncContextFrame final: public Wrappable {
   static kj::Maybe<Ref<AsyncContextFrame>> currentRef(Lock& js);
   static kj::Maybe<Ref<AsyncContextFrame>> currentRef(v8::Isolate* isolate);
 
+  // A native turn can observe changes to its continuation context. Promise reactions restore
+  // the context inside V8 and notify the same observer from their promise hook.
+  class ChangeObserver {
+   public:
+    using Notify = void (*)(void*, v8::Isolate*, bool) noexcept;
+    ChangeObserver(void* data, Notify notify, const kj::Arc<StorageKey>& protectedKey);
+    ~ChangeObserver();
+    KJ_DISALLOW_COPY_AND_MOVE(ChangeObserver);
+
+   private:
+    friend class AsyncContextFrame;
+    static thread_local ChangeObserver* current;
+    ChangeObserver* previous;
+    void* data;
+    Notify notify;
+    const kj::Arc<StorageKey>& protectedKey;
+  };
+  static void notifyObserver(v8::Isolate* isolate, bool useFrame = true) noexcept {
+    if (auto* observer = ChangeObserver::current) {
+      observer->notify(observer->data, isolate, useFrame);
+    }
+  }
+
   // Create a new AsyncContextFrame. The new frame inherits the storage context of the current
   // frame (if any) and the given StorageEntry is added.
   static Ref<AsyncContextFrame> create(Lock& js, StorageEntry storageEntry);
@@ -176,14 +199,16 @@ class AsyncContextFrame final: public Wrappable {
   // AsyncContextFrame::Scope makes the given AsyncContextFrame the current in the
   // stack until the scope is destroyed.
   struct Scope {
+    enum class Kind { INTERNAL, USER };
     v8::Isolate* isolate;
     kj::Maybe<Ref<AsyncContextFrame>> prior;
+    kj::Maybe<Ref<AsyncContextFrame>> userFrame;
     // If frame is nullptr, the root frame is assumed.
-    Scope(Lock& js, kj::Maybe<AsyncContextFrame&> frame = kj::none);
+    Scope(Lock& js, kj::Maybe<AsyncContextFrame&> frame = kj::none, Kind kind = Kind::INTERNAL);
     // If frame is nullptr, the root frame is assumed.
     Scope(v8::Isolate* isolate, kj::Maybe<AsyncContextFrame&> frame = kj::none);
     // If frame is nullptr, the root frame is assumed.
-    Scope(Lock& js, kj::Maybe<Ref<AsyncContextFrame>>& frame);
+    Scope(Lock& js, kj::Maybe<Ref<AsyncContextFrame>>& frame, Kind kind = Kind::INTERNAL);
     ~Scope() noexcept(false);
     KJ_DISALLOW_COPY(Scope);
   };

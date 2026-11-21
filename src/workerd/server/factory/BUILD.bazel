@@ -18,6 +18,17 @@ kj_test(
 )
 
 wd_cc_library(
+    name = "coworkerd-durable-cpu",
+    hdrs = ["coworkerd-durable-cpu.h"],
+    visibility = ["//src/workerd/threaded:__pkg__"],
+)
+
+kj_test(
+    src = "coworkerd-durable-cpu-test.c++",
+    deps = [":coworkerd-durable-cpu"],
+)
+
+wd_cc_library(
     name = "coworkerd-durable-placement",
     srcs = ["coworkerd-durable-placement.c++"],
     hdrs = ["coworkerd-durable-placement.h"],

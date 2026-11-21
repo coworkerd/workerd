@@ -1146,6 +1146,8 @@ void ServiceWorkerGlobalScope::queueMicrotask(jsg::Lock& js, jsg::Function<void(
             // Released after the callback rather than when the closure is collected, to keep
             // tracker calls out of GC.
             KJ_DEFER(asyncTraceResource.release());
+            jsg::AsyncContextFrame::notifyObserver(js.v8Isolate);
+            KJ_DEFER(jsg::AsyncContextFrame::notifyObserver(js.v8Isolate, false));
             asyncTraceResource.settle(AsyncOutcome::OK);
             AsyncTracker::CallbackScope asyncTraceScope(asyncTraceResource);
             JSG_TRY(js) {

@@ -19,9 +19,11 @@
 #include <workerd/io/tracked-wasm-instance.h>
 #include <workerd/io/worker-entrypoint.h>
 #include <workerd/io/worker-interface.h>
+#include <workerd/jsg/async-context.h>
 #include <workerd/jsg/coworkerd-rpc-code.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/server/factory/coworkerd-durable-admission.h>
+#include <workerd/server/factory/coworkerd-durable-cpu.h>
 #include <workerd/server/factory/coworkerd-durable-placement.h>
 #include <workerd/server/factory/coworkerd-durable-test-storage.h>
 #include <workerd/server/factory/coworkerd-sandbox.h>
@@ -942,6 +944,18 @@ class CpuWatchdog {
     KJ_REQUIRE(found != entries.end());
     entries.erase(found);
   }
+  bool switchAccount(Entry& entry, uint64_t started, uint64_t used, kj::StringPtr identity) {
+    std::lock_guard lock(mutex);
+    if (entry.cause.load() != LimitCause::NONE) return false;
+    const uint64_t maximum = uint64_t(entry.cpuMs) * 1000000;
+    entry.started = started;
+    entry.previousCpu = used;
+    entry.allowance = maximum == 0 ? UINT64_MAX : maximum - std::min(maximum, used);
+    entry.due = nowNs() + (entry.allowance == UINT64_MAX ? 1000000 : entry.allowance);
+    entry.identity = identity;
+    changed.notify_one();
+    return true;
+  }
 
  private:
   std::mutex mutex;
@@ -1087,6 +1101,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
   v8::IsolateGroup group;
   // The name in this isolate's [coworkerd-sandbox] row.
   std::string sandboxName = "threaded";
+  bool durableEvents = false;
   LimitState memoryState = std::make_shared<std::atomic<LimitCause>>(LimitCause::NONE);
   std::shared_ptr<MemoryBudget> memory;
   mutable std::atomic<LimitCause> startupCause{LimitCause::NONE};
@@ -1106,6 +1121,16 @@ struct IsolateLimits final: IsolateLimitEnforcer {
   void customizeIsolate(v8::Isolate *value) override {
     server::requireSecureIsolateSandbox(value, sandboxName.c_str());
     if (memory) memory->install(value);
+    if (durableEvents) {
+      // V8 restores continuation-preserved data before kBefore and retains it
+      // through kAfter. The full amount belongs to the reaction's event.
+      value->SetPromiseHook([](v8::PromiseHookType type, v8::Local<v8::Promise>,
+                                v8::Local<v8::Value>) {
+        auto* isolate = v8::Isolate::GetCurrent();
+        if (type == v8::PromiseHookType::kBefore) jsg::AsyncContextFrame::notifyObserver(isolate);
+        if (type == v8::PromiseHookType::kAfter) jsg::AsyncContextFrame::notifyObserver(isolate, false);
+      });
+    }
   }
   ActorCacheSharedLruOptions getActorCacheLruOptions() override {
     return {};
@@ -1256,6 +1281,21 @@ struct Measurement {
   kj::Maybe<kj::ForkedPromise<void>> responseEnded;
 };
 
+struct DurableEventCpu {
+  DurableEventCpu(kj::String identity, uint32_t memoryMiB)
+      : identity(kj::mv(identity)), oomReport(oomReportText(this->identity, memoryMiB)) {}
+
+  kj::String identity, oomReport;
+  kj::Maybe<kj::Weak<IoContext::IncomingRequest>> request;
+  server::DurableCpuAccount account;
+};
+
+class DurableEventObserver final: public RequestObserver {
+ public:
+  explicit DurableEventObserver(std::shared_ptr<DurableEventCpu> cpu): cpu(std::move(cpu)) {}
+  std::shared_ptr<DurableEventCpu> cpu;
+};
+
 struct RequestLimits final: LimitEnforcer {
   RequestLimits(Slot &slot, Measurement &measurement, Timer &timer, kj::String identity)
       : slot(slot),
@@ -1281,7 +1321,7 @@ struct RequestLimits final: LimitEnforcer {
               measurement.limitCause,
               slot.limits->memoryState,
               slot.limits->memory,
-              measurement.totalCpu,
+              slot.resetDurableRoot ? 0 : measurement.totalCpu,
               slot.limits->cpuMs,
               slot.limits->memoryMiB,
               owner.identity,
@@ -1290,10 +1330,19 @@ struct RequestLimits final: LimitEnforcer {
       KJ_REQUIRE(slot.active.compare_exchange_strong(expected, 1), "overlapping JS entries");
       slot.maxActive.store(1);
       if (slot.homeTurn) slot.homeTurn(true);
-      if (slot.resetDurableRoot) owner.durableTurnStart = cpu;
+      if (slot.resetDurableRoot) {
+        owner.scope = this;
+        observer.emplace(this, &contextChanged, owner.eventKey());
+      }
     }
     ~Scope() noexcept(false) {
       KJ_DEFER(if (slot.homeTurn) slot.homeTurn(false));
+      observer.reset();
+      owner.scope = nullptr;
+      if (slot.resetDurableRoot) {
+        charge(nowNs(CLOCK_THREAD_CPUTIME_ID));
+        if (measurement.limitCause.load() == LimitCause::CPU) owner.failedEvent = event;
+      }
       execution.finish();
       auto used = nowNs(CLOCK_THREAD_CPUTIME_ID) - cpu;
       measurement.totalCpu += used;
@@ -1315,6 +1364,48 @@ struct RequestLimits final: LimitEnforcer {
       slot.active.fetch_sub(1);
       owner.publish(context);
     }
+    server::DurableCpuAccount& account() { return event ? event->account : turnOverhead; }
+    void charge(uint64_t now) {
+      auto& charged = account();
+      charged.charge(segmentStart, now);
+      const auto maximum = uint64_t(slot.limits->cpuMs) * 1000000;
+      if ((maximum != 0 && charged.remaining(maximum) == 0) ||
+          (owner.sqlBudget && owner.sqlBudget->getCause() == SqlExecutionBudget::Cause::CPU)) {
+        auto expected = LimitCause::NONE;
+        measurement.limitCause.compare_exchange_strong(expected, LimitCause::CPU);
+      }
+      segmentStart = now;
+      owner.sqlBudget.reset();
+    }
+    static void contextChanged(void* ptr, v8::Isolate* isolate, bool useFrame) noexcept {
+      auto& self = *static_cast<Scope*>(ptr);
+      if (self.isolate != isolate || self.measurement.limitCause.load() != LimitCause::NONE) return;
+      // This also runs inside V8's promise hook. Only native bookkeeping
+      // and reads of the frame's opaque token are allowed here.
+      KJ_IF_SOME(exception, kj::runCatchingExceptions([&] {
+        self.selectEvent(useFrame ? self.owner.eventFromFrame(isolate) : nullptr);
+      })) {
+        KJ_LOG(ERROR, "cannot account for durable event continuation", exception);
+        self.measurement.limitCause.store(LimitCause::CPU);
+        isolate->TerminateExecution();
+      }
+    }
+    void selectEvent(std::shared_ptr<DurableEventCpu> next) {
+      if (event == next) return;
+      const auto now = nowNs(CLOCK_THREAD_CPUTIME_ID);
+      charge(now);
+      if (measurement.limitCause.load() == LimitCause::CPU) {
+        isolate->TerminateExecution();
+        return;
+      }
+      const auto used = (next ? next->account : turnOverhead).consumed();
+      if (execution.registered && !CpuWatchdog::instance().switchAccount(
+              execution.entry, now, used, next ? next->identity : owner.identity)) {
+        return;
+      }
+      currentOomReport = next ? next->oomReport.cStr() : owner.oomReport.cStr();
+      event = std::move(next);
+    }
     RequestLimits &owner;
     IoContext &context;
     Slot &slot;
@@ -1322,26 +1413,59 @@ struct RequestLimits final: LimitEnforcer {
     v8::Isolate *isolate;
     uint64_t start, cpu;
     CpuExecution execution;
+    uint64_t segmentStart = cpu;
+    server::DurableCpuAccount turnOverhead;
+    std::shared_ptr<DurableEventCpu> event;
+    std::optional<jsg::AsyncContextFrame::ChangeObserver> observer;
   };
   kj::Own<void> enterJs(jsg::Lock &js, IoContext &context) override {
     requireLimitsNotExceeded();
     // runImpl synchronizes before waiting for the isolate; sample again after
     // that wait, while its lock is held and before this turn enters JavaScript.
     timer.syncTime();
-    auto scope = kj::heap<Scope>(*this, context, js.v8Isolate);
-    return scope;
+    return kj::heap<Scope>(*this, context, js.v8Isolate);
   }
-  void topUpActor() override {
-    if (slot.resetDurableRoot && measurement.limitCause.load() == LimitCause::NONE) {
-      measurement.totalCpu = 0;
+  void topUpActor() override {}
+  kj::Own<void> enterActorEvent(jsg::Lock& js, IoContext::IncomingRequest& request) override {
+    if (!slot.resetDurableRoot) return {};
+    auto* observer = dynamic_cast<DurableEventObserver*>(&request.getMetrics());
+    KJ_REQUIRE(observer != nullptr, "durable event has no CPU account");
+    auto& event = observer->cpu;
+    if (event->request == kj::none) event->request = request.addWeak();
+    auto token = jsg::wrapOpaque(js.v8Context(), EventToken{eventOwner, event});
+    return kj::heap<jsg::AsyncContextFrame::StorageScope>(js, eventKey().addRef(), js.v8Ref(token));
+  }
+  kj::Maybe<IoContext::IncomingRequest&> getActorEventRequest() override {
+    if (scope == nullptr || !scope->event) return kj::none;
+    return KJ_REQUIRE_NONNULL(KJ_REQUIRE_NONNULL(scope->event->request).tryGet(),
+        "the durable event that started this work has ended");
+  }
+  struct EventToken {
+    const std::weak_ptr<int> owner;
+    const std::shared_ptr<DurableEventCpu> event;
+  };
+  static const kj::Arc<jsg::AsyncContextFrame::StorageKey>& eventKey() {
+    static const auto key = kj::arc<jsg::AsyncContextFrame::StorageKey>();
+    return key;
+  }
+  std::shared_ptr<DurableEventCpu> eventFromFrame(v8::Isolate* isolate) {
+    v8::HandleScope handles(isolate);
+    KJ_IF_SOME(frame, jsg::AsyncContextFrame::current(isolate)) {
+      KJ_IF_SOME(value, frame.get(*eventKey())) {
+        auto handle = value.getHandle(jsg::Lock::from(isolate));
+        if (handle->IsUndefined()) return nullptr;
+        const auto& token = jsg::unwrapOpaqueRef<EventToken>(isolate, handle);
+        if (token.owner.lock() == eventOwner) return token.event;
+      }
     }
+    return nullptr;
   }
   std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() override {
-    if (!slot.resetDurableRoot || slot.limits->cpuMs == 0) return {};
+    if (!scope || slot.limits->cpuMs == 0) return {};
     if (!sqlBudget) {
       const uint64_t maximum = uint64_t(slot.limits->cpuMs) * 1000000;
-      const auto left = maximum - kj::min(maximum, measurement.totalCpu);
-      sqlBudget = std::make_shared<SqlExecutionBudget>(maximum, durableTurnStart + left);
+      const auto left = scope->account().remaining(maximum);
+      sqlBudget = std::make_shared<SqlExecutionBudget>(maximum, scope->segmentStart + left);
     }
     return sqlBudget;
   }
@@ -1385,7 +1509,8 @@ struct RequestLimits final: LimitEnforcer {
                                                                   : measurement.limitCause.load();
   }
   void publish(IoContext &context) {
-    if (slot.limits->cpuMs != 0 && measurement.totalCpu >= uint64_t(slot.limits->cpuMs) * 1000000) {
+    if (!slot.resetDurableRoot && slot.limits->cpuMs != 0 &&
+        measurement.totalCpu >= uint64_t(slot.limits->cpuMs) * 1000000) {
       auto expected = LimitCause::NONE;
       measurement.limitCause.compare_exchange_strong(expected, LimitCause::CPU);
     }
@@ -1395,7 +1520,9 @@ struct RequestLimits final: LimitEnforcer {
     writeLimitRow(value == LimitCause::MEMORY     ? "memory-terminated"
             : value == LimitCause::PROCESS_MEMORY ? "process-memory-pressure"
                                                   : "terminated",
-        identity, measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB,
+        failedEvent ? failedEvent->identity : identity,
+        failedEvent ? failedEvent->account.consumed() : measurement.totalCpu,
+        slot.limits->cpuMs, slot.limits->memoryMiB,
         slot.limits->memory->peakUsedBytes.load());
     if (failurePair.fulfiller->isWaiting()) failurePair.fulfiller->reject(limitException(value));
     if (value == LimitCause::CPU && slot.resetDurableRoot) {
@@ -1433,7 +1560,10 @@ struct RequestLimits final: LimitEnforcer {
   kj::PromiseFulfillerPair<void> failurePair = kj::newPromiseAndFulfiller<void>();
   kj::ForkedPromise<void> failure;
   bool published = false;
-  uint64_t durableTurnStart = 0;
+  // The weak token distinguishes actor contexts even if an old frame is restored later.
+  std::shared_ptr<int> eventOwner = slot.resetDurableRoot ? std::make_shared<int>() : nullptr;
+  std::shared_ptr<DurableEventCpu> failedEvent;
+  Scope* scope = nullptr;
   std::shared_ptr<SqlExecutionBudget> sqlBudget;
 };
 
@@ -2590,6 +2720,7 @@ struct ThreadedServer {
         ",\"homes\":" + std::to_string(homes) +
         ",\"workerThreads\":" + std::to_string(liveThreads.load()) +
         ",\"waiting\":" + std::to_string(state.waiting) +
+        ",\"running\":" + std::to_string(state.active) +
         ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
         ",\"homeSessions\":" + std::to_string(durableHomeSessions.load()) +
         ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
@@ -2962,6 +3093,7 @@ struct ThreadedServer {
         workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), kj::mv(identity),
         slot.reservation, group);
     limits->sandboxName = slot.isolateLabel;
+    limits->durableEvents = bool(slot.resetDurableRoot);
     slot.limits = limits.get();
     slot.limitsOwner = kj::addRef(*limits);
     OomReportScope oom(
@@ -4234,16 +4366,20 @@ PreparedInvocation prepareInvocation(ThreadState &state,
       str(input, "format"), field(input, "entrypoint").isString() ? str(input, "entrypoint") : "");
   auto channels = kj::rc<Channels>(state, server, slot, raw);
   auto tracer = kj::rc<TenantTracer>(channels.addRef());
+  auto identity = kj::str("\"workerId\":", encode(field(input, "workerId")),
+      ",\"versionId\":", encode(field(input, "versionId")),
+      ",\"invocationId\":", encode(field(input, "invocationId")), ",\"isolate\":\"",
+      slot->isolateLabel.c_str(), "\",");
+  if (slot->resetDurableRoot) {
+    observer = kj::refcounted<DurableEventObserver>(
+        std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
+  }
   auto entry = newWorkerEntrypoint(state.context, kj::mv(worker),
       entrypoint.empty() || entrypoint == "default"
           ? kj::Maybe<kj::String>(kj::none)
           : kj::Maybe<kj::String>(kj::str(entrypoint.c_str())),
       kj::mv(props), kj::mv(actor),
-      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer,
-          kj::str("\"workerId\":", encode(field(input, "workerId")),
-              ",\"versionId\":", encode(field(input, "versionId")),
-              ",\"invocationId\":", encode(field(input, "invocationId")), ",\"isolate\":\"",
-              slot->isolateLabel.c_str(), "\",")),
+      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity)),
       kj::addRef(*invocation), kj::mv(channels), kj::mv(observer), state.tasks, true,
       kj::mv(tracer), kj::mv(cf), kj::none);
   return {kj::mv(entry), kj::mv(invocation)};

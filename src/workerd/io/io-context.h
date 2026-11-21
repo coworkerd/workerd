@@ -144,6 +144,8 @@ class IoContext_IncomingRequest final: public kj::PtrTarget {
     return *context;
   }
 
+  kj::Own<void> enterActorEvent(jsg::Lock& lock);
+
   // Invoked when the request is actually delivered.
   //
   // If, for some reason, this is not invoked before the object is destroyed, this indicate that
@@ -1359,6 +1361,9 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // TODO(later): this is made public for Python Workers. It should be possible to make this private
   // again later.
   IoChannelFactory& getIoChannelFactory() {
+    KJ_IF_SOME(request, limitEnforcer->getActorEventRequest()) {
+      return *request.ioChannelFactory;
+    }
     return *getCurrentIncomingRequest().ioChannelFactory;
   }
 

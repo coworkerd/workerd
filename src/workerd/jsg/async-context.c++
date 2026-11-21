@@ -116,7 +116,7 @@ v8::Local<v8::Function> AsyncContextFrame::wrapSnapshot(Lock& js, jsg::Function<
             argv[n - 1] = args[n];
             }
 
-            AsyncContextFrame::Scope scope(js, frame);
+            AsyncContextFrame::Scope scope(js, frame, Scope::Kind::USER);
             return check(fn->Call(context, context->Global(), argv.size(), argv.data()));
           }));
 }
@@ -141,7 +141,7 @@ v8::Local<v8::Function> AsyncContextFrame::wrap(Lock& js,
             argv[n] = args[n];
             }
 
-            AsyncContextFrame::Scope scope(js, *frame.get());
+            AsyncContextFrame::Scope scope(js, *frame.get(), Scope::Kind::USER);
             return check(
                 function->Call(js.v8Context(), thisArg.getHandle(js), argv.size(), argv.data()));
           }));
@@ -162,7 +162,7 @@ v8::Local<v8::Function> AsyncContextFrame::wrapRoot(
             argv[n] = args[n];
             }
 
-            AsyncContextFrame::Scope scope(js, kj::none);
+            AsyncContextFrame::Scope scope(js, kj::none, Scope::Kind::USER);
             return check(
                 function->Call(js.v8Context(), thisArg.getHandle(js), argv.size(), argv.data()));
           }));
@@ -237,23 +237,62 @@ void AsyncContextFrame::upsertStorageEntry(StorageEntry entry) {
   }
 }
 
-AsyncContextFrame::Scope::Scope(Lock& js, kj::Maybe<AsyncContextFrame&> resource)
-    : Scope(js.v8Isolate, resource) {}
+thread_local AsyncContextFrame::ChangeObserver* AsyncContextFrame::ChangeObserver::current =
+    nullptr;
+
+AsyncContextFrame::ChangeObserver::ChangeObserver(
+    void* data, Notify notify, const kj::Arc<StorageKey>& protectedKey)
+    : previous(current), data(data), notify(notify), protectedKey(protectedKey) {
+  current = this;
+}
+
+AsyncContextFrame::ChangeObserver::~ChangeObserver() {
+  current = previous;
+}
+
+AsyncContextFrame::Scope::Scope(Lock& js, kj::Maybe<AsyncContextFrame&> resource, Kind kind)
+    : isolate(js.v8Isolate), prior(AsyncContextFrame::currentRef(js)) {
+  if (kind == Kind::USER && ChangeObserver::current != nullptr) {
+    // AsyncLocalStorage and AsyncResource may install an arbitrary user frame.
+    // The embedder's event identity follows the caller through that frame.
+    const auto& key = ChangeObserver::current->protectedKey;
+    kj::Maybe<Value&> currentEntry;
+    KJ_IF_SOME(frame, prior) {
+      currentEntry = frame->get(*key);
+    }
+    auto value = currentEntry.map([&](Value& value) { return value.addRef(js); })
+                     .orDefault([&] { return js.v8Ref(v8::Undefined(isolate).As<v8::Value>()); });
+    maybeSetV8ContinuationContext(isolate, resource);
+    try {
+      userFrame.emplace(AsyncContextFrame::create(js, StorageEntry(key.addRef(), kj::mv(value))));
+      resource = *KJ_ASSERT_NONNULL(userFrame);
+    } catch (...) {
+      maybeSetV8ContinuationContext(isolate, prior.map([](auto& frame) -> AsyncContextFrame& {
+        return *frame;
+      }));
+      throw;
+    }
+  }
+  maybeSetV8ContinuationContext(isolate, resource);
+  notifyObserver(isolate);
+}
 
 AsyncContextFrame::Scope::Scope(v8::Isolate* ptr, kj::Maybe<AsyncContextFrame&> maybeFrame)
     : isolate(ptr),
       prior(AsyncContextFrame::currentRef(ptr)) {
   maybeSetV8ContinuationContext(isolate, maybeFrame);
+  notifyObserver(isolate);
 }
 
-AsyncContextFrame::Scope::Scope(Lock& js, kj::Maybe<Ref<AsyncContextFrame>>& resource)
-    : Scope(js.v8Isolate, resource.map([](Ref<AsyncContextFrame>& frame) -> AsyncContextFrame& {
+AsyncContextFrame::Scope::Scope(Lock& js, kj::Maybe<Ref<AsyncContextFrame>>& resource, Kind kind)
+    : Scope(js, resource.map([](Ref<AsyncContextFrame>& frame) -> AsyncContextFrame& {
         return *frame.get();
-      })) {}
+      }), kind) {}
 
 AsyncContextFrame::Scope::~Scope() noexcept(false) {
   maybeSetV8ContinuationContext(isolate,
       prior.map([](Ref<AsyncContextFrame>& frame) -> AsyncContextFrame& { return *frame; }));
+  notifyObserver(isolate);
 }
 
 AsyncContextFrame::StorageScope::StorageScope(Lock& js, kj::Arc<StorageKey> key, Value store)

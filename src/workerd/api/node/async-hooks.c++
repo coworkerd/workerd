@@ -171,7 +171,7 @@ v8::Local<v8::Value> AsyncResource::runInAsyncScope(jsg::Lock& js,
   }
   fn.setReceiver(js.v8Ref<v8::Value>(receiver));
   validateIoContext(js, originIoContextId);
-  jsg::AsyncContextFrame::Scope scope(js, getFrame());
+  jsg::AsyncContextFrame::Scope scope(js, getFrame(), jsg::AsyncContextFrame::Scope::Kind::USER);
   return fn(js, kj::mv(args));
 }
 

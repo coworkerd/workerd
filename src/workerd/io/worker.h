@@ -1111,7 +1111,7 @@ class Worker::Actor final: public kj::Refcounted {
   //
   // This is used only for modules-syntax actors (which most are, since that's the only format we
   // support publicly).
-  void ensureConstructed(IoContext&);
+  void ensureConstructed(IoContext&, IoContext_IncomingRequest& request);
 
   // Whether the actor's class instance has an onHibernate handler. Always false without the
   // experimental compatibility flag. Reads state that requests modify, so only call it while the
@@ -1283,7 +1283,8 @@ class Worker::Actor final: public kj::Refcounted {
   kj::Maybe<api::ExportedHandler&> getHandler();
   friend class Worker;
 
-  kj::Promise<void> ensureConstructedImpl(IoContext&, ActorClassInfo& info);
+  kj::Promise<void> ensureConstructedImpl(IoContext&,
+      ActorClassInfo& info, kj::Weak<IoContext_IncomingRequest> request);
 
   kj::Promise<void> runOnHibernateImpl(HibernationReason reason,
       kj::Rc<IoChannelFactory> ioChannelFactory,
