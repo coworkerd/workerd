@@ -101,6 +101,8 @@ class DurableAdmission {
   // The home failed to open. Releases all waiting credits without a close acknowledgement.
   std::vector<Ticket> failOpen(uint64_t tree);
   bool releaseUnassigned(uint64_t tree);
+  bool reserveAuxiliary(Resources amount);
+  void releaseAuxiliary(Resources amount);
 
   State state() const {
     return counters;

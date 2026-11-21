@@ -43,5 +43,29 @@ KJ_TEST("disposable durable SQLite refuses paths and malformed identities") {
   KJ_EXPECT_THROW_MESSAGE("invalid durable test storage identity", storage.open(key, "other"));
 }
 
+KJ_TEST("disposable facet storage belongs to one root and survives reopening") {
+  DurableTestStorage storage;
+  uint source;
+  {
+    auto index = storage.openFacetIndex(key, id);
+    source = index->getId(0, "source");
+    auto database = storage.open(key, id, SqliteObserver::DEFAULT, source);
+    database->run("CREATE TABLE values_table (value INTEGER)");
+    database->run("INSERT INTO values_table VALUES (29)");
+  }
+
+  auto index = storage.openFacetIndex(key, id);
+  KJ_EXPECT(index->getId(0, "source") == source);
+  const auto clone = index->getId(0, "clone");
+  storage.cloneFacet(key, id, *index, source, clone);
+  storage.deleteFacet(key, id, *index, source);
+  auto original = storage.open(key, id, SqliteObserver::DEFAULT, source);
+  KJ_EXPECT(original->run("SELECT count(*) FROM sqlite_schema").getInt(0) == 0);
+  auto copied = storage.open(key, id, SqliteObserver::DEFAULT, clone);
+  KJ_EXPECT(copied->run("SELECT value FROM values_table").getInt(0) == 29);
+  auto unrelated = storage.open(key, other, SqliteObserver::DEFAULT, clone);
+  KJ_EXPECT(unrelated->run("SELECT count(*) FROM sqlite_schema").getInt(0) == 0);
+}
+
 }  // namespace
 }  // namespace workerd::server

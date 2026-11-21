@@ -47,6 +47,7 @@ wd_cc_library(
     hdrs = ["coworkerd-durable-test-storage.h"],
     visibility = ["//src/workerd/threaded:__pkg__"],
     deps = [
+        "//src/workerd/server:facet-tree-index",
         "//src/workerd/util:sqlite",
         "@capnp-cpp//src/kj",
     ],

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <workerd/server/facet-tree-index.h>
 #include <workerd/util/sqlite.h>
 
 namespace workerd::server {
@@ -14,12 +15,21 @@ namespace workerd::server {
 class DurableTestStorage {
  public:
   DurableTestStorage();
+  explicit DurableTestStorage(kj::Own<const kj::Directory> directory);
 
   kj::Own<SqliteDatabase> open(kj::StringPtr uniqueKey,
       kj::StringPtr storageId,
-      SqliteObserver& observer = SqliteObserver::DEFAULT) const;
+      SqliteObserver& observer = SqliteObserver::DEFAULT,
+      uint facet = 0) const;
+
+  kj::Own<FacetTreeIndex> openFacetIndex(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
+  void deleteFacet(kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index,
+      uint facet) const;
+  void cloneFacet(kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index,
+      uint source, uint destination) const;
 
  private:
+  void ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
   kj::Own<const kj::Directory> directory;
   SqliteDatabase::Vfs vfs;
 };

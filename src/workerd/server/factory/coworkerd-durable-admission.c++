@@ -113,6 +113,16 @@ bool DurableAdmission::publishHome(uint64_t tree, uint64_t home) {
   return true;
 }
 
+bool DurableAdmission::reserveAuxiliary(Resources amount) {
+  if (reserve(counters.reserved, limits.capacity, amount)) return true;
+  ++counters.overloads;
+  return false;
+}
+
+void DurableAdmission::releaseAuxiliary(Resources amount) {
+  release(counters.reserved, amount);
+}
+
 std::optional<uint64_t> DurableAdmission::homeFor(uint64_t tree) const {
   auto entry = trees.find(tree);
   if (entry == trees.end() || entry->second.home == 0) return std::nullopt;
