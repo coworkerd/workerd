@@ -40,7 +40,8 @@ void release(Resources& used, Resources amount) {
 }  // namespace
 
 DurableAdmission::DurableAdmission(Limits limits, uint64_t generation)
-    : limits(limits), generation(generation) {
+    : limits(limits),
+      generation(generation) {
   KJ_REQUIRE(limits.mailboxDepth > 0 && limits.mailboxBytes > 0 && generation > 0,
       "invalid durable admission limits or generation");
   KJ_REQUIRE(limits.tree.memory > 0 && limits.event.memory > 0,
@@ -63,8 +64,9 @@ DurableAdmission::Result DurableAdmission::queue(
     return {Status::OVERLOADED};
   };
   if (bytes > limits.mailboxBytes ||
-      (tree != nullptr && (tree->waiting >= limits.mailboxDepth ||
-          bytes > limits.mailboxBytes - tree->waitingBytes))) {
+      (tree != nullptr &&
+          (tree->waiting >= limits.mailboxDepth ||
+              bytes > limits.mailboxBytes - tree->waitingBytes))) {
     return refuse();
   }
   auto reserved = counters.reserved;
@@ -73,8 +75,9 @@ DurableAdmission::Result DurableAdmission::queue(
     return refuse();
   }
   const bool newTree = tree == nullptr;
-  if (newTree && ((limits.residentTarget != 0 && counters.trees >= limits.residentTarget) ||
-      !reserve(reserved, limits.capacity, limits.tree))) {
+  if (newTree &&
+      ((limits.residentTarget != 0 && counters.trees >= limits.residentTarget) ||
+          !reserve(reserved, limits.capacity, limits.tree))) {
     return refuse();
   }
 
@@ -131,8 +134,8 @@ std::optional<DurableAdmission::Ticket> DurableAdmission::next(uint64_t tree) co
 DurableAdmission::Delivery DurableAdmission::begin(
     Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now) {
   auto entry = trees.find(ticket.tree);
-  if (entry == trees.end() || home == 0 || entry->second.home != home ||
-      entry->second.key != key || entry->second.open != open || next(ticket.tree) != ticket) {
+  if (entry == trees.end() || home == 0 || entry->second.home != home || entry->second.key != key ||
+      entry->second.open != open || next(ticket.tree) != ticket) {
     return Delivery::STALE;
   }
   auto& tree = entry->second;
@@ -190,8 +193,8 @@ std::vector<DurableAdmission::Ticket> DurableAdmission::expire(Time now) {
 
 bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home) {
   auto entry = trees.find(tree);
-  if (entry == trees.end() || home == 0 || entry->second.home != home ||
-      entry->second.closing || !entry->second.events.empty()) {
+  if (entry == trees.end() || home == 0 || entry->second.home != home || entry->second.closing ||
+      !entry->second.events.empty()) {
     return false;
   }
   entry->second.closing = true;
@@ -220,6 +223,13 @@ std::vector<DurableAdmission::Ticket> DurableAdmission::failOpen(uint64_t tree) 
   }
   eraseTree(entry);
   return refused;
+}
+
+bool DurableAdmission::releaseUnassigned(uint64_t tree) {
+  auto entry = trees.find(tree);
+  if (entry == trees.end() || entry->second.home != 0 || !entry->second.events.empty()) return false;
+  eraseTree(entry);
+  return true;
 }
 
 void DurableAdmission::releaseWaiting(Tree& tree, const Event& event) {

@@ -50,8 +50,8 @@ KJ_TEST("durable admission fences the generation, identity, home and queued even
   KJ_EXPECT((table.homeFor(event.tree) == 9));
   KJ_EXPECT((table.next(event.tree) == event));
 
-  for (auto changed: {&Admission::Open::dataEpoch, &Admission::Open::shardEpoch,
-         &Admission::Open::openId}) {
+  for (auto changed:
+      {&Admission::Open::dataEpoch, &Admission::Open::shardEpoch, &Admission::Open::openId}) {
     stale = open;
     ++(stale.*changed);
     KJ_EXPECT(table.queue(first, stale, 10, deadline, now).status == Status::STALE);
@@ -141,6 +141,19 @@ KJ_TEST("durable admission retains a closing tree until its home acknowledges re
   KJ_EXPECT(table.publishHome(replacement.tree, 1));
   KJ_EXPECT(!table.releaseTree(old.tree, 1));
   KJ_EXPECT(table.begin(replacement, 1, first, nextOpen, now) == Delivery::ACCEPTED);
+}
+
+KJ_TEST("durable admission returns an unassigned tree only when its final waiting call leaves") {
+  Admission table(limits, 1);
+  const auto leaving = queued(table.queue(first, open, 30, deadline, now), true);
+  const auto waiting = queued(table.queue(first, open, 40, deadline, now), false);
+  KJ_EXPECT(table.cancel(leaving) == Cancellation::RELEASED);
+  KJ_EXPECT(!table.releaseUnassigned(leaving.tree));
+  KJ_EXPECT(table.state().trees == 1);
+  KJ_EXPECT(table.cancel(waiting) == Cancellation::RELEASED);
+  KJ_EXPECT(table.releaseUnassigned(waiting.tree));
+  KJ_EXPECT(!table.releaseUnassigned(waiting.tree));
+  KJ_EXPECT((table.state().reserved == Admission::Resources{}));
 }
 
 KJ_TEST("each durable reservation ceiling refuses before publishing a new tree") {

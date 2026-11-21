@@ -100,8 +100,11 @@ class DurableAdmission {
   bool releaseTree(uint64_t tree, uint64_t home);
   // The home failed to open. Releases all waiting credits without a close acknowledgement.
   std::vector<Ticket> failOpen(uint64_t tree);
+  bool releaseUnassigned(uint64_t tree);
 
-  State state() const { return counters; }
+  State state() const {
+    return counters;
+  }
 
  private:
   enum class Phase { WAITING, ACTIVE, CANCELING };

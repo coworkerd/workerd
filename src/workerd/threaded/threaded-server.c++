@@ -19,6 +19,9 @@
 #include <workerd/io/worker-interface.h>
 #include <workerd/jsg/coworkerd-rpc-code.h>
 #include <workerd/jsg/setup.h>
+#include <workerd/server/factory/coworkerd-durable-admission.h>
+#include <workerd/server/factory/coworkerd-durable-placement.h>
+#include <workerd/server/factory/coworkerd-durable-test-storage.h>
 #include <workerd/server/factory/coworkerd-sandbox.h>
 #include <workerd/server/factory/coworkerd-steady.h>
 #include <workerd/server/v8-platform-impl.h>
@@ -29,6 +32,7 @@
 #include <workerd/util/stream-utils.h>
 
 #include <arpa/inet.h>
+#include <charconv>
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <openssl/evp.h>
@@ -66,6 +70,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1487,6 +1492,54 @@ struct JsonDoc {
   }
 };
 
+struct DurableRoute {
+  server::DurableAdmission::Key key;
+  server::DurableAdmission::Open open;
+  std::string invocation;
+
+  bool operator==(const DurableRoute&) const = default;
+};
+
+struct DurableIncoming {
+  kj::AutoCloseFd socket;
+  DurableRoute route;
+  server::DurableAdmission::Ticket ticket;
+  server::DurableAdmission::Time deadline;
+};
+
+uint64_t durableNumber(std::string_view encoded) {
+  uint64_t number;
+  auto [end, error] = std::from_chars(encoded.data(), encoded.data() + encoded.size(), number);
+  KJ_REQUIRE(error == std::errc() && end == encoded.data() + encoded.size(),
+      "invalid durable routing number");
+  return number;
+}
+
+uint64_t durableNumber(Json::Reader value, kj::StringPtr name) {
+  auto encoded = text(value, name);
+  return durableNumber(std::string_view(encoded.begin(), encoded.size()));
+}
+
+DurableRoute readDurableRoute(Json::Reader value) {
+  auto checkedText = [&](kj::StringPtr name, size_t maximum) {
+    auto result = text(value, name);
+    KJ_REQUIRE(result.size() > 0 && result.size() <= maximum, "invalid durable routing field", name);
+    return std::string(result.begin(), result.size());
+  };
+  auto identifier = [&](kj::StringPtr name) {
+    auto result = checkedText(name, 64);
+    KJ_REQUIRE(result.size() == 64 && std::all_of(result.begin(), result.end(),
+        [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }),
+        "invalid durable routing identifier", name);
+    return result;
+  };
+  return {{identifier("namespaceId"), identifier("objectId")},
+    {durableNumber(value, "generation"), durableNumber(value, "dataEpoch"),
+        durableNumber(value, "shardEpoch"), durableNumber(value, "openId"),
+        checkedText("definition", 256), checkedText("className", 255)},
+    checkedText("invocationId", 255)};
+}
+
 kj::String invocationIdentity(Slot &slot, Json::Reader descriptor) {
   return kj::str("\"workerId\":", encode(field(descriptor, "workerId")),
       ",\"versionId\":", encode(field(descriptor, "versionId")),
@@ -1839,6 +1892,28 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
   bool used = false;
 };
 
+class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+ public:
+  explicit DurableBootstrap(DurableRoute route): route(std::move(route)) {}
+
+  kj::Promise<void> startEvent(StartEventContext context) override {
+    return checkDescriptor(context.getParams().getCfBlobJson());
+  }
+  kj::Promise<void> startNativeEvent(StartNativeEventContext context) override {
+    return checkDescriptor(context.getParams().getCfBlobJson());
+  }
+
+ private:
+  DurableRoute route;
+
+  kj::Promise<void> checkDescriptor(kj::StringPtr descriptor) {
+    JsonDoc full(descriptor);
+    KJ_REQUIRE(readDurableRoute(field(full.get(), "durableTestRoute")) == route,
+        "durable routing descriptor mismatch");
+    return unsupportedError("threaded durable event dispatch");
+  }
+};
+
 struct SubrequestBudget {
   SubrequestBudget(uint32_t limit, uint32_t tenantLimit): limit(limit), tenantLimit(tenantLimit) {}
   const uint32_t limit, tenantLimit;
@@ -1890,7 +1965,10 @@ struct ThreadedServer {
   server::WorkerdPlatform platform{*basePlatform};
   jsg::V8System v8{platform, {}, basePlatform.get()};
   const std::string sourceAddress, identity;
-  const bool durableTestStorage;
+  const std::unique_ptr<server::DurableTestStorage> durableTestStorage;
+  std::optional<server::DurableAdmission> durableAdmission;
+  std::mutex durableRoutingMutex;
+  std::atomic<uint64_t> durableHomeSessions{0};
   const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
       ? ""
       : getenv("COWORKERD_THREADED_BINDING_ADDRESS");
@@ -1919,6 +1997,14 @@ struct ThreadedServer {
     std::atomic<bool> invocation{false};
     std::atomic<uint64_t> idleSince{nowNs()};
     std::thread thread;
+    struct DurableHome {
+      std::string definition;
+      uint32_t reservedTrees = 0;
+      uint64_t memory = 0;
+      server::DurableHomeLoad load{std::chrono::seconds(4)};
+      std::vector<DurableIncoming> incoming;
+    };
+    std::optional<DurableHome> home;
     Thread(bool control, bool maintenanceOnly)
         : control(control),
           maintenanceOnly(maintenanceOnly),
@@ -1945,7 +2031,7 @@ struct ThreadedServer {
       bool durableTestStorage = false)
       : sourceAddress(std::move(sourceAddress)),
         identity(std::move(identity)),
-        durableTestStorage(durableTestStorage),
+        durableTestStorage(durableTestStorage ? std::make_unique<server::DurableTestStorage>() : nullptr),
         pending(limit * 2),
         limit(limit),
         resources(std::make_shared<ResourceBudget>(
@@ -1956,6 +2042,20 @@ struct ThreadedServer {
             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
         subrequestBudget(limit, tenantBudget->limit) {
     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
+    if (this->durableTestStorage) {
+      const auto colon = this->identity.rfind(':');
+      KJ_REQUIRE(colon != std::string::npos, "invalid durable child identity");
+      // Bound pre-execution admission independently of the existing ordinary queue.
+      durableAdmission.emplace(server::DurableAdmission::Limits{
+        .capacity = {.threads = limit, .descriptors = uint64_t(limit) * 8,
+          .memory = resources->admissionMaximum - resources->baselineMemory},
+        .tree = {.descriptors = 3, .memory = 16 * 1024},
+        .event = {.descriptors = 1, .memory = 4096},
+        .residentTarget = uint32_t(configuredCount("COWORKERD_DO_RESIDENT_OBJECTS", 4096)),
+        .mailboxDepth = 4,
+        .mailboxBytes = 64 * 1024,
+      }, durableNumber(std::string_view(this->identity).substr(colon + 1)));
+    }
     // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker (exit 78).
     server::requireSecureSandbox();
     resources->reclaimWake = managerWake;
@@ -2168,6 +2268,73 @@ struct ThreadedServer {
     wake(managerWake);
     return true;
   }
+
+  // The accept loop has consumed the bounded preface. Transfer the socket
+  // once it has a home assignment. Only the home reads any RPC bytes.
+  bool handoffDurable(int fd, DurableRoute& route, server::DurableAdmission::Ticket ticket,
+      server::DurableAdmission::Time deadline) {
+    if (!ready.load(std::memory_order_acquire)) return false;
+    std::lock_guard lock(durableRoutingMutex);
+    if (deadline <= server::DurableAdmission::Clock::now()) return false;
+    auto assigned = durableAdmission->homeFor(ticket.tree);
+    if (!assigned) {
+      std::vector<server::DurableCopyCandidate> candidates;
+      size_t spare = 0;
+      const auto now = server::DurableAdmission::Clock::now();
+      for (size_t i = 0; i < threads.size(); ++i) {
+        if (!threads[i]->home) continue;
+        auto& home = *threads[i]->home;
+        if (home.definition.empty()) {
+          if (spare == 0) spare = i + 1;
+          continue;
+        }
+        candidates.push_back({i + 1, home.definition, home.reservedTrees, home.memory,
+          home.load.busyFor(now), true});
+      }
+      auto choice = server::chooseDurableCopy(candidates, route.open.definition,
+          {.treesPerCopy = 64, .placementBytes = 64ull << 20, .busyThreshold = std::chrono::seconds(3)});
+      if (!choice && spare == 0) return false;
+      assigned = choice.value_or(spare);
+      auto& home = *threads[*assigned - 1]->home;
+      if (!choice) home.definition = route.open.definition;
+      KJ_ASSERT(durableAdmission->publishHome(ticket.tree, *assigned));
+      ++home.reservedTrees;
+    }
+    auto& thread = *threads[*assigned - 1];
+    thread.home->incoming.push_back({kj::AutoCloseFd(fd), std::move(route), ticket, deadline});
+    wake(thread.wake);
+    return true;
+  }
+
+  void finishDurable(server::DurableAdmission::Ticket ticket) {
+    std::lock_guard lock(durableRoutingMutex);
+    durableAdmission->cancel(ticket);
+    auto assigned = durableAdmission->homeFor(ticket.tree);
+    if (!assigned) {
+      durableAdmission->releaseUnassigned(ticket.tree);
+      return;
+    }
+    durableAdmission->complete(ticket, *assigned);
+    if (!durableAdmission->stopIdleTree(ticket.tree, *assigned)) return;
+    KJ_ASSERT(durableAdmission->releaseTree(ticket.tree, *assigned));
+    auto& home = *threads[*assigned - 1]->home;
+    if (--home.reservedTrees == 0) home.definition.clear();
+  }
+
+  kj::Promise<void> startDurableSession(ThreadState& state, DurableIncoming call) {
+    KJ_DEFER(finishDurable(call.ticket));
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            call.deadline - server::DurableAdmission::Clock::now());
+    if (remaining.count() <= 0) co_return;
+    durableHomeSessions.fetch_add(1);
+    KJ_DEFER(durableHomeSessions.fetch_sub(1));
+    auto stream = state.io.lowLevelProvider->wrapSocketFd(kj::mv(call.socket));
+    capnp::TwoPartyServer session(kj::heap<DurableBootstrap>(std::move(call.route)));
+    co_await state.io.provider->getTimer().timeoutAfter(remaining.count() * kj::NANOSECONDS,
+        session.accept(*stream)).catch_([](kj::Exception&&) {});
+  }
+
   void manage() {
     pthread_setname_np(pthread_self(), "cwkd-pool");
     // The initial high watermark is the in-flight limit. Readiness waits for
@@ -2175,8 +2342,10 @@ struct ThreadedServer {
     // initialize one.
     try {
       threads.reserve(limit + CONTROL_THREADS);
-      for (uint i = 0; i < limit + CONTROL_THREADS; ++i) {
+      const auto count = limit + (durableAdmission ? 0 : CONTROL_THREADS);
+      for (uint i = 0; i < count; ++i) {
         auto item = std::make_unique<Thread>(i >= limit, i == limit + CONTROL_THREADS - 1);
+        if (durableAdmission) item->home.emplace();
         auto *pointer = item.get();
         liveThreads.fetch_add(1);
         item->thread = std::thread([this, pointer]() { runThread(*pointer); });
@@ -2192,6 +2361,7 @@ struct ThreadedServer {
     for (auto &item: threads)
       while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
     ready.store(true, std::memory_order_release);
+    if (durableAdmission) return;
     int held = -1;
     auto nextMaintenance = nowNs();
     auto idleMs = configuredCount("COWORKERD_THREADED_THREAD_IDLE_MS", 60000);
@@ -2309,6 +2479,23 @@ struct ThreadedServer {
     thread.idleSince.store(nowNs());
     thread.descriptor.store(-1, std::memory_order_release);
     wake(managerWake);
+    if (thread.home) {
+      // Blocking on this promise pumps the home's KJ loop while it waits
+      // for the accept thread to hand over the next private RPC connection.
+      auto signal = state.io.lowLevelProvider->wrapInputFd(thread.wake);
+      for (;;) {
+        kj::byte notifications[sizeof(uint64_t)];
+        signal->read(kj::arrayPtr(notifications)).wait(state.io.waitScope);
+        std::vector<DurableIncoming> incoming;
+        {
+          std::lock_guard lock(durableRoutingMutex);
+          incoming.swap(thread.home->incoming);
+        }
+        for (auto& call: incoming) {
+          state.tasks.add(startDurableSession(state, std::move(call)));
+        }
+      }
+    }
     for (;;) {
       uint64_t count;
       ssize_t n;
@@ -3913,6 +4100,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
 }
 
 void acceptLoop(ThreadedServer &server, int listener, int parent) {
+  using Admission = workerd::server::DurableAdmission;
   int epoll = epoll_create1(EPOLL_CLOEXEC);
   KJ_REQUIRE(epoll >= 0);
   auto add = [&](int fd) {
@@ -3940,15 +4128,29 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
   struct Connection {
     std::string input, output;
     size_t sent = 0;
+    std::optional<Admission::Ticket> durableCredit;
+    std::optional<DurableRoute> durableRoute;
+    Admission::Time durableDeadline{};
   };
   std::map<int, Connection> connections;
+  std::map<uint64_t, int> durableWaiting;
+  auto closeConnection = [&](auto found) {
+    const int fd = found->first;
+    if (auto credit = found->second.durableCredit) {
+      durableWaiting.erase(credit->event);
+      server.finishDurable(*credit);
+    }
+    epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
+    ::close(fd);
+    connections.erase(found);
+  };
   for (;;) {
     if (!listening && nowNs() >= retryAt) {
       listening = add(listener);
       if (!listening) pauseListener();
     }
     epoll_event events[256];
-    int count = epoll_wait(epoll, events, 256, listening ? -1 : 25);
+    int count = epoll_wait(epoll, events, 256, listening && !server.durableAdmission ? -1 : 25);
     if (count < 0) {
       if (errno != EINTR) {
         server.acceptFailures.fetch_add(1);
@@ -3987,6 +4189,23 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
       if (found == connections.end()) continue;
       auto &connection = found->second;
       bool close = false;
+      if (connection.durableCredit) {
+        // Before the application dispatch handshake, a disconnect releases its
+        // waiting credit. No request body belongs to the routing preface.
+        char discarded;
+        const auto size = recv(fd, &discarded, 1, MSG_DONTWAIT | MSG_PEEK);
+        if (size > 0 && server.handoffDurable(fd, *connection.durableRoute, *connection.durableCredit,
+              connection.durableDeadline)) {
+          epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
+          durableWaiting.erase(connection.durableCredit->event);
+          connections.erase(found);
+          continue;
+        }
+        if (size >= 0 || (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))) {
+          closeConnection(found);
+        }
+        continue;
+      }
       if (connection.input.empty() && connection.output.empty()) {
         char prefix;
         auto size = recv(fd, &prefix, 1, MSG_PEEK | MSG_DONTWAIT);
@@ -4012,6 +4231,41 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
         else if (size == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
           close = true;
         if (connection.input.size() > 4096) close = true;
+        if (!close && server.durableAdmission && connection.input.starts_with('D') &&
+            connection.input.ends_with('\n')) {
+          char receipt = 'S';
+          auto error = kj::runCatchingExceptions([&] {
+            JsonDoc frame(kj::StringPtr(connection.input.c_str() + 1, connection.input.size() - 1));
+            auto input = frame.get();
+            auto route = readDurableRoute(input);
+            const auto deadlineNs = durableNumber(input, "expiresMonotonicNs");
+            KJ_REQUIRE(deadlineNs <= uint64_t(std::numeric_limits<int64_t>::max()),
+                "invalid durable routing deadline");
+            auto deadline = Admission::Time(std::chrono::duration_cast<Admission::Clock::duration>(
+                std::chrono::nanoseconds(deadlineNs)));
+            auto result = [&] {
+              std::lock_guard lock(server.durableRoutingMutex);
+              return server.durableAdmission->queue(route.key, route.open,
+                  durableNumber(input, "queuedBytes"), deadline, Admission::Clock::now());
+            }();
+            if (result.ticket) {
+              receipt = 'A';
+              connection.durableCredit = *result.ticket;
+              connection.durableRoute = std::move(route);
+              connection.durableDeadline = deadline;
+              durableWaiting.emplace(result.ticket->event, fd);
+            } else if (result.status == Admission::Status::OVERLOADED) {
+              receipt = 'R';
+            } else if (result.status == Admission::Status::EXPIRED) {
+              receipt = 'E';
+            }
+          });
+          if (error != kj::none || send(fd, &receipt, 1, MSG_DONTWAIT | MSG_NOSIGNAL) != 1 ||
+              receipt != 'A') {
+            closeConnection(found);
+          }
+          continue;
+        }
         if (connection.input.find("\r\n\r\n") != std::string::npos) {
           auto body = server.identity;
           if (connection.input.starts_with("GET /__coworkerd/threaded ")) {
@@ -4027,7 +4281,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                 std::to_string(server.isolateCreationAttempts.load()) +
                 ",\"canceledLoads\":" + std::to_string(server.canceledLoads.load()) +
                 ",\"liveThreads\":" + std::to_string(server.liveThreads.load()) +
-                ",\"controlThreads\":" + std::to_string(server.CONTROL_THREADS) +
+                ",\"controlThreads\":" + std::to_string(server.durableAdmission ? 0 : server.CONTROL_THREADS) +
                 ",\"threadGrowthFailures\":" + std::to_string(server.growthFailures.load()) +
                 ",\"acceptFailures\":" + std::to_string(server.acceptFailures.load()) +
                 ",\"subrequestsActive\":" + std::to_string(server.subrequestBudget.active.load()) +
@@ -4038,6 +4292,21 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                 ",\"logDroppedBytes\":" + std::to_string(server.logDroppedBytes.load()) +
                 ",\"logFlushFailures\":" + std::to_string(server.logFlushFailures.load()) +
                 ",\"logPeakQueuedBytes\":" + std::to_string(server.logPeakQueuedBytes.load()) + "}";
+            if (server.durableAdmission) {
+              const auto state = [&] {
+                std::lock_guard lock(server.durableRoutingMutex);
+                return server.durableAdmission->state();
+              }();
+              body.pop_back();
+              body += ",\"durableAdmission\":{\"trees\":" + std::to_string(state.trees) +
+                  ",\"waiting\":" + std::to_string(state.waiting) +
+                  ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
+                  ",\"homeSessions\":" + std::to_string(server.durableHomeSessions.load()) +
+                  ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
+                  ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
+                  ",\"overloaded\":" + std::to_string(state.overloads) +
+                  ",\"expired\":" + std::to_string(state.expired) + "}}";
+            }
           }
           auto status = server.ready.load(std::memory_order_acquire) ? "200 OK" : "503 Starting";
           if (!connection.input.starts_with("GET /__coworkerd/probe ") &&
@@ -4070,9 +4339,17 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
         }
       }
       if (close || (events[i].events & EPOLLRDHUP)) {
-        epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
-        ::close(fd);
-        connections.erase(fd);
+        closeConnection(found);
+      }
+    }
+    if (server.durableAdmission) {
+      const auto expired = [&] {
+        std::lock_guard lock(server.durableRoutingMutex);
+        return server.durableAdmission->expire(Admission::Clock::now());
+      }();
+      for (const auto& ticket: expired) {
+        auto socket = durableWaiting.find(ticket.event);
+        if (socket != durableWaiting.end()) closeConnection(connections.find(socket->second));
       }
     }
   }
