@@ -61,4 +61,20 @@ std::optional<uint64_t> chooseDurableCopy(std::span<const DurableCopyCandidate> 
     std::string_view definition,
     DurablePlacementLimits limits);
 
+// The caller samples again after idle trees are destroyed. A distinct observation
+// after closing placement is required before it can reset the copy.
+class DurablePressure {
+ public:
+  enum class Action { ACCEPT, EVICT_IDLE, CLOSE_PLACEMENT, WAIT, RESET };
+
+  Action sample(bool abovePlacement, bool aboveHardLimit, bool idleTree);
+  bool accepting() const { return phase == Phase::OPEN; }
+  bool resetting() const { return phase == Phase::RESETTING; }
+  void closed() { phase = Phase::OPEN; }
+
+ private:
+  enum class Phase { OPEN, CLOSED, RESETTING };
+  Phase phase = Phase::OPEN;
+};
+
 }  // namespace workerd::server

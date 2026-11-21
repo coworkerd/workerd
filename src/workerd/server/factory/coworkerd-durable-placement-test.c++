@@ -60,5 +60,21 @@ KJ_TEST("durable home retains the partial bucket at the start of its rolling win
   KJ_EXPECT((home.busyFor(origin + 4070ms) == 57ms));
 }
 
+KJ_TEST("durable pressure evicts idle objects before closing placement and resets only on continuing pressure") {
+  using Action = DurablePressure::Action;
+  DurablePressure pressure;
+  KJ_EXPECT(pressure.sample(true, true, true) == Action::EVICT_IDLE);
+  KJ_EXPECT(pressure.accepting());
+  KJ_EXPECT(pressure.sample(false, false, false) == Action::ACCEPT);
+  KJ_EXPECT(pressure.sample(true, true, false) == Action::CLOSE_PLACEMENT);
+  KJ_EXPECT(!pressure.accepting());
+  KJ_EXPECT(pressure.sample(true, false, false) == Action::WAIT);
+  KJ_EXPECT(pressure.sample(true, true, false) == Action::RESET);
+  KJ_EXPECT(pressure.resetting());
+  KJ_EXPECT(pressure.sample(false, false, true) == Action::WAIT);
+  pressure.closed();
+  KJ_EXPECT(pressure.accepting());
+}
+
 }  // namespace
 }  // namespace workerd::server

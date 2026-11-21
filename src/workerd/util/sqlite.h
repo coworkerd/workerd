@@ -38,11 +38,13 @@ class SqlExecutionBudget {
   enum class Cause { NONE, CPU, WALL };
   static bool isEnabled();
   SqlExecutionBudget();
+  SqlExecutionBudget(uint64_t eventCpuLimitNs, uint64_t threadCpuDeadlineNs);
   Cause getCause() const { return cause; }
   kj::String describe() const;
 
  private:
   uint64_t cpuLimitNs, wallLimitNs;
+  kj::Maybe<uint64_t> threadCpuDeadline;
   uint64_t cpuUsedNs = 0, wallUsedNs = 0;
   Cause cause = Cause::NONE;
   friend class SqliteDatabase;

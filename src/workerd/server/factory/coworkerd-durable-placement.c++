@@ -74,4 +74,21 @@ std::optional<uint64_t> chooseDurableCopy(std::span<const DurableCopyCandidate> 
   return selected == nullptr ? std::nullopt : std::optional(selected->home);
 }
 
+DurablePressure::Action DurablePressure::sample(
+    bool abovePlacement, bool aboveHardLimit, bool idleTree) {
+  if (phase == Phase::RESETTING) return Action::WAIT;
+  if (!abovePlacement) {
+    phase = Phase::OPEN;
+    return Action::ACCEPT;
+  }
+  if (idleTree) return Action::EVICT_IDLE;
+  if (phase == Phase::OPEN) {
+    phase = Phase::CLOSED;
+    return Action::CLOSE_PLACEMENT;
+  }
+  if (!aboveHardLimit) return Action::WAIT;
+  phase = Phase::RESETTING;
+  return Action::RESET;
+}
+
 }  // namespace workerd::server
