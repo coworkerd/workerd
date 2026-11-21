@@ -1890,6 +1890,7 @@ struct ThreadedServer {
   server::WorkerdPlatform platform{*basePlatform};
   jsg::V8System v8{platform, {}, basePlatform.get()};
   const std::string sourceAddress, identity;
+  const bool durableTestStorage;
   const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
       ? ""
       : getenv("COWORKERD_THREADED_BINDING_ADDRESS");
@@ -1940,9 +1941,11 @@ struct ThreadedServer {
   std::atomic<bool> delayedSourceForTest{false};
   std::thread manager;
 
-  ThreadedServer(uint limit, std::string sourceAddress, std::string identity)
+  ThreadedServer(uint limit, std::string sourceAddress, std::string identity,
+      bool durableTestStorage = false)
       : sourceAddress(std::move(sourceAddress)),
         identity(std::move(identity)),
+        durableTestStorage(durableTestStorage),
         pending(limit * 2),
         limit(limit),
         resources(std::make_shared<ResourceBudget>(
@@ -3991,7 +3994,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
           (void)!recv(fd, &prefix, 1, MSG_DONTWAIT);
           epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
           connections.erase(found);
-          char admission = server.pending.hasSpace() ? 'A' : 'R';
+          char admission = !server.durableTestStorage && server.pending.hasSpace() ? 'A' : 'R';
           auto sent = send(fd, &admission, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
           if (sent != 1 || admission == 'R')
             ::close(fd);
@@ -4044,7 +4047,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                    "lifecycle controls require S1c\"}";
           }
           connection.output = "HTTP/1.1 " + std::string(status) +
-              "\r\nX-Coworkerd-Threaded-Protocol: 3\r\nContent-Length: " +
+              "\r\nX-Coworkerd-Threaded-Protocol: 3" +
+              (server.durableTestStorage ? "\r\nX-Coworkerd-Threaded-Role: durable-test" : "") +
+              "\r\nContent-Length: " +
               std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
         }
       }
@@ -4090,15 +4095,20 @@ int main(int argc, char **argv) {
       fprintf(stderr, "[coworkerd-sandbox] {\"capacity\":true,\"groups\":%zu}\n", server::measureGroupCapacity());
     return 0;
   }
-  if (argc != 5) {
+  const bool durableTestStorage = argc == 6 && strcmp(argv[5], "--durable-test-storage") == 0;
+  if (argc != 5 && !durableTestStorage) {
     fprintf(stderr,
         "usage: coworkerd-threaded LISTEN_FD SOURCE_ADDRESS "
-        "IDENTITY INFLIGHT\n");
+        "IDENTITY INFLIGHT [--durable-test-storage]\n");
     return 64;
   }
   char *end = nullptr;
   auto limit = strtoul(argv[4], &end, 10);
   if (!*argv[4] || !end || *end || limit == 0 || limit > 16384) return 64;
+  if (durableTestStorage && getenv("COWORKERD_DO_WAL_FD") != nullptr) {
+    fprintf(stderr, "durable test storage refuses a persistent durable log channel\n");
+    return 78;
+  }
   if (!prepareDescriptors(limit)) return 78;
   auto event = limitEventFd();
   if (event >= 0) {
@@ -4130,7 +4140,7 @@ int main(int argc, char **argv) {
   setenv("COWORKERD_THREADED", "1", 1);
   ThreadedServer *server;
   try {
-    server = new ThreadedServer(limit, argv[2], argv[3]);
+    server = new ThreadedServer(limit, argv[2], argv[3], durableTestStorage);
   } catch (...) {
     fprintf(stderr,
         "[threaded-start] "

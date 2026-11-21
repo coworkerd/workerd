@@ -4,6 +4,19 @@ load("//:build/wd_cc_library.bzl", "wd_cc_library")
 
 package(default_visibility = ["//src/workerd/server:__subpackages__"])
 
+wd_cc_library(
+    name = "coworkerd-durable-admission",
+    srcs = ["coworkerd-durable-admission.c++"],
+    hdrs = ["coworkerd-durable-admission.h"],
+    visibility = ["//src/workerd/threaded:__pkg__"],
+    deps = ["@capnp-cpp//src/kj"],
+)
+
+kj_test(
+    src = "coworkerd-durable-admission-test.c++",
+    deps = [":coworkerd-durable-admission"],
+)
+
 # The declarations the server crate's bridge header needs. Header-only: the bridge library depends
 # on it, and :worker-factory depends on the bridge library, so the two cannot be one target.
 wd_cc_library(
