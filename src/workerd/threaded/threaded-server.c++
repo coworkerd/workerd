@@ -5467,7 +5467,7 @@ int main(int argc, char **argv) {
   }
   if (durableTestStorage) {
     try {
-      limit = boundedDurableSetting("COWORKERD_DO_TEST_HOME_COUNT", limit, 16384);
+      limit = boundedDurableSetting("COWORKERD_DO_TEST_HOME_COUNT", std::min(limit, 4ul), 16384);
     } catch (...) {
       fprintf(stderr, "invalid durable test home limit\n");
       return 78;
