@@ -2335,8 +2335,8 @@ struct ThreadedServer {
                         : 0),
             configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
             limit,
-            this->durableTestStorage ? ResourceBudget::ReclaimMode::NONE
-                                     : ResourceBudget::ReclaimMode::BACKGROUND)),
+            this->durableStorage ? ResourceBudget::ReclaimMode::NONE
+                                 : ResourceBudget::ReclaimMode::BACKGROUND)),
         tenantBudget(std::make_shared<TenantBudget>(
             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
         subrequestBudget(limit, tenantBudget->limit) {
