@@ -38,5 +38,19 @@ KJ_TEST("A durable CPU account honors both lower and higher configured limits") 
   KJ_EXPECT(event.remaining(30 * second) == 5 * second);
 }
 
+KJ_TEST("A higher durable CPU budget permits legitimate work beyond thirty seconds") {
+  constexpr uint64_t second = 1000000000;
+  DurableCpuAccount event;
+  event.charge(0, 35 * second);
+  KJ_EXPECT(event.remaining(30 * second) == 0);
+  KJ_EXPECT(event.remaining(45 * second) == 10 * second);
+  // The same delivered event resumes; an await did not give it a fresh budget.
+  event.charge(100 * second, 109 * second);
+  KJ_EXPECT(event.remaining(45 * second) == second);
+  event.charge(200 * second, 202 * second);
+  KJ_EXPECT(event.remaining(45 * second) == 0);
+  KJ_EXPECT(DurableCpuAccount().remaining(45 * second) == 45 * second);
+}
+
 }  // namespace
 }  // namespace workerd::server

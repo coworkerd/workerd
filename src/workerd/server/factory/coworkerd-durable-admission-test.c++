@@ -156,6 +156,50 @@ KJ_TEST("durable admission returns an unassigned tree only when its final waitin
   KJ_EXPECT((table.state().reserved == Admission::Resources{}));
 }
 
+KJ_TEST("durable idle retirement fences reentry and cancellation at the clock boundary") {
+  Admission table(limits, 1);
+  auto clock = now;
+  auto lastUse = clock;
+  const auto firstCall = queued(table.queue(first, open, 0, clock + 30s, clock), true);
+  KJ_ASSERT(table.publishHome(firstCall.tree, 1));
+  KJ_ASSERT(table.begin(firstCall, 1, first, open, clock) == Delivery::ACCEPTED);
+  KJ_ASSERT(table.complete(firstCall, 1));
+
+  clock = now + 10s - 1ns;
+  KJ_EXPECT(!table.stopIdleTree(firstCall.tree, 1, lastUse, clock));
+  clock += 1ns;
+  // Reentry wins the routing lock at the idle deadline. A timer with an old
+  // last-use sample cannot close a tree that now owns a waiting event.
+  const auto reentry = queued(table.queue(first, open, 20, clock + 30s, clock), false);
+  KJ_EXPECT(!table.stopIdleTree(firstCall.tree, 1, lastUse, clock));
+  KJ_ASSERT(table.begin(reentry, 1, first, open, clock) == Delivery::ACCEPTED);
+  clock += 20s;
+  KJ_EXPECT(!table.stopIdleTree(firstCall.tree, 1, lastUse, clock));
+  KJ_EXPECT(table.cancel(reentry) == Cancellation::SIGNAL_HOME);
+  KJ_EXPECT(!table.stopIdleTree(firstCall.tree, 1, lastUse, clock));
+  KJ_ASSERT(table.complete(reentry, 1));
+  lastUse = clock;
+  KJ_EXPECT(!table.stopIdleTree(firstCall.tree, 1, lastUse, clock + 10s - 1ns));
+
+  clock += 10s;
+  // Retirement wins this time. The old reservation is held until home close;
+  // a stale completion must not affect the replacement's independent identity.
+  KJ_ASSERT(table.stopIdleTree(firstCall.tree, 1, lastUse, clock));
+  KJ_EXPECT(table.queue(first, open, 0, clock + 30s, clock).status == Status::STALE);
+  KJ_EXPECT((table.state().reserved == limits.tree));
+  KJ_ASSERT(table.releaseTree(firstCall.tree, 1));
+  const auto reopened = queued(table.queue(first, open, 0, clock + 30s, clock), true);
+  KJ_EXPECT(reopened.tree != firstCall.tree);
+  KJ_ASSERT(table.publishHome(reopened.tree, 2));
+  KJ_EXPECT(!table.complete(reentry, 1));
+  KJ_EXPECT(!table.releaseTree(firstCall.tree, 1));
+  KJ_EXPECT(table.begin(reopened, 2, first, open, clock) == Delivery::ACCEPTED);
+  KJ_ASSERT(table.complete(reopened, 2));
+  KJ_ASSERT(table.stopIdleTree(reopened.tree, 2, clock, clock + 10s));
+  KJ_ASSERT(table.releaseTree(reopened.tree, 2));
+  KJ_EXPECT((table.state().reserved == Admission::Resources{}));
+}
+
 KJ_TEST("each durable reservation ceiling refuses before publishing a new tree") {
   auto below = limits;
   // The resident count is disabled. Cap capacity at one tree and event in each dimension in turn.

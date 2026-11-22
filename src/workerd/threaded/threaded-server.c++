@@ -2685,7 +2685,7 @@ struct ThreadedServer {
     for (auto it = state.durableRoots.begin(); it != state.durableRoots.end();) {
       auto current = it++;
       if (!current->second.resetting && !pressured &&
-          now - current->second.lastUse < std::chrono::seconds(10))
+          now - current->second.lastUse < server::DurableAdmission::IDLE_DELAY)
         continue;
       if (current->second.resetting) current->second.stopFacets();
       if (current->second.facetsBusy()) continue;
@@ -2696,7 +2696,10 @@ struct ThreadedServer {
       const auto tree = current->first;
       {
         std::lock_guard lock(durableRoutingMutex);
-        if (!durableAdmission->stopIdleTree(tree, homeId)) continue;
+        const bool stopped = current->second.resetting || pressured
+            ? durableAdmission->stopIdleTree(tree, homeId)
+            : durableAdmission->stopIdleTree(tree, homeId, current->second.lastUse, now);
+        if (!stopped) continue;
       }
       if (!current->second.resetting) {
         if (pressured) {

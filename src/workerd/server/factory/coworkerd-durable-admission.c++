@@ -211,6 +211,10 @@ bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home) {
   return true;
 }
 
+bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home, Time lastUse, Time now) {
+  return now - lastUse >= IDLE_DELAY && stopIdleTree(tree, home);
+}
+
 bool DurableAdmission::releaseTree(uint64_t tree, uint64_t home) {
   auto entry = trees.find(tree);
   if (entry == trees.end() || !entry->second.closing || entry->second.home != home) {

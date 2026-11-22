@@ -20,6 +20,7 @@ class DurableAdmission {
  public:
   using Clock = std::chrono::steady_clock;
   using Time = Clock::time_point;
+  static constexpr auto IDLE_DELAY = std::chrono::seconds(10);
 
   struct Resources {
     uint64_t threads = 0;
@@ -97,6 +98,9 @@ class DurableAdmission {
   // A home starts closing only after its mailbox is empty. Reject admission during close,
   // and keep the tree's reservation until the home confirms that its handles are gone.
   bool stopIdleTree(uint64_t tree, uint64_t home);
+  // Normal retirement checks the idle deadline as well as mailbox/active ownership.
+  // Pressure retirement uses the unconditional overload above.
+  bool stopIdleTree(uint64_t tree, uint64_t home, Time lastUse, Time now);
   bool releaseTree(uint64_t tree, uint64_t home);
   // The home failed to open. Releases all waiting credits without a close acknowledgement.
   std::vector<Ticket> failOpen(uint64_t tree);
