@@ -292,9 +292,14 @@ kj::Exception limitException(LimitCause cause);
 constexpr uint64_t OWN_CAGE_HEAP = (4ull << 30) - (256ull << 20);
 
 struct ResourceBudget {
+  enum class ReclaimMode { BACKGROUND, NONE };
   static constexpr uint64_t MiB = 1ull << 20;
-  ResourceBudget(uint64_t maximum, uint32_t residents, uint32_t callThreads)
-      : memoryMaximum(maximum),
+  ResourceBudget(uint64_t maximum,
+      uint32_t residents,
+      uint32_t callThreads,
+      ReclaimMode reclaimMode = ReclaimMode::BACKGROUND)
+      : reclaimMode(reclaimMode),
+        memoryMaximum(maximum),
         admissionMaximum(maximum -
             kj::min(maximum / 10, kj::max<uint64_t>(8 * MiB, uint64_t(callThreads) * MiB))),
         addressMaximum(v8::IsolateGroup::CanCreateNewGroups()
@@ -312,6 +317,7 @@ struct ResourceBudget {
     KJ_REQUIRE(residents > 0 && residents <= (v8::IsolateGroup::CanCreateNewGroups() ? 65536 : 1840),
         "invalid resident budget for this build");
   }
+  const ReclaimMode reclaimMode;
   const uint64_t memoryMaximum, admissionMaximum, addressMaximum, baselineMemory;
   // The node's per-process limit, and the one in force: the first time the address space has no
   // room for another isolate's V8 sandbox, the limit is lowered to the residents it does hold
@@ -352,6 +358,8 @@ struct ResourceBudget {
     pass();
   }
   bool reclaim(uint64_t additionalMemory = 0) {
+    // Durable homes reclaim their own actors on the event loop; none can finish this wait.
+    if (reclaimMode == ReclaimMode::NONE) return false;
     std::unique_lock lock(mutex);
     auto epoch = reclaimEpoch;
     requestReclaimLocked(additionalMemory);
@@ -748,10 +756,13 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   v8::ArrayBuffer::Allocator *inner;
   v8::Isolate *isolate = nullptr;
   std::atomic<bool> pendingPressure{false};
+  std::atomic<bool> durableProcessPressure{false};
   // How many times this isolate's ceiling was raised (install()).
   std::atomic<uint32_t> ceilingRaised{0};
   std::atomic<LimitCause> *currentCause = nullptr;  // isolate-lock protected
   void pressure() {
+    if (reservation && reservation->budget->reclaimMode == ResourceBudget::ReclaimMode::NONE)
+      durableProcessPressure.store(true);
     if (currentCause) {
       auto expected = LimitCause::NONE;
       if (currentCause->compare_exchange_strong(expected, LimitCause::PROCESS_MEMORY))
@@ -1664,6 +1675,7 @@ struct ThreadState {
     std::function<bool()> facetsBusy;
     std::function<void()> stopFacets;
     bool resetting = false;
+    kj::Maybe<kj::Promise<void>> broken;
   };
   std::map<Worker::Actor *, uint64_t> durableActorTrees;
   std::map<uint64_t, DurableRoot> durableRoots;
@@ -2309,7 +2321,9 @@ struct ThreadedServer {
                         ? configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) / 8
                         : 0),
             configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
-            limit)),
+            limit,
+            this->durableTestStorage ? ResourceBudget::ReclaimMode::NONE
+                                     : ResourceBudget::ReclaimMode::BACKGROUND)),
         tenantBudget(std::make_shared<TenantBudget>(
             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
         subrequestBudget(limit, tenantBudget->limit) {
@@ -2666,8 +2680,10 @@ struct ThreadedServer {
       {
         std::lock_guard lock(durableRoutingMutex);
         auto first = durableAdmission->next(ticket.tree);
-        KJ_REQUIRE(first.has_value() && durableAdmission->homeFor(ticket.tree) == state.durableHome,
-            "durable routing credit is no longer live");
+        if (!first.has_value() || durableAdmission->homeFor(ticket.tree) != state.durableHome) {
+          kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+              KJ_EXCEPTION(OVERLOADED, "durable object reset is draining"), "DO_UNAVAILABLE"));
+        }
         if (first == ticket) {
           const auto delivery = durableAdmission->begin(
               ticket, state.durableHome, route.key, route.open, Admission::Clock::now());
@@ -2696,7 +2712,7 @@ struct ThreadedServer {
   kj::Promise<void> startDurableSession(ThreadState &state, DurableIncoming call) {
     KJ_DEFER({
       auto root = state.durableRoots.find(call.ticket.tree);
-      if (root != state.durableRoots.end()) {
+      if (root != state.durableRoots.end() && !root->second.resetting) {
         root->second.lastUse = server::DurableAdmission::Clock::now();
       }
       finishDurable(call.ticket);
@@ -2728,6 +2744,15 @@ struct ThreadedServer {
     } catch (const kj::Exception &error) {
       reportDurableFailureForTest("session", error);
     }
+  }
+
+  void beginDurableReset(ThreadState &state, uint64_t tree) {
+    auto root = state.durableRoots.find(tree);
+    if (root == state.durableRoots.end()) return;
+    root->second.resetting = true;
+    std::lock_guard lock(durableRoutingMutex);
+    KJ_ASSERT(durableAdmission->beginReset(tree, state.durableHome));
+    wakeDurableTree(tree);
   }
 
   void retireIdleDurableRoots(ThreadState &state) {
@@ -2766,6 +2791,7 @@ struct ThreadedServer {
           durableIdleRetirements.fetch_add(1);
         }
       }
+      if (current->second.resetting && memory.durableProcessPressure.load()) reclaimed = true;
       current->second.stopFacets();
       actor.shutdown(0);
       state.durableRoots.erase(current);
@@ -2792,7 +2818,8 @@ struct ThreadedServer {
       std::lock_guard lock(durableRoutingMutex);
       auto &home = *threads[homeId - 1]->home;
       home.memory = accounted();
-      const bool rejectedGrowth = memory.cause->load() == LimitCause::MEMORY;
+      const bool rejectedGrowth =
+          memory.cause->load() == LimitCause::MEMORY || memory.durableProcessPressure.load();
       pressureAction = home.pressure.sample(home.memory >= placementLimit || rejectedGrowth,
           home.memory >= memory.maximum - memory.maximum / 10 || rejectedGrowth, reclaimed);
       const auto idleMs = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000);
@@ -2802,7 +2829,7 @@ struct ThreadedServer {
     }
     if (pressureAction == server::DurablePressure::Action::RESET) {
       for (auto &[tree, root]: state.durableRoots) {
-        root.resetting = true;
+        beginDurableReset(state, tree);
         root.actor->abort(limitException(LimitCause::MEMORY));
       }
     }
@@ -3422,9 +3449,12 @@ struct ThreadedServer {
       auto root = state.durableRoots.find(at->second);
       if (root == state.durableRoots.end() || root->second.resetting) return;
       durableActorResets.fetch_add(1);
-      root->second.resetting = true;
+      beginDurableReset(state, at->second);
       if (root->second.actor.get() != &actor) {
-        root->second.actor->abort(limitException(LimitCause::CPU));
+        // A root can be awaiting this facet. Unwind the facet turn before aborting its caller.
+        state.tasks.add(kj::evalLater([owner = kj::addRef(*root->second.actor)]() mutable {
+          owner->abort(limitException(LimitCause::CPU));
+        }));
       }
     };
     auto preparation = std::make_shared<ResourcePreparation>(slot->reservation);
@@ -5013,6 +5043,10 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
                     })
                 .first;
     server.publishDurableRoot(state.durableHome, ticket.tree);
+    found->second.broken = found->second.actor->onBroken()
+                               .then([]() {}, [tree](kj::Exception &&) {
+      tree->server.beginDurableReset(tree->state, tree->tree);
+    }).eagerlyEvaluate(nullptr);
   }
   if (found->second.resetting) {
     kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
