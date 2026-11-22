@@ -2718,11 +2718,13 @@ struct ThreadedServer {
       }
     }
     if (reclaimed) {
-      // Account again after the idle actors and their storage have closed.
-      v8::Locker locker(memory.isolate);
-      v8::Isolate::Scope entered(memory.isolate);
-      memory.isolate->LowMemoryNotification();
-      memory.observe();
+      // Actor teardown outside the isolate lock defers JSG handle destruction.
+      // Take the Worker lock to drop those roots before collecting their memory.
+      auto &worker = *KJ_REQUIRE_NONNULL(state.durableSlot->worker);
+      worker.runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock &lock) {
+        lock.getIsolate()->LowMemoryNotification();
+        memory.observe(true);
+      });
     }
     server::DurablePressure::Action pressureAction;
     bool releaseCopy;
