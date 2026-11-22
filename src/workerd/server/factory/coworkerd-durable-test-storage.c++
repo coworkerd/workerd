@@ -53,14 +53,21 @@ kj::Own<SqliteDatabase> DurableStorage::open(
 
 kj::Own<DurableLogShipper> DurableStorage::ship(kj::StringPtr uniqueKey,
     DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
-    DurableWalChannel& channel) const {
+    DurableWalChannel& channel, DurableWalPosition position, uint64_t localOpenStartedNs) const {
   auto wal = databasePath(uniqueKey, name.storageId, name.facetId, "-wal"_kj);
   auto image = databasePath(uniqueKey, name.storageId, name.facetId);
   database.run("PRAGMA journal_mode=WAL;");
   auto shipper = kj::heap<DurableLogShipper>(*directory, kj::mv(wal), kj::mv(image),
-      kj::mv(name), database, timer, channel);
+      kj::mv(name), database, timer, channel, kj::mv(position), localOpenStartedNs);
   shipper->reportAfterDatabaseClose();
   return shipper;
+}
+
+DurableStorage::WalImage DurableStorage::walImage(
+    kj::StringPtr uniqueKey, kj::StringPtr storageId, uint facet) const {
+  KJ_REQUIRE(uniqueKey.startsWith(ROOT_PREFIX) && isDigest(uniqueKey.slice(ROOT_PREFIX.size())) &&
+          isDigest(storageId), "invalid durable storage identity");
+  return {*directory, databasePath(uniqueKey, storageId, facet, "-wal"_kj)};
 }
 
 kj::Own<FacetTreeIndex> DurableStorage::openFacetIndex(

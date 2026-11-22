@@ -25,7 +25,12 @@ class DurableStorage {
 
   kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
       DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
-      DurableWalChannel& channel) const;
+      DurableWalChannel& channel, DurableWalPosition position, uint64_t localOpenStartedNs) const;
+  struct WalImage {
+    const kj::Directory& directory;
+    kj::Path path;
+  };
+  WalImage walImage(kj::StringPtr uniqueKey, kj::StringPtr storageId, uint facet) const;
 
   kj::Own<FacetTreeIndex> openFacetIndex(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
   void deleteFacet(

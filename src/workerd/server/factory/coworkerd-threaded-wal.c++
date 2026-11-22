@@ -111,6 +111,12 @@ struct Command {
   std::shared_ptr<Inbox> inbox;
 };
 
+struct OpenPreparation {
+  const kj::Directory& directory;
+  kj::Path path;
+  kj::Own<kj::CrossThreadPromiseFulfiller<DurableWalPosition>> result;
+};
+
 struct Shared {
   explicit Shared(kj::Duration confirmationTimeout): confirmationTimeout(confirmationTimeout) {}
 
@@ -400,12 +406,30 @@ struct ThreadedWalLog::Impl {
     } catch (const kj::Exception& error) {
       KJ_LOG(ERROR, "threaded WAL channel closed", error);
     }
+  }), prepare([this] {
+    auto io = kj::setupAsyncIo();
+    for (;;) {
+      auto next = opens.next().wait(io.waitScope);
+      if (next == kj::none) return;
+      auto& open = KJ_ASSERT_NONNULL(next);
+      if (!open.result->isWaiting()) continue;
+      try {
+        open.result->fulfill(readDurableWalPosition(open.directory, open.path));
+      } catch (kj::Exception& error) {
+        open.result->reject(kj::mv(error));
+      }
+    }
   }) {}
 
-  ~Impl() noexcept(false) { shared->stop(); }
+  ~Impl() noexcept(false) {
+    opens.close();
+    shared->stop();
+  }
 
   std::shared_ptr<Shared> shared;
+  Mailbox<OpenPreparation> opens;
   kj::Thread owner;
+  kj::Thread prepare;
 };
 
 ThreadedWalLog::ThreadedWalLog(int fd, uint64_t generation, kj::Duration confirmationTimeout)
@@ -416,6 +440,14 @@ bool ThreadedWalLog::ready() const { return impl->shared->negotiated(); }
 
 kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(kj::Function<void(uint64_t)> requestClose) {
   return kj::heap<Home>(impl->shared, kj::mv(requestClose));
+}
+
+kj::Promise<DurableWalPosition> ThreadedWalLog::prepareOpen(
+    const kj::Directory& directory, kj::Path path) {
+  auto paf = kj::newPromiseAndCrossThreadFulfiller<DurableWalPosition>();
+  KJ_REQUIRE(ready() && impl->opens.push({directory, kj::mv(path), kj::mv(paf.fulfiller)}, 1, 1024),
+      STORAGE_UNAVAILABLE);
+  return kj::mv(paf.promise);
 }
 
 }  // namespace workerd::server

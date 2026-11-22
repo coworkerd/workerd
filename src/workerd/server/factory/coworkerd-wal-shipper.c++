@@ -116,6 +116,27 @@ void walChecksum(bool bigEndianWords, const kj::byte* data, size_t size, uint32_
   s2 = b;
 }
 
+void readWalHeader(const kj::ReadableFile& file, DurableWalPosition& position) {
+  KJ_REQUIRE(file.read(0, kj::arrayPtr(position.header.data(), position.header.size())) == 32);
+  const auto* header = position.header.data();
+  position.magic = getBe32(header);
+  KJ_REQUIRE((position.magic & 0xFFFFFFFE) == 0x377f0682, "not a WAL header", position.magic);
+  walChecksum(position.magic & 1, header, 24, position.checksum1, position.checksum2);
+  KJ_REQUIRE(position.checksum1 == getBe32(header + 24) && position.checksum2 == getBe32(header + 28),
+      "WAL header checksum");
+  position.pageSize = getBe32(header + 8);
+  position.salt1 = getBe32(header + 16);
+  position.salt2 = getBe32(header + 20);
+}
+
+bool readWalFrame(const kj::byte* frame, uint32_t magic, uint32_t pageSize,
+    uint32_t salt1, uint32_t salt2, uint32_t& s1, uint32_t& s2) {
+  if (getBe32(frame + 8) != salt1 || getBe32(frame + 12) != salt2 || getBe32(frame) == 0) return false;
+  walChecksum(magic & 1, frame, 8, s1, s2);
+  walChecksum(magic & 1, frame + 24, pageSize, s1, s2);
+  return s1 == getBe32(frame + 16) && s2 == getBe32(frame + 20);
+}
+
 kj::LowLevelAsyncIoProvider* logProvider = nullptr;
 
 // The one channel to the node's replicator: the descriptor the process inherited. Every database's shipper writes
@@ -337,6 +358,42 @@ class Replicator final: public DurableWalChannel, private kj::TaskSet::ErrorHand
 
 }  // namespace
 
+DurableWalPosition readDurableWalPosition(const kj::Directory& directory, const kj::Path& path) {
+  DurableWalPosition position;
+  auto file = directory.tryOpenFile(path);
+  auto& wal = *KJ_UNWRAP_OR(file, return position);
+  const uint64_t size = wal.stat().size;
+  if (size < 32) return position;
+  readWalHeader(wal, position);
+  const auto pageSize = position.pageSize;
+  KJ_REQUIRE(pageSize >= 512 && pageSize <= 65536 && (pageSize & (pageSize - 1)) == 0,
+      "invalid WAL page size");
+  const size_t frameSize = 24 + pageSize;
+  auto buffer = kj::heapArray<kj::byte>(((1u << 20) / frameSize) * frameSize);
+  uint32_t s1 = position.checksum1, s2 = position.checksum2, frameCount = 0;
+  uint64_t offset = 32;
+  while (size - offset >= frameSize) {
+    const size_t bytes = kj::min<uint64_t>(size - offset, buffer.size());
+    const size_t frames = wal.read(offset, buffer.first(bytes)) / frameSize;
+    if (frames == 0) break;
+    for (size_t i = 0; i < frames; ++i) {
+      const auto* frame = buffer.begin() + i * frameSize;
+      if (!readWalFrame(frame, position.magic, pageSize, position.salt1, position.salt2, s1, s2)) {
+        return position;
+      }
+      KJ_REQUIRE(frameCount < UINT32_MAX, "WAL exceeds SQLite frame index");
+      ++frameCount;
+      if (getBe32(frame + 4) != 0) {
+        position.frames = frameCount;
+        position.checksum1 = s1;
+        position.checksum2 = s2;
+      }
+    }
+    offset += frames * frameSize;
+  }
+  return position;
+}
+
 void setDurableLogProvider(kj::LowLevelAsyncIoProvider& provider) {
   logProvider = &provider;
 }
@@ -432,7 +489,9 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
     DurableObjectName name,
     SqliteDatabase& db,
     kj::Timer& timer,
-    DurableWalChannel& channel)
+    DurableWalChannel& channel,
+    kj::Maybe<DurableWalPosition> prepared,
+    uint64_t localOpenStartedNs)
     : directory(directory),
       walPath(kj::mv(walPath)),
       databasePath(kj::mv(databasePath)),
@@ -446,7 +505,19 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
   // so this instance starts after them -- and reports where it starts, because the earlier instance may have died
   // between a commit and its confirmation. The node compares the position with what it confirmed and breaks this
   // object when they differ: the frames it never confirmed must not be read by anybody.
-  if (walBytes() >= 32) {
+  KJ_IF_SOME(position, prepared) {
+    if (position.pageSize != 0) {
+      haveHeader = true;
+      magic = position.magic;
+      pageSize = position.pageSize;
+      salt1 = position.salt1;
+      salt2 = position.salt2;
+      cksum1 = position.checksum1;
+      cksum2 = position.checksum2;
+      readFrames = ackedFrames = hookFrames = position.frames;
+      header = kj::heapArray(kj::arrayPtr(position.header.data(), position.header.size()));
+    }
+  } else if (walBytes() >= 32) {
     readNewFrames();
     pendingFrames.clear();
     pendingCount = 0;
@@ -456,7 +527,7 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
   }
   openId = channel.registerShipper(*this);
   try {
-    sendOpen();
+    sendOpen(localOpenStartedNs == 0 ? 0 : uint64_t(monoNs()) - localOpenStartedNs);
   } catch (...) {
     channel.unregisterShipper(*this);
     throw;
@@ -554,20 +625,15 @@ void DurableLogShipper::readNewFrames() {
   uint64_t size = file->stat().size;
   if (!haveHeader) {
     if (size < 32) return;
-    auto h = kj::heapArray<kj::byte>(32);
-    KJ_REQUIRE(file->read(0, h) == 32);
-    uint32_t m = getBe32(h.begin());
-    KJ_REQUIRE((m & 0xFFFFFFFE) == 0x377f0682, "not a WAL header", m);
-    uint32_t s1 = 0, s2 = 0;
-    walChecksum(m & 1, h.begin(), 24, s1, s2);
-    KJ_REQUIRE(s1 == getBe32(h.begin() + 24) && s2 == getBe32(h.begin() + 28), "WAL header checksum");
-    magic = m;
-    pageSize = getBe32(h.begin() + 8);
-    salt1 = getBe32(h.begin() + 16);
-    salt2 = getBe32(h.begin() + 20);
-    cksum1 = s1;
-    cksum2 = s2;
-    header = kj::mv(h);
+    DurableWalPosition position;
+    readWalHeader(*file, position);
+    magic = position.magic;
+    pageSize = position.pageSize;
+    salt1 = position.salt1;
+    salt2 = position.salt2;
+    cksum1 = position.checksum1;
+    cksum2 = position.checksum2;
+    header = kj::heapArray(kj::arrayPtr(position.header.data(), position.header.size()));
     haveHeader = true;
     headerSent = false;
     readFrames = 0;
@@ -589,11 +655,7 @@ void DurableLogShipper::readNewFrames() {
   uint32_t commitsHere = 0;
   for (uint64_t i = 0; i < available; i++) {
     const kj::byte* f = buffer.begin() + i * frameSize;
-    if (getBe32(f + 8) != salt1 || getBe32(f + 12) != salt2) break;
-    if (getBe32(f) == 0) break;
-    walChecksum(magic & 1, f, 8, s1, s2);
-    walChecksum(magic & 1, f + 24, pageSize, s1, s2);
-    if (s1 != getBe32(f + 16) || s2 != getBe32(f + 20)) break;
+    if (!readWalFrame(f, magic, pageSize, salt1, salt2, s1, s2)) break;
     if (getBe32(f + 4) != 0) {
       lastCommitEnd = (i + 1) * frameSize;
       lastCommitCk1 = s1;
@@ -735,7 +797,7 @@ uint64_t DurableLogShipper::databaseBytes() {
   return 0;
 }
 
-void DurableLogShipper::sendOpen() {
+void DurableLogShipper::sendOpen(uint64_t localOpenNs) {
   if (!channel.enabled()) return;
   Writer w;
   w.u8(MSG_OPEN);
@@ -751,6 +813,7 @@ void DurableLogShipper::sendOpen() {
   w.u64(walBytes());
   w.u64(databaseBytes());
   w.u64(monoNs());
+  if (openId != 0) w.u64(localOpenNs);
   channel.send(openId, w.finish(openId));
 }
 
@@ -789,6 +852,7 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
   w.u64(start);
   w.u64(took);
   w.str(reason);
+  if (openId != 0) w.u64(bytes);
   channel.send(openId, w.finish(openId));
   // The next commit opens a new generation: a new header at the head of the truncated file, new salts, frames from
   // one again.

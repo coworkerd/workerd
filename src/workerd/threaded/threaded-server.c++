@@ -1652,6 +1652,11 @@ struct ThreadState {
   std::shared_ptr<Slot> durableSlot;
   std::optional<kj::ForkedPromise<std::shared_ptr<Slot>>> durableLoad;
   kj::Own<server::DurableWalChannel> wal;
+  struct WalPreparation {
+    explicit WalPreparation(kj::Promise<server::DurableWalPosition> task): ready(task.fork()) {}
+    kj::ForkedPromise<server::DurableWalPosition> ready;
+  };
+  std::map<uint64_t, std::weak_ptr<WalPreparation>> preparingWal;
   struct DurableRoot {
     kj::Own<Worker::Actor> actor;
     server::DurableAdmission::Time lastUse;
@@ -4717,7 +4722,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     uint depth,
     std::shared_ptr<DurableFacetReservation> reservation = nullptr,
     uint parentFacet = 0,
-    kj::StringPtr facetName = ""_kj);
+    kj::StringPtr facetName = ""_kj,
+    server::DurableWalPosition position = {});
 
 class LocalFacet final: public IoChannelFactory::ActorChannel {
  public:
@@ -4913,8 +4919,14 @@ kj::Promise<void> LocalFacet::initialize() {
   KJ_REQUIRE(!stopped && binding != nullptr && slot && slot == binding->slot.lock(),
       "durable test facets require a class in the original isolate copy");
   className = kj::str(binding->name);
+  server::DurableWalPosition position;
+  if (tree->state.wal) {
+    auto wal = tree->storage().walImage(tree->uniqueKey, tree->storageId, facet);
+    position = co_await tree->server.durableLog->prepareOpen(wal.directory, kj::mv(wal.path));
+    KJ_REQUIRE(!stopped, "durable facet closed during WAL preparation");
+  }
   actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(info.id), className,
-      binding->props.clone(), facet, depth, reservation, parentFacet, name);
+      binding->props.clone(), facet, depth, reservation, parentFacet, name, position);
   if (tree->state.wal) co_await tree->state.wal->waitForOpen(
       tree->shippers.at(facet)->getOpenId(), tree->state.io.provider->getTimer());
 }
@@ -4944,21 +4956,23 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     uint depth,
     std::shared_ptr<DurableFacetReservation> reservation,
     uint parentFacet,
-    kj::StringPtr facetName) {
+    kj::StringPtr facetName,
+    server::DurableWalPosition position) {
   auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth);
   auto *borrowedHooks = hooks.get();
   auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
   auto *borrowedObserver = observer.get();
   if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
-  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName)](const ActorCache::SharedLru &, OutputGate &gate,
+  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName), position](const ActorCache::SharedLru &, OutputGate &gate,
                        ActorCache::Hooks &,
                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
+    const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
     auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet);
     if (tree->state.wal) {
       auto shipper = tree->storage().ship(tree->uniqueKey,
           {.objectName = kj::str(tree->objectName), .storageId = kj::str(tree->storageId),
             .facetId = facet, .parentFacetId = parentFacet, .facetName = kj::str(name)},
-          *database, tree->state.io.provider->getTimer(), *tree->state.wal);
+          *database, tree->state.io.provider->getTimer(), *tree->state.wal, position, localOpenStartedNs);
       auto* current = shipper.get();
       KJ_REQUIRE(tree->shippers.emplace(facet, current).second, "durable facet is already open");
       shipper = kj::mv(shipper).attach(kj::defer([tree, facet] { tree->shippers.erase(facet); }));
@@ -4996,6 +5010,20 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
   return {kj::mv(actor), borrowedHooks};
 }
 
+kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
+    ThreadState& state, const DurableRoute& route, uint64_t tree) {
+  auto& slot = state.preparingWal[tree];
+  auto preparation = slot.lock();
+  if (!preparation) {
+    auto wal = server.durableStorage->walImage(route.uniqueKey.c_str(), route.storageId.c_str(), 0);
+    preparation = std::make_shared<ThreadState::WalPreparation>(
+        server.durableLog->prepareOpen(wal.directory, kj::mv(wal.path)));
+    slot = preparation;
+  }
+  KJ_DEFER(if (preparation.use_count() == 1) state.preparingWal.erase(tree));
+  co_return co_await preparation->ready.addBranch();
+}
+
 kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
     kj::String descriptor, Frankenvalue props) {
   KJ_REQUIRE(!used, "one event per durable connection");
@@ -5019,6 +5047,11 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
   KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
       "durable class missing from pinned Worker");
   auto found = state.durableRoots.find(ticket.tree);
+  server::DurableWalPosition position;
+  if (found == state.durableRoots.end() && state.wal) {
+    position = co_await prepareRootWal(server, state, route, ticket.tree);
+    found = state.durableRoots.find(ticket.tree);
+  }
   if (found == state.durableRoots.end()) {
     auto actorId = ObjectIdFactory(kj::StringPtr(route.key.namespaceId.c_str()))
                        .idFromString(kj::str(route.key.objectId.c_str()));
@@ -5033,7 +5066,8 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
       {},
     });
     auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
-        Worker::Actor::Id(kj::mv(actorId)), route.open.className.c_str(), Frankenvalue(), 0, 0);
+        Worker::Actor::Id(kj::mv(actorId)), route.open.className.c_str(), Frankenvalue(), 0, 0,
+        nullptr, 0, ""_kj, position);
     found = state.durableRoots
                 .emplace(ticket.tree,
                     ThreadState::DurableRoot{

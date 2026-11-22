@@ -14,6 +14,7 @@ class ThreadedWalLog {
 
   bool ready() const;
   kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t)> requestClose);
+  kj::Promise<DurableWalPosition> prepareOpen(const kj::Directory& directory, kj::Path path);
 
  private:
   struct Impl;

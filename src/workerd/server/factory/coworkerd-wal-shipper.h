@@ -20,6 +20,8 @@
 #include <kj/map.h>
 #include <kj/timer.h>
 
+#include <array>
+
 namespace workerd::server {
 
 // Registered by Bootstrap before serving; the inherited descriptor uses this provider.
@@ -68,6 +70,15 @@ struct DurableObjectName {
   }
 };
 
+struct DurableWalPosition {
+  std::array<kj::byte, 32> header{};
+  uint32_t magic = 0, pageSize = 0, salt1 = 0, salt2 = 0;
+  uint32_t checksum1 = 0, checksum2 = 0, frames = 0;
+};
+
+// Reads the committed prefix of a cold image before its home opens SQLite.
+DurableWalPosition readDurableWalPosition(const kj::Directory& directory, const kj::Path& path);
+
 class DurableLogShipper;
 
 // A WAL shipper and its notifications stay on the SQLite connection's event loop.
@@ -100,7 +111,9 @@ class DurableLogShipper {
       DurableObjectName name,
       SqliteDatabase& db,
       kj::Timer& timer,
-      DurableWalChannel& channel);
+      DurableWalChannel& channel,
+      kj::Maybe<DurableWalPosition> prepared = kj::none,
+      uint64_t localOpenStartedNs = 0);
   ~DurableLogShipper() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(DurableLogShipper);
 
@@ -188,7 +201,7 @@ class DurableLogShipper {
   void maybeCheckpoint(kj::StringPtr reason);
   uint64_t walBytes();
   uint64_t databaseBytes();
-  void sendOpen();
+  void sendOpen(uint64_t localOpenNs);
 };
 
 }  // namespace workerd::server
