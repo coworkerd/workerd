@@ -94,6 +94,7 @@ class Mailbox {
 
 struct Notification {
   uint8_t type = 0;
+  uint8_t status = 0;
   uint64_t openId = 0;
   uint32_t salt1 = 0, salt2 = 0, upToFrame = 0;
   kj::String reason;
@@ -233,6 +234,10 @@ class Session {
       case MSG_CLOSE_ASKED:
         KJ_REQUIRE(payload.size() == 0, "invalid threaded WAL close request");
         break;
+      case MSG_OPENED:
+        KJ_REQUIRE(payload.size() == 1, "invalid threaded WAL open result");
+        notice.status = payload[0];
+        break;
       default:
         KJ_FAIL_REQUIRE("unknown threaded WAL reply", type);
     }
@@ -255,12 +260,22 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
   uint64_t registerShipper(DurableLogShipper& shipper) override {
     KJ_REQUIRE(shared->negotiated(), STORAGE_UNAVAILABLE);
     const auto openId = nextRequest();
-    shippers.emplace(openId, &shipper);
+    auto result = kj::newPromiseAndFulfiller<void>();
+    shippers.emplace(openId, Registration{&shipper, kj::mv(result.fulfiller), result.promise.fork()});
     return openId;
   }
 
   void unregisterShipper(DurableLogShipper& shipper) override {
     shippers.erase(shipper.getOpenId());
+  }
+
+  kj::Promise<void> waitForOpen(uint64_t openId, kj::Timer& timer) override {
+    const auto found = shippers.find(openId);
+    KJ_REQUIRE(shared->negotiated() && found != shippers.end(), STORAGE_UNAVAILABLE);
+    auto timeout = timer.afterDelay(shared->confirmationTimeout).then([] {
+      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
+    });
+    return found->second.ready.addBranch().exclusiveJoin(kj::mv(timeout));
   }
 
   void send(uint64_t openId, kj::Array<kj::byte> message) override {
@@ -291,9 +306,14 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
   }
 
  private:
+  struct Registration {
+    DurableLogShipper* shipper;
+    kj::Own<kj::PromiseFulfiller<void>> opening;
+    kj::ForkedPromise<void> ready;
+  };
   std::shared_ptr<Shared> shared;
   std::shared_ptr<Inbox> inbox;
-  std::map<uint64_t, DurableLogShipper*> shippers;
+  std::map<uint64_t, Registration> shippers;
   kj::Function<void(uint64_t)> requestClose;
   kj::TaskSet tasks;
 
@@ -317,7 +337,7 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
       return uint8_t(ACK_DISCONNECTED);
     }).exclusiveJoin(timer.afterDelay(shared->confirmationTimeout).then([] { return uint8_t(ACK_TIMEOUT); }));
     const auto found = shippers.find(openId);
-    if (status != ACK_OK && found != shippers.end()) found->second->onRefused(request);
+    if (status != ACK_OK && found != shippers.end()) found->second.shipper->onRefused(request);
     if (status == ACK_TIMEOUT) {
       gaveUp(openId, request, key, false);
       kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(
@@ -330,22 +350,35 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
     if (status != ACK_OK) {
       kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(ackRefusal(status))));
     }
-    if (found != shippers.end()) found->second->onAcked(request);
+    if (found != shippers.end()) found->second.shipper->onAcked(request);
   }
 
   kj::Promise<void> read() {
     for (;;) {
       auto next = co_await inbox->next();
-      if (next == kj::none) co_return;
+      if (next == kj::none) {
+        for (auto& [id, registration]: shippers) {
+          if (registration.opening->isWaiting()) {
+            registration.opening->reject(KJ_EXCEPTION(DISCONNECTED, kj::str(STORAGE_UNAVAILABLE)));
+          }
+        }
+        co_return;
+      }
       auto& notice = KJ_ASSERT_NONNULL(next);
       const auto found = shippers.find(notice.openId);
       if (found == shippers.end()) continue;
-      auto& shipper = *found->second;
+      auto& registration = found->second;
+      auto& shipper = *registration.shipper;
       switch (notice.type) {
         case MSG_SEALED: shipper.onSealed(notice.salt1, notice.salt2, notice.upToFrame); break;
         case MSG_BREAK: shipper.onBreak(notice.reason); break;
         case MSG_CHECKPOINT_ASKED: shipper.onCheckpointAsked(); break;
         case MSG_CLOSE_ASKED: requestClose(notice.openId); break;
+        case MSG_OPENED:
+          if (!registration.opening->isWaiting()) break;
+          if (notice.status == ACK_OK) registration.opening->fulfill();
+          else registration.opening->reject(KJ_EXCEPTION(FAILED, kj::str(ackRefusal(notice.status))));
+          break;
         default: KJ_UNREACHABLE;
       }
     }

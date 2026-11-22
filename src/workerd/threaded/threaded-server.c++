@@ -4915,13 +4915,15 @@ kj::Promise<void> LocalFacet::initialize() {
   className = kj::str(binding->name);
   actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(info.id), className,
       binding->props.clone(), facet, depth, reservation, parentFacet, name);
+  if (tree->state.wal) co_await tree->state.wal->waitForOpen(
+      tree->shippers.at(facet)->getOpenId(), tree->state.io.provider->getTimer());
 }
 
 kj::Promise<kj::Own<WorkerInterface>> LocalFacet::open(
     kj::String descriptor, kj::Own<Invocation> invocation) {
-  if (actor == kj::none) {
-    if (starting == kj::none) starting = initialize().fork();
-    co_await KJ_ASSERT_NONNULL(starting).addBranch();
+  if (actor == kj::none && starting == kj::none) starting = initialize().fork();
+  KJ_IF_SOME(load, starting) {
+    co_await load.addBranch();
   }
   KJ_REQUIRE(!stopped, "durable test facet is closed");
   auto slot = tree->slot.lock();
@@ -5047,7 +5049,11 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
                 .first;
     server.publishDurableRoot(state.durableHome, ticket.tree);
   }
-  if (found->second.resetting || found->second.closeRequested) {
+  if (state.wal) {
+    co_await state.wal->waitForOpen(found->second.rootOpenId(), state.io.provider->getTimer());
+    found = state.durableRoots.find(ticket.tree);
+  }
+  if (found == state.durableRoots.end() || found->second.resetting || found->second.closeRequested) {
     kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
         KJ_EXCEPTION(OVERLOADED, "durable object reset is still draining"), "DO_UNAVAILABLE"));
   }

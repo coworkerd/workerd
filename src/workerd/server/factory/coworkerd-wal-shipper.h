@@ -78,6 +78,7 @@ class DurableWalChannel {
   virtual uint64_t nextRequest() = 0;
   virtual uint64_t registerShipper(DurableLogShipper& shipper) = 0;
   virtual void unregisterShipper(DurableLogShipper& shipper) = 0;
+  virtual kj::Promise<void> waitForOpen(uint64_t, kj::Timer&) { return kj::READY_NOW; }
   virtual void send(uint64_t openId, kj::Array<kj::byte> message) = 0;
   virtual kj::Promise<void> sendFrames(DurableLogShipper& shipper,
       kj::Array<kj::byte> message, uint64_t request, kj::Timer& timer) = 0;
