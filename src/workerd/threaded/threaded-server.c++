@@ -4489,14 +4489,19 @@ PreparedInvocation prepareInvocation(ThreadState &state,
     observer = kj::refcounted<DurableEventObserver>(
         std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
   }
+  auto limits = kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
+  if (slot->resetDurableRoot) {
+    // Actors retain their IoContext after the first entrypoint's reference (and its
+    // ioContextDependency attachment) is gone. Keep the referenced measurement and
+    // slot alive until the context destroys its limit enforcer.
+    limits = kj::mv(limits).attach(kj::addRef(*invocation));
+  }
   auto entry = newWorkerEntrypoint(state.context, kj::mv(worker),
       entrypoint.empty() || entrypoint == "default"
           ? kj::Maybe<kj::String>(kj::none)
           : kj::Maybe<kj::String>(kj::str(entrypoint.c_str())),
-      kj::mv(props), kj::mv(actor),
-      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity)),
-      kj::addRef(*invocation), kj::mv(channels), kj::mv(observer), state.tasks, true,
-      kj::mv(tracer), kj::mv(cf), kj::none);
+      kj::mv(props), kj::mv(actor), kj::mv(limits), kj::addRef(*invocation), kj::mv(channels),
+      kj::mv(observer), state.tasks, true, kj::mv(tracer), kj::mv(cf), kj::none);
   return {kj::mv(entry), kj::mv(invocation)};
 }
 
