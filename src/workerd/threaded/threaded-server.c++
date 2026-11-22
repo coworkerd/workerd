@@ -1650,7 +1650,15 @@ struct ThreadState {
   bool rejectOnly = false;
   uint64_t durableHome = 0;
   std::shared_ptr<Slot> durableSlot;
-  std::optional<kj::ForkedPromise<std::shared_ptr<Slot>>> durableLoad;
+  // The cold load in flight on this home. Its waiters all want its definition, and it
+  // ends with the last of them, so a canceled load is never left for a later tree.
+  struct DurableLoad {
+    std::string definition;
+    kj::ForkedPromise<std::shared_ptr<Slot>> promise;
+    uint waiters = 0;
+    bool settled = false;
+  };
+  std::optional<DurableLoad> durableLoad;
   kj::Own<server::DurableWalChannel> wal;
   struct WalPreparation {
     explicit WalPreparation(kj::Promise<server::DurableWalPosition> task): ready(task.fork()) {}
@@ -2115,18 +2123,28 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
   bool used = false;
 };
 
+// An event that is still being prepared when its session ends is canceled with the session.
+// Cap'n Proto lets the startEvent call itself run on (its interface does not allow
+// cancellation), while the session's tree and home are released as soon as it has ended.
+struct DurableSessionScope {
+  kj::Canceler preparing;
+  bool ended = false;
+};
+
 class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
  public:
   DurableBootstrap(ThreadedServer &server,
       ThreadState &state,
       DurableRoute route,
       server::DurableAdmission::Ticket ticket,
-      kj::Own<kj::PromiseFulfiller<void>> accepted)
+      kj::Own<kj::PromiseFulfiller<void>> accepted,
+      std::shared_ptr<DurableSessionScope> scope)
       : server(server),
         state(state),
         route(std::move(route)),
         ticket(ticket),
-        accepted(kj::mv(accepted)) {}
+        accepted(kj::mv(accepted)),
+        scope(std::move(scope)) {}
 
   kj::Promise<void> startEvent(StartEventContext context) override;
   kj::Promise<void> startNativeEvent(StartNativeEventContext context) override;
@@ -2137,6 +2155,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
   DurableRoute route;
   server::DurableAdmission::Ticket ticket;
   kj::Own<kj::PromiseFulfiller<void>> accepted;
+  std::shared_ptr<DurableSessionScope> scope;
   bool used = false;
 
   kj::Promise<kj::Own<WorkerInterface>> prepare(kj::String descriptor, Frankenvalue props);
@@ -2695,6 +2714,13 @@ struct ThreadedServer {
       }
       finishDurable(call.ticket);
     });
+    // Runs before the release above: an event this session was still preparing ends here,
+    // and with it the waiter it has on a cold load.
+    auto scope = std::make_shared<DurableSessionScope>();
+    KJ_DEFER({
+      scope->ended = true;
+      scope->preparing.cancel("durable session ended before its event was prepared");
+    });
     const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
         call.deadline - server::DurableAdmission::Clock::now());
     if (remaining.count() <= 0) co_return;
@@ -2703,7 +2729,7 @@ struct ThreadedServer {
     auto stream = state.io.lowLevelProvider->wrapSocketFd(kj::mv(call.socket));
     auto accepted = kj::newPromiseAndFulfiller<void>();
     capnp::TwoPartyServer session(kj::heap<DurableBootstrap>(
-        *this, state, std::move(call.route), call.ticket, kj::mv(accepted.fulfiller)));
+        *this, state, std::move(call.route), call.ticket, kj::mv(accepted.fulfiller), scope));
     auto disconnected = session.accept(*stream).fork();
     try {
       co_await state.io.provider->getTimer()
@@ -3447,26 +3473,43 @@ struct ThreadedServer {
       co_return state.durableSlot;
     }
     KJ_REQUIRE(state.durableRoots.empty(), "durable home still owns a different isolate");
+    KJ_REQUIRE(!state.durableLoad || state.durableLoad->definition == definition,
+        "durable home is loading a different definition");
     state.durableSlot.reset();
     {
       std::lock_guard lock(durableRoutingMutex);
       threads[state.durableHome - 1]->home->warmDefinition.clear();
     }
     if (!state.durableLoad) {
-      state.durableLoad.emplace(loadDurableWorker(state, kj::str(descriptor), definition).fork());
+      state.durableLoad.emplace(ThreadState::DurableLoad{
+        .definition = definition,
+        .promise = loadDurableWorker(state, kj::str(descriptor), definition).fork(),
+      });
     }
-    try {
-      state.durableSlot = co_await state.durableLoad->addBranch();
-      {
-        std::lock_guard lock(durableRoutingMutex);
-        threads[state.durableHome - 1]->home->warmDefinition = state.durableSlot->planRevision;
+    ++state.durableLoad->waiters;
+    // Runs when this waiter returns, fails or is canceled. Dropping the load with its
+    // last waiter cancels a load nobody waits for, before another definition can find it.
+    KJ_DEFER({
+      auto &load = *state.durableLoad;
+      if (--load.waiters == 0) {
+        if (!load.settled) canceledLoads.fetch_add(1);
+        state.durableLoad.reset();
       }
-      state.durableLoad.reset();
-      co_return state.durableSlot;
+    });
+    std::shared_ptr<Slot> loaded;
+    try {
+      loaded = co_await state.durableLoad->promise.addBranch();
     } catch (...) {
-      state.durableLoad.reset();
+      state.durableLoad->settled = true;
       throw;
     }
+    state.durableLoad->settled = true;
+    state.durableSlot = loaded;
+    {
+      std::lock_guard lock(durableRoutingMutex);
+      threads[state.durableHome - 1]->home->warmDefinition = loaded->planRevision;
+    }
+    co_return loaded;
   }
 
   kj::Promise<std::shared_ptr<Slot>> getWorker(
@@ -5121,7 +5164,9 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
   KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
       "unsupported durable test event origin");
   try {
-    auto worker = co_await prepare(kj::str(params.getCfBlobJson()), Frankenvalue());
+    KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
+    auto worker =
+        co_await scope->preparing.wrap(prepare(kj::str(params.getCfBlobJson()), Frankenvalue()));
     context.getResults().setDispatcher(kj::heap<ChannelDispatcher>(state, kj::mv(worker)));
     if (accepted->isWaiting()) accepted->fulfill();
   } catch (const kj::Exception &error) {
@@ -5133,8 +5178,9 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
 kj::Promise<void> DurableBootstrap::startNativeEvent(StartNativeEventContext context) {
   auto params = context.getParams();
   try {
-    auto worker = co_await prepare(
-        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()));
+    KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
+    auto worker = co_await scope->preparing.wrap(prepare(
+        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps())));
     context.getResults().setDispatcher(kj::heap<ChannelDispatcher>(state, kj::mv(worker)));
     if (accepted->isWaiting()) accepted->fulfill();
   } catch (const kj::Exception &error) {
