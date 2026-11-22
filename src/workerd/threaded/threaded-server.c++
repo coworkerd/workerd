@@ -2227,6 +2227,7 @@ struct ThreadedServer {
     std::thread thread;
     struct DurableHome {
       std::string definition;
+      std::string warmDefinition;
       uint32_t reservedTrees = 0;
       uint64_t memory = 0;
       server::DurableHomeLoad load{std::chrono::seconds(4)};
@@ -2539,15 +2540,9 @@ struct ThreadedServer {
     return true;
   }
 
-  // The accept loop has consumed the bounded preface. Transfer the socket
-  // once it has a home assignment. Only the home reads any RPC bytes.
-  bool handoffDurable(int fd,
-      DurableRoute &route,
-      server::DurableAdmission::Ticket ticket,
-      server::DurableAdmission::Time deadline) {
-    if (!ready.load(std::memory_order_acquire)) return false;
-    std::lock_guard lock(durableRoutingMutex);
-    if (deadline <= server::DurableAdmission::Clock::now()) return false;
+  // durableRoutingMutex holds placement and event admission together, before
+  // the accept loop acknowledges a connection or reads its dispatch bytes.
+  bool reserveDurableHome(const DurableRoute &route, server::DurableAdmission::Ticket ticket) {
     auto assigned = durableAdmission->homeFor(ticket.tree);
     if (!assigned) {
       std::vector<server::DurableCopyCandidate> candidates;
@@ -2556,10 +2551,14 @@ struct ThreadedServer {
       for (size_t i = 0; i < threads.size(); ++i) {
         if (!threads[i]->home) continue;
         auto &home = *threads[i]->home;
-        if (home.definition.empty()) {
-          if (spare == 0 && !home.pressure.resetting()) spare = i + 1;
-          continue;
+        // An empty copy keeps its definition until its isolate is released.
+        // Prefer a matching warm copy, then an unused home, then a different empty copy.
+        if (home.reservedTrees == 0 && !home.pressure.resetting() &&
+            (spare == 0 ||
+                (home.definition.empty() && !threads[spare - 1]->home->definition.empty()))) {
+          spare = i + 1;
         }
+        if (home.definition.empty()) continue;
         candidates.push_back({i + 1, home.definition, home.reservedTrees, home.memory,
           home.load.busyFor(now), home.pressure.accepting()});
       }
@@ -2571,6 +2570,34 @@ struct ThreadedServer {
       KJ_ASSERT(durableAdmission->publishHome(ticket.tree, *assigned));
       ++home.reservedTrees;
     }
+    return !threads[*assigned - 1]->home->pressure.resetting();
+  }
+
+  server::DurableAdmission::Result queueDurable(
+      const DurableRoute &route, uint64_t bytes, server::DurableAdmission::Time deadline) {
+    using Admission = server::DurableAdmission;
+    if (!ready.load(std::memory_order_acquire)) return {Admission::Status::OVERLOADED};
+    std::lock_guard lock(durableRoutingMutex);
+    auto result =
+        durableAdmission->queue(route.key, route.open, bytes, deadline, Admission::Clock::now());
+    if (result.ticket && !reserveDurableHome(route, *result.ticket)) {
+      KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket));
+      durableAdmission->releaseUnassigned(result.ticket->tree);
+      return {Admission::Status::OVERLOADED};
+    }
+    return result;
+  }
+
+  // The connection already owns a home reservation. Only that home reads RPC bytes.
+  bool handoffDurable(int fd,
+      DurableRoute &route,
+      server::DurableAdmission::Ticket ticket,
+      server::DurableAdmission::Time deadline) {
+    if (!ready.load(std::memory_order_acquire)) return false;
+    std::lock_guard lock(durableRoutingMutex);
+    if (deadline <= server::DurableAdmission::Clock::now()) return false;
+    auto assigned = durableAdmission->homeFor(ticket.tree);
+    if (!assigned) return false;
     auto &thread = *threads[*assigned - 1];
     if (thread.home->pressure.resetting()) return false;
     thread.home->incoming.push_back({kj::AutoCloseFd(fd), std::move(route), ticket, deadline});
@@ -2598,7 +2625,7 @@ struct ThreadedServer {
     if (home.resident.contains(ticket.tree)) return;
     if (!durableAdmission->stopIdleTree(ticket.tree, *assigned)) return;
     KJ_ASSERT(durableAdmission->releaseTree(ticket.tree, *assigned));
-    if (--home.reservedTrees == 0) home.definition.clear();
+    if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
   }
 
   // durableRoutingMutex is held while checking the FIFO and installing or
@@ -2721,7 +2748,7 @@ struct ThreadedServer {
         KJ_ASSERT(durableAdmission->releaseTree(tree, homeId));
         auto &home = *threads[homeId - 1]->home;
         home.resident.erase(tree);
-        if (--home.reservedTrees == 0) home.definition.clear();
+        if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
       }
     }
     if (reclaimed) {
@@ -2758,6 +2785,8 @@ struct ThreadedServer {
       std::lock_guard lock(durableRoutingMutex);
       auto &home = *threads[homeId - 1]->home;
       home.memory = 0;
+      home.warmDefinition.clear();
+      if (home.reservedTrees == 0) home.definition.clear();
       if (home.pressure.resetting()) {
         home.pressure.closed();
         durableIsolateResets.fetch_add(1);
@@ -3396,11 +3425,19 @@ struct ThreadedServer {
     }
     KJ_REQUIRE(state.durableRoots.empty(), "durable home still owns a different isolate");
     state.durableSlot.reset();
+    {
+      std::lock_guard lock(durableRoutingMutex);
+      threads[state.durableHome - 1]->home->warmDefinition.clear();
+    }
     if (!state.durableLoad) {
       state.durableLoad.emplace(loadDurableWorker(state, kj::str(descriptor), definition).fork());
     }
     try {
       state.durableSlot = co_await state.durableLoad->addBranch();
+      {
+        std::lock_guard lock(durableRoutingMutex);
+        threads[state.durableHome - 1]->home->warmDefinition = state.durableSlot->planRevision;
+      }
       state.durableLoad.reset();
       co_return state.durableSlot;
     } catch (...) {
@@ -5332,11 +5369,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                 "invalid durable routing deadline");
             auto deadline = Admission::Time(std::chrono::duration_cast<Admission::Clock::duration>(
                 std::chrono::nanoseconds(deadlineNs)));
-            auto result = [&] {
-              std::lock_guard lock(server.durableRoutingMutex);
-              return server.durableAdmission->queue(route.key, route.open,
-                  durableNumber(input, "queuedBytes"), deadline, Admission::Clock::now());
-            }();
+            auto result = server.queueDurable(route, durableNumber(input, "queuedBytes"), deadline);
             if (result.ticket) {
               receipt = 'A';
               connection.durableCredit = *result.ticket;
