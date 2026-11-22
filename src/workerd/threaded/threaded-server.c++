@@ -4489,7 +4489,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
     observer = kj::refcounted<DurableEventObserver>(
         std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
   }
-  auto limits = kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
+  auto limits =
+      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
   if (slot->resetDurableRoot) {
     // Actors retain their IoContext after the first entrypoint's reference (and its
     // ioContextDependency attachment) is gone. Keep the referenced measurement and
