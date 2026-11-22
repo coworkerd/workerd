@@ -3436,7 +3436,10 @@ struct ThreadedServer {
       durableActorResets.fetch_add(1);
       beginDurableReset(state, at->second);
       if (root->second.actor.get() != &actor) {
-        root->second.actor->abort(limitException(LimitCause::CPU));
+        // A root can be awaiting this facet. Unwind the facet turn before aborting its caller.
+        state.tasks.add(kj::evalLater([owner = kj::addRef(*root->second.actor)]() mutable {
+          owner->abort(limitException(LimitCause::CPU));
+        }));
       }
     };
     auto preparation = std::make_shared<ResourcePreparation>(slot->reservation);
