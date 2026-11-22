@@ -1664,6 +1664,7 @@ struct ThreadState {
     std::function<bool()> facetsBusy;
     std::function<void()> stopFacets;
     bool resetting = false;
+    kj::Maybe<kj::Promise<void>> broken;
   };
   std::map<Worker::Actor *, uint64_t> durableActorTrees;
   std::map<uint64_t, DurableRoot> durableRoots;
@@ -2666,8 +2667,10 @@ struct ThreadedServer {
       {
         std::lock_guard lock(durableRoutingMutex);
         auto first = durableAdmission->next(ticket.tree);
-        KJ_REQUIRE(first.has_value() && durableAdmission->homeFor(ticket.tree) == state.durableHome,
-            "durable routing credit is no longer live");
+        if (!first.has_value() || durableAdmission->homeFor(ticket.tree) != state.durableHome) {
+          kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+              KJ_EXCEPTION(OVERLOADED, "durable object reset is draining"), "DO_UNAVAILABLE"));
+        }
         if (first == ticket) {
           const auto delivery = durableAdmission->begin(
               ticket, state.durableHome, route.key, route.open, Admission::Clock::now());
@@ -2696,7 +2699,7 @@ struct ThreadedServer {
   kj::Promise<void> startDurableSession(ThreadState &state, DurableIncoming call) {
     KJ_DEFER({
       auto root = state.durableRoots.find(call.ticket.tree);
-      if (root != state.durableRoots.end()) {
+      if (root != state.durableRoots.end() && !root->second.resetting) {
         root->second.lastUse = server::DurableAdmission::Clock::now();
       }
       finishDurable(call.ticket);
@@ -2728,6 +2731,15 @@ struct ThreadedServer {
     } catch (const kj::Exception &error) {
       reportDurableFailureForTest("session", error);
     }
+  }
+
+  void beginDurableReset(ThreadState &state, uint64_t tree) {
+    auto root = state.durableRoots.find(tree);
+    if (root == state.durableRoots.end()) return;
+    root->second.resetting = true;
+    std::lock_guard lock(durableRoutingMutex);
+    KJ_ASSERT(durableAdmission->beginReset(tree, state.durableHome));
+    wakeDurableTree(tree);
   }
 
   void retireIdleDurableRoots(ThreadState &state) {
@@ -2802,7 +2814,7 @@ struct ThreadedServer {
     }
     if (pressureAction == server::DurablePressure::Action::RESET) {
       for (auto &[tree, root]: state.durableRoots) {
-        root.resetting = true;
+        beginDurableReset(state, tree);
         root.actor->abort(limitException(LimitCause::MEMORY));
       }
     }
@@ -3422,7 +3434,7 @@ struct ThreadedServer {
       auto root = state.durableRoots.find(at->second);
       if (root == state.durableRoots.end() || root->second.resetting) return;
       durableActorResets.fetch_add(1);
-      root->second.resetting = true;
+      beginDurableReset(state, at->second);
       if (root->second.actor.get() != &actor) {
         root->second.actor->abort(limitException(LimitCause::CPU));
       }
@@ -5013,6 +5025,10 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
                     })
                 .first;
     server.publishDurableRoot(state.durableHome, ticket.tree);
+    found->second.broken = found->second.actor->onBroken()
+                               .then([]() {}, [tree](kj::Exception &&) {
+      tree->server.beginDurableReset(tree->state, tree->tree);
+    }).eagerlyEvaluate(nullptr);
   }
   if (found->second.resetting) {
     kj::throwRecoverableException(jsg::tagCoworkerdRpcError(

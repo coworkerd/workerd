@@ -212,9 +212,21 @@ std::vector<DurableAdmission::Ticket> DurableAdmission::expire(Time now) {
   return expired;
 }
 
+bool DurableAdmission::beginReset(uint64_t tree, uint64_t home) {
+  auto entry = trees.find(tree);
+  if (entry == trees.end() || home == 0 || entry->second.home != home) return false;
+  auto& pending = entry->second;
+  pending.closing = true;
+  for (auto it = pending.events.begin(); it != pending.events.end();) {
+    auto event = it++;
+    if (event->second.phase == Phase::WAITING) releaseEvent(pending, event);
+  }
+  return true;
+}
+
 bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home) {
   auto entry = trees.find(tree);
-  if (entry == trees.end() || home == 0 || entry->second.home != home || entry->second.closing ||
+  if (entry == trees.end() || home == 0 || entry->second.home != home ||
       !entry->second.events.empty()) {
     return false;
   }
@@ -228,7 +240,8 @@ bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home, Time lastUse, 
 
 bool DurableAdmission::releaseTree(uint64_t tree, uint64_t home) {
   auto entry = trees.find(tree);
-  if (entry == trees.end() || !entry->second.closing || entry->second.home != home) {
+  if (entry == trees.end() || !entry->second.closing || entry->second.home != home ||
+      !entry->second.events.empty()) {
     return false;
   }
   eraseTree(entry);
