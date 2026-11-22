@@ -41,6 +41,11 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
     virtual kj::Promise<void> scheduleRun(
         kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask);
 
+    // A node-owned scheduler learns the time from confirmed storage and
+    // supplies that exact time when it opens an alarm event.
+    virtual bool hasConfirmedAlarmScheduler() const { return false; }
+    virtual void alarmConfirmed(kj::Maybe<kj::Date>) {}
+
     static const Hooks DEFAULT;
 
     static constexpr inline Hooks& getDefaultHooks() {

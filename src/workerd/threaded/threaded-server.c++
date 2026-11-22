@@ -3716,20 +3716,80 @@ class DurableTestHttp final: public kj::HttpService {
   kj::Own<WorkerInterface> worker;
 };
 
+struct DurableAlarmEvent {
+  kj::Own<Worker::Actor> actor;
+  kj::Date scheduledTime;
+  uint32_t retryCount;
+  bool clear;
+};
+
+// This service is selected by the trusted event descriptor. A Worker fetch
+// to the same URL uses its regular entrypoint.
+class DurableAlarmHttp final: public kj::HttpService {
+ public:
+  DurableAlarmHttp(kj::Own<WorkerInterface> worker, DurableAlarmEvent event,
+      const kj::HttpHeaderTable& headers)
+      : worker(kj::mv(worker)), event(kj::mv(event)), headers(headers) {}
+
+  kj::Promise<void> request(kj::HttpMethod method,
+      kj::StringPtr url,
+      const kj::HttpHeaders&,
+      kj::AsyncInputStream&,
+      Response& response) override {
+    KJ_REQUIRE(method == kj::HttpMethod::POST &&
+        url == "http://coworkerd-node/__coworkerd/durable-alarm", "invalid alarm event");
+    KJ_REQUIRE(worker.get() != nullptr, "one call per alarm event");
+    auto entry = kj::mv(worker);
+    auto& actor = *event.actor;
+    auto& gate = actor.getOutputGate();
+    co_await gate.wait(nullptr);
+
+    kj::StringPtr outcome;
+    if (event.clear) {
+      co_await entry->abandonAlarm(event.scheduledTime);
+      co_await gate.wait(nullptr);
+      outcome = "cleared";
+    } else {
+      auto result = co_await entry->runAlarm(event.scheduledTime, event.retryCount);
+      if (result.outcome == EventOutcome::OK || result.outcome == EventOutcome::SCRIPT_NOT_FOUND) {
+        co_await gate.wait(nullptr);
+        outcome = "fired";
+      } else if (result.retry && result.retryCountsAgainstLimit) {
+        outcome = "failed";
+      } else {
+        outcome = "unavailable";
+      }
+    }
+    auto json = kj::str("{\"outcome\":\"", outcome, "\"}");
+    auto body = response.send(200, "OK", kj::HttpHeaders(headers), json.size());
+    co_await body->write(json.asBytes());
+  }
+
+ private:
+  kj::Own<WorkerInterface> worker;
+  DurableAlarmEvent event;
+  const kj::HttpHeaderTable& headers;
+};
+
 class ChannelDispatcher final: public rpc::EventDispatcher::Server {
  public:
   ChannelDispatcher(ThreadState &state,
       kj::Own<WorkerInterface> worker,
       std::shared_ptr<Slot> bindingSlot = {},
-      kj::String bindingIdentity = nullptr)
+      kj::String bindingIdentity = nullptr,
+      kj::Maybe<DurableAlarmEvent> alarm = kj::none)
       : state(state),
         worker(kj::mv(worker)),
         bindingSlot(std::move(bindingSlot)),
-        bindingIdentity(kj::mv(bindingIdentity)) {}
+        bindingIdentity(kj::mv(bindingIdentity)),
+        alarm(kj::mv(alarm)) {}
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
     KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
     auto &http = state.http;
-    if (state.durableHome) {
+    KJ_IF_SOME(event, alarm) {
+      context.getResults().setHttp(
+          http.kjToCapnp(kj::heap<DurableAlarmHttp>(kj::mv(worker), kj::mv(event), *state.headers)));
+    } else if (state.durableHome) {
       context.getResults().setHttp(http.kjToCapnp(kj::heap<DurableTestHttp>(kj::mv(worker))));
     } else {
       context.getResults().setHttp(http.kjToCapnp(kj::mv(worker)));
@@ -3744,6 +3804,7 @@ class ChannelDispatcher final: public rpc::EventDispatcher::Server {
   // Only a node-dispatched invocation receives the platform binding handshake.
   std::shared_ptr<Slot> bindingSlot;
   kj::String bindingIdentity;
+  kj::Maybe<DurableAlarmEvent> alarm;
 };
 
 class ChannelBootstrap final: public rpc::WorkerdBootstrap::Server {
@@ -4583,6 +4644,7 @@ void startBoundRpcSession(rpc::EventDispatcher::JsRpcSessionResults::Builder res
 
 kj::Promise<void> ChannelDispatcher::jsRpcSession(JsRpcSessionContext context) {
   KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
+  KJ_REQUIRE(alarm == kj::none, "alarm event requires the alarm dispatcher");
   if (bindingSlot) {
     startBoundRpcSession(
         context.getResults(), kj::mv(worker), std::move(bindingSlot), kj::mv(bindingIdentity));
@@ -4802,10 +4864,14 @@ class DurableAlarmReporter final: public ActorSqlite::Hooks {
   explicit DurableAlarmReporter(server::DurableLogShipper& shipper, uint facet)
       : shipper(shipper), facet(facet) {}
 
-  kj::Promise<void> scheduleRun(kj::Maybe<kj::Date> time, kj::Promise<void> priorTask) override {
-    JSG_REQUIRE(facet == 0, Error, "Facets currently cannot set alarms.");
+  kj::Promise<void> scheduleRun(kj::Maybe<kj::Date>, kj::Promise<void>) override {
+    JSG_FAIL_REQUIRE(Error, "Facets currently cannot set alarms.");
+  }
+  bool hasConfirmedAlarmScheduler() const override {
+    return facet == 0;
+  }
+  void alarmConfirmed(kj::Maybe<kj::Date> time) override {
     shipper.reportAlarm(time);
-    return kj::READY_NOW;
   }
 
  private:
@@ -5216,9 +5282,21 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
   }
   auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props), nullptr,
       nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*found->second.actor));
+  kj::Maybe<DurableAlarmEvent> alarm;
+  auto alarmDescriptor = field(input, "durableAlarm");
+  if (alarmDescriptor.isObject()) {
+    KJ_REQUIRE(state.wal.get() != nullptr, "persistent storage is required for an alarm");
+    const auto time = durableNumber(alarmDescriptor, "scheduledTime");
+    const auto retries = durableNumber(alarmDescriptor, "retryCount");
+    KJ_REQUIRE(time > 0 && time <= INT64_MAX / 1000000 && retries <= 6,
+        "invalid durable alarm descriptor");
+    alarm = DurableAlarmEvent{kj::addRef(*found->second.actor),
+      kj::UNIX_EPOCH + static_cast<int64_t>(time) * kj::MILLISECONDS,
+      static_cast<uint32_t>(retries), flag(alarmDescriptor, "clear")};
+  }
   auto identity = invocationIdentity(*slot, input);
   co_return rpc::EventDispatcher::Client(kj::heap<ChannelDispatcher>(
-      state, kj::mv(prepared.entry), std::move(slot), kj::mv(identity)));
+      state, kj::mv(prepared.entry), std::move(slot), kj::mv(identity), kj::mv(alarm)));
 }
 
 kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
