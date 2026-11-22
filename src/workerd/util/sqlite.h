@@ -396,6 +396,12 @@ class SqliteDatabase {
     afterResetCallback = kj::mv(callback);
   }
 
+  // On destruction, only a synchronous SQLite close proves that no deferred
+  // handle can still touch the files.
+  void afterClose(kj::Function<void()> callback) {
+    afterCloseCallback = kj::mv(callback);
+  }
+
   // Register a callback which shall be called if the current transaction is rolled back. If the
   // current transaction commits, then the callback is discarded without invoking it.
   //
@@ -475,6 +481,7 @@ class SqliteDatabase {
   kj::Maybe<kj::Function<void(kj::StringPtr errorMessage, kj::Maybe<kj::Exception> maybeException)>>
       onCriticalErrorCallback;
   kj::Maybe<kj::Function<void(SqliteDatabase&)>> afterResetCallback;
+  kj::Maybe<kj::Function<void()>> afterCloseCallback;
   kj::Maybe<kj::String> errorContext;
 
   kj::List<ResetListener, &ResetListener::link> resetListeners;

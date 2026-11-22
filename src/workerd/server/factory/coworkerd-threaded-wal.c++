@@ -1,0 +1,453 @@
+#include "coworkerd-threaded-wal.h"
+#include "coworkerd-wal-wire.h"
+
+#include <kj/thread.h>
+
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <deque>
+#include <map>
+#include <memory>
+#include <mutex>
+
+namespace workerd::server {
+namespace {
+
+using namespace wal;
+
+// The node caps a record at its 64 MiB RPC traversal bound, including when the
+// WAL has one large transaction. Leave room for its private wire header.
+constexpr size_t QUEUED_RECORD_BYTES = 72u << 20;
+// Reserve room for open/close and give-up commands when the data queue is full.
+constexpr size_t QUEUED_CONTROL_BYTES = 1u << 20;
+constexpr size_t QUEUED_NOTIFICATIONS = 4096;
+constexpr uint8_t ACK_TIMEOUT = 255;
+constexpr uint8_t ACK_DISCONNECTED = 254;
+constexpr auto STORAGE_UNAVAILABLE =
+    "jsg.Error: Durable Object storage is unavailable: the node's replicator is not reachable "
+    "(STORAGE_UNAVAILABLE)"_kj;
+
+// The producer transfers owned data and wakes the consumer without entering its
+// loop. A queue has one consumer. Its mutex is released before any I/O or await.
+template <typename T>
+class Mailbox {
+ public:
+  bool push(T item, size_t cost, size_t capacity) {
+    kj::Own<kj::CrossThreadPromiseFulfiller<void>> wake;
+    {
+      std::lock_guard lock(mutex);
+      if (closed || cost > capacity || used > capacity - cost) return false;
+      items.push_back({kj::mv(item), cost});
+      used += cost;
+      wake = kj::mv(waiting);
+    }
+    if (wake.get() != nullptr) wake->fulfill();
+    return true;
+  }
+
+  kj::Promise<kj::Maybe<T>> next() {
+    for (;;) {
+      kj::Promise<void> signal = nullptr;
+      {
+        std::lock_guard lock(mutex);
+        if (closed) co_return kj::none;
+        if (!items.empty()) {
+          auto entry = kj::mv(items.front());
+          items.pop_front();
+          used -= entry.cost;
+          co_return kj::mv(entry.item);
+        }
+        auto paf = kj::newPromiseAndCrossThreadFulfiller<void>();
+        signal = kj::mv(paf.promise);
+        waiting = kj::mv(paf.fulfiller);
+      }
+      co_await signal;
+    }
+  }
+
+  void close() {
+    kj::Own<kj::CrossThreadPromiseFulfiller<void>> wake;
+    std::deque<Entry> discarded;
+    {
+      std::lock_guard lock(mutex);
+      closed = true;
+      used = 0;
+      items.swap(discarded);
+      wake = kj::mv(waiting);
+    }
+    if (wake.get() != nullptr) wake->fulfill();
+  }
+
+ private:
+  struct Entry {
+    T item;
+    size_t cost;
+  };
+  std::mutex mutex;
+  std::deque<Entry> items;
+  size_t used = 0;
+  bool closed = false;
+  kj::Own<kj::CrossThreadPromiseFulfiller<void>> waiting;
+};
+
+struct Notification {
+  uint8_t type = 0;
+  uint8_t status = 0;
+  uint64_t openId = 0;
+  uint32_t salt1 = 0, salt2 = 0, upToFrame = 0;
+  kj::String reason;
+};
+
+using Inbox = Mailbox<Notification>;
+
+struct Command {
+  kj::Array<kj::byte> bytes;
+  uint64_t openId;
+  uint64_t request = 0;
+  bool unconditional = false;
+  kj::Own<kj::CrossThreadPromiseFulfiller<uint8_t>> ack;
+  std::shared_ptr<Inbox> inbox;
+};
+
+struct OpenPreparation {
+  const kj::Directory& directory;
+  kj::Path path;
+  kj::Own<kj::CrossThreadPromiseFulfiller<DurableWalPosition>> result;
+};
+
+struct Shared {
+  explicit Shared(kj::Duration confirmationTimeout): confirmationTimeout(confirmationTimeout) {}
+
+  void stop() {
+    if (stopped.exchange(true, std::memory_order_acq_rel)) return;
+    ready.store(false, std::memory_order_release);
+    commands.close();
+    stopSignal.close();
+  }
+
+  bool post(Command command, bool control) {
+    const auto size = command.bytes.size();
+    const auto capacity = QUEUED_RECORD_BYTES + (control ? QUEUED_CONTROL_BYTES : 0);
+    return commands.push(kj::mv(command), size, capacity);
+  }
+
+  bool negotiated() const {
+    return !stopped.load(std::memory_order_acquire) && ready.load(std::memory_order_acquire);
+  }
+
+  const kj::Duration confirmationTimeout;
+  Mailbox<Command> commands;
+  Mailbox<bool> stopSignal;
+  std::atomic<uint64_t> nextId{0};
+  std::atomic<bool> ready{false};
+  std::atomic<bool> stopped{false};
+};
+
+class Session {
+ public:
+  Session(Shared& shared, WalWire& wire, uint64_t generation)
+      : shared(shared), wire(wire), generation(generation) {}
+
+  ~Session() noexcept(false) {
+    shared.stop();
+    for (auto& [request, fulfiller]: pending) fulfiller->fulfill(uint8_t(ACK_DISCONNECTED));
+    for (auto& [openId, inbox]: routes) inbox->close();
+  }
+
+  kj::Promise<void> run() {
+    return wire.read([this](auto bytes) { receive(bytes); })
+        .exclusiveJoin(write())
+        .exclusiveJoin(shared.stopSignal.next().ignoreResult());
+  }
+
+ private:
+  Shared& shared;
+  WalWire& wire;
+  uint64_t generation;
+  std::map<uint64_t, std::shared_ptr<Inbox>> routes;
+  std::map<uint64_t, kj::Own<kj::CrossThreadPromiseFulfiller<uint8_t>>> pending;
+
+  kj::Promise<void> write() {
+    Writer hello;
+    hello.u8(MSG_HELLO);
+    hello.u32(getpid());
+    hello.u64(std::chrono::steady_clock::now().time_since_epoch() / std::chrono::nanoseconds(1));
+    hello.u32(THREADED_WAL_REVISION);
+    hello.u64(generation);
+    co_await wire.write(hello.finish());
+    for (;;) {
+      auto next = co_await shared.commands.next();
+      if (next == kj::none) co_return;
+      auto command = kj::mv(KJ_ASSERT_NONNULL(next));
+      const auto type = command.bytes[4];
+      if (type == MSG_GAVE_UP) {
+        const auto waiting = pending.erase(command.request);
+        if (!waiting && !command.unconditional) continue;
+      }
+      if (type == MSG_OPEN) routes.emplace(command.openId, kj::mv(command.inbox));
+      if (command.ack.get() != nullptr) pending.emplace(command.request, kj::mv(command.ack));
+      co_await wire.write(kj::mv(command.bytes));
+      if (type == MSG_CLOSED) routes.erase(command.openId);
+    }
+  }
+
+  void receive(kj::ArrayPtr<const kj::byte> reply) {
+    KJ_REQUIRE(reply.size() >= 1, "empty threaded WAL reply");
+    const auto type = reply[0];
+    if (!shared.negotiated()) {
+      KJ_REQUIRE(type == MSG_READY && reply.size() == 13 &&
+              getLe32(reply.begin() + 1) == THREADED_WAL_REVISION &&
+              getLe64(reply.begin() + 5) == generation,
+          "threaded WAL readiness mismatch");
+      shared.ready.store(true, std::memory_order_release);
+      return;
+    }
+    if (type == MSG_ACK) {
+      KJ_REQUIRE(reply.size() == 10, "invalid threaded WAL acknowledgement");
+      const auto request = getLe64(reply.begin() + 1);
+      auto entry = pending.find(request);
+      if (entry == pending.end()) return;
+      entry->second->fulfill(uint8_t(reply[9]));
+      pending.erase(entry);
+      return;
+    }
+    KJ_REQUIRE(reply.size() >= 9, "missing threaded WAL open ID");
+    const auto openId = getLe64(reply.begin() + 1);
+    const auto entry = routes.find(openId);
+    if (entry == routes.end()) return;
+    const auto payload = reply.slice(9);
+    Notification notice{.type = type, .openId = openId};
+    switch (type) {
+      case MSG_SEALED:
+        KJ_REQUIRE(payload.size() == 12, "invalid threaded WAL seal");
+        notice.salt1 = getLe32(payload.begin());
+        notice.salt2 = getLe32(payload.begin() + 4);
+        notice.upToFrame = getLe32(payload.begin() + 8);
+        break;
+      case MSG_BREAK: {
+        KJ_REQUIRE(payload.size() >= 2, "invalid threaded WAL break");
+        const size_t length = size_t(payload[0]) | (size_t(payload[1]) << 8);
+        KJ_REQUIRE(payload.size() == length + 2, "invalid threaded WAL break length");
+        notice.reason = kj::str(kj::arrayPtr(
+            reinterpret_cast<const char*>(payload.begin() + 2), length));
+        break;
+      }
+      case MSG_CHECKPOINT_ASKED:
+        KJ_REQUIRE(payload.size() == 0, "invalid threaded WAL checkpoint");
+        break;
+      case MSG_CLOSE_ASKED:
+        KJ_REQUIRE(payload.size() == 0, "invalid threaded WAL close request");
+        break;
+      case MSG_OPENED:
+        KJ_REQUIRE(payload.size() == 1, "invalid threaded WAL open result");
+        notice.status = payload[0];
+        break;
+      default:
+        KJ_FAIL_REQUIRE("unknown threaded WAL reply", type);
+    }
+    KJ_REQUIRE(entry->second->push(kj::mv(notice), 1, QUEUED_NOTIFICATIONS),
+        "threaded WAL home cannot receive notification");
+  }
+};
+
+class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+ public:
+  Home(std::shared_ptr<Shared> shared, kj::Function<void(uint64_t)> requestClose)
+      : shared(kj::mv(shared)), inbox(std::make_shared<Inbox>()),
+        requestClose(kj::mv(requestClose)), tasks(*this) {
+    tasks.add(read());
+  }
+
+  bool enabled() const override { return true; }
+  uint64_t nextRequest() override { return ++shared->nextId; }
+
+  uint64_t registerShipper(DurableLogShipper& shipper) override {
+    KJ_REQUIRE(shared->negotiated(), STORAGE_UNAVAILABLE);
+    const auto openId = nextRequest();
+    auto result = kj::newPromiseAndFulfiller<void>();
+    shippers.emplace(openId, Registration{&shipper, kj::mv(result.fulfiller), result.promise.fork()});
+    return openId;
+  }
+
+  void unregisterShipper(DurableLogShipper& shipper) override {
+    shippers.erase(shipper.getOpenId());
+  }
+
+  kj::Promise<void> waitForOpen(uint64_t openId, kj::Timer& timer) override {
+    const auto found = shippers.find(openId);
+    KJ_REQUIRE(shared->negotiated() && found != shippers.end(), STORAGE_UNAVAILABLE);
+    auto timeout = timer.afterDelay(shared->confirmationTimeout).then([] {
+      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
+    });
+    return found->second.ready.addBranch().exclusiveJoin(kj::mv(timeout));
+  }
+
+  void send(uint64_t openId, kj::Array<kj::byte> message) override {
+    const auto type = message[4];
+    if (!shared->post({.bytes = kj::mv(message), .openId = openId, .inbox = inbox}, true)) {
+      // Losing a control record could leave a dirty image registered. Fail the whole
+      // channel so the node uses generation recovery.
+      shared->stop();
+      if (type == MSG_OPEN) kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
+    }
+  }
+
+  kj::Promise<void> sendFrames(DurableLogShipper& shipper,
+      kj::Array<kj::byte> message, uint64_t request, kj::Timer& timer) override {
+    const auto openId = shipper.getOpenId();
+    auto paf = kj::newPromiseAndCrossThreadFulfiller<uint8_t>();
+    if (!shared->post({.bytes = kj::mv(message), .openId = openId,
+          .request = request, .ack = kj::mv(paf.fulfiller)}, false)) {
+      gaveUp(openId, request, shipper.getKey(), true);
+      shipper.onRefused(request);
+      return kj::Promise<void>(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
+    }
+    auto ack = waitForAck(openId, request, kj::str(shipper.getKey()), timer, kj::mv(paf.promise)).fork();
+    // A canceled caller releases its branch. The committed transaction still needs
+    // a definite acknowledgement or the give-up record, independent of that caller.
+    tasks.add(ack.addBranch().catch_([](kj::Exception&&) {}));
+    return ack.addBranch();
+  }
+
+ private:
+  struct Registration {
+    DurableLogShipper* shipper;
+    kj::Own<kj::PromiseFulfiller<void>> opening;
+    kj::ForkedPromise<void> ready;
+  };
+  std::shared_ptr<Shared> shared;
+  std::shared_ptr<Inbox> inbox;
+  std::map<uint64_t, Registration> shippers;
+  kj::Function<void(uint64_t)> requestClose;
+  kj::TaskSet tasks;
+
+  void taskFailed(kj::Exception&&) override { shared->stop(); }
+
+  void gaveUp(uint64_t openId, uint64_t request, kj::StringPtr key, bool unsent) {
+    Writer writer;
+    writer.u8(MSG_GAVE_UP);
+    writer.u64(request);
+    writer.str(key);
+    writer.u64(std::chrono::steady_clock::now().time_since_epoch() / std::chrono::nanoseconds(1));
+    if (!shared->post({.bytes = writer.finish(openId), .openId = openId,
+            .request = request, .unconditional = unsent}, true)) {
+      shared->stop();
+    }
+  }
+
+  kj::Promise<void> waitForAck(uint64_t openId, uint64_t request, kj::String key,
+      kj::Timer& timer, kj::Promise<uint8_t> answer) {
+    const auto status = co_await answer.catch_([](kj::Exception&&) {
+      return uint8_t(ACK_DISCONNECTED);
+    }).exclusiveJoin(timer.afterDelay(shared->confirmationTimeout).then([] { return uint8_t(ACK_TIMEOUT); }));
+    const auto found = shippers.find(openId);
+    if (status != ACK_OK && found != shippers.end()) found->second.shipper->onRefused(request);
+    if (status == ACK_TIMEOUT) {
+      gaveUp(openId, request, key, false);
+      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(
+          "jsg.Error: Durable Object storage is unavailable: the node did not confirm the write "
+          "(STORAGE_UNAVAILABLE)")));
+    }
+    if (status == ACK_DISCONNECTED) {
+      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
+    }
+    if (status != ACK_OK) {
+      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(ackRefusal(status))));
+    }
+    if (found != shippers.end()) found->second.shipper->onAcked(request);
+  }
+
+  kj::Promise<void> read() {
+    for (;;) {
+      auto next = co_await inbox->next();
+      if (next == kj::none) {
+        for (auto& [id, registration]: shippers) {
+          if (registration.opening->isWaiting()) {
+            registration.opening->reject(KJ_EXCEPTION(DISCONNECTED, kj::str(STORAGE_UNAVAILABLE)));
+          }
+        }
+        co_return;
+      }
+      auto& notice = KJ_ASSERT_NONNULL(next);
+      const auto found = shippers.find(notice.openId);
+      if (found == shippers.end()) continue;
+      auto& registration = found->second;
+      auto& shipper = *registration.shipper;
+      switch (notice.type) {
+        case MSG_SEALED: shipper.onSealed(notice.salt1, notice.salt2, notice.upToFrame); break;
+        case MSG_BREAK: shipper.onBreak(notice.reason); break;
+        case MSG_CHECKPOINT_ASKED: shipper.onCheckpointAsked(); break;
+        case MSG_CLOSE_ASKED: requestClose(notice.openId); break;
+        case MSG_OPENED:
+          if (!registration.opening->isWaiting()) break;
+          if (notice.status == ACK_OK) registration.opening->fulfill();
+          else registration.opening->reject(KJ_EXCEPTION(FAILED, kj::str(ackRefusal(notice.status))));
+          break;
+        default: KJ_UNREACHABLE;
+      }
+    }
+  }
+};
+
+}  // namespace
+
+struct ThreadedWalLog::Impl {
+  Impl(int fd, uint64_t generation, kj::Duration confirmationTimeout)
+      : shared(std::make_shared<Shared>(confirmationTimeout)),
+        owner([state = shared, descriptor = kj::AutoCloseFd(fd), generation]() mutable {
+    KJ_DEFER(state->stop());
+    try {
+      auto io = kj::setupAsyncIo();
+      WalWire wire(*io.lowLevelProvider, descriptor.release());
+      Session session(*state, wire, generation);
+      session.run().wait(io.waitScope);
+    } catch (const kj::Exception& error) {
+      KJ_LOG(ERROR, "threaded WAL channel closed", error);
+    }
+  }), prepare([this] {
+    auto io = kj::setupAsyncIo();
+    for (;;) {
+      auto next = opens.next().wait(io.waitScope);
+      if (next == kj::none) return;
+      auto& open = KJ_ASSERT_NONNULL(next);
+      if (!open.result->isWaiting()) continue;
+      try {
+        open.result->fulfill(readDurableWalPosition(open.directory, open.path));
+      } catch (kj::Exception& error) {
+        open.result->reject(kj::mv(error));
+      }
+    }
+  }) {}
+
+  ~Impl() noexcept(false) {
+    opens.close();
+    shared->stop();
+  }
+
+  std::shared_ptr<Shared> shared;
+  Mailbox<OpenPreparation> opens;
+  kj::Thread owner;
+  kj::Thread prepare;
+};
+
+ThreadedWalLog::ThreadedWalLog(int fd, uint64_t generation, kj::Duration confirmationTimeout)
+    : impl(kj::heap<Impl>(fd, generation, confirmationTimeout)) {}
+ThreadedWalLog::~ThreadedWalLog() noexcept(false) = default;
+
+bool ThreadedWalLog::ready() const { return impl->shared->negotiated(); }
+
+kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(kj::Function<void(uint64_t)> requestClose) {
+  return kj::heap<Home>(impl->shared, kj::mv(requestClose));
+}
+
+kj::Promise<DurableWalPosition> ThreadedWalLog::prepareOpen(
+    const kj::Directory& directory, kj::Path path) {
+  auto paf = kj::newPromiseAndCrossThreadFulfiller<DurableWalPosition>();
+  KJ_REQUIRE(ready() && impl->opens.push({directory, kj::mv(path), kj::mv(paf.fulfiller)}, 1, 1024),
+      STORAGE_UNAVAILABLE);
+  return kj::mv(paf.promise);
+}
+
+}  // namespace workerd::server

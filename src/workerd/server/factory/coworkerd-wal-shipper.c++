@@ -1,7 +1,6 @@
 // Coworkerd: see coworkerd-wal-shipper.h.
 #include "coworkerd-wal-shipper.h"
-
-#include <workerd/jsg/exception.h>
+#include "coworkerd-wal-wire.h"
 
 #include <fcntl.h>
 #include <sqlite3.h>
@@ -15,6 +14,8 @@
 
 namespace workerd::server {
 namespace {
+
+using namespace wal;
 
 struct Settings {
   int fd = -1;
@@ -93,13 +94,6 @@ kj::String jsonString(kj::StringPtr text) {
 uint32_t getBe32(const kj::byte* p) {
   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
 }
-uint32_t getLe32(const kj::byte* p) {
-  return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
-}
-uint64_t getLe64(const kj::byte* p) {
-  return uint64_t(getLe32(p)) | (uint64_t(getLe32(p + 4)) << 32);
-}
-
 // SQLite's walChecksumBytes(): pairs of 32-bit words, native byte order unless the WAL magic's low bit asks for
 // big-endian words.
 void walChecksum(bool bigEndianWords, const kj::byte* data, size_t size, uint32_t& s1, uint32_t& s2) {
@@ -122,66 +116,32 @@ void walChecksum(bool bigEndianWords, const kj::byte* data, size_t size, uint32_
   s2 = b;
 }
 
-// Little-endian message building: u32 length, then the body, whose first byte is the type.
-struct Writer {
-  kj::Vector<kj::byte> out;
-  void u8(uint8_t v) {
-    out.add(v);
-  }
-  void u32(uint32_t v) {
-    for (int i = 0; i < 4; i++) out.add(kj::byte(v >> (8 * i)));
-  }
-  void u64(uint64_t v) {
-    for (int i = 0; i < 8; i++) out.add(kj::byte(v >> (8 * i)));
-  }
-  void str(kj::StringPtr s) {
-    KJ_REQUIRE(s.size() <= 0xffff);
-    out.add(kj::byte(s.size()));
-    out.add(kj::byte(s.size() >> 8));
-    out.addAll(s.asBytes());
-  }
-  void bytes(kj::ArrayPtr<const kj::byte> b) {
-    out.addAll(b);
-  }
-  kj::Array<kj::byte> finish() {
-    auto body = out.releaseAsArray();
-    auto result = kj::heapArray<kj::byte>(body.size() + 4);
-    uint32_t n = body.size();
-    for (int i = 0; i < 4; i++) result[i] = kj::byte(n >> (8 * i));
-    memcpy(result.begin() + 4, body.begin(), body.size());
-    return result;
-  }
-};
+void readWalHeader(const kj::ReadableFile& file, DurableWalPosition& position) {
+  KJ_REQUIRE(file.read(0, kj::arrayPtr(position.header.data(), position.header.size())) == 32);
+  const auto* header = position.header.data();
+  position.magic = getBe32(header);
+  KJ_REQUIRE((position.magic & 0xFFFFFFFE) == 0x377f0682, "not a WAL header", position.magic);
+  walChecksum(position.magic & 1, header, 24, position.checksum1, position.checksum2);
+  KJ_REQUIRE(position.checksum1 == getBe32(header + 24) && position.checksum2 == getBe32(header + 28),
+      "WAL header checksum");
+  position.pageSize = getBe32(header + 8);
+  position.salt1 = getBe32(header + 16);
+  position.salt2 = getBe32(header + 20);
+}
 
-// To the replicator.
-constexpr uint8_t MSG_HELLO = 1, MSG_FRAMES = 2, MSG_OPEN = 3, MSG_CHECKPOINT = 4, MSG_RESET = 5,
-                  MSG_DELETED = 6, MSG_CLOSED = 7, MSG_GAVE_UP = 8, MSG_ALARM = 9, MSG_RESIDENCY = 10;
-// From the replicator.
-constexpr uint8_t MSG_ACK = 1, MSG_SEALED = 2, MSG_BREAK = 3, MSG_CHECKPOINT_ASKED = 4;
-// An ACK's status. A refusal carries the code the caller sees: the node could not make the write durable, the
-// object is past its own size limit, or the tenant's Durable Object storage quota is exhausted. Reads are not
-// refused for any of them -- only the write is.
-constexpr uint8_t ACK_OK = 0, ACK_TOO_LARGE = 3, ACK_QUOTA = 4;
-
-kj::StringPtr ackRefusal(uint8_t status) {
-  switch (status) {
-    case ACK_TOO_LARGE:
-      return "jsg.Error: Durable Object is too large: the write would take it past "
-             "durableObjects.objectBytes (DO_OBJECT_TOO_LARGE)"_kj;
-    case ACK_QUOTA:
-      return "jsg.Error: the tenant's Durable Object storage quota is exhausted: the write was refused "
-             "(QUOTA_EXCEEDED)"_kj;
-    default:
-      return "jsg.Error: Durable Object storage is unavailable: the node refused the write "
-             "(STORAGE_UNAVAILABLE)"_kj;
-  }
+bool readWalFrame(const kj::byte* frame, uint32_t magic, uint32_t pageSize,
+    uint32_t salt1, uint32_t salt2, uint32_t& s1, uint32_t& s2) {
+  if (getBe32(frame + 8) != salt1 || getBe32(frame + 12) != salt2 || getBe32(frame) == 0) return false;
+  walChecksum(magic & 1, frame, 8, s1, s2);
+  walChecksum(magic & 1, frame + 24, pageSize, s1, s2);
+  return s1 == getBe32(frame + 16) && s2 == getBe32(frame + 20);
 }
 
 kj::LowLevelAsyncIoProvider* logProvider = nullptr;
 
 // The one channel to the node's replicator: the descriptor the process inherited. Every database's shipper writes
 // its messages to it and takes its confirmations from it.
-class Replicator final: private kj::TaskSet::ErrorHandler {
+class Replicator final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
  public:
   static Replicator& get() {
     auto& instance = holder();
@@ -195,19 +155,23 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
     // Cancel I/O while the stream, buffers and provider are all still alive.
     tasks.clear();
     writeChain = nullptr;
-    stream = kj::none;
+    wire = kj::none;
   }
 
   static void shutdown() {
     holder() = nullptr;
   }
 
-  bool enabled() {
+  bool enabled() const override {
     return settings().fd >= 0;
   }
 
-  uint64_t nextRequest() {
+  uint64_t nextRequest() override {
     return ++requestCounter;
+  }
+
+  void send(uint64_t, kj::Array<kj::byte> message) override {
+    send(kj::mv(message));
   }
 
   void send(kj::Array<kj::byte> message) {
@@ -217,20 +181,19 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
     auto bytes = kj::mv(message);
     writeChain = writeChain
                      .then([this, bytes = kj::mv(bytes)]() mutable -> kj::Promise<void> {
-      auto& s = *KJ_ASSERT_NONNULL(stream);
-      auto promise = s.write(bytes.asPtr());
-      return promise.attach(kj::mv(bytes));
+      return KJ_ASSERT_NONNULL(wire)->write(kj::mv(bytes));
     }).eagerlyEvaluate([this](kj::Exception&& e) { fail(kj::mv(e)); });
   }
 
   // Sends a FRAMES message and resolves when the replicator confirms `request`; rejects when it refuses them or
   // does not answer within the confirmation timeout.
-  kj::Promise<void> sendFrames(
-      kj::Array<kj::byte> message, uint64_t request, kj::StringPtr key, kj::Timer& timer) {
+  kj::Promise<void> sendFrames(DurableLogShipper& shipper,
+      kj::Array<kj::byte> message, uint64_t request, kj::Timer& timer) override {
     if (!enabled()) return kj::READY_NOW;
     KJ_IF_SOME(e, failure) {
       return kj::Promise<void>(e.clone());
     }
+    const auto key = shipper.getKey();
     auto paf = kj::newPromiseAndFulfiller<void>();
     pending.insert(request, Pending{kj::mv(paf.fulfiller), kj::str(key)});
     send(kj::mv(message));
@@ -242,11 +205,12 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
     return kj::mv(paf.promise);
   }
 
-  void registerShipper(DurableLogShipper& shipper) {
+  uint64_t registerShipper(DurableLogShipper& shipper) override {
     shippers.upsert(kj::str(shipper.getKey()), &shipper,
         [](auto& existing, auto&& replacement) { existing = replacement; });
+    return 0;
   }
-  void unregisterShipper(DurableLogShipper& shipper) {
+  void unregisterShipper(DurableLogShipper& shipper) override {
     KJ_IF_SOME(s, shippers.find(shipper.getKey())) {
       if (s == &shipper) shippers.erase(shipper.getKey());
     }
@@ -260,14 +224,12 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
 
   kj::TaskSet tasks;
   bool started = false;
-  kj::Maybe<kj::Own<kj::AsyncIoStream>> stream;
+  kj::Maybe<kj::Own<WalWire>> wire;
   kj::Promise<void> writeChain = nullptr;
   kj::Maybe<kj::Exception> failure;
   uint64_t requestCounter = 0;
   kj::HashMap<uint64_t, Pending> pending;
   kj::HashMap<kj::String, DurableLogShipper*> shippers;
-  kj::Vector<kj::byte> inbox;
-  kj::byte readBuffer[65536];
 
   static kj::Own<Replicator>& holder() {
     // Bootstrap empties this owner before destroying the provider. Static teardown is inert.
@@ -318,42 +280,14 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
     if (started) return;
     started = true;
     KJ_REQUIRE(logProvider != nullptr, "the Durable Object log channel has no I/O provider");
-    stream = logProvider->wrapSocketFd(
-        static_cast<kj::LowLevelAsyncIoProvider::Fd>(settings().fd),
-        kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP |
-            kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC);
+    wire = kj::heap<WalWire>(*logProvider, settings().fd);
     Writer w;
     w.u8(MSG_HELLO);
     w.u32(getpid());
     w.u64(monoNs());
-    auto hello = w.finish();
-    auto& st = *KJ_ASSERT_NONNULL(stream);
-    tasks.add(readLoop());
-    writeChain = st.write(hello.asPtr()).attach(kj::mv(hello));
-  }
-
-  kj::Promise<void> readLoop() {
-    auto& s = *KJ_ASSERT_NONNULL(stream);
-    return s.tryRead(readBuffer, 1, sizeof(readBuffer)).then([this](size_t n) -> kj::Promise<void> {
-      if (n == 0) {
-        fail(KJ_EXCEPTION(DISCONNECTED, "the node's replicator closed the Durable Object log channel"));
-        return kj::READY_NOW;
-      }
-      inbox.addAll(kj::arrayPtr(readBuffer, n));
-      size_t at = 0;
-      while (inbox.size() - at >= 4) {
-        uint32_t length = getLe32(inbox.begin() + at);
-        if (inbox.size() - at - 4 < length) break;
-        dispatch(kj::arrayPtr(inbox.begin() + at + 4, length));
-        at += 4 + length;
-      }
-      if (at > 0) {
-        kj::Vector<kj::byte> rest;
-        rest.addAll(kj::arrayPtr(inbox.begin() + at, inbox.size() - at));
-        inbox = kj::mv(rest);
-      }
-      return readLoop();
-    });
+    auto& connection = *KJ_ASSERT_NONNULL(wire);
+    tasks.add(connection.read([this](auto message) { dispatch(message); }));
+    writeChain = connection.write(w.finish());
   }
 
   // A message's object key: u16 length, the bytes.
@@ -424,6 +358,42 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
 
 }  // namespace
 
+DurableWalPosition readDurableWalPosition(const kj::Directory& directory, const kj::Path& path) {
+  DurableWalPosition position;
+  auto file = directory.tryOpenFile(path);
+  auto& wal = *KJ_UNWRAP_OR(file, return position);
+  const uint64_t size = wal.stat().size;
+  if (size < 32) return position;
+  readWalHeader(wal, position);
+  const auto pageSize = position.pageSize;
+  KJ_REQUIRE(pageSize >= 512 && pageSize <= 65536 && (pageSize & (pageSize - 1)) == 0,
+      "invalid WAL page size");
+  const size_t frameSize = 24 + pageSize;
+  auto buffer = kj::heapArray<kj::byte>(((1u << 20) / frameSize) * frameSize);
+  uint32_t s1 = position.checksum1, s2 = position.checksum2, frameCount = 0;
+  uint64_t offset = 32;
+  while (size - offset >= frameSize) {
+    const size_t bytes = kj::min<uint64_t>(size - offset, buffer.size());
+    const size_t frames = wal.read(offset, buffer.first(bytes)) / frameSize;
+    if (frames == 0) break;
+    for (size_t i = 0; i < frames; ++i) {
+      const auto* frame = buffer.begin() + i * frameSize;
+      if (!readWalFrame(frame, position.magic, pageSize, position.salt1, position.salt2, s1, s2)) {
+        return position;
+      }
+      KJ_REQUIRE(frameCount < UINT32_MAX, "WAL exceeds SQLite frame index");
+      ++frameCount;
+      if (getBe32(frame + 4) != 0) {
+        position.frames = frameCount;
+        position.checksum1 = s1;
+        position.checksum2 = s2;
+      }
+    }
+    offset += frames * frameSize;
+  }
+  return position;
+}
+
 void setDurableLogProvider(kj::LowLevelAsyncIoProvider& provider) {
   logProvider = &provider;
 }
@@ -437,17 +407,18 @@ bool durableLogEnabled() {
   return settings().fd >= 0;
 }
 
-void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId) {
-  if (!durableLogEnabled()) return;
+namespace {
+
+kj::Array<kj::byte> deletedFacetMessage(kj::StringPtr objectName, uint facetId, uint64_t openId) {
   Writer w;
   w.u8(MSG_DELETED);
   w.str(kj::str(objectName, "/", facetId));
   w.u64(monoNs());
-  Replicator::get().send(w.finish());
+  return w.finish(openId);
 }
 
-void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime) {
-  if (!durableLogEnabled()) return;
+kj::Array<kj::byte> alarmMessage(kj::StringPtr objectName, uint facetId,
+    kj::Maybe<kj::Date> scheduledTime, uint64_t openId) {
   Writer w;
   w.u8(MSG_ALARM);
   w.str(kj::str(objectName, "/", facetId));
@@ -461,7 +432,28 @@ void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date>
     w.u64(0);
   }
   w.u64(monoNs());
-  Replicator::get().send(w.finish());
+  return w.finish(openId);
+}
+
+}  // namespace
+
+void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId) {
+  if (durableLogEnabled()) Replicator::get().send(deletedFacetMessage(objectName, facetId, 0));
+}
+
+void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime) {
+  if (durableLogEnabled()) Replicator::get().send(alarmMessage(objectName, facetId, scheduledTime, 0));
+}
+
+kj::Maybe<kj::Date> readDurableAlarm(SqliteDatabase& db) {
+  {
+    auto exists =
+        db.run("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_cf_METADATA'");
+    if (exists.isDone()) return kj::none;
+  }
+  auto query = db.run("SELECT value FROM _cf_METADATA WHERE key = 1");
+  if (query.isDone() || query.isNull(0)) return kj::none;
+  return kj::UNIX_EPOCH + query.getInt64(0) * kj::NANOSECONDS;
 }
 
 void durableLogResidency(const DurableResidency& residency) {
@@ -491,21 +483,44 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
     DurableObjectName name,
     SqliteDatabase& db,
     kj::Timer& timer)
+    : DurableLogShipper(directory, kj::mv(walPath), kj::mv(databasePath), kj::mv(name), db, timer,
+          Replicator::get()) {}
+
+DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
+    kj::Path walPath,
+    kj::Path databasePath,
+    DurableObjectName name,
+    SqliteDatabase& db,
+    kj::Timer& timer,
+    DurableWalChannel& channel,
+    kj::Maybe<DurableWalPosition> prepared,
+    uint64_t localOpenStartedNs)
     : directory(directory),
       walPath(kj::mv(walPath)),
       databasePath(kj::mv(databasePath)),
       name(kj::mv(name)),
       key(this->name.key()),
       db(&db),
-      timer(timer) {
+      timer(timer),
+      channel(channel) {
   configure(db);
-  Replicator::get().registerShipper(*this);
-
   // The files of an earlier instance of this object may still hold a WAL: its frames went to the replicator then,
   // so this instance starts after them -- and reports where it starts, because the earlier instance may have died
   // between a commit and its confirmation. The node compares the position with what it confirmed and breaks this
   // object when they differ: the frames it never confirmed must not be read by anybody.
-  if (walBytes() >= 32) {
+  KJ_IF_SOME(position, prepared) {
+    if (position.pageSize != 0) {
+      haveHeader = true;
+      magic = position.magic;
+      pageSize = position.pageSize;
+      salt1 = position.salt1;
+      salt2 = position.salt2;
+      cksum1 = position.checksum1;
+      cksum2 = position.checksum2;
+      readFrames = ackedFrames = hookFrames = position.frames;
+      header = kj::heapArray(kj::arrayPtr(position.header.data(), position.header.size()));
+    }
+  } else if (walBytes() >= 32) {
     readNewFrames();
     pendingFrames.clear();
     pendingCount = 0;
@@ -513,13 +528,19 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
     pendingReadNs = 0;
     ackedFrames = readFrames;
   }
-  sendOpen();
+  openId = channel.registerShipper(*this);
+  try {
+    sendOpen(localOpenStartedNs == 0 ? 0 : uint64_t(monoNs()) - localOpenStartedNs);
+  } catch (...) {
+    channel.unregisterShipper(*this);
+    throw;
+  }
 }
 
 DurableLogShipper::~DurableLogShipper() noexcept(false) {
-  Replicator::get().unregisterShipper(*this);
+  KJ_DEFER(channel.unregisterShipper(*this));
   sqlite3_wal_hook(*db, nullptr, nullptr);
-  if (!durableLogEnabled()) return;
+  if (!channel.enabled()) return;
   Writer w;
   w.u8(MSG_CLOSED);
   w.str(key);
@@ -527,7 +548,18 @@ DurableLogShipper::~DurableLogShipper() noexcept(false) {
   // The database's size as this instance leaves it: a small object may never checkpoint, and the node needs its
   // size for the tenant's storage and for the object's own limit.
   w.u64(databaseBytes());
-  Replicator::get().send(w.finish());
+  if (deferredClose != nullptr) *deferredClose = w.finish(openId);
+  else channel.send(openId, w.finish(openId));
+}
+
+void DurableLogShipper::reportAfterDatabaseClose() {
+  KJ_REQUIRE(openId != 0 && deferredClose == nullptr);
+  auto message = kj::heap<kj::Array<kj::byte>>();
+  auto* slot = message.get();
+  db->afterClose([&channel = channel, id = openId, message = kj::mv(message)]() mutable {
+    if (message->size() != 0) channel.send(id, kj::mv(*message));
+  });
+  deferredClose = slot;
 }
 
 void DurableLogShipper::configure(SqliteDatabase& database) {
@@ -571,7 +603,15 @@ void DurableLogShipper::afterReset(SqliteDatabase& database) {
   w.u32(name.parentFacetId);
   w.str(name.facetName);
   w.u64(monoNs());
-  Replicator::get().send(w.finish());
+  channel.send(openId, w.finish(openId));
+}
+
+void DurableLogShipper::reportAlarm(kj::Maybe<kj::Date> scheduledTime) {
+  channel.send(openId, alarmMessage(name.objectName, name.facetId, scheduledTime, openId));
+}
+
+void DurableLogShipper::reportFacetDeleted(uint facet) {
+  channel.send(openId, deletedFacetMessage(name.objectName, facet, openId));
 }
 
 int DurableLogShipper::walHook(void* arg, sqlite3*, const char*, int frames) {
@@ -592,20 +632,15 @@ void DurableLogShipper::readNewFrames() {
   uint64_t size = file->stat().size;
   if (!haveHeader) {
     if (size < 32) return;
-    auto h = kj::heapArray<kj::byte>(32);
-    KJ_REQUIRE(file->read(0, h) == 32);
-    uint32_t m = getBe32(h.begin());
-    KJ_REQUIRE((m & 0xFFFFFFFE) == 0x377f0682, "not a WAL header", m);
-    uint32_t s1 = 0, s2 = 0;
-    walChecksum(m & 1, h.begin(), 24, s1, s2);
-    KJ_REQUIRE(s1 == getBe32(h.begin() + 24) && s2 == getBe32(h.begin() + 28), "WAL header checksum");
-    magic = m;
-    pageSize = getBe32(h.begin() + 8);
-    salt1 = getBe32(h.begin() + 16);
-    salt2 = getBe32(h.begin() + 20);
-    cksum1 = s1;
-    cksum2 = s2;
-    header = kj::mv(h);
+    DurableWalPosition position;
+    readWalHeader(*file, position);
+    magic = position.magic;
+    pageSize = position.pageSize;
+    salt1 = position.salt1;
+    salt2 = position.salt2;
+    cksum1 = position.checksum1;
+    cksum2 = position.checksum2;
+    header = kj::heapArray(kj::arrayPtr(position.header.data(), position.header.size()));
     haveHeader = true;
     headerSent = false;
     readFrames = 0;
@@ -627,11 +662,7 @@ void DurableLogShipper::readNewFrames() {
   uint32_t commitsHere = 0;
   for (uint64_t i = 0; i < available; i++) {
     const kj::byte* f = buffer.begin() + i * frameSize;
-    if (getBe32(f + 8) != salt1 || getBe32(f + 12) != salt2) break;
-    if (getBe32(f) == 0) break;
-    walChecksum(magic & 1, f, 8, s1, s2);
-    walChecksum(magic & 1, f + 24, pageSize, s1, s2);
-    if (s1 != getBe32(f + 16) || s2 != getBe32(f + 20)) break;
+    if (!readWalFrame(f, magic, pageSize, salt1, salt2, s1, s2)) break;
     if (getBe32(f + 4) != 0) {
       lastCommitEnd = (i + 1) * frameSize;
       lastCommitCk1 = s1;
@@ -666,8 +697,7 @@ kj::Promise<void> DurableLogShipper::sendPending() {
     }
     return kj::READY_NOW;
   }
-  auto& replicator = Replicator::get();
-  uint64_t request = replicator.nextRequest();
+  uint64_t request = channel.nextRequest();
   Writer w;
   w.u8(MSG_FRAMES);
   w.u64(request);
@@ -702,7 +732,7 @@ kj::Promise<void> DurableLogShipper::sendPending() {
   pendingCommits = 0;
   pendingReadNs = 0;
   inFlight.insert(request, InFlight{generation, endsAt});
-  auto promise = replicator.sendFrames(w.finish(), request, key, timer).fork();
+  auto promise = channel.sendFrames(*this, w.finish(openId), request, timer).fork();
   lastAck = promise.addBranch().fork();
   return promise.addBranch();
 }
@@ -735,6 +765,10 @@ void DurableLogShipper::onAcked(uint64_t request) {
     inFlight.erase(request);
   }
   maybeCheckpoint("confirmed"_kj);
+}
+
+void DurableLogShipper::onRefused(uint64_t request) {
+  inFlight.erase(request);
 }
 
 void DurableLogShipper::onSealed(uint32_t s1, uint32_t s2, uint32_t upToFrame) {
@@ -770,8 +804,8 @@ uint64_t DurableLogShipper::databaseBytes() {
   return 0;
 }
 
-void DurableLogShipper::sendOpen() {
-  if (!durableLogEnabled()) return;
+void DurableLogShipper::sendOpen(uint64_t localOpenNs) {
+  if (!channel.enabled()) return;
   Writer w;
   w.u8(MSG_OPEN);
   w.str(key);
@@ -786,7 +820,8 @@ void DurableLogShipper::sendOpen() {
   w.u64(walBytes());
   w.u64(databaseBytes());
   w.u64(monoNs());
-  Replicator::get().send(w.finish());
+  if (openId != 0) w.u64(localOpenNs);
+  channel.send(openId, w.finish(openId));
 }
 
 // A checkpoint moves the WAL's pages into the database file and truncates it. It runs on this process's event loop
@@ -824,7 +859,8 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
   w.u64(start);
   w.u64(took);
   w.str(reason);
-  Replicator::get().send(w.finish());
+  if (openId != 0) w.u64(bytes);
+  channel.send(openId, w.finish(openId));
   // The next commit opens a new generation: a new header at the head of the truncated file, new salts, frames from
   // one again.
   haveHeader = false;

@@ -15,7 +15,7 @@ constexpr auto id = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba98765
 constexpr auto other = "f000000000000000000000000000000000000000000000000000000000000000"_kj;
 
 KJ_TEST("disposable durable SQLite files reopen inside a generation") {
-  DurableTestStorage storage;
+  DurableStorage storage;
   {
     auto database = storage.open(key, id);
     database->run("CREATE TABLE example (value INTEGER)");
@@ -32,13 +32,13 @@ KJ_TEST("disposable durable SQLite files reopen inside a generation") {
   KJ_EXPECT(unrelated->run("SELECT count(*) FROM sqlite_schema").getInt(0) == 0);
   // Distinct directories check volume isolation, not process restart. The product's
   // threaded-durable-storage-lifecycle fixture checks actual child and node restarts.
-  DurableTestStorage independentVolume;
+  DurableStorage independentVolume;
   auto separate = independentVolume.open(key, id);
   KJ_EXPECT(separate->run("SELECT count(*) FROM sqlite_schema").getInt(0) == 0);
 }
 
 KJ_TEST("disposable durable SQLite refuses paths and malformed identities") {
-  DurableTestStorage storage;
+  DurableStorage storage;
   KJ_EXPECT_THROW_MESSAGE(
       "invalid durable test storage identity", storage.open("/var/lib/data", id));
   KJ_EXPECT_THROW_MESSAGE("invalid durable test storage identity", storage.open(key, "../other"));
@@ -46,7 +46,7 @@ KJ_TEST("disposable durable SQLite refuses paths and malformed identities") {
 }
 
 KJ_TEST("disposable facet storage belongs to one root and survives reopening") {
-  DurableTestStorage storage;
+  DurableStorage storage;
   uint source;
   {
     auto index = storage.openFacetIndex(key, id);

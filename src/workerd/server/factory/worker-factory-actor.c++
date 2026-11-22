@@ -435,18 +435,6 @@ kj::Maybe<uint32_t> actor_storage_facet_id(const ActorStorage& storage,
 
 namespace {
 
-// Read the alarm held by this database without creating a missing metadata table.
-kj::Maybe<kj::Date> alarmOf(SqliteDatabase& db) {
-  {
-    auto exists =
-        db.run("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_cf_METADATA'");
-    if (exists.isDone()) return kj::none;
-  }
-  auto query = db.run("SELECT value FROM _cf_METADATA WHERE key = 1");
-  if (query.isDone() || query.isNull(0)) return kj::none;
-  return kj::UNIX_EPOCH + query.getInt64(0) * kj::NANOSECONDS;
-}
-
 // The actor's hooks into the server: the requests it raises for itself (alarms, hibernated
 // WebSocket events, which restart the actor if needed), its facets, and its transitions between
 // idle and active. The actor owns a reference as its loopback, so the hooks it borrows as its
@@ -663,7 +651,7 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
     }
     // Every open reports the persisted value, including none, before ActorSqlite owns the database.
     if (shipped && facetId == kj::none) {
-      durableLogAlarm(shippedName, 0, alarmOf(*db));
+      durableLogAlarm(shippedName, 0, readDurableAlarm(*db));
     }
     auto sqlite = kj::heap<ActorSqlite>(kj::mv(db), outputGate, kj::mv(commit), *sqliteHooks);
     KJ_IF_SOME(root, rootHooks) {
