@@ -57,7 +57,7 @@ KJ_TEST("fatal record identifies only the invocation on the current V8 thread") 
   auto checkUnknown = [&] {
     KJ_EXPECT(readRecord() == kj::str("{\"event\":\"v8-fatal-undetermined\",\"pid\":", getpid(), "}\n"));
   };
-  constexpr kj::StringPtr identity = "\"workerId\":\"tenant/w\",\"versionId\":\"v1\","
+  const kj::StringPtr identity = "\"workerId\":\"tenant/w\",\"versionId\":\"v1\","
       "\"invocationId\":\"call\",\"isolate\":\"coworkerd-v1:tenant/w@v1#5\",";
   FatalInvocation invocation(isolate, identity);
   writeFatalRecord(fds[1]);
