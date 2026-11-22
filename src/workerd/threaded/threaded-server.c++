@@ -3346,14 +3346,17 @@ struct ThreadedServer {
     };
     auto preparation = std::make_shared<ResourcePreparation>(slot->reservation);
     auto source = co_await fetchSource(input, state, *slot);
-    trackDurableTurn(state.durableHome, true);
-    KJ_DEFER({
-      const auto bytes = slot->limits
-          ? slot->limits->memory->heap.load() + slot->limits->memory->external.load()
-          : 0;
-      trackDurableTurn(state.durableHome, false, bytes);
-    });
-    slot->worker = compile(*slot, input, source);
+    // End turn accounting before co_return moves the local slot into its result.
+    {
+      trackDurableTurn(state.durableHome, true);
+      KJ_DEFER({
+        const auto bytes = slot->limits
+            ? slot->limits->memory->heap.load() + slot->limits->memory->external.load()
+            : 0;
+        trackDurableTurn(state.durableHome, false, bytes);
+      });
+      slot->worker = compile(*slot, input, source);
+    }
     slot->complete = true;
     co_return slot;
   }
