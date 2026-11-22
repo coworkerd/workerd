@@ -55,9 +55,11 @@ KJ_TEST("fatal record identifies only the invocation on the current V8 thread") 
     return kj::heapString(row, count);
   };
   auto checkUnknown = [&] {
-    KJ_EXPECT(readRecord() == kj::str("{\"event\":\"v8-fatal-undetermined\",\"pid\":", getpid(), "}\n"));
+    KJ_EXPECT(
+        readRecord() == kj::str("{\"event\":\"v8-fatal-undetermined\",\"pid\":", getpid(), "}\n"));
   };
-  const kj::StringPtr identity = "\"workerId\":\"tenant/w\",\"versionId\":\"v1\","
+  const kj::StringPtr identity =
+      "\"workerId\":\"tenant/w\",\"versionId\":\"v1\","
       "\"invocationId\":\"call\",\"isolate\":\"coworkerd-v1:tenant/w@v1#5\",";
   FatalInvocation invocation(isolate, identity);
   writeFatalRecord(fds[1]);
@@ -69,8 +71,9 @@ KJ_TEST("fatal record identifies only the invocation on the current V8 thread") 
     other.join();
     checkUnknown();
     writeFatalRecord(fds[1]);
-    KJ_EXPECT(readRecord() == kj::str("{\"event\":\"v8-fatal\",\"pid\":", getpid(), ",",
-        identity.slice(0, identity.size() - 1), "}\n"));
+    KJ_EXPECT(readRecord() ==
+        kj::str("{\"event\":\"v8-fatal\",\"pid\":", getpid(), ",",
+            identity.slice(0, identity.size() - 1), "}\n"));
   }
 }
 
