@@ -97,8 +97,11 @@ class DurableAdmission {
   bool complete(Ticket ticket, uint64_t home);
   std::vector<Ticket> expire(Time now);
 
-  // A home starts closing only after its mailbox is empty. Reject admission during close,
-  // and keep the tree's reservation until the home confirms that its handles are gone.
+  // Reset closes admission immediately, releases waiting calls, and retains active credits
+  // until their home completes them. The home still owns every actor handle until releaseTree().
+  bool beginReset(uint64_t tree, uint64_t home);
+  // Idle close requires an empty mailbox and no active calls. It is also the drain check for
+  // a reset already in progress. Keep the tree reservation until the home releases its handles.
   bool stopIdleTree(uint64_t tree, uint64_t home);
   // Normal retirement checks the idle deadline as well as mailbox/active ownership.
   // Pressure retirement uses the unconditional overload above.
