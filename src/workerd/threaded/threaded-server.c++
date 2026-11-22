@@ -783,6 +783,8 @@ void injectSyntheticCrash(kj::StringPtr worker) {
     command[separator] = '\0';
     auto event = kj::StringPtr(command, separator);
     if (event == "fatal") nativeFatal(nullptr, nullptr);
+    // A real dispatch: V8's own API check calls whichever fatal handler this isolate ended up with.
+    if (event == "api-check") (void)v8::MaybeLocal<v8::Value>().ToLocalChecked();
     if (event == "shared-oom" && !v8::IsolateGroup::CanCreateNewGroups()) {
       nativeOom(nullptr, v8::OOMDetails{.is_heap_oom = true, .detail = nullptr});
     }
