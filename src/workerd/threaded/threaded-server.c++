@@ -756,10 +756,13 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   v8::ArrayBuffer::Allocator *inner;
   v8::Isolate *isolate = nullptr;
   std::atomic<bool> pendingPressure{false};
+  std::atomic<bool> durableProcessPressure{false};
   // How many times this isolate's ceiling was raised (install()).
   std::atomic<uint32_t> ceilingRaised{0};
   std::atomic<LimitCause> *currentCause = nullptr;  // isolate-lock protected
   void pressure() {
+    if (reservation && reservation->budget->reclaimMode == ResourceBudget::ReclaimMode::NONE)
+      durableProcessPressure.store(true);
     if (currentCause) {
       auto expected = LimitCause::NONE;
       if (currentCause->compare_exchange_strong(expected, LimitCause::PROCESS_MEMORY))
@@ -2788,6 +2791,7 @@ struct ThreadedServer {
           durableIdleRetirements.fetch_add(1);
         }
       }
+      if (current->second.resetting && memory.durableProcessPressure.load()) reclaimed = true;
       current->second.stopFacets();
       actor.shutdown(0);
       state.durableRoots.erase(current);
@@ -2814,7 +2818,8 @@ struct ThreadedServer {
       std::lock_guard lock(durableRoutingMutex);
       auto &home = *threads[homeId - 1]->home;
       home.memory = accounted();
-      const bool rejectedGrowth = memory.cause->load() == LimitCause::MEMORY;
+      const bool rejectedGrowth =
+          memory.cause->load() == LimitCause::MEMORY || memory.durableProcessPressure.load();
       pressureAction = home.pressure.sample(home.memory >= placementLimit || rejectedGrowth,
           home.memory >= memory.maximum - memory.maximum / 10 || rejectedGrowth, reclaimed);
       const auto idleMs = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000);
