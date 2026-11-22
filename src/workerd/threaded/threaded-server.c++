@@ -4838,6 +4838,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
   }
 
   void cloneFacet(kj::StringPtr source, kj::StringPtr destination) override {
+    if (tree->state.wal) unsupported("cloning a persistent Durable Object facet");
     requireIdle(source);
     requireIdle(destination);
     abortFacet(destination, KJ_EXCEPTION(DISCONNECTED, "Facet was cloned over."));
