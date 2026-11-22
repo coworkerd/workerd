@@ -30,9 +30,11 @@ KJ_TEST("disposable durable SQLite files reopen inside a generation") {
   KJ_EXPECT(rows.isDone());
   auto unrelated = storage.open(key, other);
   KJ_EXPECT(unrelated->run("SELECT count(*) FROM sqlite_schema").getInt(0) == 0);
-  DurableTestStorage replacementGeneration;
-  auto afterRestart = replacementGeneration.open(key, id);
-  KJ_EXPECT(afterRestart->run("SELECT count(*) FROM sqlite_schema").getInt(0) == 0);
+  // Distinct directories check volume isolation, not process restart. The product's
+  // threaded-durable-storage-lifecycle fixture checks actual child and node restarts.
+  DurableTestStorage independentVolume;
+  auto separate = independentVolume.open(key, id);
+  KJ_EXPECT(separate->run("SELECT count(*) FROM sqlite_schema").getInt(0) == 0);
 }
 
 KJ_TEST("disposable durable SQLite refuses paths and malformed identities") {
