@@ -82,6 +82,10 @@ wd_cc_library(
     name = "coworkerd-wal",
     srcs = ["coworkerd-wal-shipper.c++"],
     hdrs = ["coworkerd-wal-shipper.h", "coworkerd-wal-wire.h"],
+    visibility = [
+        "//src/workerd/server:__subpackages__",
+        "//src/workerd/threaded:__pkg__",
+    ],
     deps = [
         "//src/workerd/util:sqlite",
         "@capnp-cpp//src/kj",

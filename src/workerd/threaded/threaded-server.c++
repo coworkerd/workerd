@@ -2850,7 +2850,8 @@ struct ThreadedServer {
         ",\"overloaded\":" + std::to_string(state.overloads) +
         ",\"expired\":" + std::to_string(state.expired) + "}}";
     if (publish) {
-      lifecycle.publish("{\"durableServer\":\"threaded-test\"" + row, state.active,
+      const std::string role = durableLog ? "threaded" : "threaded-test";
+      lifecycle.publish("{\"durableServer\":\"" + role + "\"" + row, state.active,
           durableHomeSessions.load(), state.waiting);
     }
     if (appendTo) {
@@ -3005,7 +3006,7 @@ struct ThreadedServer {
     if (thread.home && durableLog) {
       state.wal = durableLog->attachHome([&state](uint64_t openId) {
         for (auto& [id, root]: state.durableRoots) {
-          if (root.rootOpenId() != openId) continue;
+          if (!root.rootOpenId || root.rootOpenId() != openId) continue;
           root.closeRequested = true;
           break;
         }
@@ -4967,7 +4968,11 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
       if (facet == 0) current->reportAlarm(server::readDurableAlarm(*database));
       auto& alarmHooks = *alarms;
       return kj::heap<ActorSqlite>(kj::mv(database), gate,
-          [shipper = kj::mv(shipper)](SpanParent) mutable { return shipper->onCommit(); }, alarmHooks)
+          [shipper = kj::mv(shipper), &server = tree->server](SpanParent) mutable {
+        auto confirmation = shipper->onCommit();
+        server.durablePendingCommits.fetch_add(1);
+        return confirmation.attach(kj::defer([&server] { server.durablePendingCommits.fetch_sub(1); }));
+      }, alarmHooks)
           .attach(kj::mv(alarms));
     }
     return kj::heap<ActorSqlite>(kj::mv(database), gate,
