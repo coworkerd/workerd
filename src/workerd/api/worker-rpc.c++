@@ -2166,7 +2166,8 @@ class JsRpcTargetBase: public rpc::JsRpcTarget::Server, public kj::PtrTarget {
           // actor will already have been topped up by IncomingRequest::delivered().
           return ctx.run([weakThis = addWeakToThis(), callContext, &request](
                              Worker::Lock& lock, IoContext& ctx) mutable {
-            auto& self = KJ_REQUIRE_NONNULL(weakThis.tryGet(), "RPC target destroyed before call ran");
+            auto& self =
+                KJ_REQUIRE_NONNULL(weakThis.tryGet(), "RPC target destroyed before call ran");
             auto limitScope = request.enterActorEvent(lock);
             return self.callImpl(lock, ctx, callContext);
           });

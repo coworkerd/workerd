@@ -82,7 +82,9 @@ bool SqlExecutionBudget::isEnabled() { return sqlCpuLimitNs() != 0 || sqlWallLim
 SqlExecutionBudget::SqlExecutionBudget()
     : cpuLimitNs(sqlCpuLimitNs()), wallLimitNs(sqlWallLimitNs()) {}
 SqlExecutionBudget::SqlExecutionBudget(uint64_t eventCpuLimitNs, uint64_t threadCpuDeadlineNs)
-    : cpuLimitNs(eventCpuLimitNs), wallLimitNs(kj::maxValue), threadCpuDeadline(threadCpuDeadlineNs) {}
+    : cpuLimitNs(eventCpuLimitNs),
+      wallLimitNs(kj::maxValue),
+      threadCpuDeadline(threadCpuDeadlineNs) {}
 kj::String SqlExecutionBudget::describe() const {
   const bool cpu = cause == Cause::CPU;
   return kj::str("SQL_LIMIT_EXCEEDED: ", cpu ? "cpu" : "wall", " limit ",

@@ -68,9 +68,15 @@ class DurablePressure {
   enum class Action { ACCEPT, EVICT_IDLE, CLOSE_PLACEMENT, WAIT, RESET };
 
   Action sample(bool abovePlacement, bool aboveHardLimit, bool idleTree);
-  bool accepting() const { return phase == Phase::OPEN; }
-  bool resetting() const { return phase == Phase::RESETTING; }
-  void closed() { phase = Phase::OPEN; }
+  bool accepting() const {
+    return phase == Phase::OPEN;
+  }
+  bool resetting() const {
+    return phase == Phase::RESETTING;
+  }
+  void closed() {
+    phase = Phase::OPEN;
+  }
 
  private:
   enum class Phase { OPEN, CLOSED, RESETTING };

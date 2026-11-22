@@ -1283,8 +1283,8 @@ class Worker::Actor final: public kj::Refcounted {
   kj::Maybe<api::ExportedHandler&> getHandler();
   friend class Worker;
 
-  kj::Promise<void> ensureConstructedImpl(IoContext&,
-      ActorClassInfo& info, kj::Weak<IoContext_IncomingRequest> request);
+  kj::Promise<void> ensureConstructedImpl(
+      IoContext&, ActorClassInfo& info, kj::Weak<IoContext_IncomingRequest> request);
 
   kj::Promise<void> runOnHibernateImpl(HibernationReason reason,
       kj::Rc<IoChannelFactory> ioChannelFactory,

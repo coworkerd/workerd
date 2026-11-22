@@ -4533,8 +4533,8 @@ kj::Promise<void> Worker::Actor::ensureConstructedImpl(
       containerRunning = status.getRunning();
     }
 
-    co_await context.run([this, &info, containerRunning, &request](
-                             Worker::Lock& lock, IoContext& context) {
+    co_await context.run(
+        [this, &info, containerRunning, &request](Worker::Lock& lock, IoContext& context) {
       kj::Own<void> event;
       KJ_IF_SOME(r, request.tryGet()) {
         event = r.enterActorEvent(lock);

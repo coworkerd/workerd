@@ -237,7 +237,8 @@ std::vector<DurableAdmission::Ticket> DurableAdmission::failOpen(uint64_t tree) 
 
 bool DurableAdmission::releaseUnassigned(uint64_t tree) {
   auto entry = trees.find(tree);
-  if (entry == trees.end() || entry->second.home != 0 || !entry->second.events.empty()) return false;
+  if (entry == trees.end() || entry->second.home != 0 || !entry->second.events.empty())
+    return false;
   eraseTree(entry);
   return true;
 }

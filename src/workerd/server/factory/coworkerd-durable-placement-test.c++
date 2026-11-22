@@ -60,7 +60,8 @@ KJ_TEST("durable home retains the partial bucket at the start of its rolling win
   KJ_EXPECT((home.busyFor(origin + 4070ms) == 57ms));
 }
 
-KJ_TEST("durable pressure evicts idle objects before closing placement and resets only on continuing pressure") {
+KJ_TEST(
+    "durable pressure evicts idle objects before closing placement and resets only on continuing pressure") {
   using Action = DurablePressure::Action;
   DurablePressure pressure;
   KJ_EXPECT(pressure.sample(true, true, true) == Action::EVICT_IDLE);

@@ -23,10 +23,13 @@ class DurableTestStorage {
       uint facet = 0) const;
 
   kj::Own<FacetTreeIndex> openFacetIndex(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
-  void deleteFacet(kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index,
-      uint facet) const;
-  void cloneFacet(kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index,
-      uint source, uint destination) const;
+  void deleteFacet(
+      kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index, uint facet) const;
+  void cloneFacet(kj::StringPtr uniqueKey,
+      kj::StringPtr storageId,
+      FacetTreeIndex& index,
+      uint source,
+      uint destination) const;
 
  private:
   void ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;

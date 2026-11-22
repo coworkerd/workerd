@@ -502,8 +502,8 @@ kj::Promise<void> WorkerEntrypoint::requestImpl(kj::HttpMethod method,
         api::DeferredProxy<void> deferredProxy = co_await context.run(
             [this, method, url, &headers, &requestBody, &wrappedResponse = *wrappedResponse,
                 entrypointName = entrypointName.clone(),
-                metrics = kj::addRef(incomingRequest->getMetrics()), &request = *incomingRequest](
-                Worker::Lock& lock, IoContext& context) mutable {
+                metrics = kj::addRef(incomingRequest->getMetrics()),
+                &request = *incomingRequest](Worker::Lock& lock, IoContext& context) mutable {
           TRACE_EVENT_END("workerd", PERFETTO_TRACK_FROM_POINTER(&context));
           TRACE_EVENT(
               "workerd", "WorkerEntrypoint::request() run", PERFETTO_FLOW_FROM_POINTER(this));

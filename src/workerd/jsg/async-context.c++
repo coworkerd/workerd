@@ -242,7 +242,10 @@ thread_local AsyncContextFrame::ChangeObserver* AsyncContextFrame::ChangeObserve
 
 AsyncContextFrame::ChangeObserver::ChangeObserver(
     void* data, Notify notify, const kj::Arc<StorageKey>& protectedKey)
-    : previous(current), data(data), notify(notify), protectedKey(protectedKey) {
+    : previous(current),
+      data(data),
+      notify(notify),
+      protectedKey(protectedKey) {
   current = this;
 }
 
@@ -251,7 +254,8 @@ AsyncContextFrame::ChangeObserver::~ChangeObserver() {
 }
 
 AsyncContextFrame::Scope::Scope(Lock& js, kj::Maybe<AsyncContextFrame&> resource, Kind kind)
-    : isolate(js.v8Isolate), prior(AsyncContextFrame::currentRef(js)) {
+    : isolate(js.v8Isolate),
+      prior(AsyncContextFrame::currentRef(js)) {
   if (kind == Kind::USER && ChangeObserver::current != nullptr) {
     // AsyncLocalStorage and AsyncResource may install an arbitrary user frame.
     // The embedder's event identity follows the caller through that frame.
@@ -260,16 +264,16 @@ AsyncContextFrame::Scope::Scope(Lock& js, kj::Maybe<AsyncContextFrame&> resource
     KJ_IF_SOME(frame, prior) {
       currentEntry = frame->get(*key);
     }
-    auto value = currentEntry.map([&](Value& value) { return value.addRef(js); })
-                     .orDefault([&] { return js.v8Ref(v8::Undefined(isolate).As<v8::Value>()); });
+    auto value = currentEntry.map([&](Value& value) { return value.addRef(js); }).orDefault([&] {
+      return js.v8Ref(v8::Undefined(isolate).As<v8::Value>());
+    });
     maybeSetV8ContinuationContext(isolate, resource);
     try {
       userFrame.emplace(AsyncContextFrame::create(js, StorageEntry(key.addRef(), kj::mv(value))));
       resource = *KJ_ASSERT_NONNULL(userFrame);
     } catch (...) {
-      maybeSetV8ContinuationContext(isolate, prior.map([](auto& frame) -> AsyncContextFrame& {
-        return *frame;
-      }));
+      maybeSetV8ContinuationContext(
+          isolate, prior.map([](auto& frame) -> AsyncContextFrame& { return *frame; }));
       throw;
     }
   }
@@ -285,9 +289,10 @@ AsyncContextFrame::Scope::Scope(v8::Isolate* ptr, kj::Maybe<AsyncContextFrame&> 
 }
 
 AsyncContextFrame::Scope::Scope(Lock& js, kj::Maybe<Ref<AsyncContextFrame>>& resource, Kind kind)
-    : Scope(js, resource.map([](Ref<AsyncContextFrame>& frame) -> AsyncContextFrame& {
-        return *frame.get();
-      }), kind) {}
+    : Scope(js,
+          resource.map(
+              [](Ref<AsyncContextFrame>& frame) -> AsyncContextFrame& { return *frame.get(); }),
+          kind) {}
 
 AsyncContextFrame::Scope::~Scope() noexcept(false) {
   maybeSetV8ContinuationContext(isolate,
