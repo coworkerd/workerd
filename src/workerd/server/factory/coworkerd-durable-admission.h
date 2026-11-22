@@ -92,6 +92,8 @@ class DurableAdmission {
   std::optional<Ticket> next(uint64_t tree) const;
   Delivery begin(Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now);
   Cancellation cancel(Ticket ticket);
+  // Refuse a waiting call before acknowledging it, returning its event reservation.
+  bool refuseWaiting(Ticket ticket);
   bool complete(Ticket ticket, uint64_t home);
   std::vector<Ticket> expire(Time now);
 

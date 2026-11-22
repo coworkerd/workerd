@@ -120,6 +120,32 @@ KJ_TEST("durable admission expires queued events and releases each reservation o
   KJ_EXPECT((table.state().reserved == limits.tree));
 }
 
+KJ_TEST("home refusal returns waiting credit once without canceling an active event") {
+  Admission table(limits, 1);
+  const auto active = queued(table.queue(first, open, 10, deadline, now), true);
+  KJ_REQUIRE(table.publishHome(active.tree, 1));
+  KJ_REQUIRE(table.begin(active, 1, first, open, now) == Delivery::ACCEPTED);
+  const auto reserved = table.state().reserved;
+  const auto waiting = queued(table.queue(first, open, 20, deadline, now), false);
+  KJ_EXPECT(!table.refuseWaiting(active));
+  KJ_EXPECT(table.state().active == 1);
+  KJ_EXPECT(table.state().overloads == 0);
+  KJ_EXPECT(table.refuseWaiting(waiting));
+  KJ_EXPECT(!table.refuseWaiting(waiting));
+  KJ_EXPECT(table.state().overloads == 1);
+  KJ_EXPECT(table.state().waiting == 0);
+  KJ_EXPECT((table.state().reserved == reserved));
+  KJ_EXPECT(table.complete(active, 1));
+  KJ_EXPECT(table.stopIdleTree(active.tree, 1));
+  KJ_EXPECT(table.releaseTree(active.tree, 1));
+
+  const auto unassigned = queued(table.queue(second, open, 20, deadline, now), true);
+  KJ_EXPECT(table.refuseWaiting(unassigned));
+  KJ_EXPECT(table.releaseUnassigned(unassigned.tree));
+  KJ_EXPECT((table.state().reserved == Admission::Resources{}));
+  KJ_EXPECT(table.state().overloads == 2);
+}
+
 KJ_TEST("durable admission retains a closing tree until its home acknowledges release") {
   Admission table(limits, 1);
   const auto old = queued(table.queue(first, open, 30, deadline, now), true);

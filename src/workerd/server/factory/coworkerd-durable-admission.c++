@@ -177,6 +177,17 @@ DurableAdmission::Cancellation DurableAdmission::cancel(Ticket ticket) {
   return Cancellation::RELEASED;
 }
 
+bool DurableAdmission::refuseWaiting(Ticket ticket) {
+  auto entry = trees.find(ticket.tree);
+  if (entry == trees.end()) return false;
+  auto& tree = entry->second;
+  auto event = tree.events.find(ticket.event);
+  if (event == tree.events.end() || event->second.phase != Phase::WAITING) return false;
+  releaseEvent(tree, event);
+  ++counters.overloads;
+  return true;
+}
+
 bool DurableAdmission::complete(Ticket ticket, uint64_t home) {
   auto entry = trees.find(ticket.tree);
   if (entry == trees.end() || home == 0 || entry->second.home != home) return false;
