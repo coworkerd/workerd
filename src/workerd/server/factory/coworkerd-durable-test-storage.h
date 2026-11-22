@@ -33,8 +33,8 @@ class DurableStorage {
   WalImage walImage(kj::StringPtr uniqueKey, kj::StringPtr storageId, uint facet) const;
 
   kj::Own<FacetTreeIndex> openFacetIndex(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
-  void deleteFacet(
-      kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index, uint facet) const;
+  void deleteFacet(kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index, uint facet,
+      kj::Maybe<kj::Function<void(uint)>&> report = kj::none) const;
   void cloneFacet(kj::StringPtr uniqueKey,
       kj::StringPtr storageId,
       FacetTreeIndex& index,

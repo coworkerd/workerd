@@ -407,16 +407,15 @@ bool durableLogEnabled() {
   return settings().fd >= 0;
 }
 
-void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId) {
-  if (!durableLogEnabled()) return;
+namespace {
+
+kj::Array<kj::byte> deletedFacetMessage(kj::StringPtr objectName, uint facetId, uint64_t openId) {
   Writer w;
   w.u8(MSG_DELETED);
   w.str(kj::str(objectName, "/", facetId));
   w.u64(monoNs());
-  Replicator::get().send(w.finish());
+  return w.finish(openId);
 }
-
-namespace {
 
 kj::Array<kj::byte> alarmMessage(kj::StringPtr objectName, uint facetId,
     kj::Maybe<kj::Date> scheduledTime, uint64_t openId) {
@@ -437,6 +436,10 @@ kj::Array<kj::byte> alarmMessage(kj::StringPtr objectName, uint facetId,
 }
 
 }  // namespace
+
+void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId) {
+  if (durableLogEnabled()) Replicator::get().send(deletedFacetMessage(objectName, facetId, 0));
+}
 
 void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime) {
   if (durableLogEnabled()) Replicator::get().send(alarmMessage(objectName, facetId, scheduledTime, 0));
@@ -605,6 +608,10 @@ void DurableLogShipper::afterReset(SqliteDatabase& database) {
 
 void DurableLogShipper::reportAlarm(kj::Maybe<kj::Date> scheduledTime) {
   channel.send(openId, alarmMessage(name.objectName, name.facetId, scheduledTime, openId));
+}
+
+void DurableLogShipper::reportFacetDeleted(uint facet) {
+  channel.send(openId, deletedFacetMessage(name.objectName, facet, openId));
 }
 
 int DurableLogShipper::walHook(void* arg, sqlite3*, const char*, int frames) {

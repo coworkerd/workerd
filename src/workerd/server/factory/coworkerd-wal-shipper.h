@@ -133,6 +133,7 @@ class DurableLogShipper {
   // again and the node is told to start the object from empty.
   void afterReset(SqliteDatabase& db);
   void reportAlarm(kj::Maybe<kj::Date> scheduledTime);
+  void reportFacetDeleted(uint facet);
 
   kj::StringPtr getKey() {
     return key;

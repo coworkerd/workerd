@@ -4834,7 +4834,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
     requireIdle(name);
     abortFacet(name, KJ_EXCEPTION(DISCONNECTED, "Facet was deleted."));
     auto &index = tree->facetIndex();
-    tree->storage().deleteFacet(tree->uniqueKey, tree->storageId, index, index.getId(facet, name));
+    deleteStoredFacet(index, index.getId(facet, name));
   }
 
   void cloneFacet(kj::StringPtr source, kj::StringPtr destination) override {
@@ -4845,7 +4845,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
     auto &index = tree->facetIndex();
     const auto from = index.getId(facet, source);
     const auto to = index.getId(facet, destination);
-    tree->storage().deleteFacet(tree->uniqueKey, tree->storageId, index, to);
+    deleteStoredFacet(index, to);
     tree->storage().cloneFacet(tree->uniqueKey, tree->storageId, index, from, to);
   }
 
@@ -4867,7 +4867,26 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
     }
   }
 
+  void resetStorage(SqliteDatabase& database, server::DurableLogShipper& shipper) {
+    for (const auto& [name, child]: children) {
+      KJ_REQUIRE(!child->busy(), "cannot reset storage with a live descendant facet");
+    }
+    stop();
+    database.run("PRAGMA journal_mode=WAL;");
+    shipper.afterReset(database);
+    auto& index = tree->facetIndex();
+    index.forEachChild(facet, [&](uint child, kj::StringPtr) { deleteStoredFacet(index, child); });
+  }
+
  private:
+  void deleteStoredFacet(server::FacetTreeIndex& index, uint target) {
+    kj::Function<void(uint)> report = [&](uint deleted) {
+      auto shipper = tree->shippers.find(facet);
+      if (shipper != tree->shippers.end()) shipper->second->reportFacetDeleted(deleted);
+    };
+    tree->storage().deleteFacet(tree->uniqueKey, tree->storageId, index, target, report);
+  }
+
   void requireIdle(kj::StringPtr name) {
     auto at = children.find(std::string(name.begin(), name.size()));
     KJ_REQUIRE(at == children.end() || !at->second->busy(), "durable test facet is busy");
@@ -4963,7 +4982,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
   auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
   auto *borrowedObserver = observer.get();
   if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
-  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName), position](const ActorCache::SharedLru &, OutputGate &gate,
+  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName), position, borrowedHooks](const ActorCache::SharedLru &, OutputGate &gate,
                        ActorCache::Hooks &,
                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
     const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
@@ -4976,9 +4995,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
       auto* current = shipper.get();
       KJ_REQUIRE(tree->shippers.emplace(facet, current).second, "durable facet is already open");
       shipper = kj::mv(shipper).attach(kj::defer([tree, facet] { tree->shippers.erase(facet); }));
-      database->afterReset([current](SqliteDatabase& reset) {
-        reset.run("PRAGMA journal_mode=WAL;");
-        current->afterReset(reset);
+      database->afterReset([current, borrowedHooks](SqliteDatabase& reset) {
+        borrowedHooks->resetStorage(reset, *current);
       });
       auto alarms = kj::heap<DurableAlarmReporter>(*current, facet);
       if (facet == 0) current->reportAlarm(server::readDurableAlarm(*database));

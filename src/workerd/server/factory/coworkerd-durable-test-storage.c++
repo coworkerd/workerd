@@ -79,10 +79,12 @@ kj::Own<FacetTreeIndex> DurableStorage::openFacetIndex(
 }
 
 void DurableStorage::deleteFacet(
-    kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index, uint facet) const {
+    kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index, uint facet,
+    kj::Maybe<kj::Function<void(uint)>&> report) const {
   KJ_REQUIRE(facet != 0, "expected a facet ID");
   index.forEachChild(
-      facet, [&](uint child, kj::StringPtr) { deleteFacet(uniqueKey, storageId, index, child); });
+      facet, [&](uint child, kj::StringPtr) { deleteFacet(uniqueKey, storageId, index, child, report); });
+  KJ_IF_SOME(deleted, report) deleted(facet);
   for (auto suffix: {""_kj, "-wal"_kj, "-shm"_kj}) {
     directory->tryRemove(databasePath(uniqueKey, storageId, facet, suffix));
   }
