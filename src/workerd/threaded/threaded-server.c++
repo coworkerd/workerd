@@ -3599,6 +3599,7 @@ class ChannelDispatcher final: public rpc::EventDispatcher::Server {
     return kj::READY_NOW;
   }
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
+    if (state.durableHome) unsupported("JavaScript RPC in the durable test role");
     KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
     return api::JsRpcSessionCustomEvent::receiveRpc(kj::mv(context), kj::mv(worker));
   }
