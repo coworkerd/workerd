@@ -4912,7 +4912,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
   }
 
   void resetStorage(SqliteDatabase& database, server::DurableLogShipper& shipper) {
-    for (const auto& [name, child]: children) {
+    for (auto& [name, child]: children) {
       KJ_REQUIRE(!child->busy(), "cannot reset storage with a live descendant facet");
     }
     stop();
