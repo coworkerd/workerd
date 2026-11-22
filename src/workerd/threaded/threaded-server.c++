@@ -1270,7 +1270,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
               owner.memoryMiB,
               identity,
               nullptr,
-              !owner.durableEvents) {}
+              !owner.durableEvents && (startup || IoContext::hasCurrent())) {}
     ~Startup() noexcept(false) {
       execution.finish();
       totalCpu += nowNs(CLOCK_THREAD_CPUTIME_ID) - start;
