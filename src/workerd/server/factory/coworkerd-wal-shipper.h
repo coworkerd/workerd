@@ -67,6 +67,23 @@ struct DurableObjectName {
   }
 };
 
+class DurableLogShipper;
+
+// A WAL shipper and its notifications stay on the SQLite connection's event loop.
+// The channel is responsible for the wire, request IDs and confirmation deadlines.
+class DurableWalChannel {
+ public:
+  virtual bool enabled() const = 0;
+  virtual uint64_t nextRequest() = 0;
+  virtual uint64_t registerShipper(DurableLogShipper& shipper) = 0;
+  virtual void unregisterShipper(DurableLogShipper& shipper) = 0;
+  virtual void send(DurableLogShipper& shipper, kj::Array<kj::byte> message) = 0;
+  virtual kj::Promise<void> sendFrames(DurableLogShipper& shipper,
+      kj::Array<kj::byte> message, uint64_t request, kj::Timer& timer) = 0;
+
+  virtual ~DurableWalChannel() noexcept(false) = default;
+};
+
 class DurableLogShipper {
  public:
   DurableLogShipper(const kj::Directory& directory,
@@ -75,6 +92,13 @@ class DurableLogShipper {
       DurableObjectName name,
       SqliteDatabase& db,
       kj::Timer& timer);
+  DurableLogShipper(const kj::Directory& directory,
+      kj::Path walPath,
+      kj::Path databasePath,
+      DurableObjectName name,
+      SqliteDatabase& db,
+      kj::Timer& timer,
+      DurableWalChannel& channel);
   ~DurableLogShipper() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(DurableLogShipper);
 
@@ -92,6 +116,9 @@ class DurableLogShipper {
   kj::StringPtr getKey() {
     return key;
   }
+  uint64_t getOpenId() const {
+    return openId;
+  }
 
   // From the replicator.
   void onAcked(uint64_t request);
@@ -107,6 +134,8 @@ class DurableLogShipper {
   kj::String key;
   SqliteDatabase* db;
   kj::Timer& timer;
+  DurableWalChannel& channel;
+  uint64_t openId = 0;
 
   // The WAL generation being read: its header, how far it has been read (always a commit frame) and the running
   // checksum there.

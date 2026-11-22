@@ -77,6 +77,46 @@ wd_cc_library(
     ],
 )
 
+wd_cc_library(
+    name = "coworkerd-wal",
+    srcs = ["coworkerd-wal-shipper.c++"],
+    hdrs = ["coworkerd-wal-shipper.h", "coworkerd-wal-wire.h"],
+    deps = [
+        "//src/workerd/util:sqlite",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj:kj-async-io",
+        "@sqlite3",
+    ],
+)
+
+wd_cc_library(
+    name = "coworkerd-threaded-wal",
+    srcs = ["coworkerd-threaded-wal.c++"],
+    hdrs = ["coworkerd-threaded-wal.h"],
+    visibility = ["//src/workerd/threaded:__pkg__"],
+    deps = [
+        ":coworkerd-wal",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj:kj-async-io",
+    ],
+)
+
+wd_cc_library(
+    name = "coworkerd-threaded-wal-source",
+    testonly = True,
+    textual_hdrs = ["coworkerd-threaded-wal.c++", "coworkerd-threaded-wal.h"],
+    deps = [
+        ":coworkerd-wal",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj:kj-async-io",
+    ],
+)
+
+kj_test(
+    src = "coworkerd-threaded-wal-test.c++",
+    deps = [":coworkerd-threaded-wal-source"],
+)
+
 # The C++ side of the Rust server: compiles workers, starts requests, builds actors and their
 # storage, serves the capnp RPC protocols, encodes channel tokens, runs the inspector.
 wd_cc_library(
@@ -93,16 +133,16 @@ wd_cc_library(
         "coworkerd-gc.h",
         "coworkerd-idle-eviction.c++",
         "coworkerd-idle-eviction.h",
-        "coworkerd-wal-shipper.c++",
         "worker-factory-actor.c++",
         "worker-factory-impl.h",
         "worker-factory-listen.c++",
         "worker-factory-rpc.c++",
     ],
-    hdrs = ["coworkerd-channels.h", "coworkerd-wal-shipper.h"],
+    hdrs = ["coworkerd-channels.h"],
     linkstatic = CC_LIBRARY_LINKSTATIC,
     deps = [
         ":coworkerd-sandbox",
+        ":coworkerd-wal",
         ":worker-factory-hdrs",
         "@sqlite3",
         "//src/rust/worker:bridge",
@@ -155,6 +195,7 @@ wd_cc_library(
     deps = [
         ":bootstrap-hdrs",
         ":coworkerd-sandbox",
+        ":coworkerd-wal",
         ":worker-factory",
         "//src/pyodide:pyodide_extra_capnp",
         "//src/rust/cxx/kj-rs",
