@@ -20,6 +20,8 @@
 #include <kj/map.h>
 #include <kj/timer.h>
 
+#include <array>
+
 namespace workerd::server {
 
 // Registered by Bootstrap before serving; the inherited descriptor uses this provider.
@@ -38,6 +40,7 @@ void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId);
 // is told at every change (ActorSqlite's scheduleRun hook) and whenever a database is opened -- which is how a node
 // that took the shard over learns, from the object's own files, what is still due and what has already run.
 void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime);
+kj::Maybe<kj::Date> readDurableAlarm(SqliteDatabase& db);
 
 // How many objects this process holds resident, how many it has evicted for the resident limit and how many it has
 // woken again, with the time the wakes took. Sent when the numbers change, at most once a second.
@@ -67,6 +70,33 @@ struct DurableObjectName {
   }
 };
 
+struct DurableWalPosition {
+  std::array<kj::byte, 32> header{};
+  uint32_t magic = 0, pageSize = 0, salt1 = 0, salt2 = 0;
+  uint32_t checksum1 = 0, checksum2 = 0, frames = 0;
+};
+
+// Reads the committed prefix of a cold image before its home opens SQLite.
+DurableWalPosition readDurableWalPosition(const kj::Directory& directory, const kj::Path& path);
+
+class DurableLogShipper;
+
+// A WAL shipper and its notifications stay on the SQLite connection's event loop.
+// The channel is responsible for the wire, request IDs and confirmation deadlines.
+class DurableWalChannel {
+ public:
+  virtual bool enabled() const = 0;
+  virtual uint64_t nextRequest() = 0;
+  virtual uint64_t registerShipper(DurableLogShipper& shipper) = 0;
+  virtual void unregisterShipper(DurableLogShipper& shipper) = 0;
+  virtual kj::Promise<void> waitForOpen(uint64_t, kj::Timer&) { return kj::READY_NOW; }
+  virtual void send(uint64_t openId, kj::Array<kj::byte> message) = 0;
+  virtual kj::Promise<void> sendFrames(DurableLogShipper& shipper,
+      kj::Array<kj::byte> message, uint64_t request, kj::Timer& timer) = 0;
+
+  virtual ~DurableWalChannel() noexcept(false) = default;
+};
+
 class DurableLogShipper {
  public:
   DurableLogShipper(const kj::Directory& directory,
@@ -75,8 +105,22 @@ class DurableLogShipper {
       DurableObjectName name,
       SqliteDatabase& db,
       kj::Timer& timer);
+  DurableLogShipper(const kj::Directory& directory,
+      kj::Path walPath,
+      kj::Path databasePath,
+      DurableObjectName name,
+      SqliteDatabase& db,
+      kj::Timer& timer,
+      DurableWalChannel& channel,
+      kj::Maybe<DurableWalPosition> prepared = kj::none,
+      uint64_t localOpenStartedNs = 0);
   ~DurableLogShipper() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(DurableLogShipper);
+
+  // ActorSqlite drops its commit callback (and the shipper it owns) before
+  // destroying its SQLite connection. The threaded channel reports closure only
+  // after that connection's destructor has run.
+  void reportAfterDatabaseClose();
 
   // ActorSqlite's commit callback: the frames of everything committed since the last one go to the replicator and
   // the promise resolves when it confirms them. It is rejected -- which breaks the output gate, so the object is
@@ -88,13 +132,22 @@ class DurableLogShipper {
   // SqliteDatabase::afterReset (the application called deleteAll()): the files were replaced, so the settings go on
   // again and the node is told to start the object from empty.
   void afterReset(SqliteDatabase& db);
+  void reportAlarm(kj::Maybe<kj::Date> scheduledTime);
+  void reportFacetDeleted(uint facet);
 
   kj::StringPtr getKey() {
     return key;
   }
+  uint64_t getOpenId() const {
+    return openId;
+  }
+  bool hasPendingWrites() const {
+    return inFlight.size() != 0;
+  }
 
   // From the replicator.
   void onAcked(uint64_t request);
+  void onRefused(uint64_t request);
   void onSealed(uint32_t salt1, uint32_t salt2, uint32_t upToFrame);
   void onBreak(kj::StringPtr reason);
   void onCheckpointAsked();
@@ -107,6 +160,9 @@ class DurableLogShipper {
   kj::String key;
   SqliteDatabase* db;
   kj::Timer& timer;
+  DurableWalChannel& channel;
+  uint64_t openId = 0;
+  kj::Array<kj::byte>* deferredClose = nullptr;
 
   // The WAL generation being read: its header, how far it has been read (always a commit frame) and the running
   // checksum there.
@@ -146,7 +202,7 @@ class DurableLogShipper {
   void maybeCheckpoint(kj::StringPtr reason);
   uint64_t walBytes();
   uint64_t databaseBytes();
-  void sendOpen();
+  void sendOpen(uint64_t localOpenNs);
 };
 
 }  // namespace workerd::server

@@ -877,6 +877,10 @@ SqliteDatabase::~SqliteDatabase() noexcept(false) {
 
   sqlite3_progress_handler(db, 0, nullptr, nullptr);
   auto err = sqlite3_close(db);
+  if (err == SQLITE_OK) {
+    KJ_IF_SOME(closed, afterCloseCallback) closed();
+    return;
+  }
   if (err == SQLITE_BUSY) {
     KJ_LOG(ERROR, "sqlite database destroyed while dependent objects still exist");
     // SQLite actually provides a lazy-close API which we might as well use here instead of leaking
