@@ -3718,8 +3718,10 @@ class DurableTestHttp final: public kj::HttpService {
 
 class ChannelDispatcher final: public rpc::EventDispatcher::Server {
  public:
-  ChannelDispatcher(ThreadState &state, kj::Own<WorkerInterface> worker,
-      std::shared_ptr<Slot> bindingSlot = {}, kj::String bindingIdentity = {})
+  ChannelDispatcher(ThreadState &state,
+      kj::Own<WorkerInterface> worker,
+      std::shared_ptr<Slot> bindingSlot = {},
+      kj::String bindingIdentity = nullptr)
       : state(state),
         worker(kj::mv(worker)),
         bindingSlot(std::move(bindingSlot)),
@@ -3739,6 +3741,7 @@ class ChannelDispatcher final: public rpc::EventDispatcher::Server {
  private:
   ThreadState &state;
   kj::Own<WorkerInterface> worker;
+  // Only a node-dispatched invocation receives the platform binding handshake.
   std::shared_ptr<Slot> bindingSlot;
   kj::String bindingIdentity;
 };
@@ -4565,27 +4568,27 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
   bool bound = false;
 };
 
-void startBindingRpcSession(rpc::EventDispatcher::JsRpcSessionResults::Builder results,
-    WorkerInterface &worker, kj::Own<void> invocation, std::shared_ptr<Slot> slot, kj::String identity) {
+void startBoundRpcSession(rpc::EventDispatcher::JsRpcSessionResults::Builder results,
+    kj::Own<WorkerInterface> entry,
+    std::shared_ptr<Slot> slot,
+    kj::String identity) {
   auto event = kj::heap<api::JsRpcSessionCustomEvent>(
       api::JsRpcSessionCustomEvent::WORKER_RPC_EVENT_TYPE, kj::none);
   auto target = event->getCap();
-  auto completed = worker.customEvent(kj::mv(event));
+  auto completed = entry->customEvent(kj::mv(event));
   results.setTopLevel(kj::heap<BindingTarget>(std::move(slot), kj::mv(target), kj::mv(identity)));
-  results.setSession(completed.then(
-      [invocation = kj::mv(invocation)](auto) { return rpc::JsRpcSession::Client(nullptr); }));
+  results.setSession(
+      completed.then([entry = kj::mv(entry)](auto) { return rpc::JsRpcSession::Client(nullptr); }));
 }
 
 kj::Promise<void> ChannelDispatcher::jsRpcSession(JsRpcSessionContext context) {
-  if (state.durableHome && !state.wal) unsupported("JavaScript RPC in the durable test role");
   KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
-  if (!bindingSlot) {
-    return api::JsRpcSessionCustomEvent::receiveRpc(kj::mv(context), kj::mv(worker));
+  if (bindingSlot) {
+    startBoundRpcSession(
+        context.getResults(), kj::mv(worker), std::move(bindingSlot), kj::mv(bindingIdentity));
+    return kj::READY_NOW;
   }
-  auto &entry = *worker;
-  startBindingRpcSession(context.getResults(), entry, kj::mv(worker), std::move(bindingSlot),
-      kj::mv(bindingIdentity));
-  return kj::READY_NOW;
+  return api::JsRpcSessionCustomEvent::receiveRpc(kj::mv(context), kj::mv(worker));
 }
 
 class HttpEntryObserver final: public RequestObserver {
@@ -5211,13 +5214,11 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
     kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
         KJ_EXCEPTION(OVERLOADED, "durable object reset is still draining"), "DO_UNAVAILABLE"));
   }
-  auto bindingSlot = state.wal ? slot : std::shared_ptr<Slot>();
-  auto identity = bindingSlot ? invocationIdentity(*bindingSlot, input) : kj::String();
-  auto prepared =
-      prepareInvocation(state, server, std::move(slot), input, descriptor, kj::mv(props), nullptr,
-          nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*found->second.actor));
+  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props), nullptr,
+      nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*found->second.actor));
+  auto identity = invocationIdentity(*slot, input);
   co_return rpc::EventDispatcher::Client(kj::heap<ChannelDispatcher>(
-      state, kj::mv(prepared.entry), std::move(bindingSlot), kj::mv(identity)));
+      state, kj::mv(prepared.entry), std::move(slot), kj::mv(identity)));
 }
 
 kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
@@ -5289,11 +5290,11 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
     co_await server.confirmDecision(input, state, "load-rejected", error.getDescription(), stage);
     kj::throwRecoverableException(error.clone());
   }
-  auto prepared = kj::heap<PreparedInvocation>(prepareInvocation(state, server, slot, input,
-      descriptor, kj::mv(props), std::move(preparation), std::move(tenant)));
-  auto &entry = *prepared->entry;
+  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props),
+      std::move(preparation), std::move(tenant));
   auto identity = invocationIdentity(*slot, input);
-  startBindingRpcSession(context.getResults(), entry, kj::mv(prepared), std::move(slot),
+  startBoundRpcSession(context.getResults(),
+      kj::mv(prepared.entry).attach(kj::mv(prepared.invocation)), std::move(slot),
       kj::mv(identity));
 }
 
