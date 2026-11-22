@@ -2114,18 +2114,28 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
   bool used = false;
 };
 
+// An event that is still being prepared when its session ends is canceled with the session.
+// Cap'n Proto lets the startEvent call itself run on (its interface does not allow
+// cancellation), while the session's tree and home are released as soon as it has ended.
+struct DurableSessionScope {
+  kj::Canceler preparing;
+  bool ended = false;
+};
+
 class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
  public:
   DurableBootstrap(ThreadedServer &server,
       ThreadState &state,
       DurableRoute route,
       server::DurableAdmission::Ticket ticket,
-      kj::Own<kj::PromiseFulfiller<void>> accepted)
+      kj::Own<kj::PromiseFulfiller<void>> accepted,
+      std::shared_ptr<DurableSessionScope> scope)
       : server(server),
         state(state),
         route(std::move(route)),
         ticket(ticket),
-        accepted(kj::mv(accepted)) {}
+        accepted(kj::mv(accepted)),
+        scope(std::move(scope)) {}
 
   kj::Promise<void> startEvent(StartEventContext context) override;
   kj::Promise<void> startNativeEvent(StartNativeEventContext context) override;
@@ -2136,6 +2146,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
   DurableRoute route;
   server::DurableAdmission::Ticket ticket;
   kj::Own<kj::PromiseFulfiller<void>> accepted;
+  std::shared_ptr<DurableSessionScope> scope;
   bool used = false;
 
   kj::Promise<kj::Own<WorkerInterface>> prepare(kj::String descriptor, Frankenvalue props);
@@ -2690,6 +2701,13 @@ struct ThreadedServer {
       }
       finishDurable(call.ticket);
     });
+    // Runs before the release above: an event this session was still preparing ends here,
+    // and with it the waiter it has on a cold load.
+    auto scope = std::make_shared<DurableSessionScope>();
+    KJ_DEFER({
+      scope->ended = true;
+      scope->preparing.cancel("durable session ended before its event was prepared");
+    });
     const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
         call.deadline - server::DurableAdmission::Clock::now());
     if (remaining.count() <= 0) co_return;
@@ -2698,7 +2716,7 @@ struct ThreadedServer {
     auto stream = state.io.lowLevelProvider->wrapSocketFd(kj::mv(call.socket));
     auto accepted = kj::newPromiseAndFulfiller<void>();
     capnp::TwoPartyServer session(kj::heap<DurableBootstrap>(
-        *this, state, std::move(call.route), call.ticket, kj::mv(accepted.fulfiller)));
+        *this, state, std::move(call.route), call.ticket, kj::mv(accepted.fulfiller), scope));
     auto disconnected = session.accept(*stream).fork();
     try {
       co_await state.io.provider->getTimer()
@@ -5011,7 +5029,9 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
   KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
       "unsupported durable test event origin");
   try {
-    auto worker = co_await prepare(kj::str(params.getCfBlobJson()), Frankenvalue());
+    KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
+    auto worker =
+        co_await scope->preparing.wrap(prepare(kj::str(params.getCfBlobJson()), Frankenvalue()));
     context.getResults().setDispatcher(kj::heap<ChannelDispatcher>(state, kj::mv(worker)));
     if (accepted->isWaiting()) accepted->fulfill();
   } catch (const kj::Exception &error) {
@@ -5023,8 +5043,9 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
 kj::Promise<void> DurableBootstrap::startNativeEvent(StartNativeEventContext context) {
   auto params = context.getParams();
   try {
-    auto worker = co_await prepare(
-        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()));
+    KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
+    auto worker = co_await scope->preparing.wrap(prepare(
+        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps())));
     context.getResults().setDispatcher(kj::heap<ChannelDispatcher>(state, kj::mv(worker)));
     if (accepted->isWaiting()) accepted->fulfill();
   } catch (const kj::Exception &error) {
