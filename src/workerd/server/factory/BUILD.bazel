@@ -4,6 +4,60 @@ load("//:build/wd_cc_library.bzl", "wd_cc_library")
 
 package(default_visibility = ["//src/workerd/server:__subpackages__"])
 
+wd_cc_library(
+    name = "coworkerd-durable-admission",
+    srcs = ["coworkerd-durable-admission.c++"],
+    hdrs = ["coworkerd-durable-admission.h"],
+    visibility = ["//src/workerd/threaded:__pkg__"],
+    deps = ["@capnp-cpp//src/kj"],
+)
+
+kj_test(
+    src = "coworkerd-durable-admission-test.c++",
+    deps = [":coworkerd-durable-admission"],
+)
+
+wd_cc_library(
+    name = "coworkerd-durable-cpu",
+    hdrs = ["coworkerd-durable-cpu.h"],
+    visibility = ["//src/workerd/threaded:__pkg__"],
+)
+
+kj_test(
+    src = "coworkerd-durable-cpu-test.c++",
+    deps = [":coworkerd-durable-cpu"],
+)
+
+wd_cc_library(
+    name = "coworkerd-durable-placement",
+    srcs = ["coworkerd-durable-placement.c++"],
+    hdrs = ["coworkerd-durable-placement.h"],
+    visibility = ["//src/workerd/threaded:__pkg__"],
+    deps = ["@capnp-cpp//src/kj"],
+)
+
+kj_test(
+    src = "coworkerd-durable-placement-test.c++",
+    deps = [":coworkerd-durable-placement"],
+)
+
+wd_cc_library(
+    name = "coworkerd-durable-test-storage",
+    srcs = ["coworkerd-durable-test-storage.c++"],
+    hdrs = ["coworkerd-durable-test-storage.h"],
+    visibility = ["//src/workerd/threaded:__pkg__"],
+    deps = [
+        "//src/workerd/server:facet-tree-index",
+        "//src/workerd/util:sqlite",
+        "@capnp-cpp//src/kj",
+    ],
+)
+
+kj_test(
+    src = "coworkerd-durable-test-storage-test.c++",
+    deps = [":coworkerd-durable-test-storage"],
+)
+
 # The declarations the server crate's bridge header needs. Header-only: the bridge library depends
 # on it, and :worker-factory depends on the bridge library, so the two cannot be one target.
 wd_cc_library(

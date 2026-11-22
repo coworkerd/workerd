@@ -22,6 +22,7 @@ class TrackedWasmInstanceList;
 
 struct ActorCacheSharedLruOptions;
 class IoContext;
+class IoContext_IncomingRequest;
 class SqlExecutionBudget;
 
 namespace jsg {
@@ -138,6 +139,15 @@ class LimitEnforcer {
   // limits on that code execution, particularly the CPU limit. The returned `Own<void>` should
   // be dropped when JavaScript is done, before unlocking the isolate.
   virtual kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) = 0;
+
+  // Actor contexts can outlive individual requests. Embedders that account for each event
+  // separately can tag the initial callback so asynchronous work inherits its request.
+  virtual kj::Own<void> enterActorEvent(jsg::Lock&, IoContext_IncomingRequest&) {
+    return {};
+  }
+  virtual kj::Maybe<IoContext_IncomingRequest&> getActorEventRequest() {
+    return kj::none;
+  }
 
   // Called on each new event delivered that should cause an actor's resource limits to be
   // "topped up". This method does nothing if the IoContext is not an actor. Note that this must

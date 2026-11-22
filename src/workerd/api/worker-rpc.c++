@@ -2159,15 +2159,17 @@ class JsRpcTargetBase: public rpc::JsRpcTarget::Server, public kj::PtrTarget {
 
   // Constructor use by EntrypointJsRpcTarget, which is revoked and destroyed before the IoContext
   // can possibly be canceled. It can just use ctx.run().
-  JsRpcTargetBase(IoContext& ctx, CantOutliveIncomingRequest)
+  JsRpcTargetBase(IoContext& ctx, IoContext::IncomingRequest& request, CantOutliveIncomingRequest)
       : durableObjectId(getCurrentDurableObjectId()),
-        enterIsolateAndCall([this, &ctx](CallContext callContext) {
+        enterIsolateAndCall([this, &ctx, &request](CallContext callContext) {
           // Note: No need to topUpActor() since this is the start of a top-level request, so the
           // actor will already have been topped up by IncomingRequest::delivered().
-          return ctx.run([weakThis = addWeakToThis(), callContext](
+          return ctx.run([weakThis = addWeakToThis(), callContext, &request](
                              Worker::Lock& lock, IoContext& ctx) mutable {
-            return KJ_REQUIRE_NONNULL(weakThis.tryGet(), "RPC target destroyed before call ran")
-                .callImpl(lock, ctx, callContext);
+            auto& self =
+                KJ_REQUIRE_NONNULL(weakThis.tryGet(), "RPC target destroyed before call ran");
+            auto limitScope = request.enterActorEvent(lock);
+            return self.callImpl(lock, ctx, callContext);
           });
         }),
         externalPusher(ctx.getExternalPusher()) {}
@@ -3367,7 +3369,7 @@ class EntrypointJsRpcTarget final: public JsRpcTargetBase {
       kj::Maybe<kj::Rc<BaseTracer>> tracer,
       IoContext::IncomingRequest& incomingRequest,
       bool isDynamicDispatch)
-      : JsRpcTargetBase(ioCtx, CantOutliveIncomingRequest()),
+      : JsRpcTargetBase(ioCtx, incomingRequest, CantOutliveIncomingRequest()),
         ioCtx(ioCtx),
         metrics(kj::mv(metrics)),
         // Most of the time we don't really have to clone this but it's hard to fully prove, so

@@ -81,11 +81,17 @@ constexpr uint64_t SQL_CPU_SAMPLING_CAP_NS = 250000;
 bool SqlExecutionBudget::isEnabled() { return sqlCpuLimitNs() != 0 || sqlWallLimitNs() != 0; }
 SqlExecutionBudget::SqlExecutionBudget()
     : cpuLimitNs(sqlCpuLimitNs()), wallLimitNs(sqlWallLimitNs()) {}
+SqlExecutionBudget::SqlExecutionBudget(uint64_t eventCpuLimitNs, uint64_t threadCpuDeadlineNs)
+    : cpuLimitNs(eventCpuLimitNs),
+      wallLimitNs(kj::maxValue),
+      threadCpuDeadline(threadCpuDeadlineNs) {}
 kj::String SqlExecutionBudget::describe() const {
   const bool cpu = cause == Cause::CPU;
   return kj::str("SQL_LIMIT_EXCEEDED: ", cpu ? "cpu" : "wall", " limit ",
       (cpu ? cpuLimitNs : wallLimitNs) / 1000000, "ms exceeded",
-      cpu ? " (short SQL CPU is sampled; long native segments are measured)" : "");
+      cpu && threadCpuDeadline == kj::none
+          ? " (short SQL CPU is sampled; long native segments are measured)"
+          : "");
 }
 
 bool SqliteDatabase::sampleSqlExecution() {
@@ -116,7 +122,7 @@ struct SqliteDatabase::ExecutionScope {
         previous(database.activeExecutionScope) {
     // Acquire entropy before installing this stack scope: the random source may throw.
     const bool enter = budget && !check(CheckMode::BOUNDARY);
-    if (enter) sampled = database.sampleSqlExecution();
+    if (enter && budget->threadCpuDeadline == kj::none) sampled = database.sampleSqlExecution();
     if (previous != nullptr) previous->pause();
     database.activeExecutionScope = this;
     if (enter && !check(CheckMode::BOUNDARY)) resume();
@@ -154,6 +160,14 @@ struct SqliteDatabase::ExecutionScope {
   bool check(CheckMode mode = CheckMode::PROGRESS) noexcept {
     if (!budget) return false;
     if (budget->cause != SqlExecutionBudget::Cause::NONE) return true;
+    KJ_IF_SOME(deadline, budget->threadCpuDeadline) {
+      const auto wall = sqlWallNow();
+      if (mode == CheckMode::BOUNDARY || wall - lastCpuSampleWall >= SQL_CPU_SAMPLE_NS) {
+        lastCpuSampleWall = wall;
+        if (sqlCpuNow() >= deadline) budget->cause = SqlExecutionBudget::Cause::CPU;
+      }
+      return budget->cause != SqlExecutionBudget::Cause::NONE;
+    }
     if (mode == CheckMode::BOUNDARY) {
       if (budget->cpuUsedNs >= budget->cpuLimitNs) budget->cause = SqlExecutionBudget::Cause::CPU;
       else if (budget->wallUsedNs >= budget->wallLimitNs) budget->cause = SqlExecutionBudget::Cause::WALL;
@@ -177,6 +191,7 @@ struct SqliteDatabase::ExecutionScope {
   }
   bool progress() noexcept {
     if (!budget) return false;
+    if (budget->threadCpuDeadline != kj::none) return check();
     if (!sawCallback) {
       sawCallback = true;
       if (!sampled) {

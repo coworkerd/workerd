@@ -4465,7 +4465,7 @@ Worker::Actor::Actor(const Worker& worker,
   }
 }
 
-void Worker::Actor::ensureConstructed(IoContext& context) {
+void Worker::Actor::ensureConstructed(IoContext& context, IoContext_IncomingRequest& request) {
   KJ_IF_SOME(info, impl->classInstance.tryGet<ActorClassInfo*>()) {
     // IMPORTANT: We need to set the state to "Initializing" synchronously, before
     // ensureConstructedImpl() actually executes and acquires the input lock.
@@ -4480,7 +4480,7 @@ void Worker::Actor::ensureConstructed(IoContext& context) {
     //
     // So the "actor still initializing" error in getHandler() should be impossible
     // unless a code path is bypassing the input lock mechanism.
-    context.addWaitUntil(ensureConstructedImpl(context, *info));
+    context.addWaitUntil(ensureConstructedImpl(context, *info, request.addWeak()));
     impl->classInstance = Impl::Initializing();
   }
 }
@@ -4512,7 +4512,8 @@ kj::Maybe<jsg::JsRef<jsg::JsFunction>> readOnHibernateHandler(
 
 }  // namespace
 
-kj::Promise<void> Worker::Actor::ensureConstructedImpl(IoContext& context, ActorClassInfo& info) {
+kj::Promise<void> Worker::Actor::ensureConstructedImpl(
+    IoContext& context, ActorClassInfo& info, kj::Weak<IoContext_IncomingRequest> request) {
   InputGate::Lock inputLock = co_await impl->inputGate.wait(context.getCurrentTraceSpan());
 
   try {
@@ -4532,7 +4533,12 @@ kj::Promise<void> Worker::Actor::ensureConstructedImpl(IoContext& context, Actor
       containerRunning = status.getRunning();
     }
 
-    co_await context.run([this, &info, containerRunning](Worker::Lock& lock, IoContext& context) {
+    co_await context.run(
+        [this, &info, containerRunning, &request](Worker::Lock& lock, IoContext& context) {
+      kj::Own<void> event;
+      KJ_IF_SOME(r, request.tryGet()) {
+        event = r.enterActorEvent(lock);
+      }
       jsg::Lock& js = lock;
 
       kj::Maybe<jsg::Ref<api::DurableObjectStorage>> storage;
