@@ -149,7 +149,7 @@ class Replicator final: public DurableWalChannel, private kj::TaskSet::ErrorHand
     return ++requestCounter;
   }
 
-  void send(DurableLogShipper&, kj::Array<kj::byte> message) override {
+  void send(uint64_t, kj::Array<kj::byte> message) override {
     send(kj::mv(message));
   }
 
@@ -359,8 +359,10 @@ void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId) {
   Replicator::get().send(w.finish());
 }
 
-void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime) {
-  if (!durableLogEnabled()) return;
+namespace {
+
+kj::Array<kj::byte> alarmMessage(kj::StringPtr objectName, uint facetId,
+    kj::Maybe<kj::Date> scheduledTime, uint64_t openId) {
   Writer w;
   w.u8(MSG_ALARM);
   w.str(kj::str(objectName, "/", facetId));
@@ -374,7 +376,24 @@ void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date>
     w.u64(0);
   }
   w.u64(monoNs());
-  Replicator::get().send(w.finish());
+  return w.finish(openId);
+}
+
+}  // namespace
+
+void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime) {
+  if (durableLogEnabled()) Replicator::get().send(alarmMessage(objectName, facetId, scheduledTime, 0));
+}
+
+kj::Maybe<kj::Date> readDurableAlarm(SqliteDatabase& db) {
+  {
+    auto exists =
+        db.run("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_cf_METADATA'");
+    if (exists.isDone()) return kj::none;
+  }
+  auto query = db.run("SELECT value FROM _cf_METADATA WHERE key = 1");
+  if (query.isDone() || query.isNull(0)) return kj::none;
+  return kj::UNIX_EPOCH + query.getInt64(0) * kj::NANOSECONDS;
 }
 
 void durableLogResidency(const DurableResidency& residency) {
@@ -455,7 +474,18 @@ DurableLogShipper::~DurableLogShipper() noexcept(false) {
   // The database's size as this instance leaves it: a small object may never checkpoint, and the node needs its
   // size for the tenant's storage and for the object's own limit.
   w.u64(databaseBytes());
-  channel.send(*this, w.finish(openId));
+  if (deferredClose != nullptr) *deferredClose = w.finish(openId);
+  else channel.send(openId, w.finish(openId));
+}
+
+void DurableLogShipper::reportAfterDatabaseClose() {
+  KJ_REQUIRE(openId != 0 && deferredClose == nullptr);
+  auto message = kj::heap<kj::Array<kj::byte>>();
+  auto* slot = message.get();
+  db->afterClose([&channel = channel, id = openId, message = kj::mv(message)]() mutable {
+    if (message->size() != 0) channel.send(id, kj::mv(*message));
+  });
+  deferredClose = slot;
 }
 
 void DurableLogShipper::configure(SqliteDatabase& database) {
@@ -499,7 +529,11 @@ void DurableLogShipper::afterReset(SqliteDatabase& database) {
   w.u32(name.parentFacetId);
   w.str(name.facetName);
   w.u64(monoNs());
-  channel.send(*this, w.finish(openId));
+  channel.send(openId, w.finish(openId));
+}
+
+void DurableLogShipper::reportAlarm(kj::Maybe<kj::Date> scheduledTime) {
+  channel.send(openId, alarmMessage(name.objectName, name.facetId, scheduledTime, openId));
 }
 
 int DurableLogShipper::walHook(void* arg, sqlite3*, const char*, int frames) {
@@ -664,6 +698,10 @@ void DurableLogShipper::onAcked(uint64_t request) {
   maybeCheckpoint("confirmed"_kj);
 }
 
+void DurableLogShipper::onRefused(uint64_t request) {
+  inFlight.erase(request);
+}
+
 void DurableLogShipper::onSealed(uint32_t s1, uint32_t s2, uint32_t upToFrame) {
   if (!haveHeader || s1 != salt1 || s2 != salt2) return;
   sealedFrames = kj::max(sealedFrames, upToFrame);
@@ -713,7 +751,7 @@ void DurableLogShipper::sendOpen() {
   w.u64(walBytes());
   w.u64(databaseBytes());
   w.u64(monoNs());
-  channel.send(*this, w.finish(openId));
+  channel.send(openId, w.finish(openId));
 }
 
 // A checkpoint moves the WAL's pages into the database file and truncates it. It runs on this process's event loop
@@ -751,7 +789,7 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
   w.u64(start);
   w.u64(took);
   w.str(reason);
-  channel.send(*this, w.finish(openId));
+  channel.send(openId, w.finish(openId));
   // The next commit opens a new generation: a new header at the head of the truncated file, new salts, frames from
   // one again.
   haveHeader = false;

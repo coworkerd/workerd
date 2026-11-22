@@ -230,6 +230,9 @@ class Session {
       case MSG_CHECKPOINT_ASKED:
         KJ_REQUIRE(payload.size() == 0, "invalid threaded WAL checkpoint");
         break;
+      case MSG_CLOSE_ASKED:
+        KJ_REQUIRE(payload.size() == 0, "invalid threaded WAL close request");
+        break;
       default:
         KJ_FAIL_REQUIRE("unknown threaded WAL reply", type);
     }
@@ -240,8 +243,9 @@ class Session {
 
 class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
  public:
-  explicit Home(std::shared_ptr<Shared> shared)
-      : shared(kj::mv(shared)), inbox(std::make_shared<Inbox>()), tasks(*this) {
+  Home(std::shared_ptr<Shared> shared, kj::Function<void(uint64_t)> requestClose)
+      : shared(kj::mv(shared)), inbox(std::make_shared<Inbox>()),
+        requestClose(kj::mv(requestClose)), tasks(*this) {
     tasks.add(read());
   }
 
@@ -259,9 +263,9 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
     shippers.erase(shipper.getOpenId());
   }
 
-  void send(DurableLogShipper& shipper, kj::Array<kj::byte> message) override {
+  void send(uint64_t openId, kj::Array<kj::byte> message) override {
     const auto type = message[4];
-    if (!shared->post({.bytes = kj::mv(message), .openId = shipper.getOpenId(), .inbox = inbox}, true)) {
+    if (!shared->post({.bytes = kj::mv(message), .openId = openId, .inbox = inbox}, true)) {
       // Losing a control record could leave a dirty image registered. Fail the whole
       // channel so the node uses generation recovery.
       shared->stop();
@@ -276,6 +280,7 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
     if (!shared->post({.bytes = kj::mv(message), .openId = openId,
           .request = request, .ack = kj::mv(paf.fulfiller)}, false)) {
       gaveUp(openId, request, shipper.getKey(), true);
+      shipper.onRefused(request);
       return kj::Promise<void>(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
     }
     auto ack = waitForAck(openId, request, kj::str(shipper.getKey()), timer, kj::mv(paf.promise)).fork();
@@ -289,6 +294,7 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
   std::shared_ptr<Shared> shared;
   std::shared_ptr<Inbox> inbox;
   std::map<uint64_t, DurableLogShipper*> shippers;
+  kj::Function<void(uint64_t)> requestClose;
   kj::TaskSet tasks;
 
   void taskFailed(kj::Exception&&) override { shared->stop(); }
@@ -310,6 +316,8 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
     const auto status = co_await answer.catch_([](kj::Exception&&) {
       return uint8_t(ACK_DISCONNECTED);
     }).exclusiveJoin(timer.afterDelay(shared->confirmationTimeout).then([] { return uint8_t(ACK_TIMEOUT); }));
+    const auto found = shippers.find(openId);
+    if (status != ACK_OK && found != shippers.end()) found->second->onRefused(request);
     if (status == ACK_TIMEOUT) {
       gaveUp(openId, request, key, false);
       kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(
@@ -322,7 +330,6 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
     if (status != ACK_OK) {
       kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(ackRefusal(status))));
     }
-    const auto found = shippers.find(openId);
     if (found != shippers.end()) found->second->onAcked(request);
   }
 
@@ -338,6 +345,7 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
         case MSG_SEALED: shipper.onSealed(notice.salt1, notice.salt2, notice.upToFrame); break;
         case MSG_BREAK: shipper.onBreak(notice.reason); break;
         case MSG_CHECKPOINT_ASKED: shipper.onCheckpointAsked(); break;
+        case MSG_CLOSE_ASKED: requestClose(notice.openId); break;
         default: KJ_UNREACHABLE;
       }
     }
@@ -373,8 +381,8 @@ ThreadedWalLog::~ThreadedWalLog() noexcept(false) = default;
 
 bool ThreadedWalLog::ready() const { return impl->shared->negotiated(); }
 
-kj::Own<DurableWalChannel> ThreadedWalLog::attachHome() {
-  return kj::heap<Home>(impl->shared);
+kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(kj::Function<void(uint64_t)> requestClose) {
+  return kj::heap<Home>(impl->shared, kj::mv(requestClose));
 }
 
 }  // namespace workerd::server

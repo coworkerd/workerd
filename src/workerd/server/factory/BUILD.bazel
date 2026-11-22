@@ -47,6 +47,7 @@ wd_cc_library(
     hdrs = ["coworkerd-durable-test-storage.h"],
     visibility = ["//src/workerd/threaded:__pkg__"],
     deps = [
+        ":coworkerd-wal",
         "//src/workerd/server:facet-tree-index",
         "//src/workerd/util:sqlite",
         "@capnp-cpp//src/kj",
@@ -94,6 +95,7 @@ wd_cc_library(
     srcs = ["coworkerd-threaded-wal.c++"],
     hdrs = ["coworkerd-threaded-wal.h"],
     visibility = ["//src/workerd/threaded:__pkg__"],
+    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":coworkerd-wal",
         "@capnp-cpp//src/kj",
@@ -114,6 +116,7 @@ wd_cc_library(
 
 kj_test(
     src = "coworkerd-threaded-wal-test.c++",
+    target_compatible_with = ["@platforms//os:linux"],
     deps = [":coworkerd-threaded-wal-source"],
 )
 

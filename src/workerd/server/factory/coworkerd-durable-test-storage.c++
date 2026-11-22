@@ -28,14 +28,14 @@ kj::Path databasePath(
 
 }  // namespace
 
-DurableTestStorage::DurableTestStorage()
-    : DurableTestStorage(kj::newInMemoryDirectory(kj::systemPreciseCalendarClock())) {}
+DurableStorage::DurableStorage()
+    : DurableStorage(kj::newInMemoryDirectory(kj::systemPreciseCalendarClock())) {}
 
-DurableTestStorage::DurableTestStorage(kj::Own<const kj::Directory> directory)
+DurableStorage::DurableStorage(kj::Own<const kj::Directory> directory)
     : directory(kj::mv(directory)),
       vfs(*this->directory) {}
 
-void DurableTestStorage::ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr storageId) const {
+void DurableStorage::ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr storageId) const {
   KJ_REQUIRE(uniqueKey.startsWith(ROOT_PREFIX) && isDigest(uniqueKey.slice(ROOT_PREFIX.size())) &&
           isDigest(storageId),
       "invalid durable test storage identity");
@@ -43,7 +43,7 @@ void DurableTestStorage::ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr 
       kj::Path({kj::str(uniqueKey)}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
 }
 
-kj::Own<SqliteDatabase> DurableTestStorage::open(
+kj::Own<SqliteDatabase> DurableStorage::open(
     kj::StringPtr uniqueKey, kj::StringPtr storageId, SqliteObserver& observer, uint facet) const {
   ensureNamespace(uniqueKey, storageId);
   const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
@@ -51,7 +51,19 @@ kj::Own<SqliteDatabase> DurableTestStorage::open(
       vfs, databasePath(uniqueKey, storageId, facet), mode, kj::maxValue, kj::maxValue, observer);
 }
 
-kj::Own<FacetTreeIndex> DurableTestStorage::openFacetIndex(
+kj::Own<DurableLogShipper> DurableStorage::ship(kj::StringPtr uniqueKey,
+    DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
+    DurableWalChannel& channel) const {
+  auto wal = databasePath(uniqueKey, name.storageId, name.facetId, "-wal"_kj);
+  auto image = databasePath(uniqueKey, name.storageId, name.facetId);
+  database.run("PRAGMA journal_mode=WAL;");
+  auto shipper = kj::heap<DurableLogShipper>(*directory, kj::mv(wal), kj::mv(image),
+      kj::mv(name), database, timer, channel);
+  shipper->reportAfterDatabaseClose();
+  return shipper;
+}
+
+kj::Own<FacetTreeIndex> DurableStorage::openFacetIndex(
     kj::StringPtr uniqueKey, kj::StringPtr storageId) const {
   ensureNamespace(uniqueKey, storageId);
   auto path = kj::Path({kj::str(uniqueKey), kj::str(storageId, ".facets")});
@@ -59,7 +71,7 @@ kj::Own<FacetTreeIndex> DurableTestStorage::openFacetIndex(
       directory->openFile(path, kj::WriteMode::CREATE | kj::WriteMode::MODIFY));
 }
 
-void DurableTestStorage::deleteFacet(
+void DurableStorage::deleteFacet(
     kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index, uint facet) const {
   KJ_REQUIRE(facet != 0, "expected a facet ID");
   index.forEachChild(
@@ -69,7 +81,7 @@ void DurableTestStorage::deleteFacet(
   }
 }
 
-void DurableTestStorage::cloneFacet(kj::StringPtr uniqueKey,
+void DurableStorage::cloneFacet(kj::StringPtr uniqueKey,
     kj::StringPtr storageId,
     FacetTreeIndex& index,
     uint source,

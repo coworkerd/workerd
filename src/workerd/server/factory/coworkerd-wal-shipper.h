@@ -38,6 +38,7 @@ void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId);
 // is told at every change (ActorSqlite's scheduleRun hook) and whenever a database is opened -- which is how a node
 // that took the shard over learns, from the object's own files, what is still due and what has already run.
 void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime);
+kj::Maybe<kj::Date> readDurableAlarm(SqliteDatabase& db);
 
 // How many objects this process holds resident, how many it has evicted for the resident limit and how many it has
 // woken again, with the time the wakes took. Sent when the numbers change, at most once a second.
@@ -77,7 +78,7 @@ class DurableWalChannel {
   virtual uint64_t nextRequest() = 0;
   virtual uint64_t registerShipper(DurableLogShipper& shipper) = 0;
   virtual void unregisterShipper(DurableLogShipper& shipper) = 0;
-  virtual void send(DurableLogShipper& shipper, kj::Array<kj::byte> message) = 0;
+  virtual void send(uint64_t openId, kj::Array<kj::byte> message) = 0;
   virtual kj::Promise<void> sendFrames(DurableLogShipper& shipper,
       kj::Array<kj::byte> message, uint64_t request, kj::Timer& timer) = 0;
 
@@ -102,6 +103,11 @@ class DurableLogShipper {
   ~DurableLogShipper() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(DurableLogShipper);
 
+  // ActorSqlite drops its commit callback (and the shipper it owns) before
+  // destroying its SQLite connection. The threaded channel reports closure only
+  // after that connection's destructor has run.
+  void reportAfterDatabaseClose();
+
   // ActorSqlite's commit callback: the frames of everything committed since the last one go to the replicator and
   // the promise resolves when it confirms them. It is rejected -- which breaks the output gate, so the object is
   // reset and every answer it was holding fails -- when the replicator refuses them or does not confirm them within
@@ -112,6 +118,7 @@ class DurableLogShipper {
   // SqliteDatabase::afterReset (the application called deleteAll()): the files were replaced, so the settings go on
   // again and the node is told to start the object from empty.
   void afterReset(SqliteDatabase& db);
+  void reportAlarm(kj::Maybe<kj::Date> scheduledTime);
 
   kj::StringPtr getKey() {
     return key;
@@ -119,9 +126,13 @@ class DurableLogShipper {
   uint64_t getOpenId() const {
     return openId;
   }
+  bool hasPendingWrites() const {
+    return inFlight.size() != 0;
+  }
 
   // From the replicator.
   void onAcked(uint64_t request);
+  void onRefused(uint64_t request);
   void onSealed(uint32_t salt1, uint32_t salt2, uint32_t upToFrame);
   void onBreak(kj::StringPtr reason);
   void onCheckpointAsked();
@@ -136,6 +147,7 @@ class DurableLogShipper {
   kj::Timer& timer;
   DurableWalChannel& channel;
   uint64_t openId = 0;
+  kj::Array<kj::byte>* deferredClose = nullptr;
 
   // The WAL generation being read: its header, how far it has been read (always a commit frame) and the running
   // checksum there.

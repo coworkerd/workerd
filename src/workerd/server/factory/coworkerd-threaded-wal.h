@@ -13,7 +13,7 @@ class ThreadedWalLog {
   KJ_DISALLOW_COPY_AND_MOVE(ThreadedWalLog);
 
   bool ready() const;
-  kj::Own<DurableWalChannel> attachHome();
+  kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t)> requestClose);
 
  private:
   struct Impl;

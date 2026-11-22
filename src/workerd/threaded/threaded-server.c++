@@ -26,6 +26,7 @@
 #include <workerd/server/factory/coworkerd-durable-cpu.h>
 #include <workerd/server/factory/coworkerd-durable-placement.h>
 #include <workerd/server/factory/coworkerd-durable-test-storage.h>
+#include <workerd/server/factory/coworkerd-threaded-wal.h>
 #include <workerd/server/factory/coworkerd-sandbox.h>
 #include <workerd/server/factory/coworkerd-steady.h>
 #include <workerd/server/v8-platform-impl.h>
@@ -1650,12 +1651,15 @@ struct ThreadState {
   uint64_t durableHome = 0;
   std::shared_ptr<Slot> durableSlot;
   std::optional<kj::ForkedPromise<std::shared_ptr<Slot>>> durableLoad;
+  kj::Own<server::DurableWalChannel> wal;
   struct DurableRoot {
     kj::Own<Worker::Actor> actor;
     server::DurableAdmission::Time lastUse;
     std::function<bool()> facetsBusy;
     std::function<void()> stopFacets;
+    std::function<uint64_t()> rootOpenId;
     bool resetting = false;
+    bool closeRequested = false;
   };
   std::map<Worker::Actor *, uint64_t> durableActorTrees;
   std::map<uint64_t, DurableRoot> durableRoots;
@@ -2184,7 +2188,8 @@ struct ThreadedServer {
   server::WorkerdPlatform platform{*basePlatform};
   jsg::V8System v8{platform, {}, basePlatform.get()};
   const std::string sourceAddress, identity;
-  const std::unique_ptr<server::DurableTestStorage> durableTestStorage;
+  const std::unique_ptr<server::DurableStorage> durableStorage;
+  const kj::Own<server::ThreadedWalLog> durableLog;
   const server::DurablePlacementLimits durablePlacement;
   std::optional<server::DurableAdmission> durableAdmission;
   std::mutex durableRoutingMutex;
@@ -2262,31 +2267,34 @@ struct ThreadedServer {
   ThreadedServer(uint limit,
       std::string sourceAddress,
       std::string identity,
-      kj::Own<const kj::Directory> disposableStorage = {})
+      kj::Own<const kj::Directory> durableDirectory = {},
+      kj::Own<server::ThreadedWalLog> durableLog = {})
       : sourceAddress(std::move(sourceAddress)),
         identity(std::move(identity)),
-        durableTestStorage(disposableStorage
-                ? std::make_unique<server::DurableTestStorage>(kj::mv(disposableStorage))
+        durableStorage(durableDirectory
+                ? std::make_unique<server::DurableStorage>(kj::mv(durableDirectory))
                 : nullptr),
+        durableLog(kj::mv(durableLog)),
         durablePlacement{
-          .treesPerCopy = this->durableTestStorage
+          .treesPerCopy = this->durableStorage
               ? uint32_t(boundedDurableSetting("COWORKERD_DO_TEST_TREES_PER_COPY", 64, 65536))
               : 0,
-          .placementBytes = this->durableTestStorage
+          .placementBytes = this->durableStorage
               ? configuredCount("COWORKERD_DO_TEST_PLACEMENT_BYTES", 64ull << 20)
               : 0,
-          .busyThreshold = this->durableTestStorage
+          .busyThreshold = this->durableStorage
               ? std::chrono::milliseconds(
                     boundedDurableSetting("COWORKERD_DO_TEST_BUSY_MS", 3000, 4000))
               : std::chrono::milliseconds(0),
         },
         durableCommitDelayMs(
-            this->durableTestStorage ? configuredCount("COWORKERD_DO_TEST_COMMIT_DELAY_MS", 0) : 0),
+            this->durableStorage && !this->durableLog
+                ? configuredCount("COWORKERD_DO_TEST_COMMIT_DELAY_MS", 0) : 0),
         pending(limit * 2),
         limit(limit),
         resources(std::make_shared<ResourceBudget>(
             configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) -
-                (this->durableTestStorage
+                (this->durableStorage
                         ? configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) / 8
                         : 0),
             configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
@@ -2295,7 +2303,7 @@ struct ThreadedServer {
             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
         subrequestBudget(limit, tenantBudget->limit) {
     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
-    if (this->durableTestStorage) {
+    if (this->durableStorage) {
       KJ_REQUIRE(durableCommitDelayMs <= 1000, "invalid durable test commit delay");
       const auto refuseGroup = configuredCount("COWORKERD_DO_TEST_REFUSE_GROUP", 0);
       KJ_REQUIRE(refuseGroup <= 1, "invalid durable test group refusal");
@@ -2715,7 +2723,7 @@ struct ThreadedServer {
     bool reclaimed = false;
     for (auto it = state.durableRoots.begin(); it != state.durableRoots.end();) {
       auto current = it++;
-      if (!current->second.resetting && !pressured &&
+      if (!current->second.resetting && !current->second.closeRequested && !pressured &&
           now - current->second.lastUse < server::DurableAdmission::IDLE_DELAY)
         continue;
       if (current->second.resetting) current->second.stopFacets();
@@ -2727,12 +2735,12 @@ struct ThreadedServer {
       const auto tree = current->first;
       {
         std::lock_guard lock(durableRoutingMutex);
-        const bool stopped = current->second.resetting || pressured
+        const bool stopped = current->second.resetting || current->second.closeRequested || pressured
             ? durableAdmission->stopIdleTree(tree, homeId)
             : durableAdmission->stopIdleTree(tree, homeId, current->second.lastUse, now);
         if (!stopped) continue;
       }
-      if (!current->second.resetting) {
+      if (!current->second.resetting && !current->second.closeRequested) {
         if (pressured) {
           durablePressureRetirements.fetch_add(1);
           reclaimed = true;
@@ -2994,6 +3002,15 @@ struct ThreadedServer {
     auto &state = *storage;
     state.rejectOnly = thread.control;
     state.durableHome = thread.homeId;
+    if (thread.home && durableLog) {
+      state.wal = durableLog->attachHome([&state](uint64_t openId) {
+        for (auto& [id, root]: state.durableRoots) {
+          if (root.rootOpenId() != openId) continue;
+          root.closeRequested = true;
+          break;
+        }
+      });
+    }
     thread.idleSince.store(nowNs());
     thread.descriptor.store(-1, std::memory_order_release);
     wake(managerWake);
@@ -3636,7 +3653,7 @@ class ChannelDispatcher final: public rpc::EventDispatcher::Server {
     return kj::READY_NOW;
   }
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
-    if (state.durableHome) unsupported("JavaScript RPC in the durable test role");
+    if (state.durableHome && !state.wal) unsupported("JavaScript RPC in the durable test role");
     KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
     return api::JsRpcSessionCustomEvent::receiveRpc(kj::mv(context), kj::mv(worker));
   }
@@ -4577,12 +4594,13 @@ struct DurableTreeContext {
   ThreadedServer &server;
   std::weak_ptr<Slot> slot;
   uint64_t tree;
-  kj::String uniqueKey, storageId;
+  kj::String uniqueKey, storageId, objectName;
   kj::Own<server::FacetTreeIndex> index;
+  std::map<uint, server::DurableLogShipper*> shippers;
   uint liveFacets = 0;
 
-  const server::DurableTestStorage &storage() {
-    return *server.durableTestStorage;
+  const server::DurableStorage &storage() {
+    return *server.durableStorage;
   }
 
   server::FacetTreeIndex &facetIndex() {
@@ -4673,6 +4691,22 @@ struct DurableActorHandle {
   DurableActorHooks *hooks;
 };
 
+class DurableAlarmReporter final: public ActorSqlite::Hooks {
+ public:
+  explicit DurableAlarmReporter(server::DurableLogShipper& shipper, uint facet)
+      : shipper(shipper), facet(facet) {}
+
+  kj::Promise<void> scheduleRun(kj::Maybe<kj::Date> time, kj::Promise<void> priorTask) override {
+    JSG_REQUIRE(facet == 0, Error, "Facets currently cannot set alarms.");
+    shipper.reportAlarm(time);
+    return kj::READY_NOW;
+  }
+
+ private:
+  server::DurableLogShipper& shipper;
+  uint facet;
+};
+
 DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &tree,
     Worker &worker,
     Worker::Actor::Id id,
@@ -4680,7 +4714,9 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     Frankenvalue props,
     uint facet,
     uint depth,
-    std::shared_ptr<DurableFacetReservation> reservation = nullptr);
+    std::shared_ptr<DurableFacetReservation> reservation = nullptr,
+    uint parentFacet = 0,
+    kj::StringPtr facetName = ""_kj);
 
 class LocalFacet final: public IoChannelFactory::ActorChannel {
  public:
@@ -4689,12 +4725,16 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
   LocalFacet(std::shared_ptr<DurableTreeContext> tree,
       uint facet,
       uint depth,
+      uint parentFacet,
+      kj::StringPtr name,
       kj::Function<kj::Promise<StartInfo>()> getStartInfo,
       std::shared_ptr<DurableFacetReservation> reservation)
       : tree(std::move(tree)),
         reservation(std::move(reservation)),
         facet(facet),
         depth(depth),
+        parentFacet(parentFacet),
+        name(kj::str(name)),
         getStartInfo(kj::mv(getStartInfo)) {}
 
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata) override;
@@ -4730,6 +4770,8 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
   std::shared_ptr<DurableFacetReservation> reservation;
   uint facet;
   uint depth;
+  uint parentFacet;
+  kj::String name;
   kj::Function<kj::Promise<StartInfo>()> getStartInfo;
   kj::Maybe<kj::ForkedPromise<void>> starting;
   kj::Maybe<DurableActorHandle> actor;
@@ -4769,7 +4811,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
     auto reservation = std::make_shared<DurableFacetReservation>(tree);
     const auto id = tree->facetIndex().getId(facet, name);
     auto child =
-        kj::rc<LocalFacet>(tree, id, depth + 1, kj::mv(getStartInfo), std::move(reservation));
+        kj::rc<LocalFacet>(tree, id, depth + 1, facet, name, kj::mv(getStartInfo), std::move(reservation));
     children.emplace(key, child.addRef());
     return child;
   }
@@ -4801,6 +4843,8 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
   }
 
   bool busy() {
+    const auto shipper = tree->shippers.find(facet);
+    if (shipper != tree->shippers.end() && shipper->second->hasPendingWrites()) return true;
     for (auto &[name, child]: children) {
       if (child->busy()) return true;
     }
@@ -4869,7 +4913,7 @@ kj::Promise<void> LocalFacet::initialize() {
       "durable test facets require a class in the original isolate copy");
   className = kj::str(binding->name);
   actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(info.id), className,
-      binding->props.clone(), facet, depth, reservation);
+      binding->props.clone(), facet, depth, reservation, parentFacet, name);
 }
 
 kj::Promise<kj::Own<WorkerInterface>> LocalFacet::open(
@@ -4895,16 +4939,37 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     Frankenvalue props,
     uint facet,
     uint depth,
-    std::shared_ptr<DurableFacetReservation> reservation) {
+    std::shared_ptr<DurableFacetReservation> reservation,
+    uint parentFacet,
+    kj::StringPtr facetName) {
   auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth);
   auto *borrowedHooks = hooks.get();
   auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
   auto *borrowedObserver = observer.get();
   if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
-  auto makeCache = [tree, facet](const ActorCache::SharedLru &, OutputGate &gate,
+  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName)](const ActorCache::SharedLru &, OutputGate &gate,
                        ActorCache::Hooks &,
                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
     auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet);
+    if (tree->state.wal) {
+      auto shipper = tree->storage().ship(tree->uniqueKey,
+          {.objectName = kj::str(tree->objectName), .storageId = kj::str(tree->storageId),
+            .facetId = facet, .parentFacetId = parentFacet, .facetName = kj::str(name)},
+          *database, tree->state.io.provider->getTimer(), *tree->state.wal);
+      auto* current = shipper.get();
+      KJ_REQUIRE(tree->shippers.emplace(facet, current).second, "durable facet is already open");
+      shipper = kj::mv(shipper).attach(kj::defer([tree, facet] { tree->shippers.erase(facet); }));
+      database->afterReset([current](SqliteDatabase& reset) {
+        reset.run("PRAGMA journal_mode=WAL;");
+        current->afterReset(reset);
+      });
+      auto alarms = kj::heap<DurableAlarmReporter>(*current, facet);
+      if (facet == 0) current->reportAlarm(server::readDurableAlarm(*database));
+      auto& alarmHooks = *alarms;
+      return kj::heap<ActorSqlite>(kj::mv(database), gate,
+          [shipper = kj::mv(shipper)](SpanParent) mutable { return shipper->onCommit(); }, alarmHooks)
+          .attach(kj::mv(alarms));
+    }
     return kj::heap<ActorSqlite>(kj::mv(database), gate,
         [state = &tree->state, server = &tree->server](SpanParent) -> kj::Promise<void> {
       if (server->durableCommitDelayMs == 0) co_return;
@@ -4928,6 +4993,7 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
     kj::String descriptor, Frankenvalue props) {
   KJ_REQUIRE(!used, "one event per durable connection");
   used = true;
+  KJ_REQUIRE(!server.durableLog || server.durableLog->ready(), "durable WAL channel unavailable");
   JsonDoc full(descriptor);
   auto input = full.get();
   auto selection = field(input, "rootSelection");
@@ -4956,6 +5022,7 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
       ticket.tree,
       kj::str(route.uniqueKey.c_str()),
       kj::str(route.storageId.c_str()),
+      kj::str(route.key.namespaceId.c_str(), "/", route.key.objectId.c_str(), "/", route.open.dataEpoch),
       {},
     });
     auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
@@ -4967,11 +5034,15 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
                       .lastUse = server::DurableAdmission::Clock::now(),
                       .facetsBusy = [hooks = actor.hooks] { return hooks->busy(); },
                       .stopFacets = [hooks = actor.hooks] { hooks->stop(); },
+                      .rootOpenId = [tree]() -> uint64_t {
+                        const auto root = tree->shippers.find(0);
+                        return root == tree->shippers.end() ? 0 : root->second->getOpenId();
+                      },
                     })
                 .first;
     server.publishDurableRoot(state.durableHome, ticket.tree);
   }
-  if (found->second.resetting) {
+  if (found->second.resetting || found->second.closeRequested) {
     kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
         KJ_EXCEPTION(OVERLOADED, "durable object reset is still draining"), "DO_UNAVAILABLE"));
   }
@@ -5339,7 +5410,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
           (void)!recv(fd, &prefix, 1, MSG_DONTWAIT);
           epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
           connections.erase(found);
-          char admission = !server.durableTestStorage && server.pending.hasSpace() ? 'A' : 'R';
+          char admission = !server.durableStorage && server.pending.hasSpace() ? 'A' : 'R';
           auto sent = send(fd, &admission, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
           if (sent != 1 || admission == 'R')
             ::close(fd);
@@ -5364,6 +5435,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
             JsonDoc frame(kj::StringPtr(connection.input.c_str() + 1, connection.input.size() - 1));
             auto input = frame.get();
             auto route = readDurableRoute(input);
+            KJ_REQUIRE(!server.durableLog || server.durableLog->ready(), "durable WAL channel unavailable");
             const auto deadlineNs = durableNumber(input, "expiresMonotonicNs");
             KJ_REQUIRE(deadlineNs <= uint64_t(std::numeric_limits<int64_t>::max()),
                 "invalid durable routing deadline");
@@ -5417,7 +5489,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                 ",\"logPeakQueuedBytes\":" + std::to_string(server.logPeakQueuedBytes.load()) + "}";
             if (server.durableAdmission) server.reportDurable(false, &body);
           }
-          auto status = server.ready.load(std::memory_order_acquire) ? "200 OK" : "503 Starting";
+          const bool walReady = !server.durableLog || server.durableLog->ready();
+          auto status = server.ready.load(std::memory_order_acquire) && walReady
+              ? "200 OK" : "503 Starting";
           if (!connection.input.starts_with("GET /__coworkerd/probe ") &&
               !connection.input.starts_with("GET /__coworkerd/threaded ")) {
             status = "501 Not Implemented";
@@ -5426,7 +5500,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
           }
           connection.output = "HTTP/1.1 " + std::string(status) +
               "\r\nX-Coworkerd-Threaded-Protocol: 3" +
-              (server.durableTestStorage ? "\r\nX-Coworkerd-Threaded-Role: durable-test" : "") +
+              (server.durableLog
+                      ? "\r\nX-Coworkerd-Threaded-Role: durable\r\nX-Coworkerd-WAL-Protocol: 1"
+                      : server.durableStorage ? "\r\nX-Coworkerd-Threaded-Role: durable-test" : "") +
               "\r\nContent-Length: " + std::to_string(body.size()) +
               "\r\nConnection: close\r\n\r\n" + body;
         }
@@ -5485,21 +5561,22 @@ int main(int argc, char **argv) {
       fprintf(stderr, "[coworkerd-sandbox] {\"capacity\":true,\"groups\":%zu}\n", server::measureGroupCapacity());
     return 0;
   }
-  const bool durableTestStorage = argc == 6 && strcmp(argv[5], "--durable-test-storage") == 0;
-  if (argc != 5 && !durableTestStorage) {
+  const bool disposable = argc == 6 && strcmp(argv[5], "--durable-test-storage") == 0;
+  const bool persistent = argc == 6 && strcmp(argv[5], "--durable-storage") == 0;
+  if (argc != 5 && !disposable && !persistent) {
     fprintf(stderr,
         "usage: coworkerd-threaded LISTEN_FD SOURCE_ADDRESS "
-        "IDENTITY INFLIGHT [--durable-test-storage]\n");
+        "IDENTITY INFLIGHT [--durable-test-storage|--durable-storage]\n");
     return 64;
   }
   char *end = nullptr;
   auto limit = strtoul(argv[4], &end, 10);
   if (!*argv[4] || !end || *end || limit == 0 || limit > 16384) return 64;
-  if (durableTestStorage && getenv("COWORKERD_DO_WAL_FD") != nullptr) {
+  if (disposable && getenv("COWORKERD_DO_WAL_FD") != nullptr) {
     fprintf(stderr, "durable test storage refuses a persistent durable log channel\n");
     return 78;
   }
-  if (durableTestStorage) {
+  if (disposable || persistent) {
     try {
       limit = boundedDurableSetting("COWORKERD_DO_TEST_HOME_COUNT", std::min(limit, 4ul), 16384);
     } catch (...) {
@@ -5539,9 +5616,29 @@ int main(int argc, char **argv) {
   const int listener = strtol(argv[1], nullptr, 10);
   ThreadedServer *server;
   try {
-    auto directory =
-        durableTestStorage ? newDurableTestDirectory(listener) : kj::Own<const kj::Directory>();
-    server = new ThreadedServer(limit, argv[2], argv[3], kj::mv(directory));
+    kj::Own<const kj::Directory> directory;
+    kj::Own<server::ThreadedWalLog> wal;
+    if (persistent) {
+      auto path = getenv("COWORKERD_DO_STORAGE_DIR");
+      KJ_REQUIRE(path != nullptr && path[0] == '/', "persistent durable storage requires a volume");
+      auto filesystem = kj::newDiskFilesystem();
+      directory = filesystem->getRoot().openSubdir(filesystem->getCurrentPath().evalNative(path),
+          kj::WriteMode::MODIFY);
+      const auto descriptor = configuredCount("COWORKERD_DO_WAL_FD", 0);
+      KJ_REQUIRE(descriptor > STDERR_FILENO && descriptor <= INT_MAX,
+          "persistent durable storage requires an inherited WAL socket");
+      const auto fd = static_cast<int>(descriptor);
+      KJ_SYSCALL(fcntl(fd, F_SETFD, FD_CLOEXEC));
+      const std::string_view identity(argv[3]);
+      auto colon = identity.rfind(':');
+      KJ_REQUIRE(colon != std::string_view::npos, "invalid durable child identity");
+      const auto generation = durableNumber(identity.substr(colon + 1));
+      const auto confirm = boundedDurableSetting("COWORKERD_DO_CONFIRM_TIMEOUT_MS", 5000, 29000);
+      wal = kj::heap<server::ThreadedWalLog>(fd, generation, confirm * kj::MILLISECONDS);
+    } else if (disposable) {
+      directory = newDurableTestDirectory(listener);
+    }
+    server = new ThreadedServer(limit, argv[2], argv[3], kj::mv(directory), kj::mv(wal));
   } catch (...) {
     fprintf(stderr,
         "[threaded-start] "
