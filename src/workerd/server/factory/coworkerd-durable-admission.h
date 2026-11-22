@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -95,6 +96,7 @@ class DurableAdmission {
   // Refuse a waiting call before acknowledging it, returning its event reservation.
   bool refuseWaiting(Ticket ticket);
   bool complete(Ticket ticket, uint64_t home);
+  bool markSocket(Ticket ticket, uint64_t home);
   std::vector<Ticket> expire(Time now);
 
   // Reset closes admission immediately, releases waiting calls, and retains active credits
@@ -103,6 +105,7 @@ class DurableAdmission {
   // Idle close requires an empty mailbox and no active calls. It is also the drain check for
   // a reset already in progress. Keep the tree reservation until the home releases its handles.
   bool stopIdleTree(uint64_t tree, uint64_t home);
+  bool stopIdleTreeWithSockets(uint64_t tree, uint64_t home);
   // Normal retirement checks the idle deadline as well as mailbox/active ownership.
   // Pressure retirement uses the unconditional overload above.
   bool stopIdleTree(uint64_t tree, uint64_t home, Time lastUse, Time now);
@@ -124,6 +127,7 @@ class DurableAdmission {
     uint64_t bytes;
     Time deadline;
     Phase phase = Phase::WAITING;
+    bool socket = false;
   };
 
   struct Tree {
@@ -146,6 +150,27 @@ class DurableAdmission {
   uint64_t nextTree = 1, nextEvent = 1;
   std::map<Key, uint64_t> objects;
   std::map<uint64_t, Tree> trees;
+};
+
+// Owned by the home loop. Admission and socket handoff still have to succeed
+// before a decision to retire can close the actor.
+class DurableIdleLifecycle {
+ public:
+  using Time = DurableAdmission::Time;
+  using Pending = std::multiset<Time>::iterator;
+  enum class Decision { WAIT, RETIRE, CANCEL_PENDING };
+
+  DurableIdleLifecycle(Time opened, std::chrono::seconds nonHibernatingDelay);
+  void eventFinished(Time now);
+  Pending pendingStarted(Time now);
+  void pendingFinished(Pending pending, Time now);
+  Decision check(Time now, bool hasOrdinarySocket, bool pressured);
+
+ private:
+  Time lastEvent, lastUnblocked;
+  std::chrono::seconds nonHibernatingDelay;
+  std::multiset<Time> pending;
+  bool ordinarySocket = false;
 };
 
 }  // namespace workerd::server

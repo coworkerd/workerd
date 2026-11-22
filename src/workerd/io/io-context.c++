@@ -827,10 +827,12 @@ void IoContext::addTask(kj::Promise<void> promise) {
   tasks.add(kj::mv(promise));
 }
 
-void IoContext::addWaitUntil(kj::Promise<void> promise) {
+void IoContext::addWaitUntil(kj::Promise<void> promise, ActorTask kind) {
   kj::Own<Worker::Actor::WaitUntilTaskHandle> handle;
   KJ_IF_SOME(a, actor) {
-    KJ_IF_SOME(e, kj::runCatchingExceptions([&]() { handle = a.addedWaitUntilTask(); })) {
+    KJ_IF_SOME(e, kj::runCatchingExceptions([&]() {
+      handle = a.addedWaitUntilTask(kind == ActorTask::LOCAL_SOCKET_TRANSPORT);
+    })) {
       KJ_LOG(ERROR, "Actor::addedWaitUntilTask() threw an exception", e);
     }
   }
@@ -1062,10 +1064,10 @@ IoContext::PendingEvent::~PendingEvent() noexcept(false) {
 }
 
 kj::Own<void> IoContext::registerPendingEvent() {
-  if (actor != kj::none) {
+  KJ_IF_SOME(a, actor) {
     // Actors don't use the pending event system, because different requests to the same Actor are
     // explicitly allowed to resolve each other's promises.
-    return {};
+    return a.addedPendingIo();
   }
 
   KJ_IF_SOME(pe, pendingEvent) {

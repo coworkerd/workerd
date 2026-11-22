@@ -937,7 +937,8 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
 
   // Indicates that the script has requested that it stay active until the given promise resolves.
   // drain() waits until all such promises have completed.
-  void addWaitUntil(kj::Promise<void> promise);
+  enum class ActorTask { WORK, LOCAL_SOCKET_TRANSPORT };
+  void addWaitUntil(kj::Promise<void> promise, ActorTask kind = ActorTask::WORK);
 
   // Returns the status of waitUntil promises. If a promise fails, this sets the status to the
   // one corresponding to the exception type.

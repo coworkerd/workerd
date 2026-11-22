@@ -4971,11 +4971,19 @@ kj::Rc<NonHibernatableWebSocketCount> Worker::Actor::getNonHibernatableWebSocket
   return impl->nonHibernatableWebSocketCount.addRef();
 }
 
-kj::Own<Worker::Actor::WaitUntilTaskHandle> Worker::Actor::addedWaitUntilTask() {
+kj::Own<Worker::Actor::WaitUntilTaskHandle> Worker::Actor::addedWaitUntilTask(bool localSocketTransport) {
   KJ_IF_SOME(tracker, waitUntilTaskTracker) {
+    if (localSocketTransport && tracker->tracksSocketTransportSeparately()) return {};
     return tracker->registerTask();
   }
   return kj::Own<WaitUntilTaskHandle>();
+}
+
+kj::Own<void> Worker::Actor::addedPendingIo() {
+  KJ_IF_SOME(tracker, waitUntilTaskTracker) {
+    return tracker->registerPendingIo();
+  }
+  return {};
 }
 
 InputGate& Worker::Actor::getInputGate() {

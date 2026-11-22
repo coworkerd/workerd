@@ -923,7 +923,8 @@ void LegacyWebSocketAdapter::startReadLoop(
     }
     return false;
   };
-  if (!hasLocalPeer()) {
+  const bool localPeer = hasLocalPeer();
+  if (!localPeer) {
     promise = promise.attach(context.registerPendingEvent());
   }
 
@@ -968,7 +969,7 @@ void LegacyWebSocketAdapter::startReadLoop(
         self->reportError(js, e.clone());
       }
     }
-  })));
+  })), localPeer ? IoContext::ActorTask::LOCAL_SOCKET_TRANSPORT : IoContext::ActorTask::WORK);
 }
 
 void LegacyWebSocketAdapter::send(jsg::Lock& js, kj::OneOf<kj::Array<byte>, kj::String> message) {
