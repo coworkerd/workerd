@@ -206,7 +206,20 @@ kj::Ptr<bool> WebSocket::getDispatchFailed() {
   return impl->getDispatchFailed();
 }
 
-kj::Rc<kj::WebSocket> WebSocket::acceptAsHibernatable(kj::Array<kj::String> tags) {
+bool WebSocket::isPeerOf(jsg::Lock& js, const WebSocket& candidate) {
+  return kj::downcast<LegacyWebSocketAdapter>(*impl).isPeerOf(js, candidate);
+}
+
+kj::Maybe<kj::ArrayPtr<const byte>> WebSocket::getSerializedAttachment() const {
+  return kj::downcast<const LegacyWebSocketAdapter>(*impl).getSerializedAttachment();
+}
+
+bool WebSocket::isOutputClosed() const {
+  return kj::downcast<const LegacyWebSocketAdapter>(*impl).isOutputClosed();
+}
+
+kj::Rc<kj::WebSocket> WebSocket::acceptAsHibernatable(
+    kj::Array<kj::String> tags, kj::Own<kj::WebSocket> transport) {
   // TODO(EW-10817): When the HibernatableWebSocketAdapter path is functional, re-enable the
   // autogate-driven swap below — extract the kj::WebSocket from the legacy adapter (via
   // `LegacyWebSocketAdapter::extractForHibernatableTransition`, also commented out today)
@@ -218,6 +231,10 @@ kj::Rc<kj::WebSocket> WebSocket::acceptAsHibernatable(kj::Array<kj::String> tags
   //   impl = kj::heap<HibernatableWebSocketAdapter>(*this, ws.addRef(), kj::mv(tags));
   //   return ws;
   // }
+  if (transport.get() != nullptr) {
+    return kj::downcast<LegacyWebSocketAdapter>(*impl)
+        .acceptWithTransport(kj::mv(tags), kj::mv(transport));
+  }
   return impl->acceptAsHibernatable(kj::mv(tags));
 }
 
@@ -1704,10 +1721,35 @@ void LegacyWebSocketAdapter::setPeer(jsg::WeakRef<WebSocket> other) {
   peer = kj::mv(other);
 }
 
+bool LegacyWebSocketAdapter::isPeerOf(jsg::Lock& js, const WebSocket& candidate) {
+  KJ_IF_SOME(ref, peer) {
+    KJ_IF_SOME(strong, ref.tryAddRef(js)) {
+      return strong.get() == &candidate;
+    }
+  }
+  return false;
+}
+
+kj::Maybe<kj::ArrayPtr<const byte>> LegacyWebSocketAdapter::getSerializedAttachment() const {
+  return serializedAttachment.map([](const auto& bytes) -> kj::ArrayPtr<const byte> {
+    return bytes.asPtr();
+  });
+}
+
+bool LegacyWebSocketAdapter::isOutputClosed() const {
+  return closedOutgoingForHib;
+}
+
 kj::Rc<kj::WebSocket> LegacyWebSocketAdapter::acceptAsHibernatable(kj::Array<kj::String> tags) {
+  return acceptWithTransport(kj::mv(tags), {});
+}
+
+kj::Rc<kj::WebSocket> LegacyWebSocketAdapter::acceptWithTransport(
+    kj::Array<kj::String> tags, kj::Own<kj::WebSocket> transport) {
   KJ_IF_SOME(hibernatable, farNative->state.tryGet<AwaitingAcceptanceOrCoupling>()) {
     // We can only request hibernation if we have not called accept.
-    auto ws = kj::Rc<kj::WebSocket>(kj::mv(hibernatable.ws));
+    auto ws = kj::Rc<kj::WebSocket>(
+        transport.get() != nullptr ? kj::mv(transport) : kj::mv(hibernatable.ws));
     farNative->state.init<Accepted>(Accepted::Hibernatable{.ws = ws.addRef(), .tags = kj::mv(tags)},
         *farNative, IoContext::current());
     return ws;

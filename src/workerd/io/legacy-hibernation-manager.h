@@ -22,8 +22,37 @@ struct LegacyHibernationManagerTestAccess;
 // Implements the HibernationManager class.
 class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManager {
  public:
-  LegacyHibernationManagerImpl(
-      kj::Own<Worker::Actor::Loopback> loopback, uint16_t hibernationEventType);
+  // A threaded home dispatches frames only after a node-authorized open.
+  class NodeSocket: public kj::WebSocket {
+   public:
+    virtual void attach(kj::StringPtr socketId, kj::StringPtr invocationId) = 0;
+    virtual void activate() = 0;
+    virtual kj::StringPtr id() const = 0;
+    virtual kj::Promise<void> configure(
+        kj::Maybe<kj::StringPtr> request, kj::Maybe<kj::StringPtr> response) = 0;
+  };
+
+  struct SocketSnapshot {
+    kj::String id;
+    kj::Array<kj::String> tags;
+    kj::Maybe<kj::Array<kj::byte>> attachment;
+    kj::Maybe<kj::Date> lastAutoResponse;
+    uint64_t lastFrame = 0;
+    bool closedOutgoing = false;
+  };
+  using SocketFactory = kj::Function<kj::Own<NodeSocket>()>;
+
+  LegacyHibernationManagerImpl(kj::Own<Worker::Actor::Loopback> loopback,
+      uint16_t hibernationEventType, kj::Maybe<SocketFactory> nodeSockets = kj::none);
+
+  static constexpr auto NODE_SOCKET_HEADER = "x-coworkerd-managed-socket"_kj;
+  kj::Maybe<kj::StringPtr> stageNodeSocket(jsg::Lock& js, api::WebSocket& peer);
+  kj::Promise<void> activateNodeSocket(kj::StringPtr pending, kj::StringPtr invocation);
+  kj::Promise<void> configureNodeSocket(NodeSocket& socket);
+  kj::Array<SocketSnapshot> snapshotNodeSockets();
+  void adoptNodeSocket(SocketSnapshot snapshot, kj::StringPtr invocationId);
+  kj::Promise<void> dispatchNodeSocket(WorkerInterface& worker, kj::String id,
+      uint64_t position, kj::Maybe<kj::Date> autoResponse, api::HibernatableSocketParams params);
   ~LegacyHibernationManagerImpl() noexcept(false);
 
   // Tells the HibernationManager to create a new HibernatableWebSocket with the associated tags
@@ -86,6 +115,7 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
   friend class LoopbackHandoff;
 
   kj::Promise<void> handleReadLoop(HibernatableWebSocket& refToHibernatable);
+  void addSocket(kj::Own<HibernatableWebSocket> socket, kj::ArrayPtr<kj::String> tags);
 
   // Each HibernatableWebSocket can have multiple tags, so we want to store a reference
   // in our kj::List.
@@ -107,7 +137,8 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
   // when initiating, or waking from hibernation.
   class HibernatableWebSocket {
    public:
-    HibernatableWebSocket(jsg::Ref<api::WebSocket> websocket,
+    using State = kj::OneOf<jsg::Ref<api::WebSocket>, api::WebSocket::HibernationPackage>;
+    HibernatableWebSocket(State websocket,
         kj::ArrayPtr<kj::String> tags,
         LegacyHibernationManagerImpl& manager);
     ~HibernatableWebSocket() noexcept(false);
@@ -134,7 +165,10 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
 
     // If active, we have an api::WebSocket reference, otherwise, we're hibernating, so we retain
     // the websocket's properties in a HibernationPackage until it's time to wake up.
-    kj::OneOf<jsg::Ref<api::WebSocket>, api::WebSocket::HibernationPackage> activeOrPackage;
+    State activeOrPackage;
+    NodeSocket* nodeSocket = nullptr;
+    kj::String pendingNodeSocket;
+    uint64_t lastFrame = 0;
 
     // This is the manager's strong reference to the websocket shared with api::WebSocket after
     // accepting as hibernatable.
@@ -294,6 +328,7 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
 
   // Passed to HibernatableWebSocket custom event as the typeId.
   uint16_t hibernationEventType;
+  kj::Maybe<SocketFactory> nodeSockets;
 
   // How many of this manager's events are registered in the event loop's registry. Lets the
   // destructor skip the registry when nothing is registered, which is the only case reachable

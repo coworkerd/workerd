@@ -57,7 +57,10 @@ DurableAdmission::Result DurableAdmission::queue(
   }
   auto existing = objects.find(key);
   auto* tree = existing == objects.end() ? nullptr : &trees.at(existing->second);
-  if (tree != nullptr && (tree->open != open || tree->closing)) return {Status::STALE};
+  if (tree != nullptr) {
+    if (tree->open != open) return {Status::STALE};
+    if (tree->closing) return {tree->idleClosing ? Status::RETIRING : Status::STALE};
+  }
 
   auto refuse = [&]() -> Result {
     ++counters.overloads;
@@ -227,6 +230,7 @@ bool DurableAdmission::beginReset(uint64_t tree, uint64_t home) {
   if (entry == trees.end() || home == 0 || entry->second.home != home) return false;
   auto& pending = entry->second;
   pending.closing = true;
+  pending.idleClosing = false;
   for (auto it = pending.events.begin(); it != pending.events.end();) {
     auto event = it++;
     if (event->second.phase == Phase::WAITING) releaseEvent(pending, event);
@@ -240,7 +244,10 @@ bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home) {
       !entry->second.events.empty()) {
     return false;
   }
-  entry->second.closing = true;
+  if (!entry->second.closing) {
+    entry->second.closing = true;
+    entry->second.idleClosing = true;
+  }
   return true;
 }
 
@@ -251,7 +258,21 @@ bool DurableAdmission::stopIdleTreeWithSockets(uint64_t tree, uint64_t home) {
   for (const auto& [id, event]: at->second.events) {
     if (event.phase != Phase::ACTIVE || !event.socket) return false;
   }
-  at->second.closing = true;
+  if (!at->second.closing) {
+    at->second.closing = true;
+    at->second.idleClosing = true;
+  }
+  return true;
+}
+
+bool DurableAdmission::resumeIdleTree(uint64_t tree, uint64_t home) {
+  auto at = trees.find(tree);
+  if (at == trees.end() || home == 0 || at->second.home != home ||
+      !at->second.events.empty() || !at->second.idleClosing) {
+    return false;
+  }
+  at->second.closing = false;
+  at->second.idleClosing = false;
   return true;
 }
 

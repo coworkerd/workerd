@@ -63,7 +63,7 @@ class DurableAdmission {
     bool operator==(const Ticket&) const = default;
   };
 
-  enum class Status { QUEUED, OVERLOADED, EXPIRED, STALE };
+  enum class Status { QUEUED, OVERLOADED, EXPIRED, STALE, RETIRING };
   struct Result {
     Status status;
     std::optional<Ticket> ticket = std::nullopt;
@@ -106,6 +106,7 @@ class DurableAdmission {
   // a reset already in progress. Keep the tree reservation until the home releases its handles.
   bool stopIdleTree(uint64_t tree, uint64_t home);
   bool stopIdleTreeWithSockets(uint64_t tree, uint64_t home);
+  bool resumeIdleTree(uint64_t tree, uint64_t home);
   // Normal retirement checks the idle deadline as well as mailbox/active ownership.
   // Pressure retirement uses the unconditional overload above.
   bool stopIdleTree(uint64_t tree, uint64_t home, Time lastUse, Time now);
@@ -138,6 +139,7 @@ class DurableAdmission {
     uint64_t waitingBytes = 0;
     uint32_t waiting = 0;
     bool closing = false;
+    bool idleClosing = false;
   };
 
   void releaseWaiting(Tree& tree, const Event& event);
