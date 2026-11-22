@@ -2194,7 +2194,7 @@ struct ThreadedServer {
   jsg::V8System v8{platform, {}, basePlatform.get()};
   const std::string sourceAddress, identity;
   const std::unique_ptr<server::DurableStorage> durableStorage;
-  const kj::Own<server::ThreadedWalLog> durableLog;
+  kj::Own<server::ThreadedWalLog> durableLog;
   const server::DurablePlacementLimits durablePlacement;
   std::optional<server::DurableAdmission> durableAdmission;
   std::mutex durableRoutingMutex;
