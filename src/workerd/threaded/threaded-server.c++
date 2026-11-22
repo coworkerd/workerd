@@ -2771,16 +2771,23 @@ struct ThreadedServer {
   void reportDurable(bool publish, std::string *appendTo = nullptr) {
     std::lock_guard lock(durableRoutingMutex);
     const auto state = durableAdmission->state();
-    size_t resident = 0, homes = 0;
+    size_t resident = 0, homes = 0, placementClosedHomes = 0, resettingHomes = 0;
+    uint64_t maxHomeMemory = 0;
     if (ready.load(std::memory_order_acquire)) {
       for (const auto &thread: threads) {
         const auto &home = *thread->home;
         homes += !home.definition.empty();
+        placementClosedHomes += !home.pressure.accepting();
+        resettingHomes += home.pressure.resetting();
+        maxHomeMemory = kj::max(maxHomeMemory, home.memory);
         resident += home.resident.size();
       }
     }
     auto row = ",\"durableAdmission\":{\"trees\":" + std::to_string(state.trees) +
         ",\"residentRoots\":" + std::to_string(resident) + ",\"homes\":" + std::to_string(homes) +
+        ",\"placementClosedHomes\":" + std::to_string(placementClosedHomes) +
+        ",\"resettingHomes\":" + std::to_string(resettingHomes) +
+        ",\"maxHomeMemoryBytes\":" + std::to_string(maxHomeMemory) +
         ",\"workerThreads\":" + std::to_string(liveThreads.load()) +
         ",\"waiting\":" + std::to_string(state.waiting) +
         ",\"running\":" + std::to_string(state.active) +
