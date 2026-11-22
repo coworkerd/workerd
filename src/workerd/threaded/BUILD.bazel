@@ -40,6 +40,19 @@ wd_cc_binary(
     deps = THREADED_DEPS,
 )
 
+wd_cc_binary(
+    name = "coworkerd-threaded-fatal-test",
+    srcs = [
+        "protocol.h",
+        "threaded-server.c++",
+    ],
+    local_defines = ["COWORKERD_FATAL_TEST_BUILD"],
+    malloc = "//src/workerd/server:malloc",
+    target_compatible_with = ["@platforms//os:linux"],
+    testonly = True,
+    deps = THREADED_DEPS,
+)
+
 wd_capnp_library(
     src = "protocol.capnp",
     deps = [

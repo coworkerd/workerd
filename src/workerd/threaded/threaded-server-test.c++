@@ -39,6 +39,41 @@ void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
   limits.customizeIsolate(isolate);
 }
 
+KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
+  int fds[2];
+  KJ_SYSCALL(pipe(fds));
+  KJ_DEFER(close(fds[0]));
+  KJ_DEFER(close(fds[1]));
+  v8::Isolate::CreateParams params;
+  params.array_buffer_allocator_shared.reset(v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+  auto* isolate = v8::Isolate::New(newGroup(), params);
+  KJ_DEFER(isolate->Dispose());
+  auto readRecord = [&] {
+    char row[PIPE_BUF];
+    const auto count = read(fds[0], row, sizeof(row));
+    KJ_REQUIRE(count > 0);
+    return kj::heapString(row, count);
+  };
+  auto checkUnknown = [&] {
+    KJ_EXPECT(readRecord() == kj::str("{\"event\":\"v8-fatal-undetermined\",\"pid\":", getpid(), "}\n"));
+  };
+  constexpr kj::StringPtr identity = "\"workerId\":\"tenant/w\",\"versionId\":\"v1\","
+      "\"invocationId\":\"call\",\"isolate\":\"coworkerd-v1:tenant/w@v1#5\",";
+  FatalInvocation invocation(isolate, identity);
+  writeFatalRecord(fds[1]);
+  checkUnknown();  // A scope alone does not prove the isolate is current.
+  {
+    v8::Locker locker(isolate);
+    v8::Isolate::Scope active(isolate);
+    std::thread other([&] { writeFatalRecord(fds[1]); });
+    other.join();
+    checkUnknown();
+    writeFatalRecord(fds[1]);
+    KJ_EXPECT(readRecord() == kj::str("{\"event\":\"v8-fatal\",\"pid\":", getpid(), ",",
+        identity.slice(0, identity.size() - 1), "}\n"));
+  }
+}
+
 KJ_TEST("descriptor queue: empty, full, FIFO, SPSC handoff and close") {
   DescriptorQueue queue(2);
   KJ_EXPECT(queue.pop() == -1 && queue.hasSpace());
