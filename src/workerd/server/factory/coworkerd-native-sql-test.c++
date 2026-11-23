@@ -84,6 +84,13 @@ KJ_TEST("native SQL rolls back a failed query batch and keeps the execute prefix
   KJ_EXPECT(f.count() == 1);
 }
 
+KJ_TEST("native SQL platform errors retain the code consumed by the binding") {
+  auto body = nativeSqlFailure("STORAGE_UNAVAILABLE", "the write was unconfirmed");
+  KJ_EXPECT(body ==
+      "{\"code\":\"STORAGE_UNAVAILABLE\",\"reason\":\"the write was unconfirmed\","
+      "\"error\":\"STORAGE_UNAVAILABLE: the write was unconfirmed\"}");
+}
+
 KJ_TEST("native SQL counts the complete JSON response at the exact byte limit") {
   Fixture f;
   for (auto format: {NativeSqlResults::OBJECTS, NativeSqlResults::COLUMNS}) {
@@ -129,7 +136,8 @@ KJ_TEST("native SQL timeout interrupts a write, rolls the batch back, and permit
       R"SQL([{"sql":"INSERT INTO ledger VALUES(-1)"},{"sql":"WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n<1000000000) INSERT INTO ledger SELECT n FROM r"}])SQL",
       NativeSqlResults::OBJECTS, 20ms);
   KJ_EXPECT(result.status == 503);
-  KJ_EXPECT(result.body.find("SQL_LIMIT_EXCEEDED") != std::string::npos);
+  KJ_EXPECT(result.body.find("\"code\":\"SQL_LIMIT_EXCEEDED\"") != std::string::npos);
+  KJ_EXPECT(result.body.find("\"error\":\"SQL_LIMIT_EXCEEDED: ") != std::string::npos);
   KJ_EXPECT(f.count() == 0);
   // SQLite aborts an interrupted write transaction and marks the connection
   // unusable. The home closes it after settlement, then opens the same image.
