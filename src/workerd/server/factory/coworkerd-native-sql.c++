@@ -600,7 +600,8 @@ std::string nativeSqlFailure(kj::StringPtr code, kj::StringPtr reason) {
   out.append(",\"reason\":");
   out.string(reason);
   out.append(",\"error\":");
-  out.string(reason);
+  // The D1 adapter reads the error string and may discard the other fields.
+  out.string(kj::str(code, ": ", reason));
   out.append("}");
   return std::move(out.bytes);
 }
