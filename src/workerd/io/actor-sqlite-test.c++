@@ -94,11 +94,21 @@ struct ActorSqliteTest final: public kj::PtrTarget {
       return kj::mv(promise);
     }
 
+    bool hasConfirmedAlarmScheduler() const override {
+      return parent.confirmedAlarms;
+    }
+
+    void alarmConfirmed(kj::Maybe<kj::Date> time) override {
+      parent.alarmReports.add(time);
+    }
+
     ActorSqliteTest& parent;
   };
   kj::Maybe<kj::Function<kj::Promise<void>(kj::Maybe<kj::Date>)>> scheduleRunHandler;
   kj::Maybe<kj::Function<kj::Promise<void>(kj::Maybe<kj::Date>, kj::Promise<void>)>>
       scheduleRunWithPriorHandler;
+  bool confirmedAlarms = false;
+  kj::Vector<kj::Maybe<kj::Date>> alarmReports;
   ActorSqliteTestHooks hooks = ActorSqliteTestHooks(*this);
 
   ActorSqlite actor;
@@ -1201,6 +1211,45 @@ KJ_TEST("rapid move-later alarm changes coalesce into bounded scheduleRun calls"
   test.pollAndExpectCalls({});
 
   KJ_ASSERT(expectSync(test.getAlarm()) == fiveMs);
+}
+
+KJ_TEST("node-owned alarms are reported, run and abandoned only at the confirmed time") {
+  ActorSqliteTest test;
+  test.confirmedAlarms = true;
+  test.setAlarm(oneMs);
+  auto first = kj::mv(test.pollAndExpectCalls({"commit"})[0]);
+  KJ_EXPECT(test.alarmReports.empty());
+  KJ_EXPECT(test.actor.confirmedAlarmTime() == kj::none);
+  auto unconfirmed = test.actor.armAlarmHandler(oneMs, nullptr, twoMs);
+  KJ_REQUIRE(unconfirmed.is<ActorSqlite::CancelAlarmHandler>());
+  unconfirmed.get<ActorSqlite::CancelAlarmHandler>().waitBeforeCancel.wait(test.ws);
+  KJ_EXPECT(test.actor.abandonAlarm(oneMs).wait(test.ws) == kj::none);
+  KJ_EXPECT(expectSync(test.getAlarm()) == oneMs);
+  first->fulfill();
+  test.pollAndExpectCalls({});
+  KJ_REQUIRE(test.alarmReports.size() == 1 && test.alarmReports[0] == oneMs);
+
+  test.setAlarm(twoMs);
+  auto replacement = kj::mv(test.pollAndExpectCalls({"commit"})[0]);
+  KJ_EXPECT(test.alarmReports.size() == 1 && test.actor.confirmedAlarmTime() == oneMs);
+  KJ_EXPECT(
+      test.actor.armAlarmHandler(oneMs, nullptr, threeMs).is<ActorSqlite::CancelAlarmHandler>());
+  KJ_EXPECT(test.actor.abandonAlarm(twoMs).wait(test.ws) == oneMs);
+  KJ_EXPECT(expectSync(test.getAlarm()) == twoMs);
+  replacement->fulfill();
+  test.pollAndExpectCalls({});
+  KJ_REQUIRE(test.alarmReports.size() == 2 && test.alarmReports[1] == twoMs);
+  KJ_EXPECT(
+      test.actor.armAlarmHandler(oneMs, nullptr, threeMs).is<ActorSqlite::CancelAlarmHandler>());
+  KJ_EXPECT(test.actor.abandonAlarm(oneMs).wait(test.ws) == twoMs);
+  KJ_EXPECT(expectSync(test.getAlarm()) == twoMs);
+
+  KJ_EXPECT(test.actor.abandonAlarm(twoMs).wait(test.ws) == kj::none);
+  auto clear = kj::mv(test.pollAndExpectCalls({"commit"})[0]);
+  KJ_EXPECT(test.alarmReports.size() == 2 && test.actor.confirmedAlarmTime() == twoMs);
+  clear->fulfill();
+  test.pollAndExpectCalls({});
+  KJ_REQUIRE(test.alarmReports.size() == 3 && test.alarmReports[2] == kj::none);
 }
 
 KJ_TEST("armAlarmHandler with coalesced pending alarms schedules reschedule exactly once") {
