@@ -17,6 +17,7 @@ THREADED_DEPS = [
     "//src/workerd/server/factory:coworkerd-durable-cpu",
     "//src/workerd/server/factory:coworkerd-durable-placement",
     "//src/workerd/server/factory:coworkerd-durable-test-storage",
+    "//src/workerd/server/factory:coworkerd-native-sql",
     "//src/workerd/server/factory:coworkerd-sandbox",
     "//src/workerd/server/factory:coworkerd-steady",
     "//src/workerd/server/factory:coworkerd-threaded-wal",
