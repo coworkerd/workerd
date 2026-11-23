@@ -58,7 +58,7 @@ constexpr uint8_t MSG_HELLO = 1, MSG_FRAMES = 2, MSG_OPEN = 3, MSG_CHECKPOINT = 
                   MSG_DELETED = 6, MSG_CLOSED = 7, MSG_GAVE_UP = 8, MSG_ALARM = 9, MSG_RESIDENCY = 10;
 // From the replicator.
 constexpr uint8_t MSG_ACK = 1, MSG_SEALED = 2, MSG_BREAK = 3, MSG_CHECKPOINT_ASKED = 4;
-constexpr uint8_t MSG_READY = 5, MSG_CLOSE_ASKED = 6, MSG_OPENED = 7;
+constexpr uint8_t MSG_READY = 5, MSG_CLOSE_ASKED = 6, MSG_OPENED = 7, MSG_CLOSE_FOR_CODE_UPDATE = 8;
 constexpr uint32_t THREADED_WAL_REVISION = 1;
 // An ACK's status. A refusal carries the code the caller sees: the node could not make the write durable, the
 // object is past its own size limit, or the tenant's Durable Object storage quota is exhausted. Reads are not

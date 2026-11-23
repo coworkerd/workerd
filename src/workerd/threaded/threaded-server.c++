@@ -1684,7 +1684,7 @@ struct ThreadState {
     std::shared_ptr<server::DurableIdleLifecycle> idle;
     std::function<bool(bool)> facetsBusy;
     std::function<bool()> facetHasOrdinaryWebSocket;
-    std::function<void()> stopFacets;
+    std::function<void(const kj::Exception *)> stopFacets;
     std::function<uint64_t()> rootOpenId;
     std::map<uint64_t, std::weak_ptr<DurableSessionScope>> sockets;
     bool resetting = false;
@@ -2826,7 +2826,7 @@ struct ThreadedServer {
       if (decision == Decision::WAIT) continue;
       const bool cancelPending = decision == Decision::CANCEL_PENDING;
       const bool closeSocketSessions = !root.sockets.empty() && !root.resetting && !root.idleClosing;
-      if (root.resetting || root.idleClosing) root.stopFacets();
+      if (root.resetting || root.idleClosing) root.stopFacets(nullptr);
       if (root.facetsBusy(!cancelPending && !closeSocketSessions)) continue;
       if (!cancelPending && !closeSocketSessions) {
         KJ_IF_SOME(context, actor.getIoContext()) {
@@ -2852,7 +2852,7 @@ struct ThreadedServer {
       }
       if (cancelPending || closeSocketSessions) {
         if (!explicitClose) root.idleClosing = true;
-        root.stopFacets();
+        root.stopFacets(nullptr);
         actor.abort(KJ_EXCEPTION(DISCONNECTED, "Durable Object retired after its pending work expired."));
         continue;
       }
@@ -2874,7 +2874,7 @@ struct ThreadedServer {
         }
       }
       if (current->second.resetting && memory.durableProcessPressure.load()) reclaimed = true;
-      current->second.stopFacets();
+      current->second.stopFacets(nullptr);
       actor.shutdown(0);
       state.durableRoots.erase(current);
       {
@@ -3132,10 +3132,20 @@ struct ThreadedServer {
     state.rejectOnly = thread.control;
     state.durableHome = thread.homeId;
     if (thread.home && durableLog) {
-      state.wal = durableLog->attachHome([&state](uint64_t openId) {
+      state.wal = durableLog->attachHome(
+          [this, &state](uint64_t openId, server::ThreadedWalLog::CloseReason why) {
         for (auto& [id, root]: state.durableRoots) {
           if (!root.rootOpenId || root.rootOpenId() != openId) continue;
           root.closeRequested = true;
+          if (why == server::ThreadedWalLog::CloseReason::CODE_UPDATED) {
+            beginDurableReset(state, id);
+            auto reason = jsg::tagCoworkerdRpcError(
+                KJ_EXCEPTION(DISCONNECTED,
+                    "broken.codeUpdated; jsg.Error: Durable Object reset because its code was updated"),
+                "DO_CODE_UPDATED"_kj);
+            root.stopFacets(&reason);
+            root.actor->abort(kj::mv(reason));
+          }
           break;
         }
       });
@@ -5504,6 +5514,10 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
 
   void stop() {
     const auto reason = KJ_EXCEPTION(DISCONNECTED, "Durable test tree was closed.");
+    stop(reason);
+  }
+
+  void stop(const kj::Exception &reason) {
     for (auto at = children.begin(); at != children.end();) {
       auto current = at++;
       current->second->stop(reason);
@@ -5564,7 +5578,7 @@ bool LocalFacet::hasOrdinaryWebSocket() {
 void LocalFacet::stop(const kj::Exception &reason) {
   const auto wasStopped = std::exchange(stopped, true);
   KJ_IF_SOME(opened, actor) {
-    opened.hooks->stop();
+    opened.hooks->stop(reason);
     if (!wasStopped) opened.value->abort(reason.clone());
     if (!busy()) {
       opened.value->shutdown(0);
@@ -5748,17 +5762,22 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
                     ThreadState::DurableRoot{
                       .actor = kj::mv(actor.value),
                       .idle = std::move(idle),
-                      .facetsBusy = [hooks = actor.hooks](bool includeBackground) {
-                        return hooks->busy(includeBackground);
-                      },
-                      .facetHasOrdinaryWebSocket = [hooks = actor.hooks] {
-                        return hooks->hasOrdinaryWebSocket();
-                      },
-                      .stopFacets = [hooks = actor.hooks] { hooks->stop(); },
+                      .facetsBusy =
+                          [hooks = actor.hooks](
+                              bool includeBackground) { return hooks->busy(includeBackground); },
+                      .facetHasOrdinaryWebSocket =
+                          [hooks = actor.hooks] { return hooks->hasOrdinaryWebSocket(); },
+                      .stopFacets =
+                          [hooks = actor.hooks](const kj::Exception *reason) {
+      if (reason == nullptr)
+        hooks->stop();
+      else
+        hooks->stop(*reason);
+    },
                       .rootOpenId = [tree]() -> uint64_t {
-                        const auto root = tree->shippers.find(0);
-                        return root == tree->shippers.end() ? 0 : root->second->getOpenId();
-                      },
+      const auto root = tree->shippers.find(0);
+      return root == tree->shippers.end() ? 0 : root->second->getOpenId();
+    },
                     })
                 .first;
     server.publishDurableRoot(state.durableHome, ticket.tree);

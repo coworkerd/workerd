@@ -238,6 +238,7 @@ class Session {
         KJ_REQUIRE(payload.size() == 0, "invalid threaded WAL checkpoint");
         break;
       case MSG_CLOSE_ASKED:
+      case MSG_CLOSE_FOR_CODE_UPDATE:
         KJ_REQUIRE(payload.size() == 0, "invalid threaded WAL close request");
         break;
       case MSG_OPENED:
@@ -254,9 +255,12 @@ class Session {
 
 class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
  public:
-  Home(std::shared_ptr<Shared> shared, kj::Function<void(uint64_t)> requestClose)
-      : shared(kj::mv(shared)), inbox(std::make_shared<Inbox>()),
-        requestClose(kj::mv(requestClose)), tasks(*this) {
+  Home(std::shared_ptr<Shared> shared,
+      kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose)
+      : shared(kj::mv(shared)),
+        inbox(std::make_shared<Inbox>()),
+        requestClose(kj::mv(requestClose)),
+        tasks(*this) {
     tasks.add(read());
   }
 
@@ -320,7 +324,7 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
   std::shared_ptr<Shared> shared;
   std::shared_ptr<Inbox> inbox;
   std::map<uint64_t, Registration> shippers;
-  kj::Function<void(uint64_t)> requestClose;
+  kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose;
   kj::TaskSet tasks;
 
   void taskFailed(kj::Exception&&) override { shared->stop(); }
@@ -379,7 +383,12 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
         case MSG_SEALED: shipper.onSealed(notice.salt1, notice.salt2, notice.upToFrame); break;
         case MSG_BREAK: shipper.onBreak(notice.reason); break;
         case MSG_CHECKPOINT_ASKED: shipper.onCheckpointAsked(); break;
-        case MSG_CLOSE_ASKED: requestClose(notice.openId); break;
+        case MSG_CLOSE_ASKED:
+          requestClose(notice.openId, ThreadedWalLog::CloseReason::DRAIN);
+          break;
+        case MSG_CLOSE_FOR_CODE_UPDATE:
+          requestClose(notice.openId, ThreadedWalLog::CloseReason::CODE_UPDATED);
+          break;
         case MSG_OPENED:
           if (!registration.opening->isWaiting()) break;
           if (notice.status == ACK_OK) registration.opening->fulfill();
@@ -438,7 +447,8 @@ ThreadedWalLog::~ThreadedWalLog() noexcept(false) = default;
 
 bool ThreadedWalLog::ready() const { return impl->shared->negotiated(); }
 
-kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(kj::Function<void(uint64_t)> requestClose) {
+kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
+    kj::Function<void(uint64_t, CloseReason)> requestClose) {
   return kj::heap<Home>(impl->shared, kj::mv(requestClose));
 }
 
