@@ -59,6 +59,27 @@ kj_test(
     deps = [":coworkerd-durable-test-storage"],
 )
 
+wd_cc_library(
+    name = "coworkerd-native-sql",
+    srcs = ["coworkerd-native-sql.c++"],
+    hdrs = ["coworkerd-native-sql.h"],
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//src/workerd/threaded:__pkg__"],
+    deps = [
+        "//src/workerd/util:sqlite",
+        "@capnp-cpp//src/capnp",
+        "@capnp-cpp//src/capnp/compat:json",
+        "@capnp-cpp//src/kj",
+        "@sqlite3",
+    ],
+)
+
+kj_test(
+    src = "coworkerd-native-sql-test.c++",
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [":coworkerd-native-sql"],
+)
+
 # The declarations the server crate's bridge header needs. Header-only: the bridge library depends
 # on it, and :worker-factory depends on the bridge library, so the two cannot be one target.
 wd_cc_library(
