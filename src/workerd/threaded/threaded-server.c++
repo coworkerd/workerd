@@ -3897,40 +3897,76 @@ struct DurableAlarmEvent {
 // to the same URL uses its regular entrypoint.
 class DurableAlarmHttp final: public kj::HttpService {
  public:
-  DurableAlarmHttp(kj::Own<WorkerInterface> worker, DurableAlarmEvent event,
-      const kj::HttpHeaderTable& headers)
-      : worker(kj::mv(worker)), event(kj::mv(event)), headers(headers) {}
+  DurableAlarmHttp(
+      kj::Own<WorkerInterface> worker, DurableAlarmEvent event, const kj::HttpHeaderTable &headers)
+      : worker(kj::mv(worker)),
+        event(kj::mv(event)),
+        headers(headers) {}
 
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
       const kj::HttpHeaders&,
       kj::AsyncInputStream&,
       Response& response) override {
-    KJ_REQUIRE(method == kj::HttpMethod::POST &&
-        url == "http://coworkerd-node/__coworkerd/durable-alarm", "invalid alarm event");
+    KJ_REQUIRE(
+        method == kj::HttpMethod::POST && url == "http://coworkerd-node/__coworkerd/durable-alarm",
+        "invalid alarm event");
     KJ_REQUIRE(worker.get() != nullptr, "one call per alarm event");
     auto entry = kj::mv(worker);
     auto& actor = *event.actor;
     auto& gate = actor.getOutputGate();
+    auto &storage = KJ_REQUIRE_NONNULL(kj::tryDowncast<ActorSqlite>(
+        KJ_REQUIRE_NONNULL(actor.getPersistent(), "an alarm requires persistent storage")));
     co_await gate.wait(nullptr);
 
     kj::StringPtr outcome;
+    auto confirmedTime = storage.confirmedAlarmTime();
     if (event.clear) {
       co_await entry->abandonAlarm(event.scheduledTime);
       co_await gate.wait(nullptr);
-      outcome = "cleared";
+      confirmedTime = storage.confirmedAlarmTime();
+      if (confirmedTime == kj::none) {
+        outcome = "cleared";
+      } else {
+        outcome = confirmedTime != event.scheduledTime ? "notDue" : "unavailable";
+      }
+    } else if (confirmedTime != event.scheduledTime) {
+      outcome = "notDue";
     } else {
-      auto result = co_await entry->runAlarm(event.scheduledTime, event.retryCount);
-      if (result.outcome == EventOutcome::OK || result.outcome == EventOutcome::SCRIPT_NOT_FOUND) {
+      WorkerInterface::AlarmResult result;
+      try {
+        result = co_await entry->runAlarm(event.scheduledTime, event.retryCount);
+      } catch (const kj::Exception &error) {
+        const auto description = error.getDescription();
+        const auto tunneled = jsg::tunneledErrorType(description);
+        const bool tenantFailure = error.getDetail(jsg::EXCEPTION_IS_USER_ERROR) != kj::none ||
+            jsg::isExceptionFromInputGateBroken(description) ||
+            (tunneled.isJsgError && !tunneled.isInternal &&
+                (!tunneled.isDurableObjectReset ||
+                    description.startsWith("broken.constructorFailed;"_kj)));
+        if (!tenantFailure) throw;
+        result.outcome = EventOutcome::EXCEPTION;
+        result.retry = error.getDetail(jsg::EXCEPTION_DURABLE_OBJECT_ABORT_NO_RETRY) == kj::none;
+      }
+      if (result.outcome == EventOutcome::OK) {
         co_await gate.wait(nullptr);
         outcome = "fired";
-      } else if (result.retry && result.retryCountsAgainstLimit) {
+      } else if (!result.retry && result.outcome == EventOutcome::CANCELED) {
+        co_await gate.wait(nullptr);
+        confirmedTime = storage.confirmedAlarmTime();
+        outcome = confirmedTime != event.scheduledTime ? "notDue" : "unavailable";
+      } else if (!result.retry) {
+        outcome = "stop";
+      } else if (result.retryCountsAgainstLimit) {
         outcome = "failed";
       } else {
         outcome = "unavailable";
       }
     }
-    auto json = kj::str("{\"outcome\":\"", outcome, "\"}");
+    auto atUnixMs = (confirmedTime.orDefault(kj::UNIX_EPOCH) - kj::UNIX_EPOCH) / kj::MILLISECONDS;
+    auto json = outcome == "notDue"
+        ? kj::str("{\"outcome\":\"notDue\",\"atUnixMs\":", atUnixMs, "}")
+        : kj::str("{\"outcome\":\"", outcome, "\"}");
     auto body = response.send(200, "OK", kj::HttpHeaders(headers), json.size());
     co_await body->write(json.asBytes());
   }
