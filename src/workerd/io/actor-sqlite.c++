@@ -483,6 +483,7 @@ void ActorSqlite::scheduleLaterAlarm(kj::Maybe<kj::Date> newAlarmTime, SpanParen
 
 ActorSqlite::PrecommitAlarmState ActorSqlite::startPrecommitAlarmScheduling() {
   PrecommitAlarmState state;
+  if (hooks.hasConfirmedAlarmScheduler()) return state;
   if (pendingCommit == kj::none &&
       willFireEarlier(metadata.getAlarm(), alarmScheduledNoLaterThan)) {
     // We must wait on the `alarmLaterInFlight` promise here, otherwise, if there is an in-flight
@@ -561,7 +562,8 @@ kj::Promise<void> ActorSqlite::commitImpl(
   // the successfully persisted db.
   int syncIterations = 0;
   auto startAlarmState = metadata.getAlarm();
-  while (willFireEarlier(metadata.getAlarm(), alarmScheduledNoLaterThan)) {
+  while (!hooks.hasConfirmedAlarmScheduler() &&
+      willFireEarlier(metadata.getAlarm(), alarmScheduledNoLaterThan)) {
     auto alarmSpan = commitSpan.newChild("actor_sqlite_alarm_sync"_kjc);
     if (debugAlarmSync) {
       haveAlarmForDebug = true;
@@ -609,7 +611,11 @@ kj::Promise<void> ActorSqlite::commitImpl(
 
   // Wait for the db to persist.
   co_await commitCallbackPromise;
+  const bool alarmChanged = lastConfirmedAlarmDbState != alarmStateForCommit;
   lastConfirmedAlarmDbState = alarmStateForCommit;
+  if (hooks.hasConfirmedAlarmScheduler() && alarmChanged) {
+    hooks.alarmConfirmed(alarmStateForCommit);
+  }
 
   if (debugAlarmSync && haveAlarmForDebug) {
     KJ_LOG(WARNING, "NOSENTRY DEBUG_ALARM: Persisted in SQLite", "sqlite_has",
@@ -632,7 +638,7 @@ kj::Promise<void> ActorSqlite::commitImpl(
   //  3. This coalesces redundant alarm updates for better performance
   //  4. This avoids race conditions where a later commit moved the alarm earlier, requiring a
   //     pre-commit alarm update, and this update may have already been made before we get here.
-  if (alarmVersion == alarmVersionBeforeAsync) {
+  if (!hooks.hasConfirmedAlarmScheduler() && alarmVersion == alarmVersionBeforeAsync) {
     // No intervening alarm changes, it is safe to schedule a move-later alarm update if needed.
     if (willFireEarlier(alarmScheduledNoLaterThan, alarmStateForCommit)) {
       if (debugAlarmSync) {
@@ -1022,6 +1028,10 @@ kj::OneOf<ActorSqlite::CancelAlarmHandler, ActorSqlite::RunAlarmHandler> ActorSq
   }
 
   auto localAlarmState = metadata.getAlarm();
+  if (hooks.hasConfirmedAlarmScheduler() &&
+      (localAlarmState != scheduledTime || lastConfirmedAlarmDbState != scheduledTime)) {
+    return CancelAlarmHandler{.waitBeforeCancel = kj::READY_NOW};
+  }
   if (localAlarmState != scheduledTime) {
     if (localAlarmState == lastConfirmedAlarmDbState) {
       // If the local alarm time is already in the past, just run the handler now. This avoids
@@ -1130,6 +1140,9 @@ kj::Promise<kj::Maybe<kj::Date>> ActorSqlite::abandonAlarm(kj::Date scheduledTim
     // Shouldn't happen -- AlarmManager shouldn't call abandonAlarm while a handler is running.
     LOG_WARNING_ONCE("abandonAlarm called while alarm handler is still running");
     return kj::Maybe<kj::Date>(kj::none);
+  }
+  if (hooks.hasConfirmedAlarmScheduler() && lastConfirmedAlarmDbState != scheduledTime) {
+    return lastConfirmedAlarmDbState;
   }
   KJ_IF_SOME(storedTime, metadata.getAlarm()) {
     if (storedTime == scheduledTime) {
