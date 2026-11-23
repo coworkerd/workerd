@@ -41,6 +41,13 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
     virtual kj::Promise<void> scheduleRun(
         kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask);
 
+    // A node-owned scheduler learns the time from confirmed storage and
+    // supplies that exact time when it opens an alarm event.
+    virtual bool hasConfirmedAlarmScheduler() const {
+      return false;
+    }
+    virtual void alarmConfirmed(kj::Maybe<kj::Date>) {}
+
     static const Hooks DEFAULT;
 
     static constexpr inline Hooks& getDefaultHooks() {
@@ -131,6 +138,10 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
       kj::StringPtr actorId = "") override;
   void cancelDeferredAlarmDeletion() override;
   kj::Promise<kj::Maybe<kj::Date>> abandonAlarm(kj::Date scheduledTime) override;
+  // Callers check the output gate before using this as the authoritative schedule.
+  kj::Maybe<kj::Date> confirmedAlarmTime() const {
+    return lastConfirmedAlarmDbState;
+  }
   kj::Maybe<kj::Promise<void>> onNoPendingFlush(SpanParent parentSpan) override;
   kj::Promise<kj::String> getCurrentBookmark(SpanParent parentSpan) override;
   kj::Promise<void> waitForBookmark(kj::StringPtr bookmark, SpanParent parentSpan) override;
