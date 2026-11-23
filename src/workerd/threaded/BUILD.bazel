@@ -4,6 +4,7 @@ load("//:build/wd_cc_binary.bzl", "wd_cc_binary")
 load("//:build/wd_cc_library.bzl", "wd_cc_library")
 
 THREADED_DEPS = [
+    ":fatal-attribution",
     ":protocol_capnp",
     "//src/workerd/api:memory-cache",
     "//src/workerd/io",
@@ -31,6 +32,27 @@ THREADED_DEPS = [
     "@ssl",
 ]
 
+wd_cc_library(
+    name = "fatal-attribution",
+    hdrs = ["fatal-attribution.h"],
+    deps = ["@capnp-cpp//src/kj"],
+)
+
+kj_test(
+    size = "small",
+    src = "fatal-attribution-test.c++",
+    deps = [":fatal-attribution"],
+)
+
+kj_test(
+    size = "small",
+    src = "fatal-attribution-scope-test.c++",
+    deps = [
+        ":fatal-attribution",
+        "//src/workerd/jsg",
+    ],
+)
+
 wd_cc_binary(
     name = "coworkerd-threaded",
     srcs = [
@@ -44,6 +66,7 @@ wd_cc_binary(
 
 wd_cc_binary(
     name = "coworkerd-threaded-fatal-test",
+    testonly = True,
     srcs = [
         "protocol.h",
         "threaded-server.c++",
@@ -51,7 +74,6 @@ wd_cc_binary(
     local_defines = ["COWORKERD_FATAL_TEST_BUILD"],
     malloc = "//src/workerd/server:malloc",
     target_compatible_with = ["@platforms//os:linux"],
-    testonly = True,
     deps = THREADED_DEPS,
 )
 
@@ -68,7 +90,10 @@ wd_capnp_library(
 wd_cc_library(
     name = "server-source",
     testonly = True,
-    textual_hdrs = ["threaded-server.c++", "protocol.h"],
+    textual_hdrs = [
+        "threaded-server.c++",
+        "protocol.h",
+    ],
     deps = THREADED_DEPS,
 )
 

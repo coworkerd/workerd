@@ -958,8 +958,8 @@ struct Worker::Script::Impl {
         "legacy dynamic imports must not be used with the new module registry");
     static auto constexpr handleDynamicImport =
         [](kj::Own<const Worker> worker, DynamicImportHandler handler,
-            kj::Maybe<jsg::Ref<jsg::AsyncContextFrame>> asyncContext)
-        -> kj::Promise<DynamicImportResult> {
+            kj::Maybe<jsg::Ref<jsg::AsyncContextFrame>> asyncContext,
+            kj::Own<IoContext::WeakRef> origin) -> kj::Promise<DynamicImportResult> {
       co_await kj::yield();
       auto asyncLock = co_await worker->takeAsyncLockWithoutRequest(nullptr);
 
@@ -976,8 +976,10 @@ struct Worker::Script::Impl {
           try {
             kj::Maybe<jsg::Value> result;
             {
+              kj::Maybe<IoContext&> originatingContext;
+              origin->runIfAlive([&](IoContext& context) { originatingContext = context; });
               auto limitScope = worker->getIsolate().getLimitEnforcer().enterDynamicImportJs(
-                  lock, limitErrorOrTime);
+                  lock, limitErrorOrTime, originatingContext);
               result = handler();
             }
             // The limit may have been hit in a microtask, which throws nothing.
@@ -1017,7 +1019,7 @@ struct Worker::Script::Impl {
 
         return context.awaitIo(js,
             handleDynamicImport(kj::atomicAddRef(context.getWorker()), kj::mv(handler),
-                jsg::AsyncContextFrame::currentRef(js)),
+                jsg::AsyncContextFrame::currentRef(js), context.getWeakRef()),
             [](jsg::Lock& js, DynamicImportResult result) {
           if (result.isException) {
             return js.rejectedPromise<jsg::Value>(kj::mv(result.value));

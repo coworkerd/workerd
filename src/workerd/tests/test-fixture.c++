@@ -218,8 +218,9 @@ struct MockIsolateLimitEnforcer final: public IsolateLimitEnforcer {
       jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>&) const override {
     return enterStartupLimitScope();
   }
-  kj::Own<void> enterDynamicImportJs(
-      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>&) const override {
+  kj::Own<void> enterDynamicImportJs(jsg::Lock& lock,
+      kj::OneOf<kj::Exception, kj::Duration>&,
+      kj::Maybe<IoContext&>) const override {
     return {};
   }
   kj::Own<void> enterLoggingJs(
