@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Cloudflare, Inc.
+// Copyright (c) 2026 Coworkerd contributors.
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
@@ -46,6 +46,8 @@ class Deadline {
         fd(fd) {
     sqlite3_progress_handler(database, 1000,
         [](void* self) { return static_cast<Deadline*>(self)->stopped() ? 1 : 0; }, this);
+    sqlite3_commit_hook(database,
+        [](void* self) { return static_cast<Deadline*>(self)->stopped() ? 1 : 0; }, this);
   }
 
   ~Deadline() {
@@ -54,6 +56,7 @@ class Deadline {
 
   void disable() {
     sqlite3_progress_handler(database, 0, nullptr, nullptr);
+    sqlite3_commit_hook(database, nullptr, nullptr);
   }
 
   bool stopped() {
@@ -583,12 +586,12 @@ NativeSqlReply failed(kj::StringPtr reason, bool batch) {
   return {200, std::move(out.bytes)};
 }
 
-// SQLite can already have rolled back an interrupted write by the time its
-// cursor is destroyed. Roll back only a live transaction, with cancellation
-// disabled so it can reach a clean boundary.
+// SQLite may have rolled back the whole transaction as part of a failed
+// statement. Disable cancellation so any remaining rollback can finish.
 void rollback(SqliteDatabase& db, Deadline& deadline) {
   deadline.disable();
   if (sqlite3_get_autocommit(db) == 0) db.run("ROLLBACK");
+  else db.acknowledgeAutomaticRollback();
 }
 
 }  // namespace
@@ -604,6 +607,11 @@ std::string nativeSqlFailure(kj::StringPtr code, kj::StringPtr reason) {
   out.string(kj::str(code, ": ", reason));
   out.append("}");
   return std::move(out.bytes);
+}
+
+NativeSqlReply nativeSqlTimeout() {
+  return {503,
+    nativeSqlFailure("SQL_LIMIT_EXCEEDED"_kj, "SQL execution exceeded the 30-second deadline"_kj)};
 }
 
 NativeSqlReply runNativeSql(SqliteDatabase& db,
@@ -664,13 +672,25 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
         } catch (const ResultTooLarge&) {
           reason = kj::str(RESULT_TOO_LARGE);
         } catch (const kj::Exception& error) {
-          if (deadline.wasInterrupted() || db.observedCriticalError()) throw;
+          if (deadline.wasInterrupted()) throw;
           reason = kj::str(error.getDescription());
         }
         // Preserve the prefix on an ordinary SQL or result error, including
         // earlier SQL statements within this entry. Timeout cancels this entry.
         deadline.check();
-        db.run("COMMIT");
+        try {
+          if (sqlite3_get_autocommit(db) == 0) {
+            db.run("COMMIT");
+          } else {
+            KJ_ASSERT(!success, "a successful SQL entry ended its own transaction");
+            db.acknowledgeAutomaticRollback();
+          }
+        } catch (const kj::Exception& error) {
+          deadline.check();
+          rollback(db, deadline);
+          if (success) reason = kj::str(error.getDescription());
+          success = false;
+        }
         if (!success) {
           out.bytes.resize(before);
           if (separator) out.append(",");
@@ -704,8 +724,7 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
     if (!deadline.wasInterrupted()) return failed(error.getDescription(), batch);
   }
   if (deadline.clientGone()) return {0, {}};
-  return {503,
-    nativeSqlFailure("SQL_LIMIT_EXCEEDED"_kj, "SQL execution exceeded the 30-second deadline"_kj)};
+  return nativeSqlTimeout();
 }
 
 }  // namespace workerd::server

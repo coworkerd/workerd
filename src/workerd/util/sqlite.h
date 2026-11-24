@@ -426,6 +426,10 @@ class SqliteDatabase {
     }
   }
 
+  // When SQLite rolls back the entire transaction on a statement error, discard
+  // the wrapper's transaction state and notify rollback listeners.
+  void acknowledgeAutomaticRollback();
+
   // Generates a randomly generated fresh id for a new top-level operation so related statements
   // can be grouped in analytics.
   SqliteQueryId generateQueryId();
@@ -522,6 +526,7 @@ class SqliteDatabase {
   // Called immediately after a statement executes, to update our understanding of the current
   // state.
   void applyChange(const StateChange& change);
+  void clearRolledBackTransaction();
 
   void handleCriticalError(kj::Maybe<int> errorCode,
       kj::StringPtr errorMessage,
@@ -942,6 +947,10 @@ struct SqliteDatabase::VfsOptions {
   // need not survive the machine, such as those of tests, where a sync can stall for seconds on a
   // busy disk.
   bool sync = true;
+
+  // Hard limit on the logical length of WAL files opened through this VFS.
+  // An existing longer file can still be read and truncated.
+  uint64_t maxWalBytes = kj::maxValue;
 };
 
 // Implements a SQLite VFS based on a KJ directory.

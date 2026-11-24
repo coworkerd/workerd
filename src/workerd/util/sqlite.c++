@@ -907,6 +907,20 @@ bool SqliteDatabase::observedCriticalError() {
   return criticalErrorOccurred;
 }
 
+void SqliteDatabase::acknowledgeAutomaticRollback() {
+  KJ_REQUIRE(sqlite3_get_autocommit(*this) != 0, "SQLite still has a transaction");
+  clearRolledBackTransaction();
+}
+
+void SqliteDatabase::clearRolledBackTransaction() {
+  savepoints.clear();
+  inTransaction = false;
+  while (!rollbackCallbacks.empty()) {
+    rollbackCallbacks.back()();
+    rollbackCallbacks.removeLast();
+  }
+}
+
 void SqliteDatabase::notifyWrite(bool allowUnconfirmed) {
   KJ_IF_SOME(cb, onWriteCallback) {
     cb(allowUnconfirmed);
@@ -1026,14 +1040,7 @@ void SqliteDatabase::applyChange(const StateChange& change) {
         }
       } else {
         KJ_ASSERT(inTransaction, "ROLLBACK TRANSACTION without BEGIN TRANSACTION?");
-
-        savepoints.clear();
-        inTransaction = false;
-
-        while (!rollbackCallbacks.empty()) {
-          rollbackCallbacks.back()();
-          rollbackCallbacks.removeLast();
-        }
+        clearRolledBackTransaction();
       }
     }
   }
@@ -2225,6 +2232,7 @@ static int replaced_lstat(const char* path, struct stat* stats) {
 struct SqliteDatabase::Vfs::WrappedNativeFileImpl: public sqlite3_file {
   const Vfs* vfs;
   int rootFd;
+  bool wal;
 
   // It's expected that the wrapped sqlite_file begins in memory immediately after this object.
   sqlite3_file* getWrapped() {
@@ -2233,6 +2241,10 @@ struct SqliteDatabase::Vfs::WrappedNativeFileImpl: public sqlite3_file {
 
   static const sqlite3_io_methods METHOD_TABLE;
 };
+
+static bool walWriteFits(uint64_t limit, sqlite3_int64 offset, uint64_t length) {
+  return offset >= 0 && uint64_t(offset) <= limit && length <= limit - uint64_t(offset);
+}
 
 // This completely nutso template generates wrapper functions for each of the function pointer
 // members of sqlite3_vfs. The wrapper function temporarily sets `currentVfsRoot` to the FD
@@ -2285,8 +2297,18 @@ const sqlite3_io_methods SqliteDatabase::Vfs::WrappedNativeFileImpl::METHOD_TABL
 
   WRAP(xClose),
   WRAP(xRead),
-  WRAP(xWrite),
-  WRAP(xTruncate),
+  .xWrite = [](sqlite3_file* file, const void* buffer, int length, sqlite3_int64 offset) noexcept -> int {
+    auto& self = *static_cast<WrappedNativeFileImpl*>(file);
+    if (self.wal && !walWriteFits(self.vfs->options.maxWalBytes, offset, length)) return SQLITE_FULL;
+    return MethodWrapperHack<decltype(&sqlite3_io_methods::xWrite),
+        &sqlite3_io_methods::xWrite>::wrapper(file, buffer, length, offset);
+  },
+  .xTruncate = [](sqlite3_file* file, sqlite3_int64 size) noexcept -> int {
+    auto& self = *static_cast<WrappedNativeFileImpl*>(file);
+    if (self.wal && !walWriteFits(self.vfs->options.maxWalBytes, size, 0)) return SQLITE_FULL;
+    return MethodWrapperHack<decltype(&sqlite3_io_methods::xTruncate),
+        &sqlite3_io_methods::xTruncate>::wrapper(file, size);
+  },
   .xSync = [](sqlite3_file* file, int flags) noexcept -> int {
     // Also skips the directory sync that the native xSync does after creating a journal or WAL.
     if (!static_cast<WrappedNativeFileImpl*>(file)->vfs->options.sync) {
@@ -2299,7 +2321,17 @@ const sqlite3_io_methods SqliteDatabase::Vfs::WrappedNativeFileImpl::METHOD_TABL
   WRAP(xLock),
   WRAP(xUnlock),
   WRAP(xCheckReservedLock),
-  WRAP(xFileControl),
+  .xFileControl = [](sqlite3_file* file, int op, void* arg) noexcept -> int {
+    auto& self = *static_cast<WrappedNativeFileImpl*>(file);
+    if (self.wal && self.vfs->options.maxWalBytes != kj::maxValue) {
+      // A native preallocation hint is optional. Do not let it grow the WAL
+      // without passing the checks on write and truncate.
+      if (op == SQLITE_FCNTL_SIZE_HINT) return SQLITE_OK;
+      if (op == SQLITE_FCNTL_CHUNK_SIZE) return SQLITE_NOTFOUND;
+    }
+    return MethodWrapperHack<decltype(&sqlite3_io_methods::xFileControl),
+        &sqlite3_io_methods::xFileControl>::wrapper(file, op, arg);
+  },
   WRAP(xSectorSize),
   .xDeviceCharacteristics = [](sqlite3_file* file) noexcept -> int {
     auto wrapper = static_cast<WrappedNativeFileImpl*>(file);
@@ -2388,6 +2420,7 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
         wrapper->pMethods = &WrappedNativeFileImpl::METHOD_TABLE;
         wrapper->vfs = &self;
         wrapper->rootFd = self.rootFd;
+        wrapper->wal = (flags & SQLITE_OPEN_WAL) != 0;
       }
 
       return result;
@@ -2444,6 +2477,7 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
 // an actual instance.
 struct SqliteDatabase::Vfs::FileImpl: public sqlite3_file {
   const Vfs& vfs;
+  bool wal = false;
   kj::Maybe<const kj::File&> writableFile;
   kj::Own<const kj::ReadableFile> file;
 
@@ -2454,9 +2488,10 @@ struct SqliteDatabase::Vfs::FileImpl: public sqlite3_file {
   //
   // We leave this null if the file is not the main database file.
 
-  FileImpl(const Vfs& vfs, kj::Own<const kj::File> file, kj::Maybe<kj::Own<Lock>> lock)
+  FileImpl(const Vfs& vfs, kj::Own<const kj::File> file, kj::Maybe<kj::Own<Lock>> lock, bool wal)
       : sqlite3_file{.pMethods = &FILE_METHOD_TABLE},
         vfs(vfs),
+        wal(wal),
         writableFile(*file),
         file(kj::mv(file)),
         lock(kj::mv(lock)) {}
@@ -2506,6 +2541,7 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
   .xWrite =
       [](sqlite3_file* file, const void* buffer, int iAmt, sqlite3_int64 iOfst) noexcept -> int {
     WRAP_METHOD(SQLITE_IOERR_WRITE, {
+      if (self.wal && !walWriteFits(self.vfs.options.maxWalBytes, iOfst, iAmt)) return SQLITE_FULL;
       KJ_IF_SOME(writableFile, self.writableFile) {
         auto bytes = kj::arrayPtr(reinterpret_cast<const byte*>(buffer), iAmt);
         writableFile.write(iOfst, bytes);
@@ -2518,6 +2554,7 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
 
   .xTruncate = [](sqlite3_file* file, sqlite3_int64 size) noexcept -> int {
     WRAP_METHOD(SQLITE_IOERR_TRUNCATE, {
+      if (self.wal && !walWriteFits(self.vfs.options.maxWalBytes, size, 0)) return SQLITE_FULL;
       KJ_IF_SOME(writableFile, self.writableFile) {
         writableFile.truncate(size);
         return SQLITE_OK;
@@ -2748,7 +2785,7 @@ sqlite3_vfs SqliteDatabase::Vfs::makeKjVfs() {
             }
           }
 
-          kj::ctor(target, self, kj::mv(kjFile), kj::mv(lock));
+          kj::ctor(target, self, kj::mv(kjFile), kj::mv(lock), (flags & SQLITE_OPEN_WAL) != 0);
         }
 
         // In theory if read-write was requested, but failed, we should retry read-only, and then

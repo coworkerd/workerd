@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Cloudflare, Inc.
+// Copyright (c) 2026 Coworkerd contributors.
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
@@ -30,5 +30,6 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
     int connectionFd = -1);
 
 std::string nativeSqlFailure(kj::StringPtr code, kj::StringPtr reason);
+NativeSqlReply nativeSqlTimeout();
 
 }  // namespace workerd::server

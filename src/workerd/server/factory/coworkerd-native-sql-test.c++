@@ -1,9 +1,10 @@
-// Copyright (c) 2026 Cloudflare, Inc.
+// Copyright (c) 2026 Coworkerd contributors.
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "coworkerd-native-sql.h"
 
+#include <sqlite3.h>
 #include <sys/socket.h>
 
 #include <kj/io.h>
@@ -91,6 +92,36 @@ KJ_TEST("native SQL platform errors retain the code consumed by the binding") {
       "\"error\":\"STORAGE_UNAVAILABLE: the write was unconfirmed\"}");
 }
 
+KJ_TEST("native SQL handles a statement that rolls back its whole transaction") {
+  Fixture f;
+  f.db.run("CREATE TABLE prefix(id INTEGER PRIMARY KEY);"
+           "CREATE TABLE ordinary(id INTEGER PRIMARY KEY);"
+           "INSERT INTO ordinary VALUES(1);"
+           "CREATE TABLE on_conflict(id INTEGER PRIMARY KEY ON CONFLICT ROLLBACK);"
+           "INSERT INTO on_conflict VALUES(1);"
+           "CREATE TABLE on_trigger(id INTEGER);"
+           "CREATE TRIGGER reject_insert BEFORE INSERT ON on_trigger "
+           "BEGIN SELECT RAISE(ROLLBACK, 'trigger rolled back'); END");
+  for (auto sql: {"INSERT OR ROLLBACK INTO ordinary VALUES(1)"_kj,
+           "INSERT INTO on_conflict VALUES(1)"_kj, "INSERT INTO on_trigger VALUES(1)"_kj}) {
+    f.db.run("DELETE FROM prefix");
+    auto batch = kj::str(
+        "[{\"sql\":\"INSERT INTO prefix VALUES(1)\"},{\"sql\":\"", sql,
+        "\"},{\"sql\":\"INSERT INTO prefix VALUES(2)\"}]");
+    auto expected = sql.contains("on_trigger"_kj) ? "trigger rolled back" : "UNIQUE constraint failed";
+    auto query = f.query(batch);
+    KJ_EXPECT(query.body.starts_with("[{\"success\":false,"));
+    KJ_EXPECT(query.body.find(expected) != std::string::npos);
+    KJ_EXPECT(f.db.run("SELECT count(*) FROM prefix").getInt(0) == 0);
+    auto execute = f.execute(batch);
+    KJ_EXPECT(execute.body.starts_with("[{\"success\":true,"));
+    KJ_EXPECT(execute.body.find(expected) != std::string::npos);
+    KJ_EXPECT(f.db.run("SELECT sum(id) FROM prefix").getInt(0) == 1);
+    KJ_EXPECT(f.query(R"SQL({"sql":"INSERT INTO prefix VALUES(3)"})SQL").body.starts_with(
+        "{\"success\":true,"));
+  }
+}
+
 KJ_TEST("native SQL counts the complete JSON response at the exact byte limit") {
   Fixture f;
   for (auto format: {NativeSqlResults::OBJECTS, NativeSqlResults::COLUMNS}) {
@@ -148,6 +179,63 @@ KJ_TEST("native SQL timeout interrupts a write, rolls the batch back, and permit
       NativeSqlResults::OBJECTS, Clock::now() + 1s);
   KJ_EXPECT(accepted.body.starts_with("{\"success\":true,"));
   KJ_EXPECT(retry.run("SELECT count(*) FROM ledger").getInt(0) == 1);
+}
+
+KJ_TEST("native SQL rejects a commit if its deadline has elapsed") {
+  Fixture f;
+  f.db.run("CREATE TABLE ledger(id INTEGER PRIMARY KEY)");
+  auto end = Clock::now() + 100ms;
+  sqlite3_trace_v2(f.db, SQLITE_TRACE_STMT,
+      [](unsigned, void* context, void* statement, void*) {
+    auto sql = sqlite3_sql(static_cast<sqlite3_stmt*>(statement));
+    if (sql != nullptr && kj::StringPtr(sql) == "COMMIT") {
+      std::this_thread::sleep_until(*static_cast<const Clock::time_point*>(context) + 1ms);
+    }
+    return 0;
+  }, &end);
+  auto result = runNativeSql(f.db, R"SQL({"sql":"INSERT INTO ledger VALUES(1)"})SQL",
+      true, NativeSqlResults::OBJECTS, end);
+  sqlite3_trace_v2(f.db, 0, nullptr, nullptr);
+  KJ_EXPECT(result.status == 503);
+  KJ_EXPECT(result.body.find("SQL_LIMIT_EXCEEDED") != std::string::npos);
+  KJ_EXPECT(f.count() == 0);
+}
+
+KJ_TEST("native SQL keeps the committed execute prefix on deadline") {
+  Fixture f;
+  f.db.run("CREATE TABLE ledger(id INTEGER PRIMARY KEY)");
+  auto result = runNativeSql(f.db,
+      R"SQL([{"sql":"INSERT INTO ledger VALUES(-1)"},{"sql":"WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n<1000000000) INSERT INTO ledger SELECT n FROM r"}])SQL",
+      false, NativeSqlResults::OBJECTS, Clock::now() + 20ms);
+  KJ_EXPECT(result.status == 503);
+  KJ_EXPECT(result.body.find("SQL_LIMIT_EXCEEDED") != std::string::npos);
+  KJ_EXPECT(f.count() == 1);
+  KJ_EXPECT(f.db.run("SELECT id FROM ledger").getInt(0) == -1);
+}
+
+KJ_TEST("bounded native WAL refuses a large commit without publishing its rows") {
+  constexpr uint64_t walLimit = 64 * 1024;
+  auto directory = kj::newInMemoryDirectory(kj::systemPreciseCalendarClock());
+  SqliteDatabase::Vfs vfs(*directory, {.maxWalBytes = walLimit});
+  SqliteDatabase db(vfs, kj::Path({"sql"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  KJ_REQUIRE(db.run("PRAGMA journal_mode=WAL").getText(0) == "wal");
+  db.run("PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA wal_autocheckpoint=0");
+  db.run("CREATE TABLE blobs(value BLOB)");
+  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+
+  auto wal = directory->openFile(kj::Path({"sql-wal"}));
+  const auto initial = wal->stat().size;
+  db.run("BEGIN");
+  for (unsigned row = 0; row < 128; ++row) {
+    db.run("INSERT INTO blobs VALUES(randomblob(4096))");
+  }
+  // Sample while the pages are still uncommitted, before the attempted flush.
+  KJ_EXPECT(wal->stat().size == initial);
+  KJ_EXPECT_THROW_MESSAGE("database or disk is full", db.run("COMMIT"));
+  KJ_EXPECT(wal->stat().size <= walLimit);
+  if (sqlite3_get_autocommit(db) == 0) db.run("ROLLBACK");
+  else db.acknowledgeAutomaticRollback();
+  KJ_EXPECT(db.run("SELECT count(*) FROM blobs").getInt(0) == 0);
 }
 
 KJ_TEST(
