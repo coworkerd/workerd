@@ -254,6 +254,25 @@ kj::Maybe<kj::StringPtr> LegacyHibernationManagerImpl::stageNodeSocket(
   return kj::none;
 }
 
+bool LegacyHibernationManagerImpl::hasStagedNodeSocket(kj::StringPtr pending) const {
+  for (const auto& socket: allWs) {
+    if (socket->pendingNodeSocket.size() != 0 && socket->pendingNodeSocket == pending) return true;
+  }
+  return false;
+}
+
+bool LegacyHibernationManagerImpl::canForwardNodeUpgrade(
+    Worker::Actor& actor, kj::StringPtr pending) {
+  KJ_IF_SOME(manager, actor.getHibernationManager()) {
+    KJ_IF_SOME(legacy, kj::tryDowncast<LegacyHibernationManagerImpl>(manager)) {
+      KJ_IF_SOME(lookup, legacy.nodeUpgradeLookup) {
+        return lookup(pending);
+      }
+    }
+  }
+  return false;
+}
+
 kj::Promise<void> LegacyHibernationManagerImpl::activateNodeSocket(
     kj::StringPtr pending, kj::StringPtr invocation) {
   for (auto& socket: allWs) {

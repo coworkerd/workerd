@@ -50,6 +50,11 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
 
   static constexpr auto NODE_SOCKET_HEADER = "x-coworkerd-managed-socket"_kj;
   kj::Maybe<kj::StringPtr> stageNodeSocket(jsg::Lock& js, api::WebSocket& peer);
+  bool hasStagedNodeSocket(kj::StringPtr pending) const;
+  void setNodeUpgradeLookup(kj::Function<bool(kj::StringPtr)> lookup) {
+    nodeUpgradeLookup = kj::mv(lookup);
+  }
+  static bool canForwardNodeUpgrade(Worker::Actor& actor, kj::StringPtr pending);
   kj::Promise<void> activateNodeSocket(kj::StringPtr pending, kj::StringPtr invocation);
   kj::Promise<void> configureNodeSocket(NodeSocket& socket);
   kj::Array<SocketSnapshot> snapshotNodeSockets();
@@ -115,6 +120,7 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
 
  private:
   bool socketParking = false;
+  kj::Maybe<kj::Function<bool(kj::StringPtr)>> nodeUpgradeLookup;
   class HibernatableWebSocket;
 
   // Ends the handoff identified by `generation`, putting the parked loopback back if no replacement

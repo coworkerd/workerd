@@ -125,6 +125,8 @@ WebSocket::WebSocket(jsg::Lock& js, kj::String url)
     : impl(kj::heap<LegacyWebSocketAdapter>(js, *this, kj::mv(url))) {}
 
 void WebSocket::accept(jsg::Lock& js, jsg::Optional<WebSocket::AcceptOptions> options) {
+  JSG_REQUIRE(stagedNodeUpgrade.size() == 0, DOMNotSupportedError,
+      "A threaded hibernatable WebSocket must be returned in an HTTP upgrade.");
   impl->accept(js, kj::mv(options));
 }
 

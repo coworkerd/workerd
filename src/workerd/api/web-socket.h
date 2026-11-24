@@ -205,6 +205,12 @@ class WebSocket: public EventTarget {
   bool peerRequiresUpgrade() const {
     return peerMustUpgrade;
   }
+  void setStagedNodeUpgrade(kj::StringPtr token) {
+    stagedNodeUpgrade = kj::str(token);
+  }
+  kj::StringPtr getStagedNodeUpgrade() const {
+    return stagedNodeUpgrade;
+  }
   kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
   bool isOutputClosed() const;
 
@@ -382,6 +388,7 @@ class WebSocket: public EventTarget {
   // cppgc to handle this correctly, or (c) re-trigger tracing post-swap.
   kj::Own<WebSocketAdapter> impl;
   bool peerMustUpgrade = false;
+  kj::String stagedNodeUpgrade;
 };
 
 #define EW_WEBSOCKET_ISOLATE_TYPES                                                                 \

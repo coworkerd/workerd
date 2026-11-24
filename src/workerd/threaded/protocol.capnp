@@ -46,6 +46,28 @@ struct ThreadedSocketSnapshot @0x9e4cd226c6cf0c04 {
   autoResponseEnabled @7 :Bool;
   autoRequest @8 :Text;
   autoResponse @9 :Text;
+  facetId @10 :UInt32;
+}
+
+struct ThreadedSocketFacet @0xdcd0f9f40ff655bf {
+  id @0 :UInt32;
+  parent @1 :UInt32;
+  name @2 :Text;
+  className @3 :Text;
+  actorId @4 :Text;
+  namespaceId @5 :Text;  # Empty for a string actor ID.
+  hasActorName @6 :Bool;
+  actorName @7 :Text;
+  props @8 :Props;
+}
+
+# Resolved local Fetchers in a facet's props. Rebind them to the new event
+# instead of exporting capabilities that depend on the retired home.
+struct ThreadedSocketPropChannel {
+  channel @0 :UInt32;
+  hasObject @1 :Bool;
+  objectId @2 :Text;
+  props @3 :Props;
 }
 
 struct ThreadedSocketOpen @0x807618c69c531b73 {
@@ -61,11 +83,14 @@ struct ThreadedSocketOpen @0x807618c69c531b73 {
 interface ThreadedSocketControl @0xdc432f018090bcc4 {
   send @0 (authority :ThreadedSocketAuthority, frame :ThreadedSocketFrame) -> () $Cxx.allowCancellation;
   setAutoResponse @1 (authority :ThreadedSocketAuthority, enabled :Bool, request :Text, response :Text) -> (accepted :Bool);
-  park @2 (open :ThreadedSocketOpen, sockets :List(ThreadedSocketSnapshot), attempt :UInt64)
+  park @2 (open :ThreadedSocketOpen, sockets :List(ThreadedSocketSnapshot), attempt :UInt64,
+      facets :List(ThreadedSocketFacet))
       -> (accepted :Bool) $Cxx.allowCancellation;
   adopt @3 (open :ThreadedSocketOpen, attempt :UInt64, resolveOnly :Bool)
-      -> (sockets :List(ThreadedSocketSnapshot), accepted :Bool) $Cxx.allowCancellation;
+      -> (sockets :List(ThreadedSocketSnapshot), accepted :Bool, facets :List(ThreadedSocketFacet))
+      $Cxx.allowCancellation;
   resolvePark @4 (open :ThreadedSocketOpen, attempt :UInt64) -> (accepted :Bool);
+  closeAborted @5 (open :ThreadedSocketOpen, socketIds :List(Text)) -> () $Cxx.allowCancellation;
 }
 
 interface Bootstrap @0xa0c731b2df279451 extends(Worker.WorkerdBootstrap) {
