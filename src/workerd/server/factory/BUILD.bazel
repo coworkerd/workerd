@@ -62,7 +62,7 @@ kj_test(
 wd_cc_library(
     name = "coworkerd-native-sql",
     srcs = ["coworkerd-native-sql.c++"],
-    hdrs = ["coworkerd-native-sql.h"],
+    hdrs = ["coworkerd-native-sql.h", "coworkerd-native-sql-spill.h"],
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//src/workerd/threaded:__pkg__"],
     deps = [

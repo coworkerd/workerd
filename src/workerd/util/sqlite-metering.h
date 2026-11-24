@@ -29,13 +29,20 @@ namespace workerd {
 // SqliteMemoryScope is idempotent: if a scope is already active on the current thread, additional
 // scopes are no-ops. This allows safe nesting (e.g., when a column accessor calls into SQLite while
 // a Query::nextRow() scope is already active).
+class SqliteMemoryBudget {
+ public:
+  virtual bool acquire(size_t bytes) noexcept = 0;
+  virtual void release(size_t bytes) noexcept = 0;
+};
+
 class SqliteMemoryScope {
  public:
   // memoryBytes: the per-database byte counter owned by SqliteDatabase for its lifetime.
   // maxMemoryBytes: the per-database cap from WorkerLimits::sqliteMaxMemoryMb.
   //
   // If a scope is already active on this thread, this constructor is a no-op (idempotent).
-  explicit SqliteMemoryScope(size_t& memoryBytes, size_t maxMemoryBytes);
+  explicit SqliteMemoryScope(size_t& memoryBytes, size_t maxMemoryBytes,
+      SqliteMemoryBudget* budget = nullptr);
 
   ~SqliteMemoryScope() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(SqliteMemoryScope);
@@ -44,6 +51,7 @@ class SqliteMemoryScope {
   // These are accessed by the allocator functions via threadLocalScope.
   size_t& memoryBytes;
   const size_t maxMemoryBytes;
+  SqliteMemoryBudget* budget;
 
   // Thread-local pointer to the active scope. Set to this on construction (if not already set),
   // cleared on destruction (if we set it).

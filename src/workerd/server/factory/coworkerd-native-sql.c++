@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "coworkerd-native-sql.h"
+#include "coworkerd-native-sql-spill.h"
 
 #include <poll.h>
 #include <sqlite3.h>
@@ -37,6 +38,38 @@ struct SqlError {
 };
 struct ResultTooLarge {};
 struct Interrupted {};
+struct SpillRefused {};
+struct MemoryRefused {};
+
+void reserveMemory(SqliteMemoryBudget* memory, size_t bytes) {
+  if (memory != nullptr && !memory->acquire(bytes)) throw MemoryRefused{};
+}
+
+class SqlJsonMessage final: public capnp::MessageBuilder {
+ public:
+  explicit SqlJsonMessage(SqliteMemoryBudget* memory): memory(memory) {}
+  ~SqlJsonMessage() noexcept(false) {
+    segments.clear();
+    if (memory != nullptr) memory->release(reserved);
+  }
+
+  kj::ArrayPtr<capnp::word> allocateSegment(uint minimumSize) override {
+    const auto size = std::max(minimumSize, 256u);
+    const auto bytes = size * sizeof(capnp::word);
+    reserveMemory(memory, bytes);
+    reserved += bytes;
+    auto segment = kj::heapArray<capnp::word>(size);
+    memset(segment.begin(), 0, bytes);
+    auto view = segment.asPtr();
+    segments.push_back(kj::mv(segment));
+    return view;
+  }
+
+ private:
+  SqliteMemoryBudget* memory;
+  size_t reserved = 0;
+  std::vector<kj::Array<capnp::word>> segments;
+};
 
 class Deadline {
  public:
@@ -119,7 +152,8 @@ class Regulator final: public SqliteDatabase::Regulator {
         "write coalescing.");
   }
 
-  void onError(kj::Maybe<int>, kj::StringPtr message) const override {
+  void onError(kj::Maybe<int> code, kj::StringPtr message) const override {
+    if ((code.orDefault(SQLITE_OK) & 0xff) == SQLITE_NOMEM) throw MemoryRefused{};
     throw SqlError{kj::str(message)};
   }
 };
@@ -239,12 +273,22 @@ std::string number(double value) {
 
 class Writer {
  public:
-  explicit Writer(size_t limit = RESULT_LIMIT, Deadline* deadline = nullptr)
+  explicit Writer(size_t limit = RESULT_LIMIT, Deadline* deadline = nullptr,
+      SqliteMemoryBudget* memory = nullptr)
       : limit(limit),
-        deadline(deadline) {}
+        deadline(deadline),
+        memory(memory) {}
 
   void append(std::string_view value) {
     if (value.size() > limit - bytes.size()) throw ResultTooLarge{};
+    const auto needed = bytes.size() + value.size();
+    if (memory != nullptr && needed > bytes.capacity()) {
+      const auto capacity = std::max(needed, std::min(limit, bytes.capacity() * 2));
+      // The result is copied through the RPC stream when the writer finishes.
+      reserveMemory(memory, 3 * capacity - this->reserved);
+      this->reserved = 3 * capacity;
+      bytes.reserve(capacity);
+    }
     bytes += value;
   }
 
@@ -323,6 +367,8 @@ class Writer {
  private:
   size_t limit;
   Deadline* deadline;
+  SqliteMemoryBudget* memory;
+  size_t reserved = 0;
 };
 
 void value(Writer& out, Value cell) {
@@ -588,10 +634,23 @@ NativeSqlReply failed(kj::StringPtr reason, bool batch) {
 
 // SQLite may have rolled back the whole transaction as part of a failed
 // statement. Disable cancellation so any remaining rollback can finish.
-void rollback(SqliteDatabase& db, Deadline& deadline) {
+void rollback(SqliteDatabase& db, Deadline& deadline, NativeSqlSpill* spill) {
   deadline.disable();
   if (sqlite3_get_autocommit(db) == 0) db.run("ROLLBACK");
   else db.acknowledgeAutomaticRollback();
+  if (spill) spill->end(false);
+}
+
+bool spillFailed(NativeSqlSpill* spill) {
+  return spill && (spill->wasRefused() || spill->failedToMeasureWal());
+}
+
+NativeSqlReply spillFailure(const NativeSqlSpill& spill) {
+  if (spill.failedToMeasureWal()) {
+    return {503, nativeSqlFailure("STORAGE_UNAVAILABLE"_kj, "the local WAL size could not be read"_kj)};
+  }
+  return {507, nativeSqlFailure("SQL_SPILL_LIMIT_EXCEEDED"_kj,
+      "uncommitted WAL and temporary files exceeded a native SQL spill budget"_kj)};
 }
 
 }  // namespace
@@ -619,14 +678,19 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
     bool query,
     NativeSqlResults format,
     Clock::time_point end,
-    int connectionFd) {
+    int connectionFd,
+    NativeSqlSpill* spill,
+    SqliteMemoryBudget* requestMemory) {
+  auto memoryScope = db.enterMemoryScope();
   Deadline deadline(db, end, connectionFd);
-  capnp::MallocMessageBuilder parsed;
-  auto root = parsed.initRoot<Json>();
   bool batch = false;
   try {
+    SqlJsonMessage parsed(requestMemory);
+    auto root = parsed.initRoot<Json>();
     try {
       capnp::JsonCodec codec;
+      reserveMemory(requestMemory, body.size());
+      KJ_DEFER(if (requestMemory != nullptr) requestMemory->release(body.size()));
       auto normalized = normalizeJson(body.asArray(), deadline);
       codec.decodeRaw(normalized.asPtr(), root);
       batch = root.isArray();
@@ -635,9 +699,10 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
       return {400, "{\"error\":\"the body of a statement is JSON\"}"};
     }
     auto input = root.asReader();
-    Writer out(RESULT_LIMIT, &deadline);
+    Writer out(RESULT_LIMIT, &deadline, requestMemory);
     deadline.check();
     if (query) {
+      if (spill) spill->begin();
       db.run("BEGIN");
       if (batch) {
         out.append("[");
@@ -656,9 +721,11 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
       }
       deadline.check();
       db.run("COMMIT");
+      if (spill) spill->end(true);
     } else {
       auto execute = [&](Json::Reader entry, bool separator) {
         deadline.check();
+        if (spill) spill->begin();
         db.run("BEGIN");
         auto before = out.bytes.size();
         bool success = false;
@@ -675,19 +742,23 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
           if (deadline.wasInterrupted()) throw;
           reason = kj::str(error.getDescription());
         }
+        if (spillFailed(spill)) throw SpillRefused{};
         // Preserve the prefix on an ordinary SQL or result error, including
         // earlier SQL statements within this entry. Timeout cancels this entry.
         deadline.check();
         try {
           if (sqlite3_get_autocommit(db) == 0) {
             db.run("COMMIT");
+            if (spill) spill->end(true);
           } else {
             KJ_ASSERT(!success, "a successful SQL entry ended its own transaction");
             db.acknowledgeAutomaticRollback();
+            if (spill) spill->end(false);
           }
         } catch (const kj::Exception& error) {
           deadline.check();
-          rollback(db, deadline);
+          if (spillFailed(spill)) throw SpillRefused{};
+          rollback(db, deadline, spill);
           if (success) reason = kj::str(error.getDescription());
           success = false;
         }
@@ -712,16 +783,31 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
     }
     return {200, std::move(out.bytes)};
   } catch (const Interrupted&) {
-    rollback(db, deadline);
+    rollback(db, deadline, spill);
+  } catch (const SpillRefused&) {
+    rollback(db, deadline, spill);
+    return spillFailure(*spill);
+  } catch (const MemoryRefused&) {
+    rollback(db, deadline, spill);
+    if (!deadline.wasInterrupted()) {
+      return {422, nativeSqlFailure("SQL_MEMORY_LIMIT_EXCEEDED"_kj,
+          "SQLite could not allocate memory within the native database budget"_kj)};
+    }
   } catch (const ResultTooLarge&) {
-    rollback(db, deadline);
+    rollback(db, deadline, spill);
     return failed(RESULT_TOO_LARGE, batch);
   } catch (const SqlError& error) {
-    rollback(db, deadline);
-    if (!deadline.wasInterrupted()) return failed(error.message, batch);
+    rollback(db, deadline, spill);
+    if (!deadline.wasInterrupted()) {
+      if (spillFailed(spill)) return spillFailure(*spill);
+      return failed(error.message, batch);
+    }
   } catch (const kj::Exception& error) {
-    rollback(db, deadline);
-    if (!deadline.wasInterrupted()) return failed(error.getDescription(), batch);
+    rollback(db, deadline, spill);
+    if (!deadline.wasInterrupted()) {
+      if (spillFailed(spill)) return spillFailure(*spill);
+      return failed(error.getDescription(), batch);
+    }
   }
   if (deadline.clientGone()) return {0, {}};
   return nativeSqlTimeout();
