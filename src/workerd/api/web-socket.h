@@ -195,7 +195,18 @@ class WebSocket: public EventTarget {
 
   // The kj::WebSocket is shared with the HibernationManager so both it and this api::WebSocket
   // retain ownership.
-  kj::Rc<kj::WebSocket> acceptAsHibernatable(kj::Array<kj::String> tags);
+  using WrapTransport = kj::FunctionParam<kj::Own<kj::WebSocket>(kj::Own<kj::WebSocket>)>;
+  kj::Rc<kj::WebSocket> acceptAsHibernatable(
+      kj::Array<kj::String> tags, kj::Maybe<WrapTransport> wrapTransport = kj::none);
+  bool isPeerOf(jsg::Lock& js, const WebSocket& candidate);
+  void requirePeerUpgrade() {
+    peerMustUpgrade = true;
+  }
+  bool peerRequiresUpgrade() const {
+    return peerMustUpgrade;
+  }
+  kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
+  bool isOutputClosed() const;
 
   // Accesses the tags of the hibernatable websocket.
   kj::Array<kj::StringPtr> getHibernatableTags();
@@ -370,6 +381,7 @@ class WebSocket: public EventTarget {
   // migrating any traced state, (b) wait for the upcoming jsg::Own<T> which integrates with
   // cppgc to handle this correctly, or (c) re-trigger tracing post-swap.
   kj::Own<WebSocketAdapter> impl;
+  bool peerMustUpgrade = false;
 };
 
 #define EW_WEBSOCKET_ISOLATE_TYPES                                                                 \
@@ -570,6 +582,11 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
   kj::Ptr<bool> getDispatchFailed() override;
 
   kj::Rc<kj::WebSocket> acceptAsHibernatable(kj::Array<kj::String> tags) override;
+  kj::Rc<kj::WebSocket> acceptWithTransport(
+      kj::Array<kj::String> tags, kj::Maybe<WebSocket::WrapTransport> wrapTransport);
+  bool isPeerOf(jsg::Lock& js, const WebSocket& candidate);
+  kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
+  bool isOutputClosed() const;
   void initiateHibernatableRelease(jsg::Lock& js,
       kj::Array<kj::String> tags,
       WebSocket::HibernatableReleaseState releaseState) override;
@@ -819,6 +836,7 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
   void reportError(jsg::Lock& js, jsg::JsRef<jsg::JsValue> err);
 
   void assertNoError(jsg::Lock& js);
+  void requireHibernatableMutationAllowed();
 
   void tryReleaseNative(jsg::Lock& js);
 

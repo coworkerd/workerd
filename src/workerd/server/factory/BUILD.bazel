@@ -107,6 +107,16 @@ wd_cc_library(
     ],
 )
 
+kj_test(
+    src = "coworkerd-wal-shipper-test.c++",
+    deps = [
+        ":coworkerd-wal",
+        "//src/workerd/util:sqlite",
+        "@capnp-cpp//src/kj:kj-async-io",
+        "@sqlite3",
+    ],
+)
+
 wd_cc_library(
     name = "coworkerd-threaded-wal-source",
     testonly = True,

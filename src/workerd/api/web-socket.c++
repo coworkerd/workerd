@@ -206,7 +206,20 @@ kj::Ptr<bool> WebSocket::getDispatchFailed() {
   return impl->getDispatchFailed();
 }
 
-kj::Rc<kj::WebSocket> WebSocket::acceptAsHibernatable(kj::Array<kj::String> tags) {
+bool WebSocket::isPeerOf(jsg::Lock& js, const WebSocket& candidate) {
+  return kj::downcast<LegacyWebSocketAdapter>(*impl).isPeerOf(js, candidate);
+}
+
+kj::Maybe<kj::ArrayPtr<const byte>> WebSocket::getSerializedAttachment() const {
+  return kj::downcast<const LegacyWebSocketAdapter>(*impl).getSerializedAttachment();
+}
+
+bool WebSocket::isOutputClosed() const {
+  return kj::downcast<const LegacyWebSocketAdapter>(*impl).isOutputClosed();
+}
+
+kj::Rc<kj::WebSocket> WebSocket::acceptAsHibernatable(
+    kj::Array<kj::String> tags, kj::Maybe<WrapTransport> wrapTransport) {
   // TODO(EW-10817): When the HibernatableWebSocketAdapter path is functional, re-enable the
   // autogate-driven swap below — extract the kj::WebSocket from the legacy adapter (via
   // `LegacyWebSocketAdapter::extractForHibernatableTransition`, also commented out today)
@@ -218,6 +231,10 @@ kj::Rc<kj::WebSocket> WebSocket::acceptAsHibernatable(kj::Array<kj::String> tags
   //   impl = kj::heap<HibernatableWebSocketAdapter>(*this, ws.addRef(), kj::mv(tags));
   //   return ws;
   // }
+  if (wrapTransport != kj::none) {
+    return kj::downcast<LegacyWebSocketAdapter>(*impl).acceptWithTransport(
+        kj::mv(tags), kj::mv(wrapTransport));
+  }
   return impl->acceptAsHibernatable(kj::mv(tags));
 }
 
@@ -677,7 +694,8 @@ kj::Promise<DeferredProxy<void>> LegacyWebSocketAdapter::couple(
     KJ_IF_SOME(peerRef, maybePeerRef) {
       // We're terminating the WebSocket in this worker, so the upstream promise (which pumps
       // messages from the client to this worker) counts as something the request is waiting for.
-      upstream = upstream.attach(context.registerPendingEvent());
+      upstream = upstream.attach(
+          context.registerPendingEvent(Worker::Actor::PendingIoSource::LOCAL_SOCKET_TRANSPORT));
 
       // We can observe websocket traffic in both directions by attaching an observer to the peer
       // websocket which terminates in the worker.
@@ -784,6 +802,12 @@ kj::Promise<DeferredProxy<void>> LegacyWebSocketAdapter::couple(
 
 void LegacyWebSocketAdapter::accept(
     jsg::Lock& js, jsg::Optional<WebSocket::AcceptOptions> options) {
+  KJ_IF_SOME(p, peer) {
+    KJ_IF_SOME(other, p.tryAddRef(js)) {
+      JSG_REQUIRE(!other->peerRequiresUpgrade(), DOMNotSupportedError,
+          "A threaded Durable Object hibernatable WebSocketPair requires an HTTP upgrade.");
+    }
+  }
   auto& native = *farNative;
   JSG_REQUIRE(!native.state.is<AwaitingConnection>(), TypeError,
       "Websockets obtained from the 'new WebSocket()' constructor cannot call accept");
@@ -923,7 +947,9 @@ void LegacyWebSocketAdapter::startReadLoop(
     }
     return false;
   };
-  if (!hasLocalPeer()) {
+  const bool localPeer = hasLocalPeer();
+  const auto taskKind = localPeer ? IoContext::ActorTask::LOCAL_SOCKET_TRANSPORT : IoContext::ActorTask::WORK;
+  if (!localPeer) {
     promise = promise.attach(context.registerPendingEvent());
   }
 
@@ -950,7 +976,7 @@ void LegacyWebSocketAdapter::startReadLoop(
   auto self = kj::Own<LegacyWebSocketAdapter>(this, kj::NullDisposer::instance)
                   .attach(jsg::Ref<WebSocket>(kj::addRef(shell)));
   context.addWaitUntil(context.awaitJs(js,
-      context.awaitIoLegacy(js, kj::mv(promise))
+      context.awaitIoLegacy(js, kj::mv(promise), taskKind)
           .then(js,
               [self = kj::mv(self)](jsg::Lock& js, kj::Maybe<kj::Exception>&& maybeError) mutable {
     auto& native = *self->farNative;
@@ -968,10 +994,22 @@ void LegacyWebSocketAdapter::startReadLoop(
         self->reportError(js, e.clone());
       }
     }
-  })));
+  })), taskKind);
+}
+
+void LegacyWebSocketAdapter::requireHibernatableMutationAllowed() {
+  if (!isHibernatable()) return;
+  KJ_IF_SOME(context, IoContext::tryCurrent()) {
+    KJ_IF_SOME(actor, context.getActor()) {
+      KJ_IF_SOME(manager, actor.getHibernationManager()) {
+        manager.requireSocketMutationAllowed();
+      }
+    }
+  }
 }
 
 void LegacyWebSocketAdapter::send(jsg::Lock& js, kj::OneOf<kj::Array<byte>, kj::String> message) {
+  requireHibernatableMutationAllowed();
   auto& native = *farNative;
   JSG_REQUIRE(!native.closedOutgoing, TypeError, "Can't call WebSocket send() after close().");
   if (native.outgoingAborted || native.state.is<Released>()) {
@@ -1092,6 +1130,7 @@ void LegacyWebSocketAdapter::close(
       "messages.");
 
   assertNoError(js);
+  requireHibernatableMutationAllowed();
 
   outgoingMessages->insert(GatedMessage{IoContext::current().waitForOutputLocksIfNecessary(),
     kj::WebSocket::Close{
@@ -1192,6 +1231,7 @@ kj::Maybe<jsg::JsValue> LegacyWebSocketAdapter::deserializeAttachment(jsg::Lock&
 }
 
 void LegacyWebSocketAdapter::serializeAttachment(jsg::Lock& js, jsg::JsValue attachment) {
+  requireHibernatableMutationAllowed();
   jsg::Serializer serializer(js,
       jsg::Serializer::Options{
         .version = 15,
@@ -1703,10 +1743,38 @@ void LegacyWebSocketAdapter::setPeer(jsg::WeakRef<WebSocket> other) {
   peer = kj::mv(other);
 }
 
+bool LegacyWebSocketAdapter::isPeerOf(jsg::Lock& js, const WebSocket& candidate) {
+  KJ_IF_SOME(ref, peer) {
+    KJ_IF_SOME(strong, ref.tryAddRef(js)) {
+      return strong.get() == &candidate;
+    }
+  }
+  return false;
+}
+
+kj::Maybe<kj::ArrayPtr<const byte>> LegacyWebSocketAdapter::getSerializedAttachment() const {
+  return serializedAttachment.map([](const auto& bytes) -> kj::ArrayPtr<const byte> {
+    return bytes.asPtr();
+  });
+}
+
+bool LegacyWebSocketAdapter::isOutputClosed() const {
+  return closedOutgoingForHib;
+}
+
 kj::Rc<kj::WebSocket> LegacyWebSocketAdapter::acceptAsHibernatable(kj::Array<kj::String> tags) {
+  return acceptWithTransport(kj::mv(tags), kj::none);
+}
+
+kj::Rc<kj::WebSocket> LegacyWebSocketAdapter::acceptWithTransport(
+    kj::Array<kj::String> tags, kj::Maybe<WebSocket::WrapTransport> wrapTransport) {
   KJ_IF_SOME(hibernatable, farNative->state.tryGet<AwaitingAcceptanceOrCoupling>()) {
     // We can only request hibernation if we have not called accept.
-    auto ws = kj::Rc<kj::WebSocket>(kj::mv(hibernatable.ws));
+    auto transport = kj::mv(hibernatable.ws);
+    KJ_IF_SOME(wrap, wrapTransport) {
+      transport = wrap(kj::mv(transport));
+    }
+    auto ws = kj::Rc<kj::WebSocket>(kj::mv(transport));
     farNative->state.init<Accepted>(Accepted::Hibernatable{.ws = ws.addRef(), .tags = kj::mv(tags)},
         *farNative, IoContext::current());
     return ws;

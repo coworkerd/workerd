@@ -13,7 +13,8 @@ class ThreadedWalLog {
   KJ_DISALLOW_COPY_AND_MOVE(ThreadedWalLog);
 
   bool ready() const;
-  kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t)> requestClose);
+  enum class CloseReason { DRAIN, CODE_UPDATED };
+  kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t, CloseReason)> requestClose);
   kj::Promise<DurableWalPosition> prepareOpen(const kj::Directory& directory, kj::Path path);
 
  private:

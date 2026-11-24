@@ -437,6 +437,15 @@ kj::Array<kj::byte> alarmMessage(kj::StringPtr objectName, uint facetId,
 
 }  // namespace
 
+void DurableLogShipper::reportActorReset(kj::StringPtr code) {
+  if (openId == 0) return;
+  Writer message;
+  message.u8(MSG_ACTOR_RESET);
+  message.str(name.objectName);
+  message.str(code);
+  channel.send(openId, message.finish(openId));
+}
+
 void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId) {
   if (durableLogEnabled()) Replicator::get().send(deletedFacetMessage(objectName, facetId, 0));
 }
@@ -508,25 +517,18 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
   // so this instance starts after them -- and reports where it starts, because the earlier instance may have died
   // between a commit and its confirmation. The node compares the position with what it confirmed and breaks this
   // object when they differ: the frames it never confirmed must not be read by anybody.
-  KJ_IF_SOME(position, prepared) {
-    if (position.pageSize != 0) {
-      haveHeader = true;
-      magic = position.magic;
-      pageSize = position.pageSize;
-      salt1 = position.salt1;
-      salt2 = position.salt2;
-      cksum1 = position.checksum1;
-      cksum2 = position.checksum2;
-      readFrames = ackedFrames = hookFrames = position.frames;
-      header = kj::heapArray(kj::arrayPtr(position.header.data(), position.header.size()));
-    }
-  } else if (walBytes() >= 32) {
-    readNewFrames();
-    pendingFrames.clear();
-    pendingCount = 0;
-    pendingCommits = 0;
-    pendingReadNs = 0;
-    ackedFrames = readFrames;
+  const auto position =
+      prepared.orDefault([&] { return readDurableWalPosition(directory, this->walPath); });
+  if (position.pageSize != 0) {
+    haveHeader = true;
+    magic = position.magic;
+    pageSize = position.pageSize;
+    salt1 = position.salt1;
+    salt2 = position.salt2;
+    cksum1 = position.checksum1;
+    cksum2 = position.checksum2;
+    readFrames = ackedFrames = hookFrames = position.frames;
+    header = kj::heapArray(kj::arrayPtr(position.header.data(), position.header.size()));
   }
   openId = channel.registerShipper(*this);
   try {

@@ -57,7 +57,10 @@ DurableAdmission::Result DurableAdmission::queue(
   }
   auto existing = objects.find(key);
   auto* tree = existing == objects.end() ? nullptr : &trees.at(existing->second);
-  if (tree != nullptr && (tree->open != open || tree->closing)) return {Status::STALE};
+  if (tree != nullptr) {
+    if (tree->open != open) return {Status::STALE};
+    if (tree->closing) return {tree->idleClosing ? Status::RETIRING : Status::STALE};
+  }
 
   auto refuse = [&]() -> Result {
     ++counters.overloads;
@@ -198,6 +201,16 @@ bool DurableAdmission::complete(Ticket ticket, uint64_t home) {
   return true;
 }
 
+bool DurableAdmission::markSocket(Ticket ticket, uint64_t home) {
+  auto at = trees.find(ticket.tree);
+  if (at == trees.end() || at->second.home != home || at->second.closing) return false;
+  auto event = at->second.events.find(ticket.event);
+  if (event == at->second.events.end() || event->second.phase != Phase::ACTIVE || event->second.socket)
+    return false;
+  event->second.socket = true;
+  return true;
+}
+
 std::vector<DurableAdmission::Ticket> DurableAdmission::expire(Time now) {
   std::vector<Ticket> expired;
   for (auto& [treeId, tree]: trees) {
@@ -217,6 +230,7 @@ bool DurableAdmission::beginReset(uint64_t tree, uint64_t home) {
   if (entry == trees.end() || home == 0 || entry->second.home != home) return false;
   auto& pending = entry->second;
   pending.closing = true;
+  pending.idleClosing = false;
   for (auto it = pending.events.begin(); it != pending.events.end();) {
     auto event = it++;
     if (event->second.phase == Phase::WAITING) releaseEvent(pending, event);
@@ -230,7 +244,36 @@ bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home) {
       !entry->second.events.empty()) {
     return false;
   }
-  entry->second.closing = true;
+  if (!entry->second.closing) {
+    entry->second.closing = true;
+    entry->second.idleClosing = true;
+  }
+  return true;
+}
+
+bool DurableAdmission::stopIdleTreeWithSockets(uint64_t tree, uint64_t home) {
+  auto at = trees.find(tree);
+  if (at == trees.end() || home == 0 || at->second.home != home || at->second.events.empty())
+    return false;
+  for (const auto& [id, event]: at->second.events) {
+    if (event.phase != Phase::ACTIVE || !event.socket) return false;
+  }
+  if (!at->second.closing) {
+    at->second.closing = true;
+    at->second.idleClosing = true;
+  }
+  return true;
+}
+
+bool DurableAdmission::resumeIdleTree(uint64_t tree, uint64_t home) {
+  auto at = trees.find(tree);
+  if (at == trees.end() || home == 0 || at->second.home != home || !at->second.idleClosing) {
+    return false;
+  }
+  // Closing stopped admission. The only tickets that were allowed to stay
+  // active when it started are the ordinary socket transports.
+  at->second.closing = false;
+  at->second.idleClosing = false;
   return true;
 }
 
@@ -295,6 +338,40 @@ void DurableAdmission::eraseTree(std::map<uint64_t, Tree>::iterator entry) {
   trees.erase(entry);
   --counters.trees;
   release(counters.reserved, limits.tree);
+}
+
+DurableIdleLifecycle::DurableIdleLifecycle(Time opened, std::chrono::seconds nonHibernatingDelay)
+    : lastEvent(opened), lastUnblocked(opened), nonHibernatingDelay(nonHibernatingDelay) {
+  KJ_REQUIRE(nonHibernatingDelay >= std::chrono::seconds(70) &&
+      nonHibernatingDelay <= std::chrono::seconds(140));
+}
+
+void DurableIdleLifecycle::eventFinished(Time now) {
+  lastEvent = now;
+}
+
+DurableIdleLifecycle::Pending DurableIdleLifecycle::pendingStarted(Time now) {
+  return pending.insert(now);
+}
+
+void DurableIdleLifecycle::pendingFinished(Pending operation, Time now) {
+  pending.erase(operation);
+  if (pending.empty()) lastUnblocked = now;
+}
+
+DurableIdleLifecycle::Decision DurableIdleLifecycle::check(
+    Time now, bool hasOrdinarySocket, bool pressured) {
+  if (ordinarySocket && !hasOrdinarySocket) lastUnblocked = now;
+  ordinarySocket = hasOrdinarySocket;
+  const auto idle = now - std::max(lastEvent, lastUnblocked);
+  if (!pending.empty() && now - *pending.rbegin() < std::chrono::minutes(15)) {
+    return Decision::WAIT;
+  }
+  if (hasOrdinarySocket || !pending.empty()) {
+    if (idle < nonHibernatingDelay) return Decision::WAIT;
+    return pending.empty() ? Decision::RETIRE : Decision::CANCEL_PENDING;
+  }
+  return pressured || idle >= DurableAdmission::IDLE_DELAY ? Decision::RETIRE : Decision::WAIT;
 }
 
 }  // namespace workerd::server

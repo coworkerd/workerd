@@ -984,6 +984,7 @@ class Worker::Actor final: public kj::Refcounted {
   // removing WebSockets from its collection when they disconnect.
   class HibernationManager: public kj::Refcounted {
    public:
+    virtual void requireSocketMutationAllowed() const {}
     virtual void acceptWebSocket(jsg::Ref<api::WebSocket> ws, kj::ArrayPtr<kj::String> tags) = 0;
     virtual kj::Vector<jsg::Ref<api::WebSocket>> getWebSockets(
         jsg::Lock& js, kj::Maybe<kj::StringPtr> tag) = 0;
@@ -1077,6 +1078,10 @@ class Worker::Actor final: public kj::Refcounted {
     // Must not register additional tasks with IoContext, directly or through helpers,
     // since that would recursively invoke registerTask().
     virtual kj::Own<WaitUntilTaskHandle> registerTask() = 0;
+
+    // Hosts with timed actor retirement may track pending I/O on the same home.
+    virtual kj::Own<void> registerPendingIo() { return {}; }
+    virtual bool tracksSocketTransportSeparately() const { return false; }
   };
 
   // Create a new Actor hosted by this Worker. Note that this Actor object may only be manipulated
@@ -1105,7 +1110,9 @@ class Worker::Actor final: public kj::Refcounted {
 
   // Called before a promise is added to IoContext's wait-until task set. Returns the tracker's
   // handle, or an empty handle if no tracker is supplied.
-  kj::Own<WaitUntilTaskHandle> addedWaitUntilTask();
+  kj::Own<WaitUntilTaskHandle> addedWaitUntilTask(bool localSocketTransport = false);
+  enum class PendingIoSource { EVENT, LOCAL_SOCKET_TRANSPORT };
+  kj::Own<void> addedPendingIo(PendingIoSource source);
 
   // Call when starting any new request, to ensure that the actor object's constructor has run.
   //

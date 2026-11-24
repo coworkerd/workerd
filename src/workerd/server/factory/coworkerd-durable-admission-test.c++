@@ -29,11 +29,64 @@ constexpr Admission::Limits limits{
   .mailboxBytes = 100,
 };
 
+KJ_TEST("durable idle time follows the last completed event or blocker") {
+  using Decision = DurableIdleLifecycle::Decision;
+  DurableIdleLifecycle lifecycle(now, 93s);
+  lifecycle.eventFinished(now + 2s);
+  auto operation = lifecycle.pendingStarted(now + 3s);
+  KJ_EXPECT(lifecycle.check(now + 20s, false, false) == Decision::WAIT);
+  lifecycle.pendingFinished(operation, now + 22s);
+  KJ_EXPECT(lifecycle.check(now + 32s - 1ns, false, false) == Decision::WAIT);
+  KJ_EXPECT(lifecycle.check(now + 32s, false, false) == Decision::RETIRE);
+  KJ_EXPECT(lifecycle.check(now + 50s, true, true) == Decision::WAIT);
+  KJ_EXPECT(lifecycle.check(now + 115s - 1ns, true, false) == Decision::WAIT);
+  KJ_EXPECT(lifecycle.check(now + 115s, true, false) == Decision::RETIRE);
+  KJ_EXPECT(lifecycle.check(now + 116s, false, false) == Decision::WAIT);
+  KJ_EXPECT(lifecycle.check(now + 126s, false, false) == Decision::RETIRE);
+}
+
+KJ_TEST("each pending operation has its own fifteen minute protection window") {
+  using Decision = DurableIdleLifecycle::Decision;
+  DurableIdleLifecycle lifecycle(now, 140s);
+  auto earlier = lifecycle.pendingStarted(now + 4s);
+  auto later = lifecycle.pendingStarted(now + 9min);
+  KJ_EXPECT(lifecycle.check(now + 15min + 4s, false, true) == Decision::WAIT);
+  KJ_EXPECT(lifecycle.check(now + 24min - 1ns, false, false) == Decision::WAIT);
+  KJ_EXPECT(lifecycle.check(now + 24min, false, false) == Decision::CANCEL_PENDING);
+  lifecycle.pendingFinished(later, now + 24min);
+  KJ_EXPECT(lifecycle.check(now + 24min, false, false) == Decision::CANCEL_PENDING);
+  lifecycle.pendingFinished(earlier, now + 24min);
+  KJ_EXPECT(lifecycle.check(now + 24min + 10s, false, false) == Decision::RETIRE);
+}
+
 Admission::Ticket queued(Admission::Result result, bool needsHome) {
   KJ_REQUIRE(result.status == Status::QUEUED);
   KJ_EXPECT(result.needsHome == needsHome);
   KJ_REQUIRE(result.ticket.has_value());
   return *result.ticket;
+}
+
+KJ_TEST("retiring idle sockets fences admission and waits for their session credits") {
+  Admission table(limits, 1);
+  const auto socket = queued(table.queue(first, open, 0, deadline, now), true);
+  KJ_REQUIRE(table.publishHome(socket.tree, 1));
+  KJ_REQUIRE(table.begin(socket, 1, first, open, now) == Delivery::ACCEPTED);
+  KJ_EXPECT(table.markSocket(socket, 1));
+  const auto call = queued(table.queue(first, open, 0, deadline, now), false);
+  KJ_EXPECT(!table.stopIdleTreeWithSockets(socket.tree, 1));
+  KJ_REQUIRE(table.begin(call, 1, first, open, now) == Delivery::ACCEPTED);
+  KJ_EXPECT(!table.stopIdleTreeWithSockets(socket.tree, 1));
+  KJ_EXPECT(table.complete(call, 1));
+  KJ_EXPECT(table.stopIdleTreeWithSockets(socket.tree, 1));
+  KJ_EXPECT(table.queue(first, open, 0, deadline, now).status == Status::RETIRING);
+  KJ_REQUIRE(table.resumeIdleTree(socket.tree, 1));
+  const auto afterRefusal = queued(table.queue(first, open, 0, deadline, now), false);
+  KJ_REQUIRE(table.begin(afterRefusal, 1, first, open, now) == Delivery::ACCEPTED);
+  KJ_REQUIRE(table.complete(afterRefusal, 1));
+  KJ_REQUIRE(table.stopIdleTreeWithSockets(socket.tree, 1));
+  KJ_EXPECT(!table.releaseTree(socket.tree, 1));
+  KJ_EXPECT(table.complete(socket, 1));
+  KJ_EXPECT(table.releaseTree(socket.tree, 1));
 }
 
 KJ_TEST("durable admission fences the generation, identity, home and queued event") {
@@ -184,7 +237,13 @@ KJ_TEST("durable admission retains a closing tree until its home acknowledges re
   KJ_EXPECT(table.cancel(old) == Cancellation::RELEASED);
   KJ_EXPECT(!table.stopIdleTree(old.tree, 2));
   KJ_EXPECT(table.stopIdleTree(old.tree, 1));
-  KJ_EXPECT(table.queue(first, open, 30, deadline, now).status == Status::STALE);
+  KJ_EXPECT(table.queue(first, open, 30, deadline, now).status == Status::RETIRING);
+  KJ_EXPECT(!table.resumeIdleTree(old.tree, 2));
+  KJ_ASSERT(table.resumeIdleTree(old.tree, 1));
+  const auto saved = queued(table.queue(first, open, 30, deadline, now), false);
+  KJ_EXPECT(saved.tree == old.tree);
+  KJ_EXPECT(table.cancel(saved) == Cancellation::RELEASED);
+  KJ_ASSERT(table.stopIdleTree(old.tree, 1));
   KJ_EXPECT(!table.releaseTree(old.tree, 2));
   KJ_EXPECT(table.state().trees == 1);
   KJ_EXPECT((table.state().reserved == limits.tree));
@@ -242,7 +301,7 @@ KJ_TEST("durable idle retirement fences reentry and cancellation at the clock bo
   // Retirement wins this time. The old reservation is held until home close;
   // a stale completion must not affect the replacement's independent identity.
   KJ_ASSERT(table.stopIdleTree(firstCall.tree, 1, lastUse, clock));
-  KJ_EXPECT(table.queue(first, open, 0, clock + 30s, clock).status == Status::STALE);
+  KJ_EXPECT(table.queue(first, open, 0, clock + 30s, clock).status == Status::RETIRING);
   KJ_EXPECT((table.state().reserved == limits.tree));
   KJ_ASSERT(table.releaseTree(firstCall.tree, 1));
   const auto reopened = queued(table.queue(first, open, 0, clock + 30s, clock), true);
