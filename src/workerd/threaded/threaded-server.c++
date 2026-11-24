@@ -733,6 +733,15 @@ void writeFatalRecord(int fd) {
   exitFromV8Fatal(location, 0, message);
 }
 
+// The process-wide callback of this process's role, through `registrar` (V8's own outside a unit
+// test): the ordinary and quarantine roles replace the one workerd installs with V8; durable roles keep it.
+template <typename Registrar>
+void registerRoleFatalHandler(bool durable, Registrar registrar) {
+  threaded::registerProcessFatalHandler(durable ? threaded::FatalHandlerRole::DURABLE
+                                                : threaded::FatalHandlerRole::ORDINARY_OR_QUARANTINE,
+      registrar, &exitFromV8Fatal);
+}
+
 [[noreturn]] void nativeOom(const char *location, const v8::OOMDetails &details) {
   const int fd = limitEventFd();
   char unknown[96];
@@ -765,7 +774,9 @@ void writeFatalRecord(int fd) {
 }
 
 #ifdef COWORKERD_FATAL_TEST_BUILD
-void injectSyntheticCrash(kj::StringPtr worker) {
+// `load`: called while the Worker loads, after its top level ran, where only the load's own scope
+// names it; otherwise at a call's JavaScript entry.
+void injectSyntheticCrash(kj::StringPtr worker, bool load = false) {
   auto path = kj::str("/tmp/coworkerd-fatal-test/command.", getpid());
   const int fd = open(path.cStr(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (fd < 0) return;
@@ -779,6 +790,10 @@ void injectSyntheticCrash(kj::StringPtr worker) {
     if (input.slice(separator + 1) != worker) return;
     command[separator] = '\0';
     auto event = kj::StringPtr(command, separator);
+    if (load) {
+      if (event == "load-api-check") (void)v8::MaybeLocal<v8::Value>().ToLocalChecked();
+      return;
+    }
     if (event == "fatal") nativeFatal(nullptr, nullptr);
     // A real dispatch: V8's own API check calls whichever fatal handler this isolate ended up with.
     if (event == "api-check") (void)v8::MaybeLocal<v8::Value>().ToLocalChecked();
@@ -1708,6 +1723,11 @@ kj::StringPtr executionIdentity(kj::StringPtr fallback) {
   return fallback;
 }
 
+// Whom a fatal error belongs to while `owner`'s isolate runs a startup, logging or dynamic import
+// entry: the enclosing scope of this isolate (the load, or the call), else the call whose I/O
+// context started the entry (a legacy dynamic import continues outside it), else the Worker's
+// load identity, since the isolate runs only that Worker's code (the node still requires a
+// dispatch of that invocation in this process generation). None in durable roles.
 kj::Maybe<kj::StringPtr> scopedExecutionIdentity(
     const IsolateLimits &owner, v8::Isolate *isolate, kj::Maybe<IoContext &> origin) {
   if (owner.durableEvents) return kj::none;
@@ -1718,7 +1738,7 @@ kj::Maybe<kj::StringPtr> scopedExecutionIdentity(
     if (request != nullptr && request->slot.limits == &owner)
       return kj::StringPtr(request->identity);
   }
-  return kj::none;
+  return owner.identity.asPtr();
 }
 
 void noteUnsupported(kj::StringPtr feature) {
@@ -2479,10 +2499,7 @@ struct ThreadedServer {
           },
           durableNumber(std::string_view(this->identity).substr(colon + 1)));
     }
-    const auto fatalRole = durableAdmission ? threaded::FatalHandlerRole::DURABLE
-                                            : threaded::FatalHandlerRole::ORDINARY_OR_QUARANTINE;
-    threaded::registerProcessFatalHandler(
-        fatalRole, &v8::V8::SetFatalErrorHandler, &exitFromV8Fatal);
+    registerRoleFatalHandler(durableAdmission.has_value(), &v8::V8::SetFatalErrorHandler);
     // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker (exit 78).
     server::requireSecureSandbox();
     resources->reclaimWake = managerWake;
@@ -3489,6 +3506,9 @@ struct ThreadedServer {
     reporter.requireValid();
     uintptr_t isolateAddress = 0;
     worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock &lock) {
+#ifdef COWORKERD_FATAL_TEST_BUILD
+      if (!slot.resetDurableRoot) injectSyntheticCrash(slot.workerId.c_str(), true);
+#endif
       lock.validateHandlers(reporter);
       slot.loopbacks.assign(reporter.entrypoints.begin(), reporter.entrypoints.end());
       auto namespaces = field(descriptor, "nativeNamespaces");
