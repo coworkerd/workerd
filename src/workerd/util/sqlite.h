@@ -427,8 +427,9 @@ class SqliteDatabase {
   }
 
   // When SQLite rolls back the entire transaction on a statement error, discard
-  // the wrapper's transaction state and notify rollback listeners.
-  void acknowledgeAutomaticRollback();
+  // the wrapper's transaction state and notify rollback listeners. A caller
+  // that handles an expected resource refusal can keep the connection reusable.
+  void acknowledgeAutomaticRollback(bool reusable = false);
 
   // Generates a randomly generated fresh id for a new top-level operation so related statements
   // can be grouped in analytics.

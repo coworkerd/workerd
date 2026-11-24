@@ -503,7 +503,8 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
     kj::Timer& timer,
     DurableWalChannel& channel,
     kj::Maybe<DurableWalPosition> prepared,
-    uint64_t localOpenStartedNs)
+    uint64_t localOpenStartedNs,
+    kj::Maybe<uint64_t> recordFrameLimit)
     : directory(directory),
       walPath(kj::mv(walPath)),
       databasePath(kj::mv(databasePath)),
@@ -511,7 +512,8 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
       key(this->name.key()),
       db(&db),
       timer(timer),
-      channel(channel) {
+      channel(channel),
+      recordFrameLimit(recordFrameLimit) {
   configure(db);
   // The files of an earlier instance of this object may still hold a WAL: its frames went to the replicator then,
   // so this instance starts after them -- and reports where it starts, because the earlier instance may have died
@@ -654,6 +656,12 @@ void DurableLogShipper::readNewFrames() {
   uint64_t offset = 32 + uint64_t(readFrames) * frameSize;
   if (size <= offset) return;
   uint64_t available = (size - offset) / frameSize;
+  KJ_IF_SOME(limit, recordFrameLimit) {
+    // Native SQL limits each transaction at SQLite's VFS. Stop at the node's
+    // record limit even if several transactions committed in one /execute.
+    KJ_ASSERT(hookFrames >= readFrames);
+    available = kj::min(available, kj::min(limit / frameSize, uint64_t(hookFrames - readFrames)));
+  }
   if (available == 0) return;
   auto buffer = kj::heapArray<kj::byte>(available * frameSize);
   size_t got = file->read(offset, buffer);
@@ -745,6 +753,7 @@ kj::Promise<void> DurableLogShipper::onCommit() {
     // The node took this object away from this instance: nothing it commits is confirmed again.
     return kj::Promise<void>(KJ_EXCEPTION(FAILED, kj::str("jsg.Error: ", reason)));
   }
+  if (recordFrameLimit != kj::none) return confirmNativeCommits();
   // Everything committed since the last callback, in messages of at most COWORKERD_DO_RECORD_BYTES: the answer waits
   // for the last of them, and the node confirms an object's messages in the order they were sent.
   kj::Maybe<kj::Promise<void>> answer;
@@ -760,6 +769,16 @@ kj::Promise<void> DurableLogShipper::onCommit() {
   }
   // Nothing new: this commit's frames went with an earlier message, or it wrote no page.
   return sendPending();
+}
+
+kj::Promise<void> DurableLogShipper::confirmNativeCommits() {
+  // Only one native record in this request should occupy the channel at a
+  // time. Two valid near-limit records together can exceed its mailbox.
+  while (readFrames != hookFrames) {
+    readNewFrames();
+    KJ_REQUIRE(pendingCount != 0, "could not read the next committed native SQL WAL record");
+    co_await sendPending();
+  }
 }
 
 void DurableLogShipper::onAcked(uint64_t request) {

@@ -32,7 +32,8 @@ class DurableStorage {
 
   kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
       DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
-      DurableWalChannel& channel, DurableWalPosition position, uint64_t localOpenStartedNs) const;
+      DurableWalChannel& channel, DurableWalPosition position, uint64_t localOpenStartedNs,
+      kj::Maybe<uint64_t> recordFrameLimit = kj::none) const;
   struct WalImage {
     const kj::Directory& directory;
     kj::Path path;

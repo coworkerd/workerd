@@ -20,6 +20,7 @@ enum class NativeSqlResults { OBJECTS, COLUMNS };
 struct NativeSqlReply {
   uint status;
   std::string body;
+  bool memoryPressure = false;
 };
 
 // The caller exclusively owns the database for the duration of the request
@@ -34,6 +35,7 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
     SqliteMemoryBudget* requestMemory = nullptr);
 
 std::string nativeSqlFailure(kj::StringPtr code, kj::StringPtr reason);
+NativeSqlReply nativeSqlMemoryFailure(SqliteMemoryBudget::Allocation allocation);
 NativeSqlReply nativeSqlTimeout();
 
 }  // namespace workerd::server

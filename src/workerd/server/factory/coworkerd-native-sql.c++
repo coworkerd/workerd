@@ -39,10 +39,14 @@ struct SqlError {
 struct ResultTooLarge {};
 struct Interrupted {};
 struct SpillRefused {};
-struct MemoryRefused {};
+struct MemoryRefused {
+  SqliteMemoryBudget::Allocation allocation;
+};
 
 void reserveMemory(SqliteMemoryBudget* memory, size_t bytes) {
-  if (memory != nullptr && !memory->acquire(bytes)) throw MemoryRefused{};
+  if (memory == nullptr) return;
+  const auto result = memory->acquire(bytes);
+  if (result != SqliteMemoryBudget::Allocation::ACCEPTED) throw MemoryRefused{result};
 }
 
 class SqlJsonMessage final: public capnp::MessageBuilder {
@@ -130,6 +134,12 @@ class Deadline {
   bool disconnected = false;
 };
 
+void checkSqliteMemoryError(kj::Maybe<int> code) {
+  if ((code.orDefault(SQLITE_OK) & 0xff) == SQLITE_NOMEM) {
+    throw MemoryRefused{SqliteMemoryScope::takeAllocationFailure()};
+  }
+}
+
 class Regulator final: public SqliteDatabase::Regulator {
  public:
   bool isAllowedName(kj::StringPtr name) const override {
@@ -153,12 +163,26 @@ class Regulator final: public SqliteDatabase::Regulator {
   }
 
   void onError(kj::Maybe<int> code, kj::StringPtr message) const override {
-    if ((code.orDefault(SQLITE_OK) & 0xff) == SQLITE_NOMEM) throw MemoryRefused{};
+    checkSqliteMemoryError(code);
     throw SqlError{kj::str(message)};
   }
 };
 
 constexpr Regulator REGULATOR;
+
+class TransactionRegulator final: public SqliteDatabase::Regulator {
+ public:
+  void onError(kj::Maybe<int> code, kj::StringPtr) const override {
+    checkSqliteMemoryError(code);
+  }
+};
+
+constexpr TransactionRegulator TRANSACTION_REGULATOR;
+
+void runTransactionControl(SqliteDatabase& db, kj::StringPtr sql) {
+  SqliteMemoryScope::takeAllocationFailure();
+  db.run(SqliteDatabase::QueryOptions{.regulator = TRANSACTION_REGULATOR}, sql);
+}
 
 unsigned hexCodeUnit(kj::ArrayPtr<const char> input) {
   if (input.size() < 4) return 0;
@@ -524,6 +548,7 @@ void encodeRows(Writer& out, SqliteDatabase::Query& cursor, NativeSqlResults for
 }
 
 void statement(SqliteDatabase& db, Json::Reader entry, Writer& out, NativeSqlResults format) {
+  SqliteMemoryScope::takeAllocationFailure();
   if (hasField(entry, "ingest"_kj)) {
     throw SqlError{kj::str("ingest is only accepted as a standalone /query object")};
   }
@@ -595,6 +620,7 @@ void statement(SqliteDatabase& db, Json::Reader entry, Writer& out, NativeSqlRes
 }
 
 void ingest(SqliteDatabase& db, Json::Reader entry, Writer& out) {
+  SqliteMemoryScope::takeAllocationFailure();
   auto sql = field(entry, "ingest"_kj);
   if (!sql.isString() || hasField(entry, "sql"_kj) || hasField(entry, "params"_kj)) {
     throw SqlError{kj::str(
@@ -634,20 +660,25 @@ NativeSqlReply failed(kj::StringPtr reason, bool batch) {
 
 // SQLite may have rolled back the whole transaction as part of a failed
 // statement. Disable cancellation so any remaining rollback can finish.
-void rollback(SqliteDatabase& db, Deadline& deadline, NativeSqlSpill* spill) {
+void rollback(SqliteDatabase& db, Deadline& deadline, NativeSqlSpill* spill, bool reusable = false) {
   deadline.disable();
+  SqliteMemoryScope::AllowRollbackAllocations memory;
   if (sqlite3_get_autocommit(db) == 0) db.run("ROLLBACK");
-  else db.acknowledgeAutomaticRollback();
+  else db.acknowledgeAutomaticRollback(reusable || (spill && spill->exceededTransactionLimit()));
   if (spill) spill->end(false);
 }
 
 bool spillFailed(NativeSqlSpill* spill) {
-  return spill && (spill->wasRefused() || spill->failedToMeasureWal());
+  return spill && (spill->wasRefused() || spill->failedToMeasureWal() || spill->exceededTransactionLimit());
 }
 
 NativeSqlReply spillFailure(const NativeSqlSpill& spill) {
   if (spill.failedToMeasureWal()) {
     return {503, nativeSqlFailure("STORAGE_UNAVAILABLE"_kj, "the local WAL size could not be read"_kj)};
+  }
+  if (spill.exceededTransactionLimit()) {
+    return {422, nativeSqlFailure("SQL_TRANSACTION_TOO_LARGE"_kj,
+        "one native SQL transaction must fit in one replicated WAL record"_kj)};
   }
   return {507, nativeSqlFailure("SQL_SPILL_LIMIT_EXCEEDED"_kj,
       "uncommitted WAL and temporary files exceeded a native SQL spill budget"_kj)};
@@ -671,6 +702,14 @@ std::string nativeSqlFailure(kj::StringPtr code, kj::StringPtr reason) {
 NativeSqlReply nativeSqlTimeout() {
   return {503,
     nativeSqlFailure("SQL_LIMIT_EXCEEDED"_kj, "SQL execution exceeded the 30-second deadline"_kj)};
+}
+
+NativeSqlReply nativeSqlMemoryFailure(SqliteMemoryBudget::Allocation allocation) {
+  if (allocation == SqliteMemoryBudget::Allocation::BUSY) {
+    return {503, nativeSqlFailure("DO_UNAVAILABLE"_kj, "the native SQL memory budget is full"_kj), true};
+  }
+  return {422, nativeSqlFailure("SQL_MEMORY_LIMIT_EXCEEDED"_kj,
+      "the native SQL allocation exceeds its memory budget"_kj)};
 }
 
 NativeSqlReply runNativeSql(SqliteDatabase& db,
@@ -703,7 +742,7 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
     deadline.check();
     if (query) {
       if (spill) spill->begin();
-      db.run("BEGIN");
+      runTransactionControl(db, "BEGIN");
       if (batch) {
         out.append("[");
         bool first = true;
@@ -720,13 +759,13 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
         statement(db, input, out, format);
       }
       deadline.check();
-      db.run("COMMIT");
+      runTransactionControl(db, "COMMIT");
       if (spill) spill->end(true);
     } else {
       auto execute = [&](Json::Reader entry, bool separator) {
         deadline.check();
         if (spill) spill->begin();
-        db.run("BEGIN");
+        runTransactionControl(db, "BEGIN");
         auto before = out.bytes.size();
         bool success = false;
         kj::String reason;
@@ -748,7 +787,7 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
         deadline.check();
         try {
           if (sqlite3_get_autocommit(db) == 0) {
-            db.run("COMMIT");
+            runTransactionControl(db, "COMMIT");
             if (spill) spill->end(true);
           } else {
             KJ_ASSERT(!success, "a successful SQL entry ended its own transaction");
@@ -787,11 +826,10 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
   } catch (const SpillRefused&) {
     rollback(db, deadline, spill);
     return spillFailure(*spill);
-  } catch (const MemoryRefused&) {
-    rollback(db, deadline, spill);
+  } catch (const MemoryRefused& error) {
+    rollback(db, deadline, spill, true);
     if (!deadline.wasInterrupted()) {
-      return {422, nativeSqlFailure("SQL_MEMORY_LIMIT_EXCEEDED"_kj,
-          "SQLite could not allocate memory within the native database budget"_kj)};
+      return nativeSqlMemoryFailure(error.allocation);
     }
   } catch (const ResultTooLarge&) {
     rollback(db, deadline, spill);
