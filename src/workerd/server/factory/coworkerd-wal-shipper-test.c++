@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Cloudflare, Inc.
+// Copyright 2026 The Coworkerd Authors
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
@@ -8,6 +8,7 @@
 #include <sqlite3.h>
 
 #include <kj/test.h>
+#include <kj/vector.h>
 
 namespace workerd::server {
 namespace {
@@ -37,7 +38,7 @@ void writeRootIdentity(wal::Writer& message) {
 class RecordingChannel final: public DurableWalChannel {
  public:
   kj::Array<kj::byte> open;
-  kj::Array<kj::byte> frames;
+  kj::Vector<kj::Array<kj::byte>> frames;
 
   bool enabled() const override {
     return true;
@@ -54,14 +55,54 @@ class RecordingChannel final: public DurableWalChannel {
   }
   kj::Promise<void> sendFrames(
       DurableLogShipper&, kj::Array<kj::byte> message, uint64_t, kj::Timer&) override {
-    KJ_ASSERT(frames.size() == 0, "expected one frame batch");
-    frames = kj::mv(message);
+    frames.add(kj::mv(message));
     return kj::READY_NOW;
   }
 
  private:
   uint64_t request = 0;
 };
+
+void expectOpen(const RecordingChannel& channel,
+    kj::ArrayPtr<const kj::byte> header,
+    uint32_t committedFrames) {
+  wal::Writer expectedOpen;
+  expectedOpen.u8(wal::MSG_OPEN);
+  writeRootIdentity(expectedOpen);
+  expectedOpen.u32(readBigEndian(header.slice(16)));
+  expectedOpen.u32(readBigEndian(header.slice(20)));
+  auto openPrefix = expectedOpen.finish(OPEN_ID);
+  KJ_ASSERT(channel.open.size() >= openPrefix.size() + sizeof(uint32_t));
+  KJ_EXPECT(channel.open.slice(4, openPrefix.size()) == openPrefix.slice(4));
+  KJ_EXPECT(wal::getLe32(channel.open.begin() + openPrefix.size()) == committedFrames);
+}
+
+void expectFrames(kj::ArrayPtr<const kj::byte> message,
+    kj::ArrayPtr<const kj::byte> header,
+    uint32_t firstFrame,
+    kj::ArrayPtr<const kj::byte> frames,
+    uint64_t request,
+    bool withHeader) {
+  wal::Writer expectedFrames;
+  expectedFrames.u8(wal::MSG_FRAMES);
+  expectedFrames.u64(request);
+  writeRootIdentity(expectedFrames);
+  expectedFrames.u64(0);  // Generation.
+  expectedFrames.u32(readBigEndian(header.slice(16)));
+  expectedFrames.u32(readBigEndian(header.slice(20)));
+  expectedFrames.u32(PAGE_SIZE);
+  expectedFrames.u32(firstFrame);
+  expectedFrames.u32(frames.size() / FRAME_SIZE);
+  expectedFrames.u32(1);  // Commit count.
+  auto framePrefix = expectedFrames.finish(OPEN_ID);
+  const auto headerFlag = framePrefix.size() + 3 * sizeof(uint64_t);  // Skip timing fields.
+  const auto framesStart = headerFlag + 1 + (withHeader ? WAL_HEADER_SIZE : 0);
+  KJ_ASSERT(message.size() == framesStart + frames.size());
+  KJ_EXPECT(message.slice(4, framePrefix.size()) == framePrefix.slice(4));
+  KJ_EXPECT(message[headerFlag] == withHeader);
+  if (withHeader) KJ_EXPECT(message.slice(headerFlag + 1, framesStart) == header);
+  KJ_EXPECT(message.slice(framesStart) == frames);
+}
 
 void expectCommittedPrefix(const kj::ReadableFile& database,
     kj::ArrayPtr<const kj::byte> image,
@@ -99,41 +140,30 @@ void expectCommittedPrefix(const kj::ReadableFile& database,
       io.provider->getTimer(), channel);
   KJ_ASSERT(walFile->readAllBytes().asPtr() == image);
 
-  wal::Writer expectedOpen;
-  expectedOpen.u8(wal::MSG_OPEN);
-  writeRootIdentity(expectedOpen);
-  expectedOpen.u32(salt1);
-  expectedOpen.u32(salt2);
-  auto openPrefix = expectedOpen.finish(OPEN_ID);
-  KJ_ASSERT(channel.open.size() >= openPrefix.size() + sizeof(uint32_t));
-  KJ_EXPECT(channel.open.slice(4, openPrefix.size()) == openPrefix.slice(4));
-  KJ_EXPECT(wal::getLe32(channel.open.begin() + openPrefix.size()) == committedFrames);
+  expectOpen(channel, header, committedFrames);
 
   // Completing the tail must resume from the checksum of the last complete commit.
   shipper.onCommit().wait(io.waitScope);
   KJ_ASSERT(channel.frames.size() == 0);
   walFile->writeAll(fullWal);
   shipper.onCommit().wait(io.waitScope);
-  const auto appended = fullWal.slice(committedEnd);
-  wal::Writer expectedFrames;
-  expectedFrames.u8(wal::MSG_FRAMES);
-  expectedFrames.u64(1);  // Request ID.
-  writeRootIdentity(expectedFrames);
-  expectedFrames.u64(0);  // Generation.
-  expectedFrames.u32(salt1);
-  expectedFrames.u32(salt2);
-  expectedFrames.u32(PAGE_SIZE);
-  expectedFrames.u32(committedFrames + 1);
-  expectedFrames.u32(appended.size() / FRAME_SIZE);
-  expectedFrames.u32(1);  // Commit count.
-  auto framePrefix = expectedFrames.finish(OPEN_ID);
-  const auto headerFlag = framePrefix.size() + 3 * sizeof(uint64_t);  // Skip timing fields.
-  const auto framesStart = headerFlag + 1 + WAL_HEADER_SIZE;
-  KJ_ASSERT(channel.frames.size() == framesStart + appended.size());
-  KJ_EXPECT(channel.frames.slice(4, framePrefix.size()) == framePrefix.slice(4));
-  KJ_EXPECT(channel.frames[headerFlag] == 1);
-  KJ_EXPECT(channel.frames.slice(headerFlag + 1, framesStart) == header);
-  KJ_EXPECT(channel.frames.slice(framesStart) == appended);
+  KJ_ASSERT(channel.frames.size() == 1);
+  expectFrames(
+      channel.frames[0], header, committedFrames + 1, fullWal.slice(committedEnd), 1, true);
+}
+
+void configureWal(SqliteDatabase& db, uint32_t& lastCommit) {
+  db.run("PRAGMA page_size = 4096");
+  db.run("CREATE TABLE entries (value BLOB)");
+  KJ_REQUIRE(db.run("PRAGMA journal_mode = WAL").getText(0) == "wal"_kj);
+  db.run("PRAGMA synchronous = OFF");
+  KJ_REQUIRE(sqlite3_wal_autocheckpoint(db, 0) == SQLITE_OK);
+
+  // SQLite reports the last committed frame independently of either scanner.
+  sqlite3_wal_hook(db, [](void* context, sqlite3*, const char*, int frames) {
+    *static_cast<uint32_t*>(context) = frames;
+    return SQLITE_OK;
+  }, &lastCommit);
 }
 
 KJ_TEST("cold WAL scan and shipper agree on the last complete SQLite commit") {
@@ -143,18 +173,8 @@ KJ_TEST("cold WAL scan and shipper agree on the last complete SQLite commit") {
   const auto walPath = kj::Path({"test.db-wal"});
   SqliteDatabase::Vfs vfs(*dir);
   SqliteDatabase db(vfs, dbPath.clone(), CREATE_OR_MODIFY);
-  db.run("PRAGMA page_size = 4096");
-  db.run("CREATE TABLE entries (value BLOB)");
-  KJ_REQUIRE(db.run("PRAGMA journal_mode = WAL").getText(0) == "wal"_kj);
-  db.run("PRAGMA synchronous = OFF");
-  KJ_REQUIRE(sqlite3_wal_autocheckpoint(db, 0) == SQLITE_OK);
-
-  // SQLite reports the last committed frame independently of either scanner.
   uint32_t lastCommit = 0;
-  sqlite3_wal_hook(db, [](void* context, sqlite3*, const char*, int frames) {
-    *static_cast<uint32_t*>(context) = frames;
-    return SQLITE_OK;
-  }, &lastCommit);
+  configureWal(db, lastCommit);
   KJ_DEFER(sqlite3_wal_hook(db, nullptr, nullptr));
   db.run("INSERT INTO entries VALUES (x'00')");
   const uint32_t smallCommit = lastCommit;
@@ -199,6 +219,65 @@ KJ_TEST("cold WAL scan and shipper agree on the last complete SQLite commit") {
     KJ_CONTEXT("final commit frame interrupted halfway through its page");
     expectCommittedPrefix(*database, interrupted, largeCommit, complete, io);
   }
+}
+
+KJ_TEST("opening a multi-record WAL reports SQLite's last commit") {
+  constexpr size_t DEFAULT_RECORD_BYTES = 8u << 20;
+  auto io = kj::setupAsyncIo();
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  const auto dbPath = kj::Path({"test.db"});
+  const auto walPath = kj::Path({"test.db-wal"});
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, dbPath.clone(), CREATE_OR_MODIFY);
+  uint32_t lastCommit = 0;
+  configureWal(db, lastCommit);
+  KJ_DEFER(sqlite3_wal_hook(db, nullptr, nullptr));
+
+  db.run("INSERT INTO entries VALUES (x'00')");
+  const auto firstCommit = lastCommit;
+  db.run("INSERT INTO entries VALUES (zeroblob(5000000)), (zeroblob(5000000))");
+  const auto largeCommit = lastCommit;
+  db.run("INSERT INTO entries VALUES (x'01')");
+  KJ_ASSERT(lastCommit > largeCommit && largeCommit > firstCommit);
+  KJ_ASSERT((largeCommit - firstCommit) * FRAME_SIZE > DEFAULT_RECORD_BYTES);
+  const auto fullWal = dir->openFile(walPath)->readAllBytes();
+  KJ_ASSERT(fullWal.size() == WAL_HEADER_SIZE + lastCommit * FRAME_SIZE);
+  const auto header = fullWal.first(WAL_HEADER_SIZE);
+
+  auto cold = readDurableWalPosition(*dir, walPath);
+  KJ_EXPECT(cold.frames == lastCommit);
+  for (bool usePrepared: {false, true}) {
+    KJ_CONTEXT(usePrepared);
+    kj::Maybe<DurableWalPosition> prepared;
+    if (usePrepared) prepared = cold;
+    RecordingChannel channel;
+    DurableLogShipper shipper(*dir, walPath.clone(), dbPath.clone(),
+        {.objectName = kj::str(OBJECT_NAME), .storageId = kj::str(STORAGE_ID)}, db,
+        io.provider->getTimer(), channel, prepared);
+    expectOpen(channel, header, lastCommit);
+    shipper.onCommit().wait(io.waitScope);
+    KJ_EXPECT(channel.frames.size() == 0);
+  }
+
+  // Open on the first commit, then present the same WAL with both later commits available.
+  auto replica = kj::newInMemoryDirectory(kj::nullClock());
+  replica->openFile(dbPath, kj::WriteMode::CREATE)->writeAll(dir->openFile(dbPath)->readAllBytes());
+  auto replicaWal = replica->openFile(walPath, CREATE_OR_MODIFY);
+  const auto firstEnd = WAL_HEADER_SIZE + firstCommit * FRAME_SIZE;
+  const auto largeEnd = WAL_HEADER_SIZE + largeCommit * FRAME_SIZE;
+  replicaWal->writeAll(fullWal.first(firstEnd));
+  SqliteDatabase::Vfs replicaVfs(*replica);
+  SqliteDatabase replicaDb(replicaVfs, dbPath.clone(), kj::WriteMode::MODIFY);
+  RecordingChannel channel;
+  DurableLogShipper shipper(*replica, walPath.clone(), dbPath.clone(),
+      {.objectName = kj::str(OBJECT_NAME), .storageId = kj::str(STORAGE_ID)}, replicaDb,
+      io.provider->getTimer(), channel);
+  replicaWal->writeAll(fullWal);
+  shipper.onCommit().wait(io.waitScope);
+  KJ_ASSERT(channel.frames.size() == 2);
+  expectFrames(
+      channel.frames[0], header, firstCommit + 1, fullWal.slice(firstEnd, largeEnd), 1, true);
+  expectFrames(channel.frames[1], header, largeCommit + 1, fullWal.slice(largeEnd), 2, false);
 }
 
 }  // namespace

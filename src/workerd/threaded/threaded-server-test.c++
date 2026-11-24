@@ -7,6 +7,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 
+#include <kj/encoding.h>
 #include <kj/test.h>
 #include <kj/timer.h>
 
@@ -23,9 +24,9 @@ struct TestPlatform {
   server::WorkerdPlatform platform{*base};
   jsg::V8System system{platform, {}, base.get()};
 };
-void initializeV8() {
+jsg::V8System& initializeV8() {
   static auto* platform = new TestPlatform;
-  (void)platform;
+  return platform->system;
 }
 // A group of its own for a test isolate, as the server creates one per Worker.
 v8::IsolateGroup newGroup() {
@@ -37,6 +38,143 @@ void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
   v8::Locker locker(isolate);
   v8::Isolate::Scope entered(isolate);
   limits.customizeIsolate(isolate);
+}
+
+KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
+  int fds[2];
+  KJ_SYSCALL(pipe(fds));
+  KJ_DEFER(close(fds[0]));
+  KJ_DEFER(close(fds[1]));
+  v8::Isolate::CreateParams params;
+  params.array_buffer_allocator_shared.reset(v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+  auto* isolate = v8::Isolate::New(newGroup(), params);
+  KJ_DEFER(isolate->Dispose());
+  auto* otherIsolate = v8::Isolate::New(newGroup(), params);
+  KJ_DEFER(otherIsolate->Dispose());
+  auto readRecord = [&] {
+    char row[PIPE_BUF];
+    const auto count = read(fds[0], row, sizeof(row));
+    KJ_REQUIRE(count > 0);
+    return kj::heapString(row, count);
+  };
+  auto checkUnknown = [&] {
+    KJ_EXPECT(
+        readRecord() == kj::str("{\"event\":\"v8-fatal-undetermined\",\"pid\":", getpid(), "}\n"));
+  };
+  const kj::StringPtr identity =
+      "\"workerId\":\"tenant/w\",\"versionId\":\"v1\","
+      "\"invocationId\":\"call\",\"isolate\":\"coworkerd-v1:tenant/w@v1#5\",";
+  FatalInvocation invocation(isolate, identity);
+  writeFatalRecord(fds[1]);
+  checkUnknown();  // A scope alone does not prove the isolate is current.
+  {
+    v8::Locker locker(isolate);
+    v8::Isolate::Scope active(isolate);
+    std::thread other([&] { writeFatalRecord(fds[1]); });
+    other.join();
+    checkUnknown();
+    auto checkIdentity = [&](kj::StringPtr expected) {
+      writeFatalRecord(fds[1]);
+      KJ_EXPECT(readRecord() ==
+          kj::str("{\"event\":\"v8-fatal\",\"pid\":", getpid(), ",",
+              expected.slice(0, expected.size() - 1), "}\n"));
+    };
+    checkIdentity(identity);
+    {
+      const kj::StringPtr nestedIdentity = "\"invocationId\":\"nested\",";
+      FatalInvocation nested(isolate, nestedIdentity);
+      checkIdentity(nestedIdentity);
+    }
+    checkIdentity(identity);  // The outer scope is current again.
+    {
+      // Another isolate entered on this thread, with this scope still the top one.
+      v8::Locker otherLocker(otherIsolate);
+      v8::Isolate::Scope otherEntered(otherIsolate);
+      KJ_REQUIRE(v8::Isolate::TryGetCurrent() == otherIsolate);
+      writeFatalRecord(fds[1]);
+      checkUnknown();
+    }
+    checkIdentity(identity);
+  }
+}
+
+KJ_TEST("an entry outside any scope or live call takes the Worker's load identity") {
+  // Startup, logging and dynamic import entries ask scopedExecutionIdentity() whom a fatal error
+  // belongs to. With no enclosing scope of the isolate and no I/O context (a legacy dynamic import
+  // continues outside its call's), the isolate still runs only its own Worker's code.
+  IsolateLimits limits(100, 32,
+      kj::str("\"workerId\":\"tenant/w\",\"versionId\":\"v1\",\"invocationId\":\"load\","), nullptr,
+      newGroup());
+  v8::Isolate::CreateParams params;
+  params.array_buffer_allocator_shared.reset(v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+  auto* isolate = v8::Isolate::New(newGroup(), params);
+  KJ_DEFER(isolate->Dispose());
+  auto* otherIsolate = v8::Isolate::New(newGroup(), params);
+  KJ_DEFER(otherIsolate->Dispose());
+  limits.isolate = isolate;  // as customizeIsolate() records it
+  KJ_REQUIRE(!IoContext::hasCurrent());
+  KJ_EXPECT(KJ_ASSERT_NONNULL(scopedExecutionIdentity(limits, isolate)) == limits.identity);
+  {
+    // An enclosing scope of this isolate (the load or the call) takes precedence.
+    FatalInvocation call(isolate, "\"invocationId\":\"call\",");
+    KJ_EXPECT(KJ_ASSERT_NONNULL(scopedExecutionIdentity(limits, isolate)) == "\"invocationId\":\"call\",");
+    // An entry on an isolate that is not this Worker's own is named by nobody.
+    KJ_EXPECT(scopedExecutionIdentity(limits, otherIsolate) == kj::none);
+  }
+  limits.durableEvents = true;
+  KJ_EXPECT(scopedExecutionIdentity(limits, isolate) == kj::none);
+}
+
+KJ_TEST("another Worker's call never lends its identity to this Worker's entry") {
+  IsolateLimits limits(100, 32, kj::str("\"invocationId\":\"load\","), nullptr, newGroup());
+  IsolateLimits other(100, 32, kj::str("\"invocationId\":\"other-load\","), nullptr, newGroup());
+  auto* isolate = reinterpret_cast<v8::Isolate*>(&limits);  // only compared, never entered
+  limits.isolate = isolate;
+  const kj::StringPtr call = "\"invocationId\":\"call\",";
+  // The current I/O context's call runs this Worker: its identity.
+  KJ_EXPECT(KJ_ASSERT_NONNULL(entryFatalIdentity(limits, isolate, kj::none, &limits, call)) == call);
+  // It runs another Worker: this entry keeps its own Worker's load identity.
+  KJ_EXPECT(KJ_ASSERT_NONNULL(entryFatalIdentity(limits, isolate, kj::none, &other, call)) ==
+      limits.identity);
+  // No I/O context.
+  KJ_EXPECT(KJ_ASSERT_NONNULL(entryFatalIdentity(limits, isolate, kj::none, nullptr, ""_kj)) ==
+      limits.identity);
+  // An enclosing scope of this isolate comes first.
+  KJ_EXPECT(KJ_ASSERT_NONNULL(entryFatalIdentity(
+                limits, isolate, kj::StringPtr("\"invocationId\":\"outer\","), &limits, call)) ==
+      "\"invocationId\":\"outer\",");
+}
+
+// A minimal jsg isolate, for the server's own startup entry on a real jsg::Lock.
+struct StartupEntryGlobal: public jsg::Object, public jsg::ContextGlobal {
+  JSG_RESOURCE_TYPE(StartupEntryGlobal) {}
+};
+JSG_DECLARE_ISOLATE_TYPE(StartupEntryIsolate, StartupEntryGlobal);
+
+KJ_TEST("a startup entry opens the fatal scope of its Worker and closes it") {
+  auto& system = initializeV8();
+  IsolateLimits limits(100, 32,
+      kj::str("\"workerId\":\"tenant/w\",\"versionId\":\"v1\",\"invocationId\":\"load\","), nullptr,
+      newGroup());
+  StartupEntryIsolate jsgIsolate(system, newGroup(), nullptr, kj::heap<jsg::IsolateObserver>());
+  jsgIsolate.runInLockScope([&](StartupEntryIsolate::Lock& lock) {
+    limits.customizeIsolate(lock.v8Isolate);
+    KJ_EXPECT(FatalInvocation::forIsolate(lock.v8Isolate) == nullptr);
+    kj::OneOf<kj::Exception, kj::Duration> result;
+    {
+      auto entry = limits.enterStartupJs(lock, result);
+      const auto* scope = FatalInvocation::forIsolate(lock.v8Isolate);
+      KJ_ASSERT(scope != nullptr, "the startup entry pushed no fatal scope");
+      KJ_EXPECT(scope->getIdentity() == limits.identity);
+    }
+    KJ_EXPECT(FatalInvocation::forIsolate(lock.v8Isolate) == nullptr);
+    // A durable role's entry pushes none.
+    limits.durableEvents = true;
+    {
+      auto entry = limits.enterLoggingJs(lock, result);
+      KJ_EXPECT(FatalInvocation::forIsolate(lock.v8Isolate) == nullptr);
+    }
+  });
 }
 
 KJ_TEST("descriptor queue: empty, full, FIFO, SPSC handoff and close") {
@@ -884,9 +1022,8 @@ struct ChildResult {
   int status;
   std::string events;  // the rows the child wrote to its limit event descriptor
 };
-ChildResult runAllocationChild(kj::StringPtr spec) {
-  auto filter = kj::str("--filter=threaded-server-test.c++:", ALLOCATION_CHILD_LINE);
-  auto selector = kj::str("COWORKERD_THREADED_ALLOCATION_CHILD=", spec);
+ChildResult runTestChild(uint line, kj::String selector) {
+  auto filter = kj::str("--filter=threaded-server-test.c++:", line);
   // The child's limit event descriptor, as the node passes one to the server.
   int events[2];
   KJ_REQUIRE(pipe2(events, O_CLOEXEC) == 0);
@@ -926,12 +1063,101 @@ ChildResult runAllocationChild(kj::StringPtr spec) {
     rows.append(buffer, n);
   }
   close(events[0]);
+  return {status, kj::mv(rows)};
+}
+
+ChildResult runAllocationChild(kj::StringPtr spec) {
+  auto [status, rows] =
+      runTestChild(ALLOCATION_CHILD_LINE, kj::str("COWORKERD_THREADED_ALLOCATION_CHILD=", spec));
   fprintf(stdout, "ALLOCATION_CHILD spec=%s exited=%d code=%d signal=%d\n", spec.cStr(),
       WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
       WIFSIGNALED(status) ? WTERMSIG(status) : 0);
   fprintf(stdout, "ALLOCATION_CHILD_EVENTS %zu bytes\n%s", rows.size(), rows.c_str());
   fflush(stdout);
   return {status, kj::mv(rows)};
+}
+
+// The process-wide callback the role registers, captured by a registrar standing in for
+// v8::V8::SetFatalErrorHandler: no public V8 call reaches the process-wide callback.
+threaded::FatalHandler registeredProcessFatal = nullptr;
+unsigned processFatalRegistrations = 0;
+void captureProcessFatal(threaded::FatalHandler callback) {
+  ++processFatalRegistrations;
+  registeredProcessFatal = callback;
+}
+
+// A child that ends through one of the server's V8 fatal callbacks: "isolate", V8's own API
+// check on an isolate set up by customizeIsolate(); "process", the callback the ordinary role
+// registers process-wide, called as V8 calls it.
+constexpr uint FATAL_CHILD_LINE = __LINE__ + 1;
+KJ_TEST("child body: V8 fatal callbacks, selected by a parent test") {
+  auto selected = getenv("COWORKERD_THREADED_FATAL_CHILD");
+  if (selected == nullptr) return;
+  const kj::StringPtr kind = selected;
+  IsolateLimits limits(100, 32,
+      kj::str("\"workerId\":\"a/fatal-fixture\",\"versionId\":\"v1\",\"invocationId\":\"native-check\","),
+      nullptr, newGroup());
+  auto* isolate = v8::Isolate::New(limits.group, limits.getCreateParams());
+  KJ_DEFER(isolate->Dispose());
+  v8::Locker locker(isolate);
+  v8::Isolate::Scope entered(isolate);
+  limits.customizeIsolate(isolate);
+  FatalInvocation active(isolate, limits.identity);
+  if (kind == "isolate") {
+    // An intentional native API precondition failure. It executes no JavaScript.
+    (void)v8::MaybeLocal<v8::Value>().ToLocalChecked();
+  } else if (kind == "process") {
+    registerRoleFatalHandler(false, &captureProcessFatal);
+    KJ_REQUIRE(registeredProcessFatal != nullptr, "the ordinary role registered no callback");
+    registeredProcessFatal("driver.cc", 42, "process-wide check");
+  }
+  KJ_FAIL_REQUIRE("the fatal callback returned", kind);
+}
+
+struct FatalChild {
+  int status;
+  kj::String record, diagnostic;
+};
+FatalChild runFatalChild(kj::StringPtr kind) {
+  auto [status, rows] = runTestChild(FATAL_CHILD_LINE, kj::str("COWORKERD_THREADED_FATAL_CHILD=", kind));
+  fprintf(stdout, "FATAL_CHILD kind=%s exited=%d code=%d signal=%d\n%s", kind.cStr(),
+      WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+      WIFSIGNALED(status) ? WTERMSIG(status) : 0, rows.c_str());
+  fflush(stdout);
+  const auto newline = rows.find('\n');
+  if (newline == std::string::npos) return {status, kj::heapString(rows.c_str()), kj::str()};
+  return {status, kj::heapString(rows.c_str(), newline + 1), kj::heapString(rows.c_str() + newline + 1)};
+}
+kj::String fatalChildRecord(kj::StringPtr row) {
+  int pid = 0;
+  KJ_REQUIRE(sscanf(row.cStr(), "{\"event\":\"v8-fatal\",\"pid\":%d,", &pid) == 1 && pid > 0, row);
+  return kj::str("{\"event\":\"v8-fatal\",\"pid\":", pid,
+      ",\"workerId\":\"a/fatal-fixture\",\"versionId\":\"v1\",\"invocationId\":\"native-check\"}\n");
+}
+kj::String hexOf(kj::StringPtr text) {
+  return kj::encodeHex(text.asBytes());
+}
+
+KJ_TEST("the isolate's registered V8 fatal callback records the invocation and V8's reason") {
+  auto child = runFatalChild("isolate");
+  KJ_REQUIRE(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 75, child.status);
+  KJ_EXPECT(child.record == fatalChildRecord(child.record), child.record);
+  KJ_EXPECT(child.diagnostic.endsWith(kj::str(",\"fatalLocationHex\":\"", hexOf("v8::ToLocalChecked"),
+                "\",\"fatalLine\":0,\"fatalMessageHex\":\"", hexOf("Empty MaybeLocal"), "\"}\n")),
+      child.diagnostic);
+}
+
+KJ_TEST("the ordinary role registers the process-wide V8 fatal callback, durable roles do not") {
+  registeredProcessFatal = nullptr;
+  processFatalRegistrations = 0;
+  registerRoleFatalHandler(true, &captureProcessFatal);
+  KJ_EXPECT(processFatalRegistrations == 0 && registeredProcessFatal == nullptr);
+  auto child = runFatalChild("process");
+  KJ_REQUIRE(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 75, child.status);
+  KJ_EXPECT(child.record == fatalChildRecord(child.record), child.record);
+  KJ_EXPECT(child.diagnostic.endsWith(kj::str(",\"fatalLocationHex\":\"", hexOf("driver.cc"),
+                "\",\"fatalLine\":42,\"fatalMessageHex\":\"", hexOf("process-wide check"), "\"}\n")),
+      child.diagnostic);
 }
 
 KJ_TEST("126 MiB live then one near-GiB object preserves the process and a neighboring Worker") {
