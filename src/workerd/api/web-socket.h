@@ -882,6 +882,8 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
   // so it cannot be `IoOwn`ed as `farNative` is. Informs the HibernatableWebSocket if we
   // called `close()`, preventing send() after revival.
   bool closedOutgoingForHib = false;
+  // An unfinished node upgrade can end outside the accepting actor's IoContext.
+  bool abandonedUpgrade = false;
 
   // When YES, a server-initiated close does NOT automatically send a reciprocal close
   // frame, leaving readyState as CLOSING (2) when the close event fires. When NO (the

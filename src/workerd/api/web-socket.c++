@@ -1015,6 +1015,7 @@ void LegacyWebSocketAdapter::requireHibernatableMutationAllowed() {
 }
 
 void LegacyWebSocketAdapter::send(jsg::Lock& js, kj::OneOf<kj::Array<byte>, kj::String> message) {
+  if (abandonedUpgrade) return;
   requireHibernatableMutationAllowed();
   auto& native = *farNative;
   JSG_REQUIRE(!native.closedOutgoing, TypeError, "Can't call WebSocket send() after close().");
@@ -1109,6 +1110,7 @@ void LegacyWebSocketAdapter::close(
   // then there must be a code, too.
   JSG_REQUIRE(reason == kj::none || code != kj::none, DOMInvalidAccessError,
       "If you specify a WebSocket close reason, you must also specify a code.");
+  if (abandonedUpgrade) return;
 
   // Handle close before connection is established for websockets obtained through `new WebSocket()`.
   KJ_IF_SOME(pending, native.state.tryGet<AwaitingConnection>()) {
@@ -1153,6 +1155,7 @@ void LegacyWebSocketAdapter::close(
 }
 
 int LegacyWebSocketAdapter::getReadyState() {
+  if (abandonedUpgrade) return WebSocket::READY_STATE_CLOSED;
   auto& native = *farNative;
   if ((native.closedIncoming && native.closedOutgoing) || error != kj::none) {
     return WebSocket::READY_STATE_CLOSED;
@@ -1167,10 +1170,7 @@ int LegacyWebSocketAdapter::getReadyState() {
 }
 
 void LegacyWebSocketAdapter::abandonHibernatableUpgrade() {
-  KJ_ASSERT(isHibernatable());
-  farNative->closedIncoming = true;
-  farNative->closedOutgoing = true;
-  farNative->outgoingAborted = true;
+  abandonedUpgrade = true;
 }
 
 bool LegacyWebSocketAdapter::isAccepted() {

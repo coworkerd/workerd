@@ -4697,8 +4697,8 @@ class DurableNodeWebSocket final: public LegacyHibernationManagerImpl::NodeSocke
   }
   void abandonUpgrade() override {
     if (!pendingUpgrade) startUpgrade();
-    if (local) local->abort();
     attaching.fulfiller->reject(KJ_EXCEPTION(DISCONNECTED, "WebSocket upgrade was abandoned"));
+    if (local) local->abort();
   }
   kj::Promise<void> whenUpgrading() override {
     return upgraded.addBranch();

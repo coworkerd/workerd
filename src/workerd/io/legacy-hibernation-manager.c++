@@ -288,11 +288,11 @@ void LegacyHibernationManagerImpl::discardStagedNodeSockets(kj::Maybe<kj::String
 }
 
 void LegacyHibernationManagerImpl::discardNodeUpgrade(HibernatableWebSocket& socket) {
-  socket.nodeSocket->abandonUpgrade();
+  KJ_DEFER(dropHibernatableWebSocket(socket));
   KJ_IF_SOME(active, socket.activeOrPackage.tryGet<jsg::Ref<api::WebSocket>>()) {
     active->abandonHibernatableUpgrade();
   }
-  dropHibernatableWebSocket(socket);
+  socket.nodeSocket->abandonUpgrade();
 }
 
 bool LegacyHibernationManagerImpl::canForwardNodeUpgrade(
