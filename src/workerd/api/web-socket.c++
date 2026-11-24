@@ -212,6 +212,10 @@ bool WebSocket::isPeerOf(jsg::Lock& js, const WebSocket& candidate) {
   return kj::downcast<LegacyWebSocketAdapter>(*impl).isPeerOf(js, candidate);
 }
 
+void WebSocket::abandonHibernatableUpgrade() {
+  kj::downcast<LegacyWebSocketAdapter>(*impl).abandonHibernatableUpgrade();
+}
+
 kj::Maybe<kj::ArrayPtr<const byte>> WebSocket::getSerializedAttachment() const {
   return kj::downcast<const LegacyWebSocketAdapter>(*impl).getSerializedAttachment();
 }
@@ -1160,6 +1164,13 @@ int LegacyWebSocketAdapter::getReadyState() {
     return WebSocket::READY_STATE_CONNECTING;
   }
   return WebSocket::READY_STATE_OPEN;
+}
+
+void LegacyWebSocketAdapter::abandonHibernatableUpgrade() {
+  KJ_ASSERT(isHibernatable());
+  farNative->closedIncoming = true;
+  farNative->closedOutgoing = true;
+  farNative->outgoingAborted = true;
 }
 
 bool LegacyWebSocketAdapter::isAccepted() {

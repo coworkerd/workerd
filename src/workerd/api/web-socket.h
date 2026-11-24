@@ -199,6 +199,7 @@ class WebSocket: public EventTarget {
   kj::Rc<kj::WebSocket> acceptAsHibernatable(
       kj::Array<kj::String> tags, kj::Maybe<WrapTransport> wrapTransport = kj::none);
   bool isPeerOf(jsg::Lock& js, const WebSocket& candidate);
+  void abandonHibernatableUpgrade();
   void requirePeerUpgrade() {
     peerMustUpgrade = true;
   }
@@ -592,6 +593,7 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
   kj::Rc<kj::WebSocket> acceptWithTransport(
       kj::Array<kj::String> tags, kj::Maybe<WebSocket::WrapTransport> wrapTransport);
   bool isPeerOf(jsg::Lock& js, const WebSocket& candidate);
+  void abandonHibernatableUpgrade();
   kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
   bool isOutputClosed() const;
   void initiateHibernatableRelease(jsg::Lock& js,

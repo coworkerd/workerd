@@ -27,6 +27,7 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
    public:
     virtual void useLocalTransport(kj::Own<kj::WebSocket> transport) = 0;
     virtual void startUpgrade() = 0;
+    virtual void abandonUpgrade() = 0;
     virtual kj::Promise<void> whenUpgrading() = 0;
     virtual void attach(kj::StringPtr socketId, kj::StringPtr invocationId) = 0;
     virtual void activate() = 0;
@@ -50,8 +51,12 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
 
   static constexpr auto NODE_SOCKET_HEADER = "x-coworkerd-managed-socket"_kj;
   kj::Maybe<kj::StringPtr> stageNodeSocket(jsg::Lock& js, api::WebSocket& peer);
-  bool hasStagedNodeSocket(kj::StringPtr pending) const;
-  void setNodeUpgradeLookup(kj::Function<bool(kj::StringPtr)> lookup) {
+  bool hasStagedNodeSocket(kj::StringPtr pending, kj::StringPtr invocation) const;
+  bool hasNodeUpgrades() const;
+  void discardStagedNodeSockets(kj::Maybe<kj::StringPtr> invocation = kj::none);
+  void setNodeUpgradeHooks(kj::Function<kj::StringPtr()> owner,
+      kj::Function<bool(kj::StringPtr)> lookup) {
+    nodeUpgradeOwner = kj::mv(owner);
     nodeUpgradeLookup = kj::mv(lookup);
   }
   static bool canForwardNodeUpgrade(Worker::Actor& actor, kj::StringPtr pending);
@@ -120,8 +125,10 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
 
  private:
   bool socketParking = false;
+  kj::Maybe<kj::Function<kj::StringPtr()>> nodeUpgradeOwner;
   kj::Maybe<kj::Function<bool(kj::StringPtr)>> nodeUpgradeLookup;
   class HibernatableWebSocket;
+  void discardNodeUpgrade(HibernatableWebSocket& socket);
 
   // Ends the handoff identified by `generation`, putting the parked loopback back if no replacement
   // supplied one. Does nothing if that handoff already ended, so a handle dropped afterwards cannot
@@ -183,6 +190,7 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
     State activeOrPackage;
     NodeSocket* nodeSocket = nullptr;
     kj::String pendingNodeSocket;
+    kj::String pendingNodeInvocation;
     uint64_t lastFrame = 0;
 
     // This is the manager's strong reference to the websocket shared with api::WebSocket after
