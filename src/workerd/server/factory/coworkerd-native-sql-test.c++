@@ -297,6 +297,99 @@ KJ_TEST("native SQL budgets new WAL frames on disk and removes abandoned bytes")
   KJ_EXPECT(db.run("SELECT count(*) FROM blobs").getInt(0) == 66);
 }
 
+KJ_TEST("native SQL refuses a commit above its WAL record capacity and keeps the connection") {
+  SqlTestDirectory storage;
+  const auto& directory = storage.get();
+  NativeSqlSpillPool pool(4ull << 20);
+  NativeSqlSpill spill(pool, 2ull << 20, directory, kj::Path({"sql-wal"}));
+  SqliteDatabase::Vfs vfs(directory, {.spillTracker = &spill});
+  SqliteDatabase db(vfs, kj::Path({"sql"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  db.run("PRAGMA page_size=4096; CREATE TABLE ledger(payload BLOB); PRAGMA journal_mode=WAL");
+  db.run("PRAGMA cache_spill=OFF; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=OFF");
+  spill.limitTransactionFrames(16 * (4096 + 24), 4096);
+  auto query = [&](kj::StringPtr body) {
+    return runNativeSql(db, body, true, NativeSqlResults::OBJECTS, Clock::now() + 2s, -1, &spill);
+  };
+  constexpr auto insert = R"SQL({"sql":"INSERT INTO ledger VALUES(zeroblob(50000))"})SQL"_kj;
+  KJ_REQUIRE(query(insert).body.starts_with("{\"success\":true"));
+  const auto wal = directory.openFile(kj::Path({"sql-wal"}));
+  const auto before = wal->stat().size;
+  const auto reply = query(R"SQL([
+    {"sql":"INSERT INTO ledger VALUES(zeroblob(50000))"},
+    {"sql":"INSERT INTO ledger VALUES(zeroblob(50000))"}
+  ])SQL");
+  KJ_EXPECT(reply.status == 422, reply.body.c_str());
+  KJ_EXPECT(reply.body.find("SQL_TRANSACTION_TOO_LARGE") != std::string::npos);
+  KJ_EXPECT(wal->stat().size == before);
+  KJ_EXPECT(pool.size() == 0);
+  KJ_EXPECT(!db.observedCriticalError());
+  KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 1);
+  KJ_EXPECT(query(insert).body.starts_with("{\"success\":true"));
+}
+
+class RefusingBudget final: public SqliteMemoryBudget {
+ public:
+  Allocation acquire(size_t bytes, bool rollback) noexcept override {
+    if (rollback) ++rollbackAllocations;
+    if (!rollback && bytes >= refuseAt) {
+      if (sqliteBudget != nullptr) sqliteBudget->refuseAt = 1;
+      return Allocation::BUSY;
+    }
+    used += bytes;
+    return Allocation::ACCEPTED;
+  }
+
+  void release(size_t bytes) noexcept override {
+    KJ_ASSERT(bytes <= used);
+    used -= bytes;
+  }
+
+  size_t refuseAt = SIZE_MAX;
+  size_t used = 0;
+  size_t rollbackAllocations = 0;
+  RefusingBudget* sqliteBudget = nullptr;
+};
+
+KJ_TEST("native SQL treats process memory pressure as retryable and reserves memory for rollback") {
+  auto directory = kj::newInMemoryDirectory(kj::nullClock());
+  RefusingBudget sqlite;
+  SqliteDatabase::Vfs vfs(*directory, {.memoryBudget = &sqlite});
+  SqliteDatabase db(vfs, kj::Path({"sql"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY, 32ull << 20);
+  {
+    auto memory = db.enterMemoryScope();
+    KJ_REQUIRE(sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, nullptr, 0, 0) == SQLITE_OK);
+  }
+  db.run("CREATE TABLE ledger(value BLOB)");
+  auto query = [&](kj::StringPtr body, SqliteMemoryBudget* request = nullptr) {
+    return runNativeSql(db, body, true, NativeSqlResults::OBJECTS, Clock::now() + 2s, -1, nullptr, request);
+  };
+  auto expectRefusal = [&](const NativeSqlReply& reply) {
+    KJ_EXPECT(reply.status == 503, reply.body.c_str());
+    KJ_EXPECT(reply.body.find("DO_UNAVAILABLE") != std::string::npos);
+    KJ_EXPECT(reply.memoryPressure);
+    KJ_EXPECT(!db.observedCriticalError());
+    sqlite.refuseAt = SIZE_MAX;
+    KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 0);
+    KJ_EXPECT(query(R"SQL({"sql":"SELECT 1"})SQL").body.starts_with("{\"success\":true"));
+  };
+  sqlite.refuseAt = 512ull << 10;
+  expectRefusal(query(R"SQL([
+    {"sql":"INSERT INTO ledger VALUES(1)"},
+    {"sql":"INSERT INTO ledger VALUES(randomblob(1048576))"}
+  ])SQL"));
+
+  RefusingBudget request;
+  request.refuseAt = 128ull << 10;
+  request.sqliteBudget = &sqlite;
+  const auto priorRollbacks = sqlite.rollbackAllocations;
+  expectRefusal(query(R"SQL([
+    {"sql":"INSERT INTO ledger VALUES(2)"},
+    {"sql":"SELECT zeroblob(1048576)"}
+  ])SQL", &request));
+  KJ_EXPECT(sqlite.rollbackAllocations > priorRollbacks);
+  KJ_EXPECT(sqlite.used == db.getSqliteMemoryBytes());
+}
+
 KJ_TEST("native SQL builds a disk-spilling index on a table larger than the SQLite heap cap") {
   SqlTestDirectory storage;
   const auto& directory = storage.get();

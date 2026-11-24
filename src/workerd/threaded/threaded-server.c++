@@ -425,15 +425,25 @@ class NativeSqlReservation final: public SqliteMemoryBudget {
 
   ~NativeSqlReservation() { release(used); }
 
-  bool acquire(size_t bytes) noexcept override {
-    if (bytes > resources.admissionMaximum - resources.baselineMemory - used) {
-      impossible = true;
-      return false;
+  auto accountTogether(NativeSqlReservation& other) {
+    KJ_ASSERT(companion == nullptr && other.companion == nullptr);
+    companion = &other;
+    other.companion = this;
+    return kj::defer([this, &other] { companion = other.companion = nullptr; });
+  }
+
+  Allocation acquire(size_t bytes, bool rollback = false) noexcept override {
+    if (!rollback) {
+      const auto maximum = resources.admissionMaximum - resources.baselineMemory;
+      const auto required = used + (companion == nullptr ? 0 : companion->used);
+      if (required > maximum || bytes > maximum - required) return Allocation::LIMIT;
     }
-    if (!resources.change(used, used + bytes, 0, 0, true)) return false;
+    if (!resources.change(used, used + bytes, 0, 0, true, rollback) && !rollback) {
+      return Allocation::BUSY;
+    }
     used += bytes;
     if (sqlite) resources.nativeSqliteBytes.fetch_add(bytes);
-    return true;
+    return Allocation::ACCEPTED;
   }
 
   void release(size_t bytes) noexcept override {
@@ -443,13 +453,11 @@ class NativeSqlReservation final: public SqliteMemoryBudget {
     if (sqlite) resources.nativeSqliteBytes.fetch_sub(bytes);
   }
 
-  bool canNeverFit() const noexcept { return impossible; }
-
  private:
   ResourceBudget& resources;
   const bool sqlite;
   size_t used = 0;
-  bool impossible = false;
+  const NativeSqlReservation* companion = nullptr;
 };
 
 struct ResourceReservation {
@@ -2490,6 +2498,7 @@ struct ThreadedServer {
   std::atomic<bool> refuseDurableGroupForTest{false};
   const uint64_t durableCommitDelayMs;
   const uint64_t nativeSqlDatabaseSpillBytes = configuredCount("COWORKERD_DO_SQL_DATABASE_SPILL_BYTES", 1ull << 30);
+  const uint64_t nativeSqlWalFrameLimit = configuredCount("COWORKERD_DO_SQL_WAL_FRAME_BYTES", 0);
   const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
       ? ""
       : getenv("COWORKERD_THREADED_BINDING_ADDRESS");
@@ -6403,6 +6412,9 @@ class NativeDatabaseHttp final: public kj::HttpService {
         const auto format = resource == "?resultsFormat=ROWS_AND_COLUMNS"
             ? server::NativeSqlResults::COLUMNS : server::NativeSqlResults::OBJECTS;
         auto sql = inputSize == 0 ? ""_kj : kj::StringPtr(input.begin(), inputSize);
+        // Both reservations belong to this request while SQLite is running.
+        // Their combined minimum must fit even after all other homes retire.
+        auto memory = requestMemory.accountTogether(*database.memory);
         reply = server::runNativeSql(connection, sql, query, format,
             sqlDeadline, connectionFd, database.spill.get(), &requestMemory);
       }
@@ -6413,7 +6425,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
     server.reportNativeDatabaseMemory(state.durableHome, connection.getSqliteMemoryBytes());
     // A canceled client must not cancel acknowledgement of already committed WAL.
     // Keep the admitted connection alive until the outstanding confirmation settles.
-    if (connection.observedCriticalError() || reply.status == 0 || reply.status == 503) {
+    if (reply.memoryPressure) server.reclaimNativeRequestMemory();
+    if (connection.observedCriticalError() || reply.status == 0 || (reply.status == 503 && !reply.memoryPressure)) {
       server.closeNativeDatabase(state);
     }
     database.confirming = true;
@@ -6452,7 +6465,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
     constexpr size_t MAX_BODY = 40ull << 20;
     if (body.tryGetLength().orDefault(0) > MAX_BODY) co_return requestTooLarge();
     char chunk[8192];
-    if (!co_await reserveReadMemory(memory, sizeof(chunk))) co_return requestMemoryUnavailable();
+    auto reserve = co_await reserveReadMemory(memory, sizeof(chunk));
+    if (reserve != SqliteMemoryBudget::Allocation::ACCEPTED) co_return server::nativeSqlMemoryFailure(reserve);
     KJ_DEFER(memory.release(sizeof(chunk)));
     for (;;) {
       auto bytes = co_await body.tryRead(chunk, 1, sizeof(chunk));
@@ -6460,13 +6474,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
       if (bytes > MAX_BODY - size) co_return requestTooLarge();
       if (size + bytes + 1 > input.size()) {
         auto capacity = std::min(MAX_BODY + 1, std::max(size + bytes + 1, input.size() * 2));
-        if (!co_await reserveReadMemory(memory, capacity)) {
-          if (memory.canNeverFit()) {
-            co_return server::NativeSqlReply{422, server::nativeSqlFailure("SQL_MEMORY_LIMIT_EXCEEDED"_kj,
-                "the native SQL request exceeds the process memory budget"_kj)};
-          }
-          co_return requestMemoryUnavailable();
-        }
+        reserve = co_await reserveReadMemory(memory, capacity);
+        if (reserve != SqliteMemoryBudget::Allocation::ACCEPTED) co_return server::nativeSqlMemoryFailure(reserve);
         const auto previous = input.size();
         auto next = kj::heapArray<char>(capacity);
         if (size != 0) memcpy(next.begin(), input.begin(), size);
@@ -6480,22 +6489,20 @@ class NativeDatabaseHttp final: public kj::HttpService {
     co_return server::NativeSqlReply{0, {}};
   }
 
-  kj::Promise<bool> reserveReadMemory(NativeSqlReservation& memory, size_t bytes) {
-    while (!memory.acquire(bytes)) {
-      if (memory.canNeverFit() || !server.reclaimNativeRequestMemory()) co_return false;
+  kj::Promise<SqliteMemoryBudget::Allocation> reserveReadMemory(NativeSqlReservation& memory, size_t bytes) {
+    for (;;) {
+      const auto result = memory.acquire(bytes);
+      if (result != SqliteMemoryBudget::Allocation::BUSY || !server.reclaimNativeRequestMemory()) {
+        co_return result;
+      }
       // The selected home closes SQLite and returns its reservation on its
       // own event loop. Only the upload waits, under the request deadline.
       co_await state.io.provider->getTimer().afterDelay(kj::MILLISECONDS);
     }
-    co_return true;
   }
 
   static server::NativeSqlReply requestTooLarge() {
     return {413, server::nativeSqlFailure("REQUEST_TOO_LARGE"_kj, "a binding request is at most 40 MiB"_kj)};
-  }
-
-  static server::NativeSqlReply requestMemoryUnavailable() {
-    return {503, server::nativeSqlFailure("DO_UNAVAILABLE"_kj, "the native SQL memory budget is full"_kj)};
   }
 
   static server::NativeSqlReply storageFailure(const kj::Exception& error) {
@@ -6550,10 +6557,12 @@ class NativeDatabaseHttp final: public kj::HttpService {
           route.uniqueKey.c_str(), route.storageId.c_str(), *vfs);
       kj::Own<server::DurableLogShipper> shipper;
       if (state.wal) {
+        spill->limitTransactionFrames(server.nativeSqlWalFrameLimit, connection->run("PRAGMA page_size").getInt(0));
         shipper = server.durableStorage->ship(route.uniqueKey.c_str(),
             {.objectName = kj::str(route.key.namespaceId.c_str(), "/", route.key.objectId.c_str(),
                 "/", route.open.dataEpoch), .storageId = kj::str(route.storageId.c_str())},
-            *connection, state.io.provider->getTimer(), *state.wal, position, openStarted);
+            *connection, state.io.provider->getTimer(), *state.wal, position, openStarted,
+            server.nativeSqlWalFrameLimit);
         shipper->reportAlarm(server::readDurableAlarm(*connection));
       }
       state.nativeDatabase.emplace(ThreadState::NativeDatabase{
@@ -7429,7 +7438,11 @@ int main(int argc, char **argv) {
   const int listener = strtol(argv[1], nullptr, 10);
   ThreadedServer *server;
   try {
-    if (persistent || disposable) installSqliteCustomAllocator();
+    if (persistent || disposable) {
+      // The native VFS resolves "." against its storage directory descriptor.
+      KJ_SYSCALL(setenv("SQLITE_TMPDIR", ".", 1));
+      installSqliteCustomAllocator();
+    }
     kj::Own<const kj::Directory> directory;
     kj::Own<server::ThreadedWalLog> wal;
     if (persistent) {

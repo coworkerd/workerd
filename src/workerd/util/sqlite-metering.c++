@@ -39,9 +39,11 @@ thread_local SqliteMemoryScope* SqliteMemoryScope::threadLocalScope = nullptr;
 void* sqliteMemMalloc(int size) {
   if (size <= 0) return nullptr;
 
+  using Allocation = SqliteMemoryBudget::Allocation;
   SqliteMemoryScope* scope = SqliteMemoryScope::threadLocalScope;
   if (scope != nullptr) {
-    if (scope->memoryBytes + static_cast<size_t>(size) > scope->maxMemoryBytes) {
+    if (!scope->rollingBack && scope->memoryBytes + static_cast<size_t>(size) > scope->maxMemoryBytes) {
+      scope->allocationFailure = Allocation::LIMIT;
       return nullptr;
     }
   } else {
@@ -52,14 +54,23 @@ void* sqliteMemMalloc(int size) {
   }
 
   void* ptr = malloc(static_cast<size_t>(size));
-  if (ptr == nullptr) return nullptr;
+  if (ptr == nullptr) {
+    if (scope != nullptr) scope->allocationFailure = Allocation::LIMIT;
+    return nullptr;
+  }
   if (scope != nullptr) {
     size_t actual = usableSize(ptr);
     if (actual > 0) {
       // We have already checked that allocating the requested size will not exceed maxMemoryBytes,
       // but we still have to check that the actual size allocated does not exceed maxMemoryBytes.
-      if (scope->memoryBytes + actual > scope->maxMemoryBytes ||
-          (scope->budget != nullptr && !scope->budget->acquire(actual))) {
+      auto result = Allocation::ACCEPTED;
+      if (!scope->rollingBack && scope->memoryBytes + actual > scope->maxMemoryBytes) {
+        result = Allocation::LIMIT;
+      } else if (scope->budget != nullptr) {
+        result = scope->budget->acquire(actual, scope->rollingBack);
+      }
+      if (result != Allocation::ACCEPTED) {
+        scope->allocationFailure = result;
         free(ptr);
         return nullptr;
       }
@@ -134,13 +145,17 @@ void* sqliteMemRealloc(void* ptr, int newSize) {
   // size would exceed the limit before calling realloc.
   if (scope != nullptr && oldActual > 0 && static_cast<size_t>(newSize) > oldActual) {
     size_t growth = static_cast<size_t>(newSize) - oldActual;
-    if (scope->memoryBytes + growth >= scope->maxMemoryBytes) {
+    if (!scope->rollingBack && scope->memoryBytes + growth >= scope->maxMemoryBytes) {
+      scope->allocationFailure = SqliteMemoryBudget::Allocation::LIMIT;
       return nullptr;
     }
   }
 
   void* newPtr = realloc(ptr, static_cast<size_t>(newSize));
-  if (newPtr == nullptr) return nullptr;
+  if (newPtr == nullptr) {
+    if (scope != nullptr) scope->allocationFailure = SqliteMemoryBudget::Allocation::LIMIT;
+    return nullptr;
+  }
 
   if (scope != nullptr && oldActual > 0) {
     size_t newActual = usableSize(newPtr);
@@ -208,6 +223,23 @@ SqliteMemoryScope::~SqliteMemoryScope() noexcept(false) {
   if (threadLocalScope == this) {
     threadLocalScope = nullptr;
   }
+}
+
+SqliteMemoryBudget::Allocation SqliteMemoryScope::takeAllocationFailure() noexcept {
+  using Allocation = SqliteMemoryBudget::Allocation;
+  if (threadLocalScope == nullptr) return Allocation::ACCEPTED;
+  auto result = threadLocalScope->allocationFailure;
+  threadLocalScope->allocationFailure = Allocation::ACCEPTED;
+  return result;
+}
+
+SqliteMemoryScope::AllowRollbackAllocations::AllowRollbackAllocations()
+    : scope(KJ_REQUIRE_NONNULL(threadLocalScope)), previous(scope.rollingBack) {
+  scope.rollingBack = true;
+}
+
+SqliteMemoryScope::AllowRollbackAllocations::~AllowRollbackAllocations() {
+  scope.rollingBack = previous;
 }
 
 void installSqliteCustomAllocator() {

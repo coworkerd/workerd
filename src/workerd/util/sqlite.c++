@@ -907,9 +907,10 @@ bool SqliteDatabase::observedCriticalError() {
   return criticalErrorOccurred;
 }
 
-void SqliteDatabase::acknowledgeAutomaticRollback() {
+void SqliteDatabase::acknowledgeAutomaticRollback(bool reusable) {
   KJ_REQUIRE(sqlite3_get_autocommit(*this) != 0, "SQLite still has a transaction");
   clearRolledBackTransaction();
+  if (reusable) criticalErrorOccurred = false;
 }
 
 void SqliteDatabase::clearRolledBackTransaction() {
@@ -2218,6 +2219,7 @@ static bool walWriteFits(uint64_t limit, sqlite3_int64 offset, uint64_t length) 
 namespace {
 
 static thread_local int currentVfsRoot = AT_FDCWD;
+static thread_local bool storageTempOnly = false;
 // We will tell SQLite to use alternate implementations of path-oriented syscalls which use the
 // `*at()` versions of the calls with `currentVfsRoot` as the directory descriptor. When the
 // descriptor is `AT_FDCWD`, this will naturally reproduce the behavior of the non-`at()` versions.
@@ -2227,6 +2229,10 @@ static int replaced_open(const char* path, int flags, int mode) {
   return openat(currentVfsRoot, path, flags, mode);
 }
 static int replaced_access(const char* path, int type) {
+  if (storageTempOnly && strcmp(path, ".") != 0) {
+    errno = EACCES;
+    return -1;
+  }
   return faccessat(currentVfsRoot, path, type, 0);
 }
 static char* replaced_getcwd(char* buf, size_t size) noexcept {
@@ -2452,6 +2458,10 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
       currentVfsRoot = self.rootFd;
       KJ_DEFER(currentVfsRoot = AT_FDCWD);
 
+      // If SQLite cannot use ".", reject any fallback to a directory outside
+      // the storage volume. Its temporary directory probe uses access().
+      storageTempOnly = self.options.spillTracker != nullptr && zName == nullptr;
+      KJ_DEFER(storageTempOnly = false);
       int result = self.native.xOpen(&self.native, zName, file, flags, pOutFlags);
 
       // `xOpen` setting `pMethods` to non-null indicates that `xClose` is needed, i.e. the file

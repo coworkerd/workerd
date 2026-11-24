@@ -48,10 +48,17 @@ class NativeSqlSpill final: public SqliteDatabase::VfsOptions::SpillTracker {
 
   ~NativeSqlSpill() { pool.release(walBytes + temporaryBytes); }
 
+  void limitTransactionFrames(uint64_t bytes, uint32_t pageSize) {
+    KJ_ASSERT(!active && pageSize > 0);
+    transactionFrames = bytes / (24 + pageSize);
+    frameSize = 24 + pageSize;
+  }
+
   void begin() {
     KJ_ASSERT(!active && walBytes == 0);
     active = true;
     exceeded = false;
+    transactionTooLarge = false;
     walStatFailed = false;
   }
 
@@ -72,6 +79,13 @@ class NativeSqlSpill final: public SqliteDatabase::VfsOptions::SpillTracker {
     const auto start = end > HEADER_BYTES ? std::min(firstFrame, std::max(offset, HEADER_BYTES)) : firstFrame;
     const auto finish = end > HEADER_BYTES ? std::max(lastFrame, end) : lastFrame;
     const auto frames = finish > start ? finish - start : 0;
+    // SQLite writes a frame's header and page separately. Reject an oversized
+    // frame before its commit marker can overwrite any part of a reused WAL.
+    if (frameSize != 0 && frames != 0 &&
+        (finish - HEADER_BYTES - 1) / frameSize - (start - HEADER_BYTES) / frameSize >= transactionFrames) {
+      transactionTooLarge = true;
+      return false;
+    }
     const auto growth = end > originalWalSize ? end - originalWalSize : 0;
     const auto updated = std::max(walBytes, std::max(header + frames, growth));
     if (!reserve(updated - walBytes)) return false;
@@ -112,6 +126,7 @@ class NativeSqlSpill final: public SqliteDatabase::VfsOptions::SpillTracker {
   }
 
   bool wasRefused() const noexcept { return exceeded; }
+  bool exceededTransactionLimit() const noexcept { return transactionTooLarge; }
   bool failedToMeasureWal() const noexcept { return walStatFailed; }
   uint64_t temporaryHighWater() const noexcept { return peakTemporaryBytes; }
 
@@ -123,7 +138,10 @@ class NativeSqlSpill final: public SqliteDatabase::VfsOptions::SpillTracker {
   uint64_t firstFrame = std::numeric_limits<uint64_t>::max(), lastFrame = 0, headerBytes = 0;
   uint64_t originalWalSize = 0, walBytes = 0, temporaryBytes = 0;
   uint64_t peakTemporaryBytes = 0;
+  uint64_t transactionFrames = 0;
+  uint32_t frameSize = 0;
   bool active = false, walSizeKnown = false, exceeded = false, walStatFailed = false;
+  bool transactionTooLarge = false;
 
   bool reserve(uint64_t bytes) noexcept {
     if (bytes == 0) return true;

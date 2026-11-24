@@ -31,7 +31,10 @@ namespace workerd {
 // a Query::nextRow() scope is already active).
 class SqliteMemoryBudget {
  public:
-  virtual bool acquire(size_t bytes) noexcept = 0;
+  enum class Allocation { ACCEPTED, LIMIT, BUSY };
+  // Rollback allocations still count toward usage, but cannot be refused by
+  // admission policy while SQLite is releasing an already admitted request.
+  virtual Allocation acquire(size_t bytes, bool rollback = false) noexcept = 0;
   virtual void release(size_t bytes) noexcept = 0;
 };
 
@@ -47,11 +50,26 @@ class SqliteMemoryScope {
   ~SqliteMemoryScope() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(SqliteMemoryScope);
 
+  static SqliteMemoryBudget::Allocation takeAllocationFailure() noexcept;
+
+  class AllowRollbackAllocations {
+   public:
+    AllowRollbackAllocations();
+    ~AllowRollbackAllocations();
+    KJ_DISALLOW_COPY_AND_MOVE(AllowRollbackAllocations);
+
+   private:
+    SqliteMemoryScope& scope;
+    const bool previous;
+  };
+
  private:
   // These are accessed by the allocator functions via threadLocalScope.
   size_t& memoryBytes;
   const size_t maxMemoryBytes;
   SqliteMemoryBudget* budget;
+  SqliteMemoryBudget::Allocation allocationFailure = SqliteMemoryBudget::Allocation::ACCEPTED;
+  bool rollingBack = false;
 
   // Thread-local pointer to the active scope. Set to this on construction (if not already set),
   // cleared on destruction (if we set it).

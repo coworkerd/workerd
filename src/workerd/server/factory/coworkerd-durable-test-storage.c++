@@ -68,12 +68,13 @@ kj::Own<SqliteDatabase> DurableStorage::openNativeSql(
 
 kj::Own<DurableLogShipper> DurableStorage::ship(kj::StringPtr uniqueKey,
     DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
-    DurableWalChannel& channel, DurableWalPosition position, uint64_t localOpenStartedNs) const {
+    DurableWalChannel& channel, DurableWalPosition position, uint64_t localOpenStartedNs,
+    kj::Maybe<uint64_t> recordFrameLimit) const {
   auto wal = databasePath(uniqueKey, name.storageId, name.facetId, "-wal"_kj);
   auto image = databasePath(uniqueKey, name.storageId, name.facetId);
   database.run("PRAGMA journal_mode=WAL;");
   auto shipper = kj::heap<DurableLogShipper>(*directory, kj::mv(wal), kj::mv(image),
-      kj::mv(name), database, timer, channel, kj::mv(position), localOpenStartedNs);
+      kj::mv(name), database, timer, channel, kj::mv(position), localOpenStartedNs, recordFrameLimit);
   shipper->reportAfterDatabaseClose();
   return shipper;
 }

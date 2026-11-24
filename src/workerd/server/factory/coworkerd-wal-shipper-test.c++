@@ -82,7 +82,8 @@ void expectFrames(kj::ArrayPtr<const kj::byte> message,
     uint32_t firstFrame,
     kj::ArrayPtr<const kj::byte> frames,
     uint64_t request,
-    bool withHeader) {
+    bool withHeader,
+    uint32_t commits = 1) {
   wal::Writer expectedFrames;
   expectedFrames.u8(wal::MSG_FRAMES);
   expectedFrames.u64(request);
@@ -93,7 +94,7 @@ void expectFrames(kj::ArrayPtr<const kj::byte> message,
   expectedFrames.u32(PAGE_SIZE);
   expectedFrames.u32(firstFrame);
   expectedFrames.u32(frames.size() / FRAME_SIZE);
-  expectedFrames.u32(1);  // Commit count.
+  expectedFrames.u32(commits);
   auto framePrefix = expectedFrames.finish(OPEN_ID);
   const auto headerFlag = framePrefix.size() + 3 * sizeof(uint64_t);  // Skip timing fields.
   const auto framesStart = headerFlag + 1 + (withHeader ? WAL_HEADER_SIZE : 0);
@@ -219,6 +220,31 @@ KJ_TEST("cold WAL scan and shipper agree on the last complete SQLite commit") {
     KJ_CONTEXT("final commit frame interrupted halfway through its page");
     expectCommittedPrefix(*database, interrupted, largeCommit, complete, io);
   }
+}
+
+KJ_TEST("native SQL WAL shipping groups complete commits within the record capacity") {
+  auto io = kj::setupAsyncIo();
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  const auto dbPath = kj::Path({"test.db"});
+  const auto walPath = kj::Path({"test.db-wal"});
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, dbPath.clone(), CREATE_OR_MODIFY);
+  db.run("PRAGMA page_size=4096; CREATE TABLE entries(value INTEGER); INSERT INTO entries VALUES(0)");
+  KJ_REQUIRE(db.run("PRAGMA journal_mode=WAL").getText(0) == "wal"_kj);
+  RecordingChannel channel;
+  DurableLogShipper shipper(*dir, walPath.clone(), dbPath.clone(),
+      {.objectName = kj::str(OBJECT_NAME), .storageId = kj::str(STORAGE_ID)}, db,
+      io.provider->getTimer(), channel, kj::none, 0, 2 * FRAME_SIZE);
+
+  for (unsigned i = 0; i < 3; ++i) db.run("UPDATE entries SET value = value + 1");
+  const auto wal = dir->openFile(walPath)->readAllBytes();
+  KJ_ASSERT(wal.size() == WAL_HEADER_SIZE + 3 * FRAME_SIZE);
+  shipper.onCommit().wait(io.waitScope);
+  KJ_ASSERT(channel.frames.size() == 2);
+  const auto header = wal.first(WAL_HEADER_SIZE);
+  const auto frames = wal.slice(WAL_HEADER_SIZE);
+  expectFrames(channel.frames[0], header, 1, frames.first(2 * FRAME_SIZE), 1, true, 2);
+  expectFrames(channel.frames[1], header, 3, frames.slice(2 * FRAME_SIZE), 2, false);
 }
 
 KJ_TEST("opening a multi-record WAL reports SQLite's last commit") {

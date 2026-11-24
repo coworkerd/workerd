@@ -113,7 +113,8 @@ class DurableLogShipper {
       kj::Timer& timer,
       DurableWalChannel& channel,
       kj::Maybe<DurableWalPosition> prepared = kj::none,
-      uint64_t localOpenStartedNs = 0);
+      uint64_t localOpenStartedNs = 0,
+      kj::Maybe<uint64_t> recordFrameLimit = kj::none);
   ~DurableLogShipper() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(DurableLogShipper);
 
@@ -162,6 +163,7 @@ class DurableLogShipper {
   SqliteDatabase* db;
   kj::Timer& timer;
   DurableWalChannel& channel;
+  const kj::Maybe<uint64_t> recordFrameLimit;
   uint64_t openId = 0;
   kj::Array<kj::byte>* deferredClose = nullptr;
 
@@ -200,6 +202,7 @@ class DurableLogShipper {
   static int walHook(void* arg, sqlite3* db, const char* name, int frames);
   void readNewFrames();
   kj::Promise<void> sendPending();
+  kj::Promise<void> confirmNativeCommits();
   void maybeCheckpoint(kj::StringPtr reason);
   uint64_t walBytes();
   uint64_t databaseBytes();
