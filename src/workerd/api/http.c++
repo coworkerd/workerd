@@ -1724,19 +1724,15 @@ jsg::Promise<jsg::Ref<Response>> handleWebSocketFetchResponse(jsg::Lock& js,
     }
     KJ_CASE_ONEOF(webSocket, kj::Own<kj::WebSocket>) {
       KJ_ASSERT(response.statusCode == 101);
-      webSocket = webSocket.attach(kj::mv(client));
       KJ_IF_SOME(s, signal) {
         if (s->getAborted(js)) {
           return js.rejectedPromise<jsg::Ref<Response>>(s->getReason(js));
         }
-        auto cancellation = s->newCanceler(js);
-        webSocket = kj::refcounted<AbortableWebSocket>(kj::mv(webSocket),
-            kj::mv(cancellation.canceler), kj::mv(cancellation.registration));
       }
-      auto socket = js.alloc<WebSocket>(js, kj::mv(webSocket));
       constexpr auto marker = LegacyHibernationManagerImpl::NODE_SOCKET_HEADER;
       auto& context = IoContext::current();
       kj::HttpHeaders publicHeaders(context.getHeaderTable());
+      kj::Maybe<kj::StringPtr> stagedUpgrade;
       response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
         if (strcasecmp(name.cStr(), marker.cStr()) != 0) {
           publicHeaders.addPtrPtr(name, value);
@@ -1744,10 +1740,27 @@ jsg::Promise<jsg::Ref<Response>> handleWebSocketFetchResponse(jsg::Lock& js,
         }
         KJ_IF_SOME(actor, context.getActor()) {
           if (LegacyHibernationManagerImpl::canForwardNodeUpgrade(actor, value)) {
-            socket->setStagedNodeUpgrade(value);
+            stagedUpgrade = value;
           }
         }
       });
+      kj::Maybe<jsg::Ref<WebSocket>> socket;
+      KJ_IF_SOME(token, stagedUpgrade) {
+        // The node will provide the transport at the outer upgrade. Release the local
+        // fetch and its pipe with this response so neither can keep the child facet busy.
+        auto placeholder = kj::newWebSocketPipe();
+        auto forwarded = js.alloc<WebSocket>(js, kj::mv(placeholder.ends[0]));
+        forwarded->setStagedNodeUpgrade(token);
+        socket = kj::mv(forwarded);
+      } else {
+        webSocket = webSocket.attach(kj::mv(client));
+        KJ_IF_SOME(s, signal) {
+          auto cancellation = s->newCanceler(js);
+          webSocket = kj::refcounted<AbortableWebSocket>(kj::mv(webSocket),
+              kj::mv(cancellation.canceler), kj::mv(cancellation.registration));
+        }
+        socket = js.alloc<WebSocket>(js, kj::mv(webSocket));
+      }
       return js.resolvedPromise(makeHttpResponse(js, jsRequest->getMethodEnum(), kj::mv(urlList),
           response.statusCode, response.statusText, publicHeaders, newNullInputStream(),
           kj::mv(socket), jsRequest->getResponseBodyEncoding(),

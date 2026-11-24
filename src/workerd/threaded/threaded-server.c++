@@ -6248,6 +6248,8 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
 kj::Promise<void> LocalFacet::initialize(kj::String descriptor) {
   auto slot = tree->slot.lock();
   KJ_REQUIRE(slot != nullptr, "durable test facet lost its isolate copy");
+  // The startup callback is only used once. Its IoContext reentry handle counts as pending I/O.
+  auto startFacet = kj::mv(getStartInfo);
   Worker::Actor::Id id;
   Frankenvalue props;
   PropsMessage saveStart;
@@ -6267,7 +6269,7 @@ kj::Promise<void> LocalFacet::initialize(kj::String descriptor) {
     auto channels = kj::rc<Channels>(tree->state, tree->server, slot, descriptor);
     props = readFacetProps(start.getProps(), channels);
   } else {
-    auto info = co_await getStartInfo();
+    auto info = co_await startFacet();
     co_await info.ensureAllResolved();
     auto *binding = dynamic_cast<LocalActorClass *>(info.actorClass.get());
     KJ_REQUIRE(!stopped && binding != nullptr && slot == binding->slot.lock(),
