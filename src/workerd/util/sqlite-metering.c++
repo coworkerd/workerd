@@ -6,6 +6,7 @@
 
 #include <sqlite3.h>
 #include <stdlib.h>
+#include <cstring>
 
 #include <kj/debug.h>
 
@@ -57,7 +58,8 @@ void* sqliteMemMalloc(int size) {
     if (actual > 0) {
       // We have already checked that allocating the requested size will not exceed maxMemoryBytes,
       // but we still have to check that the actual size allocated does not exceed maxMemoryBytes.
-      if (scope->memoryBytes + actual > scope->maxMemoryBytes) {
+      if (scope->memoryBytes + actual > scope->maxMemoryBytes ||
+          (scope->budget != nullptr && !scope->budget->acquire(actual))) {
         free(ptr);
         return nullptr;
       }
@@ -75,6 +77,7 @@ void sqliteMemFree(void* ptr) {
     if (actual > 0) {
       if (scope->memoryBytes >= actual) {
         scope->memoryBytes -= actual;
+        if (scope->budget != nullptr) scope->budget->release(actual);
       } else {
         // This branch is a defensive measure, but it is important since scope->memoryBytes is a size_t
         // and an underflow would result in all subsequent allocations failing with SQLITE_NOMEM.
@@ -115,6 +118,16 @@ void* sqliteMemRealloc(void* ptr, int newSize) {
   }
 
   size_t oldActual = usableSize(ptr);
+  if (scope != nullptr && scope->budget != nullptr) {
+    // Reserve the replacement before changing the original pointer. SQLite
+    // relies on realloc leaving the old allocation intact if it fails.
+    if (static_cast<size_t>(newSize) <= oldActual) return ptr;
+    void* replacement = sqliteMemMalloc(newSize);
+    if (replacement == nullptr) return nullptr;
+    memcpy(replacement, ptr, oldActual);
+    sqliteMemFree(ptr);
+    return replacement;
+  }
 
   // sqliteMemRealloc must leave the original buffer intact per SQLite's contract when returning
   // a nullptr. Because realloc consumes the original pointer, we must check whether the requested
@@ -181,9 +194,11 @@ static const sqlite3_mem_methods kSqliteMemMethods = {
 
 }  // namespace
 
-SqliteMemoryScope::SqliteMemoryScope(size_t& memoryBytes, size_t maxMemoryBytes)
+SqliteMemoryScope::SqliteMemoryScope(size_t& memoryBytes, size_t maxMemoryBytes,
+    SqliteMemoryBudget* budget)
     : memoryBytes(memoryBytes),
-      maxMemoryBytes(maxMemoryBytes) {
+      maxMemoryBytes(maxMemoryBytes),
+      budget(budget) {
   if (threadLocalScope == nullptr) {
     threadLocalScope = this;
   }
