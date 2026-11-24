@@ -15,6 +15,7 @@
 #include <workerd/api/global-scope.h>
 #include <workerd/io/features.h>
 #include <workerd/io/io-context.h>
+#include <workerd/io/legacy-hibernation-manager.h>
 #include <workerd/io/stored-value.h>
 #include <workerd/jsg/ser.h>
 #include <workerd/jsg/url.h>
@@ -1315,7 +1316,27 @@ kj::Promise<DeferredProxy<void>> Response::send(jsg::Lock& js,
       outHeaders.unset(kj::HttpHeaderId::SEC_WEBSOCKET_EXTENSIONS);
     }
 
-    auto clientSocket = outer.acceptWebSocket(outHeaders);
+    // Only this native path can request node ownership of the connection.
+    // Always drop an application-supplied marker before carrying an upgrade
+    // through any of the response wrappers around the durable event.
+    constexpr auto marker = LegacyHibernationManagerImpl::NODE_SOCKET_HEADER;
+    kj::HttpHeaders upgradeHeaders(context.getHeaderTable());
+    outHeaders.forEach([&](kj::StringPtr name, kj::StringPtr value) {
+      if (strcasecmp(name.cStr(), marker.cStr()) != 0) upgradeHeaders.addPtrPtr(name, value);
+    });
+    KJ_IF_SOME(actor, context.getActor()) {
+      KJ_IF_SOME(manager, actor.getHibernationManager()) {
+        KJ_IF_SOME(legacy, kj::tryDowncast<LegacyHibernationManagerImpl>(manager)) {
+          KJ_IF_SOME(pending, legacy.stageNodeSocket(js, *ws)) {
+            upgradeHeaders.addPtrPtr(marker, pending);
+            auto transport = outer.acceptWebSocket(upgradeHeaders);
+            return DeferredProxy<void>{kj::Promise<void>(kj::READY_NOW).attach(kj::mv(transport))};
+          }
+        }
+      }
+    }
+
+    auto clientSocket = outer.acceptWebSocket(upgradeHeaders);
     auto wsPromise = ws->couple(js, kj::mv(clientSocket), context.getMetrics());
 
     KJ_IF_SOME(a, context.getActor()) {
