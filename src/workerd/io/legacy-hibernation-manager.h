@@ -53,6 +53,10 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
   kj::Promise<void> activateNodeSocket(kj::StringPtr pending, kj::StringPtr invocation);
   kj::Promise<void> configureNodeSocket(NodeSocket& socket);
   kj::Array<SocketSnapshot> snapshotNodeSockets();
+  void setSocketParking(bool parking) {
+    socketParking = parking;
+  }
+  void requireSocketMutationAllowed() const override;
   bool hasLocalSockets() const;
   void adoptNodeSocket(SocketSnapshot snapshot, kj::StringPtr invocationId);
   kj::Promise<void> dispatchNodeSocket(WorkerInterface& worker, kj::String id,
@@ -110,6 +114,7 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
       kj::StringPtr websocketId);
 
  private:
+  bool socketParking = false;
   class HibernatableWebSocket;
 
   // Ends the handoff identified by `generation`, putting the parked loopback back if no replacement

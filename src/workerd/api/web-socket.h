@@ -199,6 +199,12 @@ class WebSocket: public EventTarget {
   kj::Rc<kj::WebSocket> acceptAsHibernatable(
       kj::Array<kj::String> tags, kj::Maybe<WrapTransport> wrapTransport = kj::none);
   bool isPeerOf(jsg::Lock& js, const WebSocket& candidate);
+  void requirePeerUpgrade() {
+    peerMustUpgrade = true;
+  }
+  bool peerRequiresUpgrade() const {
+    return peerMustUpgrade;
+  }
   kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
   bool isOutputClosed() const;
 
@@ -375,6 +381,7 @@ class WebSocket: public EventTarget {
   // migrating any traced state, (b) wait for the upcoming jsg::Own<T> which integrates with
   // cppgc to handle this correctly, or (c) re-trigger tracing post-swap.
   kj::Own<WebSocketAdapter> impl;
+  bool peerMustUpgrade = false;
 };
 
 #define EW_WEBSOCKET_ISOLATE_TYPES                                                                 \
@@ -829,6 +836,7 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
   void reportError(jsg::Lock& js, jsg::JsRef<jsg::JsValue> err);
 
   void assertNoError(jsg::Lock& js);
+  void requireHibernatableMutationAllowed();
 
   void tryReleaseNative(jsg::Lock& js);
 

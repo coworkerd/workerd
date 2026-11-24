@@ -161,6 +161,7 @@ kj::Own<Worker::Actor::HibernationManager> LegacyHibernationManagerImpl::addRef(
 
 void LegacyHibernationManagerImpl::acceptWebSocket(
     jsg::Ref<api::WebSocket> ws, kj::ArrayPtr<kj::String> tags) {
+  requireSocketMutationAllowed();
   // First, we create the HibernatableWebSocket and add it to the collection where it'll stay
   // until it's destroyed.
 
@@ -187,14 +188,12 @@ void LegacyHibernationManagerImpl::acceptWebSocket(
     };
     refToHibernatable.ws = active->acceptAsHibernatable(
         refToHibernatable.getTags(), api::WebSocket::WrapTransport(wrap));
+    active->requirePeerUpgrade();
+    return;
   } else {
     refToHibernatable.ws = active->acceptAsHibernatable(refToHibernatable.getTags());
   }
-  auto reading = handleReadLoop(refToHibernatable);
-  if (refToHibernatable.nodeSocket != nullptr) {
-    reading = reading.exclusiveJoin(refToHibernatable.nodeSocket->whenUpgrading());
-  }
-  readLoopTasks.add(reading.catch_([](kj::Exception&& e) {
+  readLoopTasks.add(handleReadLoop(refToHibernatable).catch_([](kj::Exception&& e) {
     if (isInterestingException(e)) {
       LOG_EXCEPTION_IF_INTERNAL("LegacyHibernationManagerImpl::handleReadLoop", e);
     }
@@ -273,6 +272,11 @@ kj::Promise<void> LegacyHibernationManagerImpl::activateNodeSocket(
 
 kj::Promise<void> LegacyHibernationManagerImpl::configureNodeSocket(NodeSocket& socket) {
   return socket.configure(autoResponsePair->request, autoResponsePair->response);
+}
+
+void LegacyHibernationManagerImpl::requireSocketMutationAllowed() const {
+  JSG_REQUIRE(
+      !socketParking, DOMInvalidStateError, "The Durable Object is parking its WebSockets.");
 }
 
 kj::Array<LegacyHibernationManagerImpl::SocketSnapshot>
@@ -394,6 +398,7 @@ uint64_t LegacyHibernationManagerImpl::getWebSocketCount() const {
 
 void LegacyHibernationManagerImpl::setWebSocketAutoResponse(
     kj::Maybe<kj::StringPtr> request, kj::Maybe<kj::StringPtr> response) {
+  requireSocketMutationAllowed();
   KJ_IF_SOME(req, request) {
     // If we have a request, we must also have a response. If response is kj::none, we'll throw.
     autoResponsePair->request = kj::str(req);

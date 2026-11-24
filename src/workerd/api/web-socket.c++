@@ -802,6 +802,12 @@ kj::Promise<DeferredProxy<void>> LegacyWebSocketAdapter::couple(
 
 void LegacyWebSocketAdapter::accept(
     jsg::Lock& js, jsg::Optional<WebSocket::AcceptOptions> options) {
+  KJ_IF_SOME(p, peer) {
+    KJ_IF_SOME(other, p.tryAddRef(js)) {
+      JSG_REQUIRE(!other->peerRequiresUpgrade(), DOMNotSupportedError,
+          "A threaded Durable Object hibernatable WebSocketPair requires an HTTP upgrade.");
+    }
+  }
   auto& native = *farNative;
   JSG_REQUIRE(!native.state.is<AwaitingConnection>(), TypeError,
       "Websockets obtained from the 'new WebSocket()' constructor cannot call accept");
@@ -991,7 +997,19 @@ void LegacyWebSocketAdapter::startReadLoop(
   })), taskKind);
 }
 
+void LegacyWebSocketAdapter::requireHibernatableMutationAllowed() {
+  if (!isHibernatable()) return;
+  KJ_IF_SOME(context, IoContext::tryCurrent()) {
+    KJ_IF_SOME(actor, context.getActor()) {
+      KJ_IF_SOME(manager, actor.getHibernationManager()) {
+        manager.requireSocketMutationAllowed();
+      }
+    }
+  }
+}
+
 void LegacyWebSocketAdapter::send(jsg::Lock& js, kj::OneOf<kj::Array<byte>, kj::String> message) {
+  requireHibernatableMutationAllowed();
   auto& native = *farNative;
   JSG_REQUIRE(!native.closedOutgoing, TypeError, "Can't call WebSocket send() after close().");
   if (native.outgoingAborted || native.state.is<Released>()) {
@@ -1112,6 +1130,7 @@ void LegacyWebSocketAdapter::close(
       "messages.");
 
   assertNoError(js);
+  requireHibernatableMutationAllowed();
 
   outgoingMessages->insert(GatedMessage{IoContext::current().waitForOutputLocksIfNecessary(),
     kj::WebSocket::Close{
@@ -1212,6 +1231,7 @@ kj::Maybe<jsg::JsValue> LegacyWebSocketAdapter::deserializeAttachment(jsg::Lock&
 }
 
 void LegacyWebSocketAdapter::serializeAttachment(jsg::Lock& js, jsg::JsValue attachment) {
+  requireHibernatableMutationAllowed();
   jsg::Serializer serializer(js,
       jsg::Serializer::Options{
         .version = 15,

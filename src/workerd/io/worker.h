@@ -984,6 +984,7 @@ class Worker::Actor final: public kj::Refcounted {
   // removing WebSockets from its collection when they disconnect.
   class HibernationManager: public kj::Refcounted {
    public:
+    virtual void requireSocketMutationAllowed() const {}
     virtual void acceptWebSocket(jsg::Ref<api::WebSocket> ws, kj::ArrayPtr<kj::String> tags) = 0;
     virtual kj::Vector<jsg::Ref<api::WebSocket>> getWebSockets(
         jsg::Lock& js, kj::Maybe<kj::StringPtr> tag) = 0;

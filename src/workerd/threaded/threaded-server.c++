@@ -2835,8 +2835,10 @@ struct ThreadedServer {
       return kj::str(bytes.asChars());
     });
     root->second.notifyReset(code.orDefault(kj::String()));
+    if (code == kj::none || KJ_ASSERT_NONNULL(code) != "DO_CODE_UPDATED"_kj) return;
     // Give failed calls a chance to return the actor's typed exception before
-    // closing capabilities that still hold the dead tree.
+    // closing capabilities that still hold the drained definition. Resource
+    // resets leave the regular typed-error path in charge of their sessions.
     state.tasks.add(state.io.provider->getTimer()
                         .afterDelay(100 * kj::MILLISECONDS)
                         .then([&state, tree, reason = reason.clone()] {
@@ -2864,6 +2866,7 @@ struct ThreadedServer {
       using Decision = server::DurableIdleLifecycle::Decision;
       auto& root = current->second;
       auto& actor = *root.actor;
+      if (root.adopting) continue;
       if (root.parking != kj::none && root.parked == kj::none) continue;
       KJ_IF_SOME(parked, root.parked) {
         root.parking = kj::none;
@@ -4345,7 +4348,16 @@ class DurableNodeSockets final {
   }
 
   kj::Promise<SocketParkResult> park(LegacyHibernationManagerImpl &manager) {
-    auto sockets = manager.snapshotNodeSockets();
+    manager.setSocketParking(true);
+    bool release = true;
+    KJ_DEFER(if (release) manager.setSocketParking(false));
+    const auto result = co_await park(manager.snapshotNodeSockets());
+    release = result == SocketParkResult::REFUSED;
+    co_return result;
+  }
+
+  kj::Promise<SocketParkResult> park(
+      kj::Array<LegacyHibernationManagerImpl::SocketSnapshot> sockets) {
     if (sockets.size() == 0) co_return SocketParkResult::PARKED;
     co_await ready();
     const auto parkAttempt = ++lastParkAttempt;
@@ -4385,20 +4397,27 @@ class DurableNodeSockets final {
     }
   }
 
-  kj::Promise<void> adopt(LegacyHibernationManagerImpl& manager) {
+  kj::Promise<bool> adopt(LegacyHibernationManagerImpl &manager) {
     co_await ready();
-    auto call = control.adoptRequest();
-    writeOpen(call.initOpen());
+    const auto adoption = ++lastAdoptAttempt;
     auto attempt = connected;
-    auto result =
-        co_await clock()
-            .timeoutAfter(CONTROL_TIMEOUT, call.send())
-            .catch_([this, attempt](kj::Exception &&error)
-                        -> kj::Promise<
-                            capnp::Response<threaded::rpc::ThreadedSocketControl::AdoptResults>> {
+    kj::Maybe<capnp::Response<threaded::rpc::ThreadedSocketControl::AdoptResults>> answer;
+    try {
+      answer = co_await clock().timeoutAfter(CONTROL_TIMEOUT, requestAdopt(adoption, false));
+    } catch (const kj::Exception &error) {
+      reportDurableFailureForTest("WebSocket adoption reply", error);
       forget(attempt);
-      return kj::mv(error);
-    });
+    }
+    if (answer == kj::none) {
+      try {
+        answer = co_await clock().timeoutAfter(CONTROL_TIMEOUT, requestAdopt(adoption, true));
+      } catch (const kj::Exception &error) {
+        reportDurableFailureForTest("WebSocket adoption resolution", error);
+        co_return false;
+      }
+    }
+    auto &result = KJ_ASSERT_NONNULL(answer);
+    KJ_REQUIRE(result.getAccepted(), "the node refused to restore the Durable Object's WebSockets");
     auto entries = result.getSockets();
     if (entries.size() != 0 && entries[0].getAutoResponseEnabled()) {
       manager.setWebSocketAutoResponse(entries[0].getAutoRequest(), entries[0].getAutoResponse());
@@ -4421,9 +4440,25 @@ class DurableNodeSockets final {
       }
       manager.adoptNodeSocket(kj::mv(snapshot), entry.getAuthority().getInvocationId());
     }
+    co_return true;
   }
 
   kj::Timer& clock() { return state.io.provider->getTimer(); }
+
+  template <typename Result>
+  kj::Promise<capnp::Response<Result>> awaitReply(
+      capnp::RemotePromise<Result> reply, kj::Maybe<kj::TimePoint> deadline = kj::none) {
+    auto attempt = connected;
+    try {
+      KJ_IF_SOME(at, deadline) {
+        co_return co_await clock().timeoutAt(at, kj::mv(reply));
+      }
+      co_return co_await kj::mv(reply);
+    } catch (...) {
+      forget(attempt);
+      throw;
+    }
+  }
 
  private:
   static constexpr auto CONTROL_TIMEOUT = 5 * kj::SECONDS;
@@ -4446,6 +4481,16 @@ class DurableNodeSockets final {
     co_return (co_await call.send()).getAccepted();
   }
 
+  kj::Promise<capnp::Response<threaded::rpc::ThreadedSocketControl::AdoptResults>> requestAdopt(
+      uint64_t attempt, bool resolveOnly) {
+    co_await ready();
+    auto call = control.adoptRequest();
+    writeOpen(call.initOpen());
+    call.setAttempt(attempt);
+    call.setResolveOnly(resolveOnly);
+    co_return co_await awaitReply(call.send());
+  }
+
   kj::Promise<void> connect() {
     KJ_REQUIRE(address.size() != 0, "missing node socket control address");
     auto parsed = co_await state.io.provider->getNetwork().parseAddress(address);
@@ -4464,7 +4509,7 @@ class DurableNodeSockets final {
   kj::String address;
   DurableRoute route;
   uint64_t walOpen;
-  uint64_t lastParkAttempt = 0;
+  uint64_t lastParkAttempt = 0, lastAdoptAttempt = 0;
   std::shared_ptr<server::DurableIdleLifecycle> idle;
   kj::Own<BindingConnection> connection;
   std::shared_ptr<ConnectAttempt> connected;
@@ -4515,7 +4560,7 @@ class DurableNodeWebSocket final: public LegacyHibernationManagerImpl::NodeSocke
     auto call = control->control.sendRequest();
     control->writeAuthority(call.initAuthority(), socketId, invocation);
     call.initFrame().setBinary(message);
-    co_await call.send();
+    co_await control->awaitReply(call.send());
     sent += message.size();
   }
 
@@ -4527,7 +4572,7 @@ class DurableNodeWebSocket final: public LegacyHibernationManagerImpl::NodeSocke
     auto call = control->control.sendRequest();
     control->writeAuthority(call.initAuthority(), socketId, invocation);
     call.initFrame().setText(kj::str(message));
-    co_await call.send();
+    co_await control->awaitReply(call.send());
     sent += message.size();
   }
 
@@ -4541,7 +4586,7 @@ class DurableNodeWebSocket final: public LegacyHibernationManagerImpl::NodeSocke
     auto frame = call.initFrame().initClose();
     frame.setCode(code);
     frame.setReason(reason);
-    co_await call.send();
+    co_await control->awaitReply(call.send());
   }
 
   kj::Promise<Message> receive(size_t maxSize) override {
@@ -4573,6 +4618,7 @@ class DurableNodeWebSocket final: public LegacyHibernationManagerImpl::NodeSocke
   }
 
   kj::Promise<void> setAutoResponse(kj::Maybe<kj::String> request, kj::Maybe<kj::String> response) {
+    auto pending = control->beginWrite();
     co_await control->ready();
     auto& timer = control->clock();
     const auto deadline = timer.now() + 5 * kj::SECONDS;
@@ -4584,7 +4630,7 @@ class DurableNodeWebSocket final: public LegacyHibernationManagerImpl::NodeSocke
         call.setRequest(value);
         call.setResponse(KJ_ASSERT_NONNULL(response));
       }
-      if ((co_await timer.timeoutAt(deadline, call.send())).getAccepted()) co_return;
+      if ((co_await control->awaitReply(call.send(), deadline)).getAccepted()) co_return;
       KJ_REQUIRE(attaching.fulfiller->isWaiting() && timer.now() < deadline,
           "the node refused to configure the WebSocket transport");
       co_await timer.afterDelay(10 * kj::MILLISECONDS);
@@ -5421,7 +5467,6 @@ struct DurableTreeContext {
   std::weak_ptr<Slot> slot;
   uint64_t tree;
   kj::String uniqueKey, storageId, objectName;
-  kj::String localEventDescriptor;
   kj::Own<server::FacetTreeIndex> index;
   std::shared_ptr<server::DurableIdleLifecycle> idle;
   std::map<uint, server::DurableLogShipper*> shippers;
@@ -5650,32 +5695,13 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
                                public Worker::Actor::FacetManager,
                                public kj::Refcounted {
  public:
-  DurableActorHooks(
-      std::shared_ptr<DurableTreeContext> tree, uint facet, uint depth, kj::StringPtr className)
+  DurableActorHooks(std::shared_ptr<DurableTreeContext> tree, uint facet, uint depth)
       : tree(std::move(tree)),
         facet(facet),
-        depth(depth),
-        className(kj::str(className)) {}
+        depth(depth) {}
 
   kj::Own<WorkerInterface> getWorker(IoChannelFactory::SubrequestMetadata) override {
-    // Only in-process pairs use this loopback. A parked transport can never
-    // reopen a tree through it.
-    auto root = tree->state.durableRoots.find(tree->tree);
-    KJ_REQUIRE(root != tree->state.durableRoots.end() && !root->second.resetting &&
-            !root->second.closeRequested && !root->second.idleClosing &&
-            root->second.parking == kj::none,
-        "the Durable Object tree is closing");
-    auto &active = KJ_REQUIRE_NONNULL(actor->tryGet(), "the local WebSocket actor has ended");
-    auto slot = tree->slot.lock();
-    KJ_REQUIRE(slot != nullptr, "the local WebSocket's isolate has ended");
-    JsonDoc input(tree->localEventDescriptor);
-    auto prepared = prepareInvocation(tree->state, tree->server, std::move(slot), input.get(),
-        tree->localEventDescriptor, Frankenvalue(), nullptr, nullptr,
-        kj::refcounted<RequestObserver>(), kj::addRef(active), className.asPtr());
-    return kj::mv(prepared.entry).attach(kj::mv(prepared.invocation));
-  }
-  void bind(Worker::Actor &value) {
-    actor = value.getWeakRef();
+    unsupported("local hibernatable WebSocketPair events on the threaded Durable Object host");
   }
   kj::Own<Worker::Actor::Loopback> addRef() override {
     return kj::addRef(*this);
@@ -5785,8 +5811,6 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
   std::shared_ptr<DurableTreeContext> tree;
   uint facet;
   uint depth;
-  kj::String className;
-  kj::Own<Worker::Actor::WeakRef> actor;
   std::map<std::string, kj::Rc<LocalFacet>> children;
 };
 
@@ -5880,7 +5904,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     uint parentFacet,
     kj::StringPtr facetName,
     server::DurableWalPosition position) {
-  auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth, className);
+  auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth);
   auto *borrowedHooks = hooks.get();
   auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
   auto *borrowedObserver = observer.get();
@@ -5929,7 +5953,6 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
       kj::mv(observer), kj::none, kj::none, kj::none, jsg::Dict<kj::String>{}, *borrowedHooks,
       kj::none, kj::none, kj::heap<DurablePendingOperations>(tree->idle));
   borrowedObserver->bind(*actor);
-  borrowedHooks->bind(*actor);
   return {kj::mv(actor), borrowedHooks};
 }
 
@@ -5990,7 +6013,6 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
       kj::str(route.storageId.c_str()),
       kj::str(route.key.namespaceId.c_str(), "/", route.key.objectId.c_str(), "/",
           route.open.dataEpoch),
-      kj::str(descriptor),
       {},
       idle,
     });
@@ -6060,18 +6082,38 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
     if (!root.socketsRestored && !root.adopting) {
       auto &manager = kj::downcast<LegacyHibernationManagerImpl>(
           KJ_REQUIRE_NONNULL(root.actor->getHibernationManager()));
+      const auto tree = ticket.tree;
       root.adopting = std::make_shared<ThreadState::SocketAdoption>(
-          root.nodeSockets->adopt(manager).attach(kj::addRef(manager)));
+          root.nodeSockets->adopt(manager)
+              .then([&state = state, &server = server, tree](bool restored) {
+        auto current = state.durableRoots.find(tree);
+        KJ_REQUIRE(
+            current != state.durableRoots.end(), "the Durable Object WebSocket home has ended");
+        if (!restored) {
+          auto reason =
+              KJ_EXCEPTION(DISCONNECTED, "Durable Object could not confirm WebSocket adoption.");
+          server.beginDurableReset(state, tree, reason);
+          current->second.actor->abort(kj::mv(reason));
+          KJ_FAIL_REQUIRE("the node could not confirm WebSocket adoption");
+        }
+        current->second.socketsRestored = true;
+      }).attach(kj::addRef(manager)));
+      // A client can drop the first event while the node is adopting. Let the
+      // home finish the handoff and settle the admission fence anyway.
+      auto adopting = root.adopting;
+      state.tasks.add(adopting->ready.addBranch()
+                          .catch_([](kj::Exception &&error) {
+        reportDurableFailureForTest("WebSocket adoption", error);
+      }).then([&state = state, tree, adopting] {
+        auto current = state.durableRoots.find(tree);
+        if (current != state.durableRoots.end() && current->second.adopting == adopting)
+          current->second.adopting.reset();
+      }));
     }
     if (auto adopting = root.adopting) {
       try {
         co_await adopting->ready.addBranch();
-      } catch (const kj::Exception &error) {
-        reportDurableFailureForTest("WebSocket adoption", error);
-        auto current = state.durableRoots.find(ticket.tree);
-        if (current != state.durableRoots.end() && current->second.adopting == adopting) {
-          current->second.adopting.reset();
-        }
+      } catch (const kj::Exception &) {
         kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
             KJ_EXCEPTION(OVERLOADED, "the node could not restore the durable object's WebSockets"),
             "DO_UNAVAILABLE"));
@@ -6082,8 +6124,6 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
         kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
             KJ_EXCEPTION(OVERLOADED, "durable object reset is still draining"), "DO_UNAVAILABLE"));
       }
-      found->second.socketsRestored = true;
-      found->second.adopting.reset();
     }
   }
   auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props), nullptr,
