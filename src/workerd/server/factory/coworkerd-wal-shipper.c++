@@ -437,6 +437,15 @@ kj::Array<kj::byte> alarmMessage(kj::StringPtr objectName, uint facetId,
 
 }  // namespace
 
+void DurableLogShipper::reportActorReset(kj::StringPtr code) {
+  if (openId == 0) return;
+  Writer message;
+  message.u8(MSG_ACTOR_RESET);
+  message.str(name.objectName);
+  message.str(code);
+  channel.send(openId, message.finish(openId));
+}
+
 void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId) {
   if (durableLogEnabled()) Replicator::get().send(deletedFacetMessage(objectName, facetId, 0));
 }

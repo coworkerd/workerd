@@ -25,6 +25,9 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
   // A threaded home dispatches frames only after a node-authorized open.
   class NodeSocket: public kj::WebSocket {
    public:
+    virtual void useLocalTransport(kj::Own<kj::WebSocket> transport) = 0;
+    virtual void startUpgrade() = 0;
+    virtual kj::Promise<void> whenUpgrading() = 0;
     virtual void attach(kj::StringPtr socketId, kj::StringPtr invocationId) = 0;
     virtual void activate() = 0;
     virtual kj::StringPtr id() const = 0;
@@ -50,6 +53,7 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
   kj::Promise<void> activateNodeSocket(kj::StringPtr pending, kj::StringPtr invocation);
   kj::Promise<void> configureNodeSocket(NodeSocket& socket);
   kj::Array<SocketSnapshot> snapshotNodeSockets();
+  bool hasLocalSockets() const;
   void adoptNodeSocket(SocketSnapshot snapshot, kj::StringPtr invocationId);
   kj::Promise<void> dispatchNodeSocket(WorkerInterface& worker, kj::String id,
       uint64_t position, kj::Maybe<kj::Date> autoResponse, api::HibernatableSocketParams params);

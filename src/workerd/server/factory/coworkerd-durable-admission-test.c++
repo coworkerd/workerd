@@ -79,6 +79,11 @@ KJ_TEST("retiring idle sockets fences admission and waits for their session cred
   KJ_EXPECT(table.complete(call, 1));
   KJ_EXPECT(table.stopIdleTreeWithSockets(socket.tree, 1));
   KJ_EXPECT(table.queue(first, open, 0, deadline, now).status == Status::RETIRING);
+  KJ_REQUIRE(table.resumeIdleTree(socket.tree, 1));
+  const auto afterRefusal = queued(table.queue(first, open, 0, deadline, now), false);
+  KJ_REQUIRE(table.begin(afterRefusal, 1, first, open, now) == Delivery::ACCEPTED);
+  KJ_REQUIRE(table.complete(afterRefusal, 1));
+  KJ_REQUIRE(table.stopIdleTreeWithSockets(socket.tree, 1));
   KJ_EXPECT(!table.releaseTree(socket.tree, 1));
   KJ_EXPECT(table.complete(socket, 1));
   KJ_EXPECT(table.releaseTree(socket.tree, 1));

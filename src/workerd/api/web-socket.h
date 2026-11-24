@@ -195,8 +195,9 @@ class WebSocket: public EventTarget {
 
   // The kj::WebSocket is shared with the HibernationManager so both it and this api::WebSocket
   // retain ownership.
+  using WrapTransport = kj::FunctionParam<kj::Own<kj::WebSocket>(kj::Own<kj::WebSocket>)>;
   kj::Rc<kj::WebSocket> acceptAsHibernatable(
-      kj::Array<kj::String> tags, kj::Own<kj::WebSocket> transport = {});
+      kj::Array<kj::String> tags, kj::Maybe<WrapTransport> wrapTransport = kj::none);
   bool isPeerOf(jsg::Lock& js, const WebSocket& candidate);
   kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
   bool isOutputClosed() const;
@@ -575,7 +576,7 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
 
   kj::Rc<kj::WebSocket> acceptAsHibernatable(kj::Array<kj::String> tags) override;
   kj::Rc<kj::WebSocket> acceptWithTransport(
-      kj::Array<kj::String> tags, kj::Own<kj::WebSocket> transport);
+      kj::Array<kj::String> tags, kj::Maybe<WebSocket::WrapTransport> wrapTransport);
   bool isPeerOf(jsg::Lock& js, const WebSocket& candidate);
   kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
   bool isOutputClosed() const;

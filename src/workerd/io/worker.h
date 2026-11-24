@@ -1110,7 +1110,8 @@ class Worker::Actor final: public kj::Refcounted {
   // Called before a promise is added to IoContext's wait-until task set. Returns the tracker's
   // handle, or an empty handle if no tracker is supplied.
   kj::Own<WaitUntilTaskHandle> addedWaitUntilTask(bool localSocketTransport = false);
-  kj::Own<void> addedPendingIo();
+  enum class PendingIoSource { EVENT, LOCAL_SOCKET_TRANSPORT };
+  kj::Own<void> addedPendingIo(PendingIoSource source);
 
   // Call when starting any new request, to ensure that the actor object's constructor has run.
   //

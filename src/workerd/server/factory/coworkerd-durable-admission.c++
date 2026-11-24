@@ -267,10 +267,11 @@ bool DurableAdmission::stopIdleTreeWithSockets(uint64_t tree, uint64_t home) {
 
 bool DurableAdmission::resumeIdleTree(uint64_t tree, uint64_t home) {
   auto at = trees.find(tree);
-  if (at == trees.end() || home == 0 || at->second.home != home ||
-      !at->second.events.empty() || !at->second.idleClosing) {
+  if (at == trees.end() || home == 0 || at->second.home != home || !at->second.idleClosing) {
     return false;
   }
+  // Closing stopped admission. The only tickets that were allowed to stay
+  // active when it started are the ordinary socket transports.
   at->second.closing = false;
   at->second.idleClosing = false;
   return true;

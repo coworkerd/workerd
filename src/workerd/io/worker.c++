@@ -4979,8 +4979,12 @@ kj::Own<Worker::Actor::WaitUntilTaskHandle> Worker::Actor::addedWaitUntilTask(bo
   return kj::Own<WaitUntilTaskHandle>();
 }
 
-kj::Own<void> Worker::Actor::addedPendingIo() {
+kj::Own<void> Worker::Actor::addedPendingIo(PendingIoSource source) {
   KJ_IF_SOME(tracker, waitUntilTaskTracker) {
+    if (source == PendingIoSource::LOCAL_SOCKET_TRANSPORT &&
+        tracker->tracksSocketTransportSeparately()) {
+      return {};
+    }
     return tracker->registerPendingIo();
   }
   return {};

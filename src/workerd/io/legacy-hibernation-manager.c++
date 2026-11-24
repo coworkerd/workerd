@@ -181,12 +181,20 @@ void LegacyHibernationManagerImpl::acceptWebSocket(
   KJ_IF_SOME(factory, nodeSockets) {
     auto transport = factory();
     refToHibernatable.nodeSocket = transport.get();
-    refToHibernatable.ws =
-        active->acceptAsHibernatable(refToHibernatable.getTags(), kj::mv(transport));
-    return;
+    auto wrap = [&transport](kj::Own<kj::WebSocket> local) -> kj::Own<kj::WebSocket> {
+      transport->useLocalTransport(kj::mv(local));
+      return kj::mv(transport);
+    };
+    refToHibernatable.ws = active->acceptAsHibernatable(
+        refToHibernatable.getTags(), api::WebSocket::WrapTransport(wrap));
+  } else {
+    refToHibernatable.ws = active->acceptAsHibernatable(refToHibernatable.getTags());
   }
-  refToHibernatable.ws = active->acceptAsHibernatable(refToHibernatable.getTags());
-  readLoopTasks.add(handleReadLoop(refToHibernatable).catch_([](kj::Exception&& e) {
+  auto reading = handleReadLoop(refToHibernatable);
+  if (refToHibernatable.nodeSocket != nullptr) {
+    reading = reading.exclusiveJoin(refToHibernatable.nodeSocket->whenUpgrading());
+  }
+  readLoopTasks.add(reading.catch_([](kj::Exception&& e) {
     if (isInterestingException(e)) {
       LOG_EXCEPTION_IF_INTERNAL("LegacyHibernationManagerImpl::handleReadLoop", e);
     }
@@ -239,6 +247,7 @@ kj::Maybe<kj::StringPtr> LegacyHibernationManagerImpl::stageNodeSocket(
       if (active->isPeerOf(js, peer)) {
         KJ_REQUIRE(socket->pendingNodeSocket.size() == 0, "WebSocket was already upgraded");
         socket->pendingNodeSocket = randomUUID(kj::none);
+        socket->nodeSocket->startUpgrade();
         return socket->pendingNodeSocket.asPtr();
       }
     }
@@ -292,6 +301,13 @@ LegacyHibernationManagerImpl::snapshotNodeSockets() {
     snapshots.add(kj::mv(snapshot));
   }
   return snapshots.releaseAsArray();
+}
+
+bool LegacyHibernationManagerImpl::hasLocalSockets() const {
+  for (const auto& socket: allWs) {
+    if (socket->nodeSocket == nullptr || socket->nodeSocket->id().size() == 0) return true;
+  }
+  return false;
 }
 
 void LegacyHibernationManagerImpl::adoptNodeSocket(

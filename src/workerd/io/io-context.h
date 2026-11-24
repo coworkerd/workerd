@@ -713,7 +713,8 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
 
   // Arrange for the given promise to execute as part of this request. It will be canceled if the
   // request is canceled.
-  void addTask(kj::Promise<void> promise);
+  enum class ActorTask { WORK, LOCAL_SOCKET_TRANSPORT };
+  void addTask(kj::Promise<void> promise, ActorTask kind = ActorTask::WORK);
 
   template <typename T, typename Func>
   jsg::PromiseForResult<Func, T, true> awaitIo(jsg::Lock& js, kj::Promise<T> promise, Func&& func);
@@ -818,7 +819,8 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // new `awaitIo()` implementation. This should go away once all API implementations are
   // refactored to use `awaitIo()`.
   template <typename T>
-  jsg::Promise<T> awaitIoLegacy(jsg::Lock& js, kj::Promise<T> promise);
+  jsg::Promise<T> awaitIoLegacy(
+      jsg::Lock& js, kj::Promise<T> promise, ActorTask kind = ActorTask::WORK);
 
   // Returns a KJ promise that resolves when a particular JavaScript promise completes.
   //
@@ -937,7 +939,6 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
 
   // Indicates that the script has requested that it stay active until the given promise resolves.
   // drain() waits until all such promises have completed.
-  enum class ActorTask { WORK, LOCAL_SOCKET_TRANSPORT };
   void addWaitUntil(kj::Promise<void> promise, ActorTask kind = ActorTask::WORK);
 
   // Returns the status of waitUntil promises. If a promise fails, this sets the status to the
@@ -998,7 +999,8 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // at some point in the future, in response to some *external* event that the caller is waiting
   // for. Then, hold on to the returned handle until that time. This prevents finalizers from being
   // called in the meantime.
-  kj::Own<void> registerPendingEvent();
+  kj::Own<void> registerPendingEvent(
+      Worker::Actor::PendingIoSource source = Worker::Actor::PendingIoSource::EVENT);
   // TODO(cleanup): awaitIo() automatically applies this. Is the public method needed anymore?
 
   // When you want to perform a task that returns Promise<DeferredProxy<T>> and the application
@@ -1562,7 +1564,8 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
 
   template <typename T, typename InputLockOrMaybeCriticalSection, typename Func>
   jsg::PromiseForResult<Func, T, true> awaitIoImpl(
-      jsg::Lock& js, kj::Promise<T> promise, InputLockOrMaybeCriticalSection ilOrCs, Func&& func);
+      jsg::Lock& js, kj::Promise<T> promise, InputLockOrMaybeCriticalSection ilOrCs, Func&& func,
+      ActorTask kind = ActorTask::WORK);
 
   // The I/O half of awaitIoImpl() and awaitIoAndRun(): waits for `promise` as a task of this
   // IoContext, then calls `func(Worker::Lock&, ExceptionOr<T>&&)` in run(), under `ilOrCs`, in the
@@ -1570,7 +1573,8 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // turn's cause. The caller checks that this IoContext is current.
   template <typename T, typename InputLockOrMaybeCriticalSection, typename Func>
   void resumeAfterIo(
-      jsg::Lock& js, kj::Promise<T> promise, InputLockOrMaybeCriticalSection ilOrCs, Func&& func);
+      jsg::Lock& js, kj::Promise<T> promise, InputLockOrMaybeCriticalSection ilOrCs, Func&& func,
+      ActorTask kind = ActorTask::WORK);
 
   // Async trace resources for the awaitIo() and awaitJs() bridges. Inert if the context is not
   // traced.
@@ -1781,8 +1785,8 @@ jsg::Promise<T> IoContext::awaitIoWithInputLock(jsg::Lock& js, kj::Promise<T> pr
 }
 
 template <typename T>
-jsg::Promise<T> IoContext::awaitIoLegacy(jsg::Lock& js, kj::Promise<T> promise) {
-  return awaitIoImpl(js, kj::mv(promise), getCriticalSection(), IdentityFunc<T>());
+jsg::Promise<T> IoContext::awaitIoLegacy(jsg::Lock& js, kj::Promise<T> promise, ActorTask kind) {
+  return awaitIoImpl(js, kj::mv(promise), getCriticalSection(), IdentityFunc<T>(), kind);
 }
 
 // To reduce the code size impact of awaitIoImpl, move promise continuation code out of
@@ -1833,7 +1837,8 @@ Result throwOrReturnResult(jsg::Lock& js, IoContext::ExceptionOr<Result>&& excep
 
 template <typename T, typename InputLockOrMaybeCriticalSection, typename Func>
 void IoContext::resumeAfterIo(
-    jsg::Lock& js, kj::Promise<T> promise, InputLockOrMaybeCriticalSection ilOrCs, Func&& func) {
+    jsg::Lock& js, kj::Promise<T> promise, InputLockOrMaybeCriticalSection ilOrCs, Func&& func,
+    ActorTask kind) {
   // WARNING: The fact that `promise` has been passed by value whereas `func` is by reference is
   // actually important, because this means that if we throw an exception here in the function
   // body, `promise` will be destroyed first, before `func`. That's important as often `func`
@@ -1873,12 +1878,13 @@ void IoContext::resumeAfterIo(
       funcResultPair.func(lock, kj::mv(funcResultPair.exceptionOrT));
     },
         kj::mv(ilOrCs));
-  }));
+  }), kind);
 }
 
 template <typename T, typename InputLockOrMaybeCriticalSection, typename Func>
 jsg::PromiseForResult<Func, T, true> IoContext::awaitIoImpl(
-    jsg::Lock& js, kj::Promise<T> promise, InputLockOrMaybeCriticalSection ilOrCs, Func&& func) {
+    jsg::Lock& js, kj::Promise<T> promise, InputLockOrMaybeCriticalSection ilOrCs, Func&& func,
+    ActorTask kind) {
   // WARNING: As in resumeAfterIo(), `promise` is passed by value and `func` by reference, and
   // `promise` is moved into a local, so that if we throw an exception here, `promise` is destroyed
   // before `func`.
@@ -1965,7 +1971,7 @@ jsg::PromiseForResult<Func, T, true> IoContext::awaitIoImpl(
         }
       }
     }
-  });
+  }, kind);
 
   // Reminder: This can throw JsExceptionThrown if the execution context has been terminated. We
   // have already disowned `promise` and `func` by this point, though, so teardown order is no

@@ -219,7 +219,7 @@ bool WebSocket::isOutputClosed() const {
 }
 
 kj::Rc<kj::WebSocket> WebSocket::acceptAsHibernatable(
-    kj::Array<kj::String> tags, kj::Own<kj::WebSocket> transport) {
+    kj::Array<kj::String> tags, kj::Maybe<WrapTransport> wrapTransport) {
   // TODO(EW-10817): When the HibernatableWebSocketAdapter path is functional, re-enable the
   // autogate-driven swap below — extract the kj::WebSocket from the legacy adapter (via
   // `LegacyWebSocketAdapter::extractForHibernatableTransition`, also commented out today)
@@ -231,9 +231,9 @@ kj::Rc<kj::WebSocket> WebSocket::acceptAsHibernatable(
   //   impl = kj::heap<HibernatableWebSocketAdapter>(*this, ws.addRef(), kj::mv(tags));
   //   return ws;
   // }
-  if (transport.get() != nullptr) {
-    return kj::downcast<LegacyWebSocketAdapter>(*impl)
-        .acceptWithTransport(kj::mv(tags), kj::mv(transport));
+  if (wrapTransport != kj::none) {
+    return kj::downcast<LegacyWebSocketAdapter>(*impl).acceptWithTransport(
+        kj::mv(tags), kj::mv(wrapTransport));
   }
   return impl->acceptAsHibernatable(kj::mv(tags));
 }
@@ -694,7 +694,8 @@ kj::Promise<DeferredProxy<void>> LegacyWebSocketAdapter::couple(
     KJ_IF_SOME(peerRef, maybePeerRef) {
       // We're terminating the WebSocket in this worker, so the upstream promise (which pumps
       // messages from the client to this worker) counts as something the request is waiting for.
-      upstream = upstream.attach(context.registerPendingEvent());
+      upstream = upstream.attach(
+          context.registerPendingEvent(Worker::Actor::PendingIoSource::LOCAL_SOCKET_TRANSPORT));
 
       // We can observe websocket traffic in both directions by attaching an observer to the peer
       // websocket which terminates in the worker.
@@ -941,6 +942,7 @@ void LegacyWebSocketAdapter::startReadLoop(
     return false;
   };
   const bool localPeer = hasLocalPeer();
+  const auto taskKind = localPeer ? IoContext::ActorTask::LOCAL_SOCKET_TRANSPORT : IoContext::ActorTask::WORK;
   if (!localPeer) {
     promise = promise.attach(context.registerPendingEvent());
   }
@@ -968,7 +970,7 @@ void LegacyWebSocketAdapter::startReadLoop(
   auto self = kj::Own<LegacyWebSocketAdapter>(this, kj::NullDisposer::instance)
                   .attach(jsg::Ref<WebSocket>(kj::addRef(shell)));
   context.addWaitUntil(context.awaitJs(js,
-      context.awaitIoLegacy(js, kj::mv(promise))
+      context.awaitIoLegacy(js, kj::mv(promise), taskKind)
           .then(js,
               [self = kj::mv(self)](jsg::Lock& js, kj::Maybe<kj::Exception>&& maybeError) mutable {
     auto& native = *self->farNative;
@@ -986,7 +988,7 @@ void LegacyWebSocketAdapter::startReadLoop(
         self->reportError(js, e.clone());
       }
     }
-  })), localPeer ? IoContext::ActorTask::LOCAL_SOCKET_TRANSPORT : IoContext::ActorTask::WORK);
+  })), taskKind);
 }
 
 void LegacyWebSocketAdapter::send(jsg::Lock& js, kj::OneOf<kj::Array<byte>, kj::String> message) {
@@ -1741,15 +1743,18 @@ bool LegacyWebSocketAdapter::isOutputClosed() const {
 }
 
 kj::Rc<kj::WebSocket> LegacyWebSocketAdapter::acceptAsHibernatable(kj::Array<kj::String> tags) {
-  return acceptWithTransport(kj::mv(tags), {});
+  return acceptWithTransport(kj::mv(tags), kj::none);
 }
 
 kj::Rc<kj::WebSocket> LegacyWebSocketAdapter::acceptWithTransport(
-    kj::Array<kj::String> tags, kj::Own<kj::WebSocket> transport) {
+    kj::Array<kj::String> tags, kj::Maybe<WebSocket::WrapTransport> wrapTransport) {
   KJ_IF_SOME(hibernatable, farNative->state.tryGet<AwaitingAcceptanceOrCoupling>()) {
     // We can only request hibernation if we have not called accept.
-    auto ws = kj::Rc<kj::WebSocket>(
-        transport.get() != nullptr ? kj::mv(transport) : kj::mv(hibernatable.ws));
+    auto transport = kj::mv(hibernatable.ws);
+    KJ_IF_SOME(wrap, wrapTransport) {
+      transport = wrap(kj::mv(transport));
+    }
+    auto ws = kj::Rc<kj::WebSocket>(kj::mv(transport));
     farNative->state.init<Accepted>(Accepted::Hibernatable{.ws = ws.addRef(), .tags = kj::mv(tags)},
         *farNative, IoContext::current());
     return ws;

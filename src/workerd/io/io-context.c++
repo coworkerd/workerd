@@ -793,13 +793,13 @@ void IoContext::abortWhen(kj::Promise<void> promise) {
   }
 }
 
-void IoContext::addTask(kj::Promise<void> promise) {
+void IoContext::addTask(kj::Promise<void> promise, ActorTask kind) {
   ++addTaskCounter;
 
   // In Actors, we treat all tasks as wait-until tasks, because it's perfectly legit to start a
   // task under one request and then expect some other request to handle it later.
   if (actor != kj::none) {
-    addWaitUntil(kj::mv(promise));
+    addWaitUntil(kj::mv(promise), kind);
     return;
   }
 
@@ -1063,11 +1063,12 @@ IoContext::PendingEvent::~PendingEvent() noexcept(false) {
   }).eagerlyEvaluate(nullptr);
 }
 
-kj::Own<void> IoContext::registerPendingEvent() {
+kj::Own<void> IoContext::registerPendingEvent(Worker::Actor::PendingIoSource source) {
   KJ_IF_SOME(a, actor) {
     // Actors don't use the pending event system, because different requests to the same Actor are
-    // explicitly allowed to resolve each other's promises.
-    return a.addedPendingIo();
+    // explicitly allowed to resolve each other's promises. The threaded host tracks local
+    // WebSocket transports separately from pending operations.
+    return a.addedPendingIo(source);
   }
 
   KJ_IF_SOME(pe, pendingEvent) {
