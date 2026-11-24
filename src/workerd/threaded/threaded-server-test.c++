@@ -24,9 +24,9 @@ struct TestPlatform {
   server::WorkerdPlatform platform{*base};
   jsg::V8System system{platform, {}, base.get()};
 };
-void initializeV8() {
+jsg::V8System& initializeV8() {
   static auto* platform = new TestPlatform;
-  (void)platform;
+  return platform->system;
 }
 // A group of its own for a test isolate, as the server creates one per Worker.
 v8::IsolateGroup newGroup() {
@@ -101,7 +101,7 @@ KJ_TEST("fatal record identifies only the invocation on the current V8 thread") 
 KJ_TEST("an entry outside any scope or live call takes the Worker's load identity") {
   // Startup, logging and dynamic import entries ask scopedExecutionIdentity() whom a fatal error
   // belongs to. With no enclosing scope of the isolate and no I/O context (a legacy dynamic import
-  // whose call has ended), the isolate still runs only its own Worker's code.
+  // continues outside its call's), the isolate still runs only its own Worker's code.
   IsolateLimits limits(100, 32,
       kj::str("\"workerId\":\"tenant/w\",\"versionId\":\"v1\",\"invocationId\":\"load\","), nullptr,
       newGroup());
@@ -111,20 +111,70 @@ KJ_TEST("an entry outside any scope or live call takes the Worker's load identit
   KJ_DEFER(isolate->Dispose());
   auto* otherIsolate = v8::Isolate::New(newGroup(), params);
   KJ_DEFER(otherIsolate->Dispose());
+  limits.isolate = isolate;  // as customizeIsolate() records it
   KJ_REQUIRE(!IoContext::hasCurrent());
-  auto identity = [&](v8::Isolate* entered) {
-    return KJ_ASSERT_NONNULL(scopedExecutionIdentity(limits, entered, kj::none));
-  };
-  KJ_EXPECT(identity(isolate) == limits.identity);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(scopedExecutionIdentity(limits, isolate)) == limits.identity);
   {
     // An enclosing scope of this isolate (the load or the call) takes precedence.
     FatalInvocation call(isolate, "\"invocationId\":\"call\",");
-    KJ_EXPECT(identity(isolate) == "\"invocationId\":\"call\",");
-    // Another isolate's scope does not name this one's entry.
-    KJ_EXPECT(identity(otherIsolate) == limits.identity);
+    KJ_EXPECT(KJ_ASSERT_NONNULL(scopedExecutionIdentity(limits, isolate)) == "\"invocationId\":\"call\",");
+    // An entry on an isolate that is not this Worker's own is named by nobody.
+    KJ_EXPECT(scopedExecutionIdentity(limits, otherIsolate) == kj::none);
   }
   limits.durableEvents = true;
-  KJ_EXPECT(scopedExecutionIdentity(limits, isolate, kj::none) == kj::none);
+  KJ_EXPECT(scopedExecutionIdentity(limits, isolate) == kj::none);
+}
+
+KJ_TEST("another Worker's call never lends its identity to this Worker's entry") {
+  IsolateLimits limits(100, 32, kj::str("\"invocationId\":\"load\","), nullptr, newGroup());
+  IsolateLimits other(100, 32, kj::str("\"invocationId\":\"other-load\","), nullptr, newGroup());
+  auto* isolate = reinterpret_cast<v8::Isolate*>(&limits);  // only compared, never entered
+  limits.isolate = isolate;
+  const kj::StringPtr call = "\"invocationId\":\"call\",";
+  // The current I/O context's call runs this Worker: its identity.
+  KJ_EXPECT(KJ_ASSERT_NONNULL(entryFatalIdentity(limits, isolate, kj::none, &limits, call)) == call);
+  // It runs another Worker: this entry keeps its own Worker's load identity.
+  KJ_EXPECT(KJ_ASSERT_NONNULL(entryFatalIdentity(limits, isolate, kj::none, &other, call)) ==
+      limits.identity);
+  // No I/O context.
+  KJ_EXPECT(KJ_ASSERT_NONNULL(entryFatalIdentity(limits, isolate, kj::none, nullptr, ""_kj)) ==
+      limits.identity);
+  // An enclosing scope of this isolate comes first.
+  KJ_EXPECT(KJ_ASSERT_NONNULL(entryFatalIdentity(
+                limits, isolate, kj::StringPtr("\"invocationId\":\"outer\","), &limits, call)) ==
+      "\"invocationId\":\"outer\",");
+}
+
+// A minimal jsg isolate, for the server's own startup entry on a real jsg::Lock.
+struct StartupEntryGlobal: public jsg::Object, public jsg::ContextGlobal {
+  JSG_RESOURCE_TYPE(StartupEntryGlobal) {}
+};
+JSG_DECLARE_ISOLATE_TYPE(StartupEntryIsolate, StartupEntryGlobal);
+
+KJ_TEST("a startup entry opens the fatal scope of its Worker and closes it") {
+  auto& system = initializeV8();
+  IsolateLimits limits(100, 32,
+      kj::str("\"workerId\":\"tenant/w\",\"versionId\":\"v1\",\"invocationId\":\"load\","), nullptr,
+      newGroup());
+  StartupEntryIsolate jsgIsolate(system, newGroup(), nullptr, kj::heap<jsg::IsolateObserver>());
+  jsgIsolate.runInLockScope([&](StartupEntryIsolate::Lock& lock) {
+    limits.customizeIsolate(lock.v8Isolate);
+    KJ_EXPECT(FatalInvocation::forIsolate(lock.v8Isolate) == nullptr);
+    kj::OneOf<kj::Exception, kj::Duration> result;
+    {
+      auto entry = limits.enterStartupJs(lock, result);
+      const auto* scope = FatalInvocation::forIsolate(lock.v8Isolate);
+      KJ_ASSERT(scope != nullptr, "the startup entry pushed no fatal scope");
+      KJ_EXPECT(scope->getIdentity() == limits.identity);
+    }
+    KJ_EXPECT(FatalInvocation::forIsolate(lock.v8Isolate) == nullptr);
+    // A durable role's entry pushes none.
+    limits.durableEvents = true;
+    {
+      auto entry = limits.enterLoggingJs(lock, result);
+      KJ_EXPECT(FatalInvocation::forIsolate(lock.v8Isolate) == nullptr);
+    }
+  });
 }
 
 KJ_TEST("descriptor queue: empty, full, FIFO, SPSC handoff and close") {

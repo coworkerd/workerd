@@ -635,8 +635,7 @@ uint64_t configuredCount(const char *name, uint64_t fallback) {
 
 kj::StringPtr executionIdentity(kj::StringPtr fallback);
 struct IsolateLimits;
-kj::Maybe<kj::StringPtr> scopedExecutionIdentity(
-    const IsolateLimits &owner, v8::Isolate *isolate, kj::Maybe<IoContext &> origin);
+kj::Maybe<kj::StringPtr> scopedExecutionIdentity(const IsolateLimits &owner, v8::Isolate *isolate);
 
 kj::Exception limitException(LimitCause cause) {
   if (cause == LimitCause::PROCESS_MEMORY)
@@ -1276,7 +1275,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
     std::atomic<LimitCause> localCause{LimitCause::NONE};
     uint64_t &totalCpu;
     std::atomic<LimitCause> &cause;
-    kj::Maybe<kj::StringPtr> scopedIdentity;
+    bool scoped;
     kj::String identity;
     uint64_t start = nowNs(CLOCK_THREAD_CPUTIME_ID);
     FatalInvocation fatal;
@@ -1284,15 +1283,20 @@ struct IsolateLimits final: IsolateLimitEnforcer {
     Startup(const IsolateLimits &owner,
         jsg::Lock &js,
         kj::OneOf<kj::Exception, kj::Duration> &result,
+        bool startup)
+        : Startup(owner, js, result, startup, scopedExecutionIdentity(owner, js.v8Isolate)) {}
+    Startup(const IsolateLimits &owner,
+        jsg::Lock &js,
+        kj::OneOf<kj::Exception, kj::Duration> &result,
         bool startup,
-        kj::Maybe<IoContext &> origin = kj::none)
+        kj::Maybe<kj::StringPtr> scopedIdentity)
         : owner(owner),
           result(result),
           totalCpu(startup ? owner.startupCpu : localCpu),
           cause(startup ? owner.startupCause : localCause),
-          scopedIdentity(scopedExecutionIdentity(owner, js.v8Isolate, origin)),
+          scoped(scopedIdentity != kj::none),
           identity(kj::str(scopedIdentity.orDefault(executionIdentity(owner.identity)))),
-          fatal(scopedIdentity == kj::none ? nullptr : js.v8Isolate, identity),
+          fatal(scoped ? js.v8Isolate : nullptr, identity),
           execution(js.v8Isolate,
               cause,
               owner.memoryState,
@@ -1325,10 +1329,9 @@ struct IsolateLimits final: IsolateLimitEnforcer {
       jsg::Lock &js, kj::OneOf<kj::Exception, kj::Duration> &r) const override {
     return enterStartupJs(js, r);
   }
-  kj::Own<void> enterDynamicImportJs(jsg::Lock &js,
-      kj::OneOf<kj::Exception, kj::Duration> &r,
-      kj::Maybe<IoContext &> origin) const override {
-    return kj::heap<Startup>(*this, js, r, false, origin);
+  kj::Own<void> enterDynamicImportJs(
+      jsg::Lock &js, kj::OneOf<kj::Exception, kj::Duration> &r) const override {
+    return kj::heap<Startup>(*this, js, r, false);
   }
   kj::Own<void> enterLoggingJs(
       jsg::Lock &js, kj::OneOf<kj::Exception, kj::Duration> &r) const override {
@@ -1724,21 +1727,35 @@ kj::StringPtr executionIdentity(kj::StringPtr fallback) {
 }
 
 // Whom a fatal error belongs to while `owner`'s isolate runs a startup, logging or dynamic import
-// entry: the enclosing scope of this isolate (the load, or the call), else the call whose I/O
-// context started the entry (a legacy dynamic import continues outside it), else the Worker's
-// load identity, since the isolate runs only that Worker's code (the node still requires a
-// dispatch of that invocation in this process generation). None in durable roles.
-kj::Maybe<kj::StringPtr> scopedExecutionIdentity(
-    const IsolateLimits &owner, v8::Isolate *isolate, kj::Maybe<IoContext &> origin) {
+// entry, from the facts at entry: none in durable roles, or on an isolate other than the Worker's
+// own; else the enclosing scope of this isolate (the load, or the call); else the call of the
+// current I/O context when that call runs this Worker (`callOwner`); else the Worker's load
+// identity, since the isolate runs only that Worker's code. The node attributes a record only to
+// a dispatch of the named invocation in the same process generation.
+kj::Maybe<kj::StringPtr> entryFatalIdentity(const IsolateLimits &owner,
+    v8::Isolate *entered,
+    kj::Maybe<kj::StringPtr> enclosing,
+    const IsolateLimits *callOwner,
+    kj::StringPtr callIdentity) {
   if (owner.durableEvents) return kj::none;
-  if (const auto *scope = FatalInvocation::forIsolate(isolate)) return scope->getIdentity();
-  if (origin == kj::none) origin = IoContext::tryCurrent();
-  KJ_IF_SOME(context, origin) {
-    auto *request = dynamic_cast<RequestLimits *>(&context.getLimitEnforcer());
-    if (request != nullptr && request->slot.limits == &owner)
-      return kj::StringPtr(request->identity);
-  }
+  if (owner.isolate != nullptr && owner.isolate != entered) return kj::none;
+  KJ_IF_SOME(identity, enclosing) return identity;
+  if (callOwner == &owner) return callIdentity;
   return owner.identity.asPtr();
+}
+
+kj::Maybe<kj::StringPtr> scopedExecutionIdentity(const IsolateLimits &owner, v8::Isolate *isolate) {
+  kj::Maybe<kj::StringPtr> enclosing;
+  if (const auto *scope = FatalInvocation::forIsolate(isolate)) enclosing = scope->getIdentity();
+  const IsolateLimits *callOwner = nullptr;
+  kj::StringPtr callIdentity;
+  KJ_IF_SOME(context, IoContext::tryCurrent()) {
+    if (auto *request = dynamic_cast<RequestLimits *>(&context.getLimitEnforcer())) {
+      callOwner = request->slot.limits;
+      callIdentity = request->identity;
+    }
+  }
+  return entryFatalIdentity(owner, isolate, enclosing, callOwner, callIdentity);
 }
 
 void noteUnsupported(kj::StringPtr feature) {
@@ -3424,12 +3441,13 @@ struct ThreadedServer {
         capnp::List<server::config::Extension>::Reader(), limits->getCreateParams(), group,
         kj::atomicRefcounted<JsgIsolateObserver>(), slot.cache, python);
     auto name = kj::str(text(descriptor, "workerId"), "@", text(descriptor, "versionId"));
+    // Declared before the isolate so that a load that fails tears its Worker down in this scope.
+    kj::Maybe<FatalInvocation> fatal;
     auto isolate =
         kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), kj::atomicRefcounted<IsolateObserver>(),
             name, kj::mv(limits), Worker::Isolate::InspectorPolicy::DISALLOW,
             Worker::LoggingOptions(Worker::ConsoleMode::STDOUT));
-    FatalInvocation fatal(
-        slot.limits->durableEvents ? nullptr : slot.limits->isolate, slot.limits->identity);
+    fatal.emplace(slot.limits->durableEvents ? nullptr : slot.limits->isolate, slot.limits->identity);
     slot.loadStage = threaded::LoadStage::EVALUATION;
     auto extracted = server::WorkerdApi::extractSource(name, config, flags.asReader(), reporter);
     reporter.requireValid();

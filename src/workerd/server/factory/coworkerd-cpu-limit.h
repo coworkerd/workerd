@@ -199,11 +199,9 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     if (memory) return enterAuxiliaryJs(lock, result);
     return fallback->enterStartupPython(lock, result);
   }
-  kj::Own<void> enterDynamicImportJs(jsg::Lock& lock,
-      kj::OneOf<kj::Exception, kj::Duration>& result,
-      kj::Maybe<IoContext&> origin) const override {
+  kj::Own<void> enterDynamicImportJs(jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
     if (memory) return enterAuxiliaryJs(lock, result);
-    return fallback->enterDynamicImportJs(lock, result, origin);
+    return fallback->enterDynamicImportJs(lock, result);
   }
   kj::Own<void> enterLoggingJs(jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
     if (memory) return enterAuxiliaryJs(lock, result);

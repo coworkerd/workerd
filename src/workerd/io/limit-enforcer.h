@@ -56,11 +56,9 @@ class IsolateLimitEnforcer: public kj::Refcounted {
   virtual kj::Own<void> enterStartupPython(
       jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const = 0;
 
-  // Like enterStartupJs(), but used when compiling a dynamically-imported module. Its legacy
-  // continuation runs outside IoContext::current(); the originating context may still be alive.
-  virtual kj::Own<void> enterDynamicImportJs(jsg::Lock& lock,
-      kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime,
-      kj::Maybe<IoContext&> origin) const = 0;
+  // Like enterStartupJs(), but used when compiling a dynamically-imported module.
+  virtual kj::Own<void> enterDynamicImportJs(
+      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const = 0;
 
   // Like enterStartupJs(), but used to enforce tight limits in cases where we just intend
   // to log an error to the inspector or the like.

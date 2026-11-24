@@ -304,7 +304,7 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     return {};
   }
   kj::Own<void> enterDynamicImportJs(
-      jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&, kj::Maybe<IoContext&>) const override {
+      jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
     return {};
   }
   kj::Own<void> enterLoggingJs(jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
