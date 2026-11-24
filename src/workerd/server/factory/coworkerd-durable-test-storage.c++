@@ -33,7 +33,8 @@ DurableStorage::DurableStorage()
 
 DurableStorage::DurableStorage(kj::Own<const kj::Directory> directory)
     : directory(kj::mv(directory)),
-      vfs(*this->directory) {}
+      vfs(*this->directory),
+      nativeSqlVfs(*this->directory, {.maxWalBytes = NATIVE_SQL_WAL_BYTES}) {}
 
 void DurableStorage::ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr storageId) const {
   KJ_REQUIRE(uniqueKey.startsWith(ROOT_PREFIX) && isDigest(uniqueKey.slice(ROOT_PREFIX.size())) &&
@@ -49,6 +50,18 @@ kj::Own<SqliteDatabase> DurableStorage::open(
   const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
   return kj::heap<SqliteDatabase>(
       vfs, databasePath(uniqueKey, storageId, facet), mode, kj::maxValue, kj::maxValue, observer);
+}
+
+kj::Own<SqliteDatabase> DurableStorage::openNativeSql(
+    kj::StringPtr uniqueKey, kj::StringPtr storageId) const {
+  ensureNamespace(uniqueKey, storageId);
+  auto database = kj::heap<SqliteDatabase>(nativeSqlVfs, databasePath(uniqueKey, storageId, 0),
+      kj::WriteMode::CREATE | kj::WriteMode::MODIFY, NATIVE_SQL_MEMORY_BYTES);
+  // Sorters and temporary tables stay within SQLite's metered heap. Keep
+  // uncommitted dirty pages in that heap until COMMIT instead of spilling them.
+  database->run("PRAGMA temp_store=MEMORY");
+  database->run("PRAGMA cache_spill=OFF");
+  return database;
 }
 
 kj::Own<DurableLogShipper> DurableStorage::ship(kj::StringPtr uniqueKey,
