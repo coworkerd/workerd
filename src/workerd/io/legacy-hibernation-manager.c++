@@ -19,7 +19,7 @@ LegacyHibernationManagerImpl::EventRegistry& LegacyHibernationManagerImpl::getEv
 }
 
 LegacyHibernationManagerImpl::HibernatableWebSocket::HibernatableWebSocket(
-    jsg::Ref<api::WebSocket> websocket,
+    State websocket,
     kj::ArrayPtr<kj::String> tags,
     LegacyHibernationManagerImpl& manager)
     : tagItems(kj::heapArray<TagListItem>(tags.size())),
@@ -117,9 +117,11 @@ jsg::Ref<api::WebSocket> LegacyHibernationManagerImpl::HibernatableWebSocket::
 }
 
 LegacyHibernationManagerImpl::LegacyHibernationManagerImpl(
-    kj::Own<Worker::Actor::Loopback> loopback, uint16_t hibernationEventType)
+    kj::Own<Worker::Actor::Loopback> loopback, uint16_t hibernationEventType,
+    kj::Maybe<SocketFactory> nodeSockets)
     : loopback(kj::mv(loopback)),
       hibernationEventType(hibernationEventType),
+      nodeSockets(kj::mv(nodeSockets)),
       onDisconnect(DisconnectHandler{}),
       readLoopTasks(onDisconnect) {}
 
@@ -159,6 +161,7 @@ kj::Own<Worker::Actor::HibernationManager> LegacyHibernationManagerImpl::addRef(
 
 void LegacyHibernationManagerImpl::acceptWebSocket(
     jsg::Ref<api::WebSocket> ws, kj::ArrayPtr<kj::String> tags) {
+  requireSocketMutationAllowed();
   // First, we create the HibernatableWebSocket and add it to the collection where it'll stay
   // until it's destroyed.
 
@@ -173,6 +176,33 @@ void LegacyHibernationManagerImpl::acceptWebSocket(
   auto invCtx = IoContext::current().getInvocationSpanContext();
   refToHibernatable.userSpanContext = tracing::SpanContext(invCtx.getTraceId(), invCtx.getSpanId());
 
+  addSocket(kj::mv(hib), tags);
+
+  auto& active = refToHibernatable.activeOrPackage.get<jsg::Ref<api::WebSocket>>();
+  KJ_IF_SOME(factory, nodeSockets) {
+    auto transport = factory();
+    refToHibernatable.nodeSocket = transport.get();
+    auto wrap = [&transport](kj::Own<kj::WebSocket> local) -> kj::Own<kj::WebSocket> {
+      transport->useLocalTransport(kj::mv(local));
+      return kj::mv(transport);
+    };
+    refToHibernatable.ws = active->acceptAsHibernatable(
+        refToHibernatable.getTags(), api::WebSocket::WrapTransport(wrap));
+    active->requirePeerUpgrade();
+    return;
+  } else {
+    refToHibernatable.ws = active->acceptAsHibernatable(refToHibernatable.getTags());
+  }
+  readLoopTasks.add(handleReadLoop(refToHibernatable).catch_([](kj::Exception&& e) {
+    if (isInterestingException(e)) {
+      LOG_EXCEPTION_IF_INTERNAL("LegacyHibernationManagerImpl::handleReadLoop", e);
+    }
+  }));
+}
+
+void LegacyHibernationManagerImpl::addSocket(
+    kj::Own<HibernatableWebSocket> hib, kj::ArrayPtr<kj::String> tags) {
+  auto& refToHibernatable = *hib;
   allWs.push_front(kj::mv(hib));
   refToHibernatable.node = allWs.begin();
 
@@ -206,19 +236,129 @@ void LegacyHibernationManagerImpl::acceptWebSocket(
     tagListItem.list = *list.get();
   }
 
-  // Before starting the readLoop, share ownership of the kj::WebSocket with the
-  // HibernatableWebSocket and accept the api::WebSocket as hibernatable.
-  refToHibernatable.ws =
-      refToHibernatable.activeOrPackage.get<jsg::Ref<api::WebSocket>>()->acceptAsHibernatable(
-          refToHibernatable.getTags());
+}
 
-  // Finally, we initiate the readloop for this HibernatableWebSocket and
-  // give the task to the HibernationManager so it lives long.
-  readLoopTasks.add(handleReadLoop(refToHibernatable).catch_([](kj::Exception&& e) {
-    if (isInterestingException(e)) {
-      LOG_EXCEPTION_IF_INTERNAL("LegacyHibernationManagerImpl::handleReadLoop", e);
+kj::Maybe<kj::StringPtr> LegacyHibernationManagerImpl::stageNodeSocket(
+    jsg::Lock& js, api::WebSocket& peer) {
+  for (auto& socket: allWs) {
+    if (socket->nodeSocket == nullptr || socket->nodeSocket->id().size() != 0) continue;
+    KJ_IF_SOME(active, socket->activeOrPackage.tryGet<jsg::Ref<api::WebSocket>>()) {
+      if (active->isPeerOf(js, peer)) {
+        KJ_REQUIRE(socket->pendingNodeSocket.size() == 0, "WebSocket was already upgraded");
+        socket->pendingNodeSocket = randomUUID(kj::none);
+        socket->nodeSocket->startUpgrade();
+        return socket->pendingNodeSocket.asPtr();
+      }
     }
-  }));
+  }
+  return kj::none;
+}
+
+kj::Promise<void> LegacyHibernationManagerImpl::activateNodeSocket(
+    kj::StringPtr pending, kj::StringPtr invocation) {
+  for (auto& socket: allWs) {
+    if (socket->pendingNodeSocket != pending) continue;
+    KJ_REQUIRE(socket->nodeSocket != nullptr);
+    socket->pendingNodeSocket = nullptr;
+    auto keepAlive = KJ_ASSERT_NONNULL(socket->ws).addRef();
+    auto& transport = *socket->nodeSocket;
+    transport.attach(invocation, invocation);
+    co_await configureNodeSocket(transport);
+    transport.activate();
+    co_return;
+  }
+  KJ_FAIL_REQUIRE("node-owned WebSocket is missing from the admitted actor");
+}
+
+kj::Promise<void> LegacyHibernationManagerImpl::configureNodeSocket(NodeSocket& socket) {
+  return socket.configure(autoResponsePair->request, autoResponsePair->response);
+}
+
+void LegacyHibernationManagerImpl::requireSocketMutationAllowed() const {
+  JSG_REQUIRE(
+      !socketParking, DOMInvalidStateError, "The Durable Object is parking its WebSockets.");
+}
+
+kj::Array<LegacyHibernationManagerImpl::SocketSnapshot>
+LegacyHibernationManagerImpl::snapshotNodeSockets() {
+  kj::Vector<SocketSnapshot> snapshots;
+  for (auto& socket: allWs) {
+    if (socket->nodeSocket == nullptr || socket->nodeSocket->id().size() == 0) continue;
+    SocketSnapshot snapshot{
+      .id = kj::str(socket->nodeSocket->id()),
+      .tags = socket->getTags(),
+      .lastAutoResponse = socket->autoResponseTimestamp,
+      .lastFrame = socket->lastFrame,
+    };
+    KJ_IF_SOME(active, socket->activeOrPackage.tryGet<jsg::Ref<api::WebSocket>>()) {
+      snapshot.attachment = active->getSerializedAttachment().map([](auto bytes) {
+        return kj::heapArray<kj::byte>(bytes);
+      });
+      snapshot.closedOutgoing = active->isOutputClosed();
+    } else {
+      auto& package = socket->activeOrPackage.get<api::WebSocket::HibernationPackage>();
+      snapshot.attachment = package.serializedAttachment.map([](auto& bytes) {
+        return kj::heapArray<kj::byte>(bytes.asPtr());
+      });
+      snapshot.closedOutgoing = package.closedOutgoingConnection;
+    }
+    snapshots.add(kj::mv(snapshot));
+  }
+  return snapshots.releaseAsArray();
+}
+
+bool LegacyHibernationManagerImpl::hasLocalSockets() const {
+  for (const auto& socket: allWs) {
+    if (socket->nodeSocket == nullptr || socket->nodeSocket->id().size() == 0) return true;
+  }
+  return false;
+}
+
+void LegacyHibernationManagerImpl::adoptNodeSocket(
+    SocketSnapshot snapshot, kj::StringPtr invocationId) {
+  KJ_REQUIRE(allWs.size() < ACTIVE_CONNECTION_LIMIT, "too many resumed web sockets");
+  auto transport = KJ_REQUIRE_NONNULL(nodeSockets)();
+  auto& tagList = snapshot.tags;
+  auto socket = kj::heap<HibernatableWebSocket>(api::WebSocket::HibernationPackage{
+    .serializedAttachment = kj::mv(snapshot.attachment),
+    .closedOutgoingConnection = snapshot.closedOutgoing,
+  }, tagList, *this);
+  socket->nodeSocket = transport.get();
+  socket->nodeSocket->attach(snapshot.id, invocationId);
+  socket->nodeSocket->activate();
+  socket->ws = kj::Rc<kj::WebSocket>(kj::mv(transport));
+  socket->autoResponseTimestamp = snapshot.lastAutoResponse;
+  socket->lastFrame = snapshot.lastFrame;
+  addSocket(kj::mv(socket), tagList);
+}
+
+kj::Promise<void> LegacyHibernationManagerImpl::dispatchNodeSocket(
+    WorkerInterface& worker, kj::String id, uint64_t position, kj::Maybe<kj::Date> autoResponse,
+    api::HibernatableSocketParams params) {
+  for (auto& candidate: allWs) {
+    auto& socket = *candidate;
+    if (socket.nodeSocket == nullptr || socket.nodeSocket->id() != id) continue;
+    KJ_REQUIRE(position > socket.lastFrame, "stale socket event");
+    socket.lastFrame = position;
+    socket.autoResponseTimestamp = autoResponse;
+    KJ_IF_SOME(active, socket.activeOrPackage.tryGet<jsg::Ref<api::WebSocket>>()) {
+      active->setAutoResponseStatus(autoResponse, socket.branchWriteBarrier());
+    }
+    const bool terminal = params.isCloseEvent() ||
+        params.eventType.is<api::HibernatableSocketParams::Error>();
+    auto eventId = randomUUID(kj::none);
+    params.websocketId = kj::str(eventId);
+    params.setTimeout(eventTimeoutMs);
+    registerEventWebSocket(kj::str(eventId), socket);
+    KJ_DEFER({
+      cancelEvent(eventId);
+      if (terminal) dropHibernatableWebSocket(socket);
+    });
+    co_await worker.customEvent(
+        kj::rc<api::HibernatableWebSocketCustomEvent>(hibernationEventType, kj::mv(params)).toOwn());
+    co_return;
+  }
+  KJ_FAIL_REQUIRE("node socket is not attached to the admitted actor", id);
 }
 
 kj::Promise<void> LegacyHibernationManagerImpl::handleReadLoop(
@@ -258,15 +398,21 @@ uint64_t LegacyHibernationManagerImpl::getWebSocketCount() const {
 
 void LegacyHibernationManagerImpl::setWebSocketAutoResponse(
     kj::Maybe<kj::StringPtr> request, kj::Maybe<kj::StringPtr> response) {
+  requireSocketMutationAllowed();
   KJ_IF_SOME(req, request) {
     // If we have a request, we must also have a response. If response is kj::none, we'll throw.
     autoResponsePair->request = kj::str(req);
     autoResponsePair->response = kj::str(KJ_REQUIRE_NONNULL(response));
-    return;
+  } else {
+    autoResponsePair->request = kj::none;
+    autoResponsePair->response = kj::none;
   }
-  // If we don't have a request, we must unset both request and response.
-  autoResponsePair->request = kj::none;
-  autoResponsePair->response = kj::none;
+  for (auto& socket: allWs) {
+    if (socket->nodeSocket != nullptr && socket->nodeSocket->id().size() != 0) {
+      readLoopTasks.add(configureNodeSocket(*socket->nodeSocket)
+          .attach(KJ_ASSERT_NONNULL(socket->ws).addRef()));
+    }
+  }
 }
 
 kj::Maybe<jsg::Ref<api::WebSocketRequestResponsePair>> LegacyHibernationManagerImpl::
