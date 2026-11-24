@@ -3,20 +3,51 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "coworkerd-native-sql.h"
+#include "coworkerd-native-sql-spill.h"
 
 #include <sqlite3.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <kj/io.h>
 #include <kj/test.h>
 
+#include <cstdlib>
 #include <thread>
 
 namespace workerd::server {
 namespace {
 
+const bool allocatorInstalled KJ_UNUSED = [] {
+  installSqliteCustomAllocator();
+  return true;
+}();
+
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
+
+class SqlTestDirectory {
+ public:
+  ~SqlTestDirectory() noexcept(false) {
+    directory = nullptr;
+    filesystem->getRoot().remove(path);
+  }
+
+  const kj::Directory& get() const { return *directory; }
+
+ private:
+  kj::Own<kj::Filesystem> filesystem = kj::newDiskFilesystem();
+  kj::Path path = createPath();
+  kj::Own<const kj::Directory> directory = filesystem->getRoot().openSubdir(path, kj::WriteMode::MODIFY);
+
+  kj::Path createPath() {
+    const auto* temporaryDirectory = getenv("TEST_TMPDIR");
+    auto scratch = kj::str(temporaryDirectory != nullptr ? temporaryDirectory : "/tmp",
+        "/workerd-native-sql.XXXXXX");
+    KJ_REQUIRE(mkdtemp(scratch.begin()) != nullptr, "could not make a SQLite spill test directory");
+    return filesystem->getCurrentPath().evalNative(scratch);
+  }
+};
 
 struct Fixture {
   kj::Own<kj::Directory> directory = kj::newInMemoryDirectory(kj::systemPreciseCalendarClock());
@@ -236,6 +267,83 @@ KJ_TEST("bounded native WAL refuses a large commit without publishing its rows")
   if (sqlite3_get_autocommit(db) == 0) db.run("ROLLBACK");
   else db.acknowledgeAutomaticRollback();
   KJ_EXPECT(db.run("SELECT count(*) FROM blobs").getInt(0) == 0);
+}
+
+KJ_TEST("native SQL budgets new WAL frames on disk and removes abandoned bytes") {
+  SqlTestDirectory storage;
+  const auto& directory = storage.get();
+  NativeSqlSpillPool pool(4ull << 20);
+  NativeSqlSpill spill(pool, 2ull << 20, directory, kj::Path({"sql-wal"}));
+  SqliteDatabase::Vfs vfs(directory, {.spillTracker = &spill});
+  SqliteDatabase db(vfs, kj::Path({"sql"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  KJ_REQUIRE(db.run("PRAGMA journal_mode=WAL").getText(0) == "wal");
+  db.run("PRAGMA cache_size=-512; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=OFF");
+  db.run("CREATE TABLE blobs(value BLOB)");
+  auto wal = directory.openFile(kj::Path({"sql-wal"}));
+  auto query = [&](kj::StringPtr body) {
+    return runNativeSql(db, body, true, NativeSqlResults::OBJECTS, Clock::now() + 10s, -1, &spill);
+  };
+  auto insert = R"SQL({"sql":"INSERT INTO blobs VALUES(zeroblob(1048576))"})SQL"_kj;
+  for (unsigned i = 0; i < 65; ++i) KJ_REQUIRE(query(insert).body.starts_with("{\"success\":true"));
+  const auto initial = wal->stat().size;
+  KJ_EXPECT(initial > (64ull << 20));
+  auto refused = query(R"SQL({"sql":"INSERT INTO blobs VALUES(zeroblob(4194304))"})SQL");
+  KJ_EXPECT(refused.status == 507, refused.body.c_str());
+  KJ_EXPECT(refused.body.find("SQL_SPILL_LIMIT_EXCEEDED") != std::string::npos);
+  KJ_EXPECT(wal->stat().size == initial);
+  KJ_EXPECT(pool.size() == 0);
+  KJ_EXPECT(db.run("SELECT count(*) FROM blobs").getInt(0) == 65);
+  KJ_EXPECT(query(insert).body.starts_with("{\"success\":true"));
+  KJ_EXPECT(db.run("SELECT count(*) FROM blobs").getInt(0) == 66);
+}
+
+KJ_TEST("native SQL builds a disk-spilling index on a table larger than the SQLite heap cap") {
+  SqlTestDirectory storage;
+  const auto& directory = storage.get();
+  NativeSqlSpillPool pool(256ull << 20);
+  NativeSqlSpill spill(pool, 256ull << 20, directory, kj::Path({"sql-wal"}));
+  SqliteDatabase::Vfs vfs(directory, {.spillTracker = &spill});
+  constexpr auto heapCap = 32ull << 20;
+  SqliteDatabase db(vfs, kj::Path({"sql"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY, heapCap);
+  KJ_REQUIRE(db.run("PRAGMA journal_mode=WAL").getText(0) == "wal");
+  db.run("PRAGMA temp_store=FILE; PRAGMA cache_spill=ON; PRAGMA cache_size=-512; PRAGMA synchronous=OFF");
+  db.run("CREATE TABLE blobs(payload BLOB)");
+  auto loaded = runNativeSql(db, R"SQL({"sql":"WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<12288) INSERT INTO blobs SELECT randomblob(8192) FROM n"})SQL",
+      true, NativeSqlResults::OBJECTS, Clock::now() + 30s, -1, &spill);
+  KJ_REQUIRE(loaded.body.starts_with("{\"success\":true"), loaded.body.c_str());
+  KJ_REQUIRE(db.run("SELECT sum(length(payload)) FROM blobs").getInt64(0) == 3 * heapCap);
+  const auto idle = db.getSqliteMemoryBytes();
+  sqlite3_int64 initial, peak;
+  sqlite3_status64(SQLITE_STATUS_MEMORY_USED, &initial, &peak, 1);
+  auto reply = runNativeSql(db, R"SQL({"sql":"CREATE INDEX payload_order ON blobs(payload)"})SQL",
+      true, NativeSqlResults::OBJECTS, Clock::now() + 30s, -1, &spill);
+  sqlite3_int64 end;
+  sqlite3_status64(SQLITE_STATUS_MEMORY_USED, &end, &peak, 0);
+  KJ_EXPECT(reply.body.starts_with("{\"success\":true"), reply.body.c_str());
+  KJ_EXPECT(spill.temporaryHighWater() > 0);
+  KJ_EXPECT(pool.size() == 0);
+  KJ_EXPECT(idle > 0 && idle < heapCap);
+  KJ_LOG(INFO, "native SQL index memory and spill", idle, initial, peak, end, spill.temporaryHighWater());
+}
+
+KJ_TEST("native SQL spill accounts for each database and the process together") {
+  auto directory = kj::newInMemoryDirectory(kj::systemPreciseCalendarClock());
+  NativeSqlSpillPool pool(1024);
+  NativeSqlSpill first(pool, 768, *directory, kj::Path({"one-wal"}));
+  NativeSqlSpill second(pool, 768, *directory, kj::Path({"two-wal"}));
+  first.begin();
+  second.begin();
+  KJ_EXPECT(first.writeWal(0, 640));
+  KJ_EXPECT(first.writeWal(32, 256));
+  KJ_EXPECT(!first.resizeTemporary(0, 129));
+  KJ_EXPECT(second.resizeTemporary(0, 384));
+  KJ_EXPECT(!second.writeWal(0, 32));
+  KJ_EXPECT(pool.size() == 1024);
+  first.end(false);
+  KJ_EXPECT(second.writeWal(0, 32));
+  KJ_EXPECT(second.resizeTemporary(384, 0));
+  second.end(true);
+  KJ_EXPECT(pool.size() == 0);
 }
 
 KJ_TEST(

@@ -572,6 +572,7 @@ void DurableLogShipper::reportAfterDatabaseClose() {
 }
 
 void DurableLogShipper::configure(SqliteDatabase& database) {
+  auto memory = database.enterMemoryScope();
   db = &database;
   sqlite3* handle = database;
   // No checkpoint but the ones below: not after a commit, and not when the last connection closes -- the WAL must
@@ -846,6 +847,7 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
   sqlite3* handle = *db;
   if (sqlite3_get_autocommit(handle) == 0) return;
   if (hookFrames != readFrames) return;
+  auto memory = db->enterMemoryScope();
   int64_t start = monoNs();
   int logFrames = -1, checkpointed = -1;
   int rc = sqlite3_wal_checkpoint_v2(handle, "main", SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &checkpointed);

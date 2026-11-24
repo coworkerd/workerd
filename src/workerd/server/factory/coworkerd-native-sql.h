@@ -11,6 +11,8 @@
 
 namespace workerd::server {
 
+class NativeSqlSpill;
+
 inline constexpr auto NATIVE_SQL_LIMIT = std::chrono::seconds(30);
 
 enum class NativeSqlResults { OBJECTS, COLUMNS };
@@ -27,7 +29,9 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
     bool query,
     NativeSqlResults format,
     std::chrono::steady_clock::time_point deadline,
-    int connectionFd = -1);
+    int connectionFd = -1,
+    NativeSqlSpill* spill = nullptr,
+    SqliteMemoryBudget* requestMemory = nullptr);
 
 std::string nativeSqlFailure(kj::StringPtr code, kj::StringPtr reason);
 NativeSqlReply nativeSqlTimeout();

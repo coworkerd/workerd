@@ -15,8 +15,8 @@ namespace workerd::server {
 // node-created volume and attaches its home-local WAL channel to each connection.
 class DurableStorage {
  public:
-  static constexpr uint64_t NATIVE_SQL_MEMORY_BYTES = 64ull << 20;
-  static constexpr uint64_t NATIVE_SQL_WAL_BYTES = 64ull << 20;
+  static constexpr uint64_t NATIVE_SQL_MEMORY_BYTES = 32ull << 20;
+  static constexpr uint64_t NATIVE_SQL_HOME_OVERHEAD = 64ull << 10;
 
   DurableStorage();
   explicit DurableStorage(kj::Own<const kj::Directory> directory);
@@ -25,7 +25,10 @@ class DurableStorage {
       kj::StringPtr storageId,
       SqliteObserver& observer = SqliteObserver::DEFAULT,
       uint facet = 0) const;
-  kj::Own<SqliteDatabase> openNativeSql(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
+  kj::Own<SqliteDatabase::Vfs> nativeSqlVfs(SqliteDatabase::VfsOptions::SpillTracker& tracker,
+      SqliteMemoryBudget& memory) const;
+  kj::Own<SqliteDatabase> openNativeSql(kj::StringPtr uniqueKey, kj::StringPtr storageId,
+      SqliteDatabase::Vfs& vfs) const;
 
   kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
       DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
@@ -49,7 +52,6 @@ class DurableStorage {
   void ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
   kj::Own<const kj::Directory> directory;
   SqliteDatabase::Vfs vfs;
-  SqliteDatabase::Vfs nativeSqlVfs;
 };
 
 }  // namespace workerd::server

@@ -948,9 +948,18 @@ struct SqliteDatabase::VfsOptions {
   // busy disk.
   bool sync = true;
 
-  // Hard limit on the logical length of WAL files opened through this VFS.
-  // An existing longer file can still be read and truncated.
+  // Optional per-file bound for callers that do not use a spill tracker.
   uint64_t maxWalBytes = kj::maxValue;
+
+  // An embedder may associate one tracker with a database's VFS. SQLite
+  // invokes it on the database's own thread, before creating spill bytes.
+  class SpillTracker {
+   public:
+    virtual bool writeWal(uint64_t offset, uint64_t bytes) noexcept = 0;
+    virtual bool resizeTemporary(uint64_t before, uint64_t after) noexcept = 0;
+  };
+  SpillTracker* spillTracker = nullptr;
+  SqliteMemoryBudget* memoryBudget = nullptr;
 };
 
 // Implements a SQLite VFS based on a KJ directory.
@@ -1004,6 +1013,8 @@ class SqliteDatabase::Vfs {
   kj::StringPtr getName() const {
     return name;
   }
+
+  SqliteMemoryBudget* getMemoryBudget() const { return options.memoryBudget; }
 
   KJ_DISALLOW_COPY_AND_MOVE(Vfs);
 
