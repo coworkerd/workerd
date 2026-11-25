@@ -24,6 +24,7 @@
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/coworkerd-rpc-code.h>
 #include <workerd/jsg/setup.h>
+#include <workerd/server/factory/coworkerd-alarm-limit.h>
 #include <workerd/server/factory/coworkerd-durable-admission.h>
 #include <workerd/server/factory/coworkerd-durable-cpu.h>
 #include <workerd/server/factory/coworkerd-durable-placement.h>
@@ -1653,7 +1654,7 @@ struct RequestLimits final: LimitEnforcer {
     return kj::NEVER_DONE;
   }
   kj::Duration getAlarmLimit() override {
-    return 0 * kj::SECONDS;
+    return coworkerdAlarmLimit();
   }
   size_t getBufferingLimit() override {
     return 1 << 20;
