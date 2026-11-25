@@ -21,7 +21,8 @@ class DurableStorage {
   kj::Own<SqliteDatabase> open(kj::StringPtr uniqueKey,
       kj::StringPtr storageId,
       SqliteObserver& observer = SqliteObserver::DEFAULT,
-      uint facet = 0) const;
+      uint facet = 0,
+      uint64_t sqlWalFrameLimitBytes = 0) const;
 
   kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
       DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,

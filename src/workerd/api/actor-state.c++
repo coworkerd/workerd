@@ -19,6 +19,7 @@
 #include <workerd/io/features.h>
 #include <workerd/io/legacy-hibernation-manager.h>
 #include <workerd/io/stored-value.h>
+#include <workerd/jsg/coworkerd-rpc-code.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/ser.h>
 #include <workerd/jsg/util.h>
@@ -743,6 +744,41 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
     jsg::Lock& js, jsg::Function<jsg::JsRef<jsg::JsValue>()> callback) {
   KJ_IF_SOME(sqlite, cache->getSqliteDatabase()) {
     auto& context = IoContext::current();
+
+    if (auto* limit = sqlite.getWalTransactionLimit()) {
+      // Platform SQL needs the SQLite commit to happen here so both a spill
+      // refusal and a refusal during the final commit can reach this caller.
+      // The actor still owns WAL confirmation and locks its output gate.
+      limit->begin();
+      KJ_DEFER(limit->abandon(sqlite));
+      auto started = cache->startTransaction();
+      auto& txn = KJ_REQUIRE_NONNULL(started.tryGet<kj::Own<ActorCacheInterface::Transaction>>());
+      StoredExternalHandler::SyncNestedTransaction syncExternalTxn(
+          context.getActorOrThrow().getOrCreateStoredExternalHandler());
+      return js.tryCatch([&]() {
+        auto result = callback(js);
+        JSG_REQUIRE(!sqlite.observedCriticalError(), Error,
+            "Cannot commit transaction due to an earlier SQL critical error");
+        auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
+        if (budget && budget->hasDeadline() && budget->checkDeadline()) {
+          static constexpr SqlStorageRegulator regulator;
+          kj::throwRecoverableException(regulator.sqlExecutionLimitException(*budget));
+        }
+        KJ_REQUIRE(txn->commit() == kj::none, "synchronous SQL commit unexpectedly deferred");
+        syncExternalTxn.commit();
+        limit->end(sqlite);
+        return kj::mv(result);
+      }, [&](jsg::Value exception) -> jsg::JsRef<jsg::JsValue> {
+        txn = nullptr;  // Roll back before translating the error.
+        if (limit->wasRefused()) {
+          limit->end(sqlite);
+          kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+              KJ_EXCEPTION(FAILED, "jsg.Error: the transaction exceeds one recoverable WAL record"),
+              "SQL_TRANSACTION_TOO_LARGE"));
+        }
+        js.throwException(kj::mv(exception));
+      });
+    }
 
     // SAVEPOINT is a readonly statement, but we need to trigger an outer TRANSACTION
     sqlite.notifyWrite();

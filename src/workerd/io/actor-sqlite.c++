@@ -285,6 +285,13 @@ void ActorSqlite::ExplicitTxn::rollbackImpl() noexcept(false) {
   // Cancel any blocking async tasks that were scheduled as part of the transaction.
   actorSqlite.blockTasks.clear();
 
+  if (parent == kj::none && actorSqlite.db->getWalTransactionLimit() != nullptr) {
+    actorSqlite.db->rollbackWalTransaction();
+    alarmDirty = false;
+    someWriteConfirmed = false;
+    return;
+  }
+
   actorSqlite.db->run(
       {.regulator = SqliteDatabase::TRUSTED}, kj::str("ROLLBACK TO _cf_savepoint_", depth));
   actorSqlite.db->run(

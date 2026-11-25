@@ -44,9 +44,19 @@ void DurableStorage::ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr stor
 }
 
 kj::Own<SqliteDatabase> DurableStorage::open(
-    kj::StringPtr uniqueKey, kj::StringPtr storageId, SqliteObserver& observer, uint facet) const {
+    kj::StringPtr uniqueKey, kj::StringPtr storageId, SqliteObserver& observer, uint facet,
+    uint64_t sqlWalFrameLimitBytes) const {
   ensureNamespace(uniqueKey, storageId);
   const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
+  if (sqlWalFrameLimitBytes != 0) {
+    auto limit = kj::heap<SqliteDatabase::WalTransactionLimit>(sqlWalFrameLimitBytes);
+    auto guardedVfs =
+        kj::heap<SqliteDatabase::Vfs>(*directory, SqliteDatabase::VfsOptions{
+          .walTransactionLimit = limit.get()});
+    auto database = kj::heap<SqliteDatabase>(
+        *guardedVfs, databasePath(uniqueKey, storageId, facet), mode, kj::maxValue, kj::maxValue, observer);
+    return database.attach(kj::mv(guardedVfs).attach(kj::mv(limit)));
+  }
   return kj::heap<SqliteDatabase>(
       vfs, databasePath(uniqueKey, storageId, facet), mode, kj::maxValue, kj::maxValue, observer);
 }
