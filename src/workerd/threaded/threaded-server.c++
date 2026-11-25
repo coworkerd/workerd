@@ -2114,6 +2114,16 @@ bool productPlatformPlan(Json::Reader plan) {
       name.isString() && name.getString() == "coworkerd:platform";
 }
 
+constexpr char PLATFORM_DATABASE_COPY_PREFIX[] = "platform-object-v1:";
+
+bool shouldReleaseDurableCopy(uint32_t reservedTrees, bool hasResidentRoots,
+    const std::string &definition, bool resettingOrExpired) {
+  // The catalog mints tenant fingerprints with a hexadecimal definition hash first.
+  // The platform copy key below is recomputed when the database route is validated.
+  return reservedTrees == 0 && !hasResidentRoots &&
+      (resettingOrExpired || definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX));
+}
+
 std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
     const server::DurableAdmission::Key *object = nullptr) {
   auto namedLimit = [&](kj::StringPtr name) -> uint32_t {
@@ -2129,7 +2139,7 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
       namedLimit("memoryLimitMiB"));
   if (object != nullptr) {
     auto exclusive = kj::str(identity, "\n", object->namespaceId.c_str(), "\n", object->objectId.c_str());
-    return "platform-object-v1:" + digest(exclusive.asBytes());
+    return PLATFORM_DATABASE_COPY_PREFIX + digest(exclusive.asBytes());
   }
   return "platform-v1:" + digest(identity.asBytes());
 }
@@ -3266,8 +3276,11 @@ struct ThreadedServer {
           home.memory >= memory.maximum - memory.maximum / 10 || rejectedGrowth, reclaimed);
       const auto idleMs = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000);
       const auto lastUse = state.durableSlot->lastUseNs.load();
-      releaseCopy = home.reservedTrees == 0 && state.durableRoots.empty() &&
-          (home.pressure.resetting() || (idleMs && nowNs() - lastUse >= idleMs * 1000000));
+      // An empty database copy still charges the process budget. Release it when its
+      // tree retires so a new database can open on an unused home.
+      releaseCopy = shouldReleaseDurableCopy(home.reservedTrees, !state.durableRoots.empty(),
+          state.durableSlot->planRevision,
+          home.pressure.resetting() || (idleMs && nowNs() - lastUse >= idleMs * 1000000));
     }
     if (pressureAction == server::DurablePressure::Action::RESET) {
       for (auto &[tree, root]: state.durableRoots) {
