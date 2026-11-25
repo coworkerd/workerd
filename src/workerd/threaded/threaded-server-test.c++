@@ -41,11 +41,11 @@ void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
 }
 
 KJ_TEST("platform durable plans pin the class and copy to the tenant") {
-  JsonDoc input(kj::str(R"({"workerId":"alpha/__platform","format":"v2","versionId":"build-a",
+  JsonDoc input(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
-  JsonDoc otherTenant(kj::str(R"({"workerId":"beta/__platform","format":"v2","versionId":"build-a",
+  JsonDoc otherTenant(kj::str(R"({"workerId":"beta/:platform","format":"v2","versionId":"build-a",
       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
-  JsonDoc bound(kj::str(R"({"workerId":"alpha/__platform","format":"v2","versionId":"build-a",
+  JsonDoc bound(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
       "variables":[{"name":"TENANT_SECRET","value":"fixture"}]})"));
   JsonDoc alpha(kj::str(R"({"tenant":"alpha","definitionName":"coworkerd:platform-test"})"));

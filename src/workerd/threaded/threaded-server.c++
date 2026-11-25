@@ -2121,7 +2121,7 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan) {
 bool platformDurablePlan(Json::Reader input, Json::Reader plan, Json::Reader selection,
     const DurableRoute &route) {
   const auto tenant = text(plan, "tenant");
-  if (tenant.size() == 0 || text(input, "workerId") != kj::str(tenant, "/__platform") ||
+  if (tenant.size() == 0 || text(input, "workerId") != kj::str(tenant, "/:platform") ||
       text(input, "format") != "v2" || text(selection, "className") != route.open.className.c_str() ||
       platformCopyKey(input, plan) != route.open.definition) return false;
   auto empty = [](Json::Reader value) {
