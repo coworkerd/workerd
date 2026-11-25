@@ -218,6 +218,41 @@ KJ_TEST("a SQL WAL transaction at the record limit commits and an extra frame ro
   KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 3);
 }
 
+KJ_TEST("the SQL WAL shipper splits a group of commits that exceeds the record limit") {
+  auto io = kj::setupAsyncIo();
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  const auto dbPath = kj::Path({"test.db"});
+  const auto walPath = kj::Path({"test.db-wal"});
+  SqliteDatabase::WalTransactionLimit limit(FRAME_SIZE);
+  SqliteDatabase::Vfs vfs(*dir, {.walTransactionLimit = &limit});
+  SqliteDatabase db(vfs, dbPath.clone(), CREATE_OR_MODIFY);
+  db.run("PRAGMA page_size = 4096; CREATE TABLE entries (value INTEGER); INSERT INTO entries VALUES (0)");
+  db.run("PRAGMA journal_mode = WAL");
+  RecordingChannel channel;
+  DurableLogShipper shipper(*dir, walPath.clone(), dbPath.clone(),
+      {.objectName = kj::str(OBJECT_NAME), .storageId = kj::str(STORAGE_ID)}, db,
+      io.provider->getTimer(), channel);
+
+  // Leave both commits for a single shipper callback. Each changes the same
+  // leaf page and fits on its own.
+  for (int value: {1, 2}) {
+    limit.begin();
+    db.run("SAVEPOINT ledger");
+    db.run("UPDATE entries SET value = ?", value);
+    db.run("RELEASE ledger");
+    KJ_EXPECT(!limit.wasRefused());
+    limit.end(db);
+  }
+  const auto wal = dir->openFile(walPath)->readAllBytes();
+  KJ_ASSERT(wal.size() == WAL_HEADER_SIZE + 2 * FRAME_SIZE);
+  const auto header = wal.first(WAL_HEADER_SIZE);
+  const auto frames = wal.slice(WAL_HEADER_SIZE);
+  shipper.onCommit().wait(io.waitScope);
+  KJ_ASSERT(channel.frames.size() == 2);
+  expectFrames(channel.frames[0], header, 1, frames.first(FRAME_SIZE), 1, true);
+  expectFrames(channel.frames[1], header, 2, frames.slice(FRAME_SIZE), 2, false);
+}
+
 KJ_TEST("cold WAL scan and shipper agree on the last complete SQLite commit") {
   auto io = kj::setupAsyncIo();
   auto dir = kj::newInMemoryDirectory(kj::nullClock());

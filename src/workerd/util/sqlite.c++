@@ -986,6 +986,18 @@ void SqliteDatabase::WalTransactionLimit::end(SqliteDatabase& db) {
   }
 }
 
+void SqliteDatabase::WalTransactionLimit::abandon(SqliteDatabase& db) noexcept {
+  const bool unfinishedRefusal = wasRefused();
+  active = false;
+  if (unfinishedRefusal) {
+    // Rollback can fail while another exception is unwinding. Record the
+    // SQLite state while preserving the original exception.
+    kj::runCatchingExceptions([&] {
+      KJ_LOG(ERROR, "SQL WAL refusal cleanup did not finish", sqlite3_get_autocommit(db));
+    });
+  }
+}
+
 void SqliteDatabase::notifyWrite(bool allowUnconfirmed) {
   KJ_IF_SOME(cb, onWriteCallback) {
     cb(allowUnconfirmed);

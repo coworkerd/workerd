@@ -750,7 +750,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
       // refusal and a refusal during the final commit can reach this caller.
       // The actor still owns WAL confirmation and locks its output gate.
       limit->begin();
-      KJ_DEFER(limit->end(sqlite));
+      KJ_DEFER(limit->abandon(sqlite));
       auto started = cache->startTransaction();
       auto& txn = KJ_REQUIRE_NONNULL(started.tryGet<kj::Own<ActorCacheInterface::Transaction>>());
       StoredExternalHandler::SyncNestedTransaction syncExternalTxn(
@@ -766,6 +766,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
         }
         KJ_REQUIRE(txn->commit() == kj::none, "synchronous SQL commit unexpectedly deferred");
         syncExternalTxn.commit();
+        limit->end(sqlite);
         return kj::mv(result);
       }, [&](jsg::Value exception) -> jsg::JsRef<jsg::JsValue> {
         txn = nullptr;  // Roll back before translating the error.
