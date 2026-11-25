@@ -1651,7 +1651,7 @@ struct RequestLimits final: LimitEnforcer {
     };
     kj::Promise<void> wait = nullptr;
     KJ_IF_SOME(ended, measurement.responseEnded) {
-      wait = ended.addBranch().then(deadline);
+      wait = ended.addBranch().then(kj::mv(deadline));
     } else {
       wait = deadline();
     }
