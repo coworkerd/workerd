@@ -1649,8 +1649,12 @@ struct RequestLimits final: LimitEnforcer {
     auto deadline = [this]() {
       return timer.timer.atTime(kj::max(kj::systemPreciseMonotonicClock().now(), timer.timer.now()) + WAIT_UNTIL_LIMIT);
     };
-    auto wait = measurement.responseEnded.map([&](auto &ended) { return ended.addBranch().then(deadline); })
-        .orDefault([&]() { return deadline(); });
+    kj::Promise<void> wait = nullptr;
+    KJ_IF_SOME(ended, measurement.responseEnded) {
+      wait = ended.addBranch().then(deadline);
+    } else {
+      wait = deadline();
+    }
     KJ_IF_SOME(ended, measurement.requestLeaseEnded) {
       return kj::mv(wait).exclusiveJoin(ended.addBranch());
     }
