@@ -84,6 +84,16 @@ KJ_TEST("platform databases require a copy pinned to the specific object") {
   KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
 }
 
+KJ_TEST("an exclusive database copy keeps its isolate while the home has a reservation") {
+  const auto database = PLATFORM_DATABASE_COPY_PREFIX + std::string(64, 'a');
+  const auto tenant = std::string(64, 'a') + ":" + std::string(64, 'b');
+  KJ_EXPECT(!shouldReleaseDurableCopy(1, false, database, false));
+  KJ_EXPECT(!shouldReleaseDurableCopy(0, true, database, false));
+  KJ_EXPECT(shouldReleaseDurableCopy(0, false, database, false));
+  KJ_EXPECT(!shouldReleaseDurableCopy(0, false, tenant, false));
+  KJ_EXPECT(shouldReleaseDurableCopy(0, false, tenant, true));
+}
+
 KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
   int fds[2];
   KJ_SYSCALL(pipe(fds));
