@@ -40,6 +40,31 @@ void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
   limits.customizeIsolate(isolate);
 }
 
+KJ_TEST("platform durable plans pin the class and copy to the tenant") {
+  JsonDoc input(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
+  JsonDoc otherTenant(kj::str(R"({"workerId":"beta/:platform","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
+  JsonDoc bound(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
+      "variables":[{"name":"TENANT_SECRET","value":"fixture"}]})"));
+  JsonDoc alpha(kj::str(R"({"tenant":"alpha","definitionName":"coworkerd:platform-test"})"));
+  JsonDoc beta(kj::str(R"({"tenant":"beta","definitionName":"coworkerd:platform-test"})"));
+  JsonDoc selection(kj::str(R"({"className":"Store"})"));
+  JsonDoc otherClass(kj::str(R"({"className":"Other"})"));
+  DurableRoute route{};
+  route.open.className = "Store";
+  route.open.definition = platformCopyKey(input.get(), alpha.get());
+  KJ_EXPECT(platformDurablePlan(input.get(), alpha.get(), selection.get(), route));
+  KJ_EXPECT(platformCopyKey(otherTenant.get(), beta.get()) != route.open.definition);
+  KJ_EXPECT(!platformDurablePlan(otherTenant.get(), beta.get(), selection.get(), route));
+  KJ_EXPECT(!platformDurablePlan(input.get(), beta.get(), selection.get(), route));
+  KJ_EXPECT(!platformDurablePlan(input.get(), alpha.get(), otherClass.get(), route));
+  KJ_EXPECT(!platformDurablePlan(bound.get(), alpha.get(), selection.get(), route));
+  route.open.definition = "wrong pin";
+  KJ_EXPECT(!platformDurablePlan(input.get(), alpha.get(), selection.get(), route));
+}
+
 KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
   int fds[2];
   KJ_SYSCALL(pipe(fds));
