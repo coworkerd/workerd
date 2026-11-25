@@ -137,6 +137,7 @@ kj_test(
 wd_cc_library(
     name = "coworkerd-alarm-limit",
     hdrs = ["coworkerd-alarm-limit.h"],
+    visibility = ["//src/workerd/server:__subpackages__", "//src/workerd/threaded:__pkg__"],
     deps = ["@capnp-cpp//src/kj"],
 )
 

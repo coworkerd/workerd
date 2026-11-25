@@ -1640,15 +1640,11 @@ struct RequestLimits final: LimitEnforcer {
     unsupported("analytics");
   }
   kj::Promise<void> limitDrain() override {
-    // Called when the handler has returned. A lease expires the authority to
-    // make child calls, not this invocation's waitUntil work, which keeps its
-    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT after the
-    // response ended: as on Cloudflare, once the response is sent -- a
-    // streamed body to its end -- or the client disconnected, not when the
-    // handler returned the response (v138 section 4). KJ's timer does not
-    // advance while JavaScript runs, so the deadline is taken from the
-    // monotonic clock (or the timer, if that is ahead), not as a delay from the
-    // timer's cached time.
+    // This invocation keeps its CPU and heap limits while draining. A live
+    // request may end the drain sooner than the per-invocation ceiling. That
+    // ceiling starts once the response body finishes or the client disconnects
+    // (v138 section 4). KJ's timer does not advance while JavaScript runs, so
+    // take the deadline from the monotonic clock (or the timer if it is ahead).
     if (drainLimitDisabledForTest()) return kj::NEVER_DONE;
     auto deadline = [this]() {
       return timer.timer.atTime(kj::max(kj::systemPreciseMonotonicClock().now(), timer.timer.now()) + WAIT_UNTIL_LIMIT);
