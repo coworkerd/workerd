@@ -2816,6 +2816,7 @@ struct ThreadedServer {
     size_t offset = 0;
     for (;;) {
       bool pending;
+      bool retry = false;
       {
         std::lock_guard lock(budgetReleaseMutex);
         while (!budgetReleases.empty()) {
@@ -2825,9 +2826,9 @@ struct ThreadedServer {
           if (written < 0 && errno == EINTR) continue;
           if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
           if (written <= 0) {
-            // EOF tells the node to drop all tickets for this generation.
-            (void)shutdown(parent, SHUT_WR);
-            return;
+            if (written < 0 && (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)) return;
+            retry = true;
+            break;
           }
           offset += written;
           if (offset == sizeof(uint64_t)) {
@@ -2837,15 +2838,18 @@ struct ThreadedServer {
         }
         pending = !budgetReleases.empty();
       }
+      // Keep a partially sent ticket at the front until the parent receives it.
+      if (retry) {
+        (void)poll(nullptr, 0, 10);
+        continue;
+      }
       pollfd waits[] = {{managerWake, POLLIN, 0}, {parent, short(pending ? POLLOUT : 0), 0}};
       int result;
       do {
         result = poll(waits, 2, -1);
       } while (result < 0 && errno == EINTR);
-      if (result < 0 || (waits[1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
-        (void)shutdown(parent, SHUT_WR);
-        return;
-      }
+      if (result >= 0 && (waits[1].revents & POLLHUP)) return;
+      if (result < 0 || (waits[1].revents & (POLLERR | POLLNVAL))) (void)poll(nullptr, 0, 10);
       uint64_t count;
       while (read(managerWake, &count, sizeof(count)) > 0) {}
     }
