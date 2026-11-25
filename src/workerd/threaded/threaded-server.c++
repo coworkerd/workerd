@@ -2121,6 +2121,16 @@ bool productPlatformPlan(Json::Reader plan) {
       name.isString() && name.getString() == "coworkerd:platform";
 }
 
+constexpr char PLATFORM_DATABASE_COPY_PREFIX[] = "platform-object-v1:";
+
+bool shouldReleaseDurableCopy(uint32_t reservedTrees, bool hasResidentRoots,
+    const std::string &definition, bool resettingOrExpired) {
+  // The catalog mints tenant fingerprints with a hexadecimal definition hash first.
+  // The platform copy key below is recomputed when the database route is validated.
+  return reservedTrees == 0 && !hasResidentRoots &&
+      (resettingOrExpired || definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX));
+}
+
 std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
     const server::DurableAdmission::Key *object = nullptr) {
   auto namedLimit = [&](kj::StringPtr name) -> uint32_t {
@@ -2136,7 +2146,7 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
       namedLimit("memoryLimitMiB"));
   if (object != nullptr) {
     auto exclusive = kj::str(identity, "\n", object->namespaceId.c_str(), "\n", object->objectId.c_str());
-    return "platform-object-v1:" + digest(exclusive.asBytes());
+    return PLATFORM_DATABASE_COPY_PREFIX + digest(exclusive.asBytes());
   }
   return "platform-v1:" + digest(identity.asBytes());
 }
@@ -3290,8 +3300,11 @@ struct ThreadedServer {
           home.memory >= memory.maximum - memory.maximum / 10 || rejectedGrowth, reclaimed);
       const auto idleMs = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000);
       const auto lastUse = state.durableSlot->lastUseNs.load();
-      releaseCopy = home.reservedTrees == 0 && state.durableRoots.empty() &&
-          (home.pressure.resetting() || (idleMs && nowNs() - lastUse >= idleMs * 1000000));
+      // An empty database copy still charges the process budget. Release it when its
+      // tree retires so a new database can open on an unused home.
+      releaseCopy = shouldReleaseDurableCopy(home.reservedTrees, !state.durableRoots.empty(),
+          state.durableSlot->planRevision,
+          home.pressure.resetting() || (idleMs && nowNs() - lastUse >= idleMs * 1000000));
     }
     if (pressureAction == server::DurablePressure::Action::RESET) {
       for (auto &[tree, root]: state.durableRoots) {
@@ -6217,7 +6230,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     uint parentFacet = 0,
     kj::StringPtr facetName = ""_kj,
     server::DurableWalPosition position = {},
-    bool platformDatabase = false);
+    bool platformDatabase = false,
+    uint64_t sqlWalFrameLimitBytes = 0);
 
 class LocalFacet final: public IoChannelFactory::ActorChannel {
  public:
@@ -6649,17 +6663,19 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     uint parentFacet,
     kj::StringPtr facetName,
     server::DurableWalPosition position,
-    bool platformDatabase) {
+    bool platformDatabase,
+    uint64_t sqlWalFrameLimitBytes) {
   auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth);
   auto *borrowedHooks = hooks.get();
   auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
   auto *borrowedObserver = observer.get();
   if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
-  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName), position, borrowedHooks](const ActorCache::SharedLru &, OutputGate &gate,
+  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName), position, borrowedHooks,
+                       sqlWalFrameLimitBytes](const ActorCache::SharedLru &, OutputGate &gate,
                        ActorCache::Hooks &,
                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
     const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
-    auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet);
+    auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet, sqlWalFrameLimitBytes);
     if (tree->state.wal) {
       auto shipper = tree->storage().ship(tree->uniqueKey,
           {.objectName = kj::str(tree->objectName), .storageId = kj::str(tree->storageId),
@@ -6744,6 +6760,10 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
       "durable routing descriptor mismatch");
   const bool platformDatabase = kind == "platformDurable" && productPlatformPlan(plan) &&
       route.open.className == "SqlDatabase";
+  const auto sqlWalFrameLimitBytes = platformDatabase && server.durableLog
+      ? durableNumber(input, "sqlWalFrameLimitBytes") : 0;
+  KJ_REQUIRE(!platformDatabase || !server.durableLog || sqlWalFrameLimitBytes > 0,
+      "missing SQL WAL frame limit");
   std::shared_ptr<SqlExecutionBudget> sqlDeadline;
   kj::Maybe<kj::TimePoint> sqlExpires;
   if (field(input, "sqlDeadlineMonotonicNs").isString()) {
@@ -6810,7 +6830,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
     });
     auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
         Worker::Actor::Id(kj::mv(actorId)), route.open.className.c_str(), Frankenvalue(), 0, 0,
-        nullptr, 0, ""_kj, position, platformDatabase);
+        nullptr, 0, ""_kj, position, platformDatabase, sqlWalFrameLimitBytes);
     found = state.durableRoots
                 .emplace(ticket.tree,
                     ThreadState::DurableRoot{
