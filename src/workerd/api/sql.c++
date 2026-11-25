@@ -157,8 +157,19 @@ std::shared_ptr<SqlExecutionBudget> SqlStorageRegulator::getSqlExecutionBudget()
 
 kj::Exception SqlStorageRegulator::sqlExecutionLimitException(
     const SqlExecutionBudget& budget) const {
+  if (budget.getCause() == SqlExecutionBudget::Cause::DISCONNECTED) {
+    return jsg::tagCoworkerdRpcError(KJ_EXCEPTION(DISCONNECTED, "jsg.Error: SQL client disconnected"),
+        "SQL_CLIENT_DISCONNECTED");
+  }
   return jsg::tagCoworkerdRpcError(
       KJ_EXCEPTION(OVERLOADED, kj::str("jsg.Error: ", budget.describe())), "SQL_LIMIT_EXCEEDED");
+}
+
+void SqlStorage::checkExecutionDeadline() {
+  auto budget = regulator.getSqlExecutionBudget();
+  if (budget && budget->hasDeadline() && budget->checkDeadline()) {
+    kj::throwRecoverableException(regulator.sqlExecutionLimitException(*budget));
+  }
 }
 
 void SqlStorage::abortExecutionLimit(jsg::Lock& js) {

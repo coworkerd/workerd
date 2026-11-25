@@ -72,6 +72,7 @@ ActorSqlite::ImplicitTxn::ImplicitTxn(ActorSqlite& parent): parent(parent) {
 ActorSqlite::ImplicitTxn::~ImplicitTxn() noexcept(false) {
   KJ_IF_SOME(c, parent.currentTxn.tryGet<ImplicitTxn*>()) {
     if (c == this) {
+      parent.db->clearCommitCheck();
       parent.currentTxn.init<NoTxn>();
     }
   }
@@ -87,6 +88,7 @@ ActorSqlite::ImplicitTxn::~ImplicitTxn() noexcept(false) {
 void ActorSqlite::ImplicitTxn::commit() {
   // Ignore redundant commit()s.
   if (!committed) {
+    parent.db->checkCommit();
     parent.commitTxn.run();
     committed = true;
   }

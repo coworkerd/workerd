@@ -43,6 +43,7 @@ class SqlStorage final: public jsg::Object {
   jsg::Ref<Cursor> exec(jsg::Lock& js, jsg::JsString query, jsg::Arguments<BindingValue> bindings);
   IngestResult ingest(jsg::Lock& js, kj::String query);
   void abortExecutionLimit(jsg::Lock& js);
+  void checkExecutionDeadline();
   void setMaxPageCountForTest(jsg::Lock& js, int count);
 
   jsg::Ref<Statement> prepare(jsg::Lock& js, jsg::JsString query);
@@ -54,6 +55,7 @@ class SqlStorage final: public jsg::Object {
 
     if (flags.getWorkerdExperimental()) {
       JSG_METHOD(abortExecutionLimit);
+      JSG_METHOD(checkExecutionDeadline);
       // Prepared statement API is experimental-only and deprecated. exec() will automatically
       // handle caching prepared statements, so apps don't need to worry about it.
       JSG_METHOD(prepare);
