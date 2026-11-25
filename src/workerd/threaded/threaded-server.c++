@@ -1984,7 +1984,7 @@ kj::String invocationIdentity(Slot &slot, Json::Reader descriptor) {
 }
 
 CompatibilityFlags::Builder compileTenantFlags(
-    Slot &slot, Json::Reader descriptor, Reporter &reporter) {
+    Slot &slot, Json::Reader descriptor, Reporter &reporter, bool productPlatform = false) {
   // Compatibility flags are tenant validation, before package decoding.
   slot.loadStage = threaded::LoadStage::EVALUATION;
   auto flags = slot.flagsArena.initRoot<CompatibilityFlags>();
@@ -2001,8 +2001,11 @@ CompatibilityFlags::Builder compileTenantFlags(
       list.set(i++, item.getString());
     }
   }
+  // The product SQL class uses the same experimental SQL methods as the upstream runtime.
+  const kj::StringPtr permittedPlatformFlags[] = {"experimental"};
   compileCompatibilityFlags(text(descriptor, "compatibilityDate"), list.asReader(), flags, reporter,
-      false, CompatibilityDateValidation::CODE_VERSION, {});
+      false, CompatibilityDateValidation::CODE_VERSION,
+      productPlatform ? kj::arrayPtr(permittedPlatformFlags, 1) : kj::ArrayPtr<const kj::StringPtr>());
   reporter.requireValid();
   if (flags.getPreciseTimers()) unsupported("precise_timers is disabled for tenants");
   return flags;
@@ -2104,7 +2107,15 @@ std::string digest(kj::ArrayPtr<const kj::byte> value) {
   return kj::encodeHex(result).cStr();
 }
 
-std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan) {
+bool productPlatformPlan(Json::Reader plan) {
+  auto kind = field(plan, "kind");
+  auto name = field(plan, "definitionName");
+  return kind.isString() && kind.getString() == "platformDurable" &&
+      name.isString() && name.getString() == "coworkerd:platform";
+}
+
+std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
+    const server::DurableAdmission::Key *object = nullptr) {
   auto namedLimit = [&](kj::StringPtr name) -> uint32_t {
     auto value = field(descriptor, name);
     if (value.isNull()) return 0;
@@ -2116,15 +2127,22 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan) {
       text(descriptor, "versionId"), "\n", text(descriptor, "definitionHash"), "\n",
       text(descriptor, "contentHash"), "\n", namedLimit("cpuLimitMs"), "\n",
       namedLimit("memoryLimitMiB"));
+  if (object != nullptr) {
+    auto exclusive = kj::str(identity, "\n", object->namespaceId.c_str(), "\n", object->objectId.c_str());
+    return "platform-object-v1:" + digest(exclusive.asBytes());
+  }
   return "platform-v1:" + digest(identity.asBytes());
 }
 
 bool platformDurablePlan(Json::Reader input, Json::Reader plan, Json::Reader selection,
     const DurableRoute &route) {
   const auto tenant = text(plan, "tenant");
+  const auto database = field(field(input, "durableObject"), "database");
+  const bool isDatabase = database.isString() && database.getString().size() > 0;
+  if (isDatabase != (productPlatformPlan(plan) && route.open.className == "SqlDatabase")) return false;
   if (tenant.size() == 0 || text(input, "workerId") != kj::str(tenant, "/:platform") ||
       text(input, "format") != "v2" || text(selection, "className") != route.open.className.c_str() ||
-      platformCopyKey(input, plan) != route.open.definition) return false;
+      platformCopyKey(input, plan, isDatabase ? &route.key : nullptr) != route.open.definition) return false;
   auto empty = [](Json::Reader value) {
     return value.isNull() || (value.isArray() && value.getArray().size() == 0);
   };
@@ -3632,7 +3650,9 @@ struct ThreadedServer {
   kj::Own<Worker> compile(Slot &slot, Json::Reader descriptor, kj::StringPtr source) {
     slot.loadStage = threaded::LoadStage::PACKAGE;
     Reporter reporter;
-    auto flags = compileTenantFlags(slot, descriptor, reporter);
+    // A durable package reaches this compiler after DurableBootstrap has checked the trusted root plan.
+    const bool productPlatform = slot.resetDurableRoot && productPlatformPlan(field(descriptor, "rootPlan"));
+    auto flags = compileTenantFlags(slot, descriptor, reporter, productPlatform);
     auto config = slot.configArena.initRoot<server::config::Worker>();
     auto main = text(descriptor, "mainModule");
     if (field(descriptor, "format").isString() && text(descriptor, "format") == "v2") {

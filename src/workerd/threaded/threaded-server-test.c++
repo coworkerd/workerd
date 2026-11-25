@@ -65,6 +65,25 @@ KJ_TEST("platform durable plans pin the class and copy to the tenant") {
   KJ_EXPECT(!platformDurablePlan(input.get(), alpha.get(), selection.get(), route));
 }
 
+KJ_TEST("platform databases require a copy pinned to the specific object") {
+  JsonDoc input(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
+      "durableObject":{"database":"first"}})"));
+  JsonDoc plan(kj::str(R"({"kind":"platformDurable","definitionName":"coworkerd:platform","tenant":"alpha"})"));
+  JsonDoc selection(kj::str(R"({"className":"SqlDatabase"})"));
+  DurableRoute route{};
+  route.key = {"namespace-one", "object-one"};
+  route.open.className = "SqlDatabase";
+  route.open.definition = platformCopyKey(input.get(), plan.get());
+  KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
+  route.open.definition = platformCopyKey(input.get(), plan.get(), &route.key);
+  KJ_EXPECT(platformDurablePlan(input.get(), plan.get(), selection.get(), route));
+  route.key.namespaceId = "namespace-two";
+  KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
+  route.key = {"namespace-one", "object-two"};
+  KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
+}
+
 KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
   int fds[2];
   KJ_SYSCALL(pipe(fds));
