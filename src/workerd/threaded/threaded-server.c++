@@ -75,6 +75,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -2100,6 +2101,35 @@ std::string digest(kj::ArrayPtr<const kj::byte> value) {
   kj::byte result[SHA256_DIGEST_LENGTH];
   SHA256(value.begin(), value.size(), result);
   return kj::encodeHex(result).cStr();
+}
+
+std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan) {
+  auto namedLimit = [&](kj::StringPtr name) -> uint32_t {
+    auto value = field(descriptor, name);
+    if (value.isNull()) return 0;
+    KJ_REQUIRE(value.isNumber() && value.getNumber() >= 0 && value.getNumber() <= UINT32_MAX &&
+        std::floor(value.getNumber()) == value.getNumber(), "invalid platform object limit", name);
+    return uint32_t(value.getNumber());
+  };
+  auto identity = kj::str(text(plan, "tenant"), "\n", text(plan, "definitionName"), "\n",
+      text(descriptor, "versionId"), "\n", text(descriptor, "definitionHash"), "\n",
+      text(descriptor, "contentHash"), "\n", namedLimit("cpuLimitMs"), "\n",
+      namedLimit("memoryLimitMiB"));
+  return "platform-v1:" + digest(identity.asBytes());
+}
+
+bool platformDurablePlan(Json::Reader input, Json::Reader plan, Json::Reader selection,
+    const DurableRoute &route) {
+  const auto tenant = text(plan, "tenant");
+  if (tenant.size() == 0 || text(input, "workerId") != kj::str(tenant, "/__platform") ||
+      text(input, "format") != "v2" || text(selection, "className") != route.open.className.c_str() ||
+      platformCopyKey(input, plan) != route.open.definition) return false;
+  auto empty = [](Json::Reader value) {
+    return value.isNull() || (value.isArray() && value.getArray().size() == 0);
+  };
+  return empty(field(input, "variables")) && empty(field(input, "secrets")) &&
+      empty(field(input, "nativeNamespaces")) && empty(field(plan, "serviceBindings")) &&
+      empty(field(plan, "durableObjects"));
 }
 std::string decode64(kj::StringPtr input) {
   KJ_REQUIRE(input.size() % 4 == 0, "invalid module encoding");
@@ -6551,12 +6581,14 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
   auto input = full.get();
   auto selection = field(input, "rootSelection");
   auto plan = field(input, "rootPlan");
+  const auto kind = text(plan, "kind");
   KJ_REQUIRE(readDurableRoute(field(input, "durableTestRoute")) == route &&
           flag(selection, "dispatchChecked") &&
           str(selection, "namespaceId") == route.key.namespaceId &&
           str(selection, "objectId") == route.key.objectId &&
           durableNumber(selection, "dataEpoch") == route.open.dataEpoch &&
-          text(plan, "kind") == "tenant" &&
+          (kind == "tenant" || (kind == "platformDurable" &&
+              platformDurablePlan(input, plan, selection, route))) &&
           str(plan, "versionFingerprint") == route.open.definition &&
           route.uniqueKey == "coworkerd-do-root-v1-" + route.key.namespaceId,
       "durable routing descriptor mismatch");
