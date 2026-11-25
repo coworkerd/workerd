@@ -144,6 +144,13 @@ std::optional<DurableAdmission::Ticket> DurableAdmission::next(uint64_t tree) co
   return Ticket{tree, pending->first};
 }
 
+bool DurableAdmission::hasActiveEvent(uint64_t tree) const {
+  auto entry = trees.find(tree);
+  if (entry == trees.end()) return false;
+  const auto& events = entry->second.events;
+  return !events.empty() && events.begin()->second.phase != Phase::WAITING;
+}
+
 DurableAdmission::Delivery DurableAdmission::begin(
     Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now) {
   auto entry = trees.find(ticket.tree);

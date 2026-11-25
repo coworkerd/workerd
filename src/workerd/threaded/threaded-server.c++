@@ -1923,6 +1923,8 @@ struct JsonDoc {
   }
 };
 
+constexpr auto DATABASE_SQL_WALL_LIMIT = 30 * kj::SECONDS;
+
 struct DurableRoute {
   server::DurableAdmission::Key key;
   server::DurableAdmission::Open open;
@@ -2953,8 +2955,8 @@ struct ThreadedServer {
     durableWaiters.erase(at);
   }
 
-  kj::Promise<void> admitDurableEvent(
-      ThreadState &state, const DurableRoute &route, server::DurableAdmission::Ticket ticket) {
+  kj::Promise<void> admitDurableEvent(ThreadState &state, const DurableRoute &route,
+      server::DurableAdmission::Ticket ticket, bool platformDatabase) {
     using Admission = server::DurableAdmission;
     for (;;) {
       auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
@@ -2965,7 +2967,9 @@ struct ThreadedServer {
           kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
               KJ_EXCEPTION(OVERLOADED, "durable object reset is draining"), "DO_UNAVAILABLE"));
         }
-        if (first == ticket) {
+        // Let the previous database response leave its home before the next
+        // synchronous query can block that home's event loop.
+        if (first == ticket && !(platformDatabase && durableAdmission->hasActiveEvent(ticket.tree))) {
           const auto delivery = durableAdmission->begin(
               ticket, state.durableHome, route.key, route.open, Admission::Clock::now());
           if (delivery == Admission::Delivery::EXPIRED) {
@@ -6115,7 +6119,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     std::shared_ptr<DurableFacetReservation> reservation = nullptr,
     uint parentFacet = 0,
     kj::StringPtr facetName = ""_kj,
-    server::DurableWalPosition position = {});
+    server::DurableWalPosition position = {},
+    bool platformDatabase = false);
 
 class LocalFacet final: public IoChannelFactory::ActorChannel {
  public:
@@ -6544,7 +6549,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     std::shared_ptr<DurableFacetReservation> reservation,
     uint parentFacet,
     kj::StringPtr facetName,
-    server::DurableWalPosition position) {
+    server::DurableWalPosition position,
+    bool platformDatabase) {
   auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth);
   auto *borrowedHooks = hooks.get();
   auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
@@ -6593,6 +6599,12 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
       className, kj::mv(props), kj::mv(makeStorage), kj::mv(hooks), tree->state.timer,
       kj::mv(observer), kj::none, kj::none, kj::none, jsg::Dict<kj::String>{}, *borrowedHooks,
       kj::none, kj::none, kj::heap<DurablePendingOperations>(tree->idle));
+  if (platformDatabase && tree->server.durableLog) {
+    // The output gate locks on the first write. Let both the SQL work and
+    // the subsequent WAL confirmation use their separate time windows.
+    actor->setOutputGateTimeout(
+        DATABASE_SQL_WALL_LIMIT + tree->server.durableLog->confirmationTimeout() + kj::SECONDS);
+  }
   borrowedObserver->bind(*actor);
   return {kj::mv(actor), borrowedHooks};
 }
@@ -6631,14 +6643,18 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
           str(plan, "versionFingerprint") == route.open.definition &&
           route.uniqueKey == "coworkerd-do-root-v1-" + route.key.namespaceId,
       "durable routing descriptor mismatch");
+  const bool platformDatabase = kind == "platformDurable" && productPlatformPlan(plan) &&
+      route.open.className == "SqlDatabase";
   std::shared_ptr<SqlExecutionBudget> sqlDeadline;
+  kj::Maybe<kj::TimePoint> sqlExpires;
   if (field(input, "sqlDeadlineMonotonicNs").isString()) {
-    KJ_REQUIRE(kind == "platformDurable" && productPlatformPlan(plan) &&
-        route.open.className == "SqlDatabase" && !field(input, "durableAlarm").isObject(),
+    KJ_REQUIRE(platformDatabase && !field(input, "durableAlarm").isObject(),
         "SQL deadline requires a platform database query");
-    constexpr uint64_t SQL_LIMIT_NS = 30000000000;
+    constexpr uint64_t SQL_LIMIT_NS = DATABASE_SQL_WALL_LIMIT / kj::NANOSECONDS;
     const auto expires = durableNumber(input, "sqlDeadlineMonotonicNs");
-    KJ_REQUIRE(expires <= nowNs() + SQL_LIMIT_NS, "invalid SQL deadline");
+    const auto now = nowNs();
+    KJ_REQUIRE(expires <= now + SQL_LIMIT_NS, "invalid SQL deadline");
+    sqlExpires = kj::systemPreciseMonotonicClock().now() + (expires > now ? expires - now : 0) * kj::NANOSECONDS;
     sqlDeadline = std::make_shared<SqlExecutionBudget>(SQL_LIMIT_NS,
         [expires, weak = std::weak_ptr(scope)]() noexcept {
       const auto now = nowNs();
@@ -6657,7 +6673,14 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
     }
   };
   checkSqlDeadline();
-  co_await server.admitDurableEvent(state, route, ticket);
+  auto admission = server.admitDurableEvent(state, route, ticket, platformDatabase);
+  KJ_IF_SOME(expires, sqlExpires) {
+    admission = admission.exclusiveJoin(state.io.provider->getTimer().atTime(expires).then([] {
+      kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+          KJ_EXCEPTION(OVERLOADED, "SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded"), "SQL_LIMIT_EXCEEDED"));
+    }));
+  }
+  co_await admission;
   checkSqlDeadline();
   auto slot = co_await server.getDurableWorker(state, descriptor, route.open.definition);
   KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
@@ -6688,7 +6711,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
     });
     auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
         Worker::Actor::Id(kj::mv(actorId)), route.open.className.c_str(), Frankenvalue(), 0, 0,
-        nullptr, 0, ""_kj, position);
+        nullptr, 0, ""_kj, position, platformDatabase);
     found = state.durableRoots
                 .emplace(ticket.tree,
                     ThreadState::DurableRoot{

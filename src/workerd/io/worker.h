@@ -1204,6 +1204,7 @@ class Worker::Actor final: public kj::Refcounted {
 
   InputGate& getInputGate();
   OutputGate& getOutputGate();
+  void setOutputGateTimeout(kj::Duration timeout);
 
   // Get the IoContext which should be used for all activity in this Actor. Returns null if
   // setIoContext() hasn't been called yet.
