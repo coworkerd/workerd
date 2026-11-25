@@ -1623,6 +1623,27 @@ KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handl
   if (ended) drain.wait(waitScope);
 }
 
+KJ_TEST("a nested Worker drain ends when the ingress lease ends") {
+  initializeV8();
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  const auto start = kj::systemPreciseMonotonicClock().now();
+  kj::TimerImpl clock(start);
+  Timer timer(clock);
+  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/nested\","), nullptr, newGroup());
+  Slot slot;
+  slot.limits = &isolateLimits;
+  Measurement measurement;
+  auto caller = kj::newPromiseAndFulfiller<void>();
+  measurement.requestLeaseEnded = caller.promise.fork();
+  RequestLimits limits(slot, measurement, timer, kj::str("\"workerId\":\"a/nested\","));
+  auto drain = limits.limitDrain();
+  clock.advanceTo(start + 5 * kj::SECONDS);
+  KJ_EXPECT(!drain.poll(waitScope));
+  caller.fulfiller->fulfill();
+  KJ_EXPECT(drain.poll(waitScope), "the nested invocation must not get a new 30-second drain");
+}
+
 KJ_TEST("a call thread cancels background work that outlives the drain limit") {
   kj::EventLoop loop;
   kj::WaitScope waitScope(loop);

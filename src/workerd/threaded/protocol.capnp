@@ -100,4 +100,10 @@ interface Bootstrap @0xa0c731b2df279451 extends(Worker.WorkerdBootstrap) {
   startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :Props)
       -> (dispatcher :Worker.EventDispatcher);
   socketControl @1 () -> (control :ThreadedSocketControl);
+  startLeasedEvent @2 (cfBlobJson :Text, coworkerdProps :Props, lease :NativeLeaseControl)
+      -> (dispatcher :Worker.EventDispatcher);
+}
+
+interface NativeLeaseControl @0xbbb54ed58665162a $Cxx.allowCancellation {
+  whenEnded @0 () -> ();
 }
