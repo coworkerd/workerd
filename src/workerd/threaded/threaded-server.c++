@@ -5148,10 +5148,12 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
       return encode(root.asReader());
     };
     auto target = field(input(), "durableObject");
+    const auto callerNamespace = target.isObject() ? text(target, "namespaceId") : kj::str("");
+    const auto callerObject = target.isObject() ? text(target, "objectId") : kj::str("");
     auto object = kj::str("{\"namespaceId\":", quoted(route.space),
         ",\"className\":", quoted(route.className), ",\"objectId\":", quoted(objectId),
-        ",\"callerNamespaceId\":", quoted(text(target, "namespaceId")),
-        ",\"callerObjectId\":", quoted(text(target, "objectId")),
+        ",\"callerNamespaceId\":", quoted(callerNamespace),
+        ",\"callerObjectId\":", quoted(callerObject),
         ",\"database\":", quoted(route.database),
         "}");
     return envelope(input(), "", false, kj::mv(object));
