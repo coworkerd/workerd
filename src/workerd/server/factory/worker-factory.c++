@@ -1152,6 +1152,8 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
 
   kj::Own<RequestObserver> observer =
       kj::refcounted<RequestObserverWithTracer>(workerTracer.clone());
+  // Keep the token on the incoming request, even if actor limits keep its channel factory alive.
+  observer = kj::mv(observer).attach(kj::mv(metadata.coworkerdBudgetLifetime));
 
   kj::Maybe<tracing::InvocationSpanContext> triggerContext;
   KJ_IF_SOME(ctx, metadata.userSpanParent.toSpanContext()) {
@@ -1320,16 +1322,20 @@ void request_metadata_set_coworkerd_invocation_identity(
   metadata.coworkerdInvocationIdentity = kj::str(identity);
 }
 
-::rust::String coworkerd_current_invocation_identity() {
-  KJ_IF_SOME(context, IoContext::tryCurrent()) {
-    if (context.hasCurrentIncomingRequest()) {
-      auto* channel = dynamic_cast<RustIoChannelFactory*>(&context.getIoChannelFactory());
-      if (channel != nullptr) {
-        KJ_IF_SOME(identity, channel->coworkerdIdentity) {
-          return ::rust::String(identity.begin(), identity.size());
+::rust::String coworkerd_current_invocation_identity() noexcept {
+  try {
+    KJ_IF_SOME(context, IoContext::tryCurrent()) {
+      if (context.hasCurrentIncomingRequest()) {
+        auto* channel = dynamic_cast<RustIoChannelFactory*>(&context.getIoChannelFactory());
+        if (channel != nullptr) {
+          KJ_IF_SOME(identity, channel->coworkerdIdentity) {
+            return ::rust::String(identity.begin(), identity.size());
+          }
         }
       }
     }
+  } catch (...) {
+    // The Rust FFI returns a string, so unavailable identity stays on the Rust error path.
   }
   return {};
 }

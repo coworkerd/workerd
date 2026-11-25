@@ -336,7 +336,7 @@ class RequestLimits final: public LimitEnforcer {
           auto handle = value.getHandle(jsg::Lock::from(isolate));
           if (!handle->IsUndefined()) {
             auto& request = jsg::unwrapOpaqueRef<kj::Weak<IoContext::IncomingRequest>>(isolate, handle);
-            return KJ_REQUIRE_NONNULL(request.tryGet(), "the durable event that started this work has ended");
+            return request.tryGet();
           }
         }
       }

@@ -1045,6 +1045,7 @@ kj::Promise<WorkerInterface::AlarmResult> WorkerEntrypoint::runAlarmImpl(
                 entrypointName = entrypointName.clone(), versionInfo = kj::mv(versionInfo),
                 props = kj::mv(props)](Worker::Lock& lock, IoContext& context) mutable {
           auto traceScope = context.makeRequestTraceScope(lock);
+          auto limitScope = incomingRequest.enterActorEvent(lock);
 
           // If we have an invalid timeout, set it to the default value of 15 minutes.
           auto timeout = context.getLimitEnforcer().getAlarmLimit();

@@ -251,6 +251,7 @@ class IoChannelFactory: public virtual kj::Refcounted {
     // Bound by a Coworkerd platform dynamic entrypoint, never inferred from cf or props.
     // Reporting identity only; it does not change the request or context lifetime.
     kj::Maybe<kj::String> coworkerdInvocationIdentity;
+    capnp::Capability::Client coworkerdBudgetLifetime = nullptr;
   };
 
   // Parameters that can influence the version of a worker that is used to serve a subrequest.

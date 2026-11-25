@@ -1088,7 +1088,8 @@ interface WorkerdBootstrap {
   # Bootstrap interface exposed by workerd when serving Cap'n Proto RPC.
 
   startEvent @0 (cfBlobJson :Text, fromPersistentStub :Bool, fromHandoff :Bool,
-                 forwardedBy :Text, causedBy :List(Text)) -> (dispatcher :EventDispatcher);
+                 forwardedBy :Text, causedBy :List(Text), budgetLifetime :Capability)
+      -> (dispatcher :EventDispatcher);
   # Start a new event. Exactly one event should be delivered to the returned EventDispatcher.
   #
   # If the event is an HTTP request, `cfBlobJson` optionally carries the JSON-encoded `request.cf`
@@ -1101,6 +1102,7 @@ interface WorkerdBootstrap {
   #
   # `fromHandoff` and `causedBy` say which Durable Objects' work made the request, as
   # `SubrequestMetadata::fromHandoff` and `SubrequestMetadata::causedBy`.
+  # Coworkerd's optional lifetime token is held by the incoming request's I/O channels.
   #
   # `forwardedBy` names the cluster node that sent the request on, as
   # `SubrequestMetadata::forwardedBy`.
