@@ -199,11 +199,18 @@ class WebSocket: public EventTarget {
   kj::Rc<kj::WebSocket> acceptAsHibernatable(
       kj::Array<kj::String> tags, kj::Maybe<WrapTransport> wrapTransport = kj::none);
   bool isPeerOf(jsg::Lock& js, const WebSocket& candidate);
+  void abandonHibernatableUpgrade();
   void requirePeerUpgrade() {
     peerMustUpgrade = true;
   }
   bool peerRequiresUpgrade() const {
     return peerMustUpgrade;
+  }
+  void setStagedNodeUpgrade(kj::StringPtr token) {
+    stagedNodeUpgrade = kj::str(token);
+  }
+  kj::StringPtr getStagedNodeUpgrade() const {
+    return stagedNodeUpgrade;
   }
   kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
   bool isOutputClosed() const;
@@ -382,6 +389,7 @@ class WebSocket: public EventTarget {
   // cppgc to handle this correctly, or (c) re-trigger tracing post-swap.
   kj::Own<WebSocketAdapter> impl;
   bool peerMustUpgrade = false;
+  kj::String stagedNodeUpgrade;
 };
 
 #define EW_WEBSOCKET_ISOLATE_TYPES                                                                 \
@@ -585,6 +593,7 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
   kj::Rc<kj::WebSocket> acceptWithTransport(
       kj::Array<kj::String> tags, kj::Maybe<WebSocket::WrapTransport> wrapTransport);
   bool isPeerOf(jsg::Lock& js, const WebSocket& candidate);
+  void abandonHibernatableUpgrade();
   kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
   bool isOutputClosed() const;
   void initiateHibernatableRelease(jsg::Lock& js,
@@ -873,6 +882,8 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
   // so it cannot be `IoOwn`ed as `farNative` is. Informs the HibernatableWebSocket if we
   // called `close()`, preventing send() after revival.
   bool closedOutgoingForHib = false;
+  // An unfinished node upgrade can end outside the accepting actor's IoContext.
+  bool abandonedUpgrade = false;
 
   // When YES, a server-initiated close does NOT automatically send a reciprocal close
   // frame, leaving readyState as CLOSING (2) when the close event fires. When NO (the

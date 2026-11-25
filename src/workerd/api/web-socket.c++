@@ -125,6 +125,8 @@ WebSocket::WebSocket(jsg::Lock& js, kj::String url)
     : impl(kj::heap<LegacyWebSocketAdapter>(js, *this, kj::mv(url))) {}
 
 void WebSocket::accept(jsg::Lock& js, jsg::Optional<WebSocket::AcceptOptions> options) {
+  JSG_REQUIRE(stagedNodeUpgrade.size() == 0, DOMNotSupportedError,
+      "A threaded hibernatable WebSocket must be returned in an HTTP upgrade.");
   impl->accept(js, kj::mv(options));
 }
 
@@ -208,6 +210,10 @@ kj::Ptr<bool> WebSocket::getDispatchFailed() {
 
 bool WebSocket::isPeerOf(jsg::Lock& js, const WebSocket& candidate) {
   return kj::downcast<LegacyWebSocketAdapter>(*impl).isPeerOf(js, candidate);
+}
+
+void WebSocket::abandonHibernatableUpgrade() {
+  kj::downcast<LegacyWebSocketAdapter>(*impl).abandonHibernatableUpgrade();
 }
 
 kj::Maybe<kj::ArrayPtr<const byte>> WebSocket::getSerializedAttachment() const {
@@ -1009,6 +1015,7 @@ void LegacyWebSocketAdapter::requireHibernatableMutationAllowed() {
 }
 
 void LegacyWebSocketAdapter::send(jsg::Lock& js, kj::OneOf<kj::Array<byte>, kj::String> message) {
+  if (abandonedUpgrade) return;
   requireHibernatableMutationAllowed();
   auto& native = *farNative;
   JSG_REQUIRE(!native.closedOutgoing, TypeError, "Can't call WebSocket send() after close().");
@@ -1103,6 +1110,7 @@ void LegacyWebSocketAdapter::close(
   // then there must be a code, too.
   JSG_REQUIRE(reason == kj::none || code != kj::none, DOMInvalidAccessError,
       "If you specify a WebSocket close reason, you must also specify a code.");
+  if (abandonedUpgrade) return;
 
   // Handle close before connection is established for websockets obtained through `new WebSocket()`.
   KJ_IF_SOME(pending, native.state.tryGet<AwaitingConnection>()) {
@@ -1147,6 +1155,7 @@ void LegacyWebSocketAdapter::close(
 }
 
 int LegacyWebSocketAdapter::getReadyState() {
+  if (abandonedUpgrade) return WebSocket::READY_STATE_CLOSED;
   auto& native = *farNative;
   if ((native.closedIncoming && native.closedOutgoing) || error != kj::none) {
     return WebSocket::READY_STATE_CLOSED;
@@ -1158,6 +1167,10 @@ int LegacyWebSocketAdapter::getReadyState() {
     return WebSocket::READY_STATE_CONNECTING;
   }
   return WebSocket::READY_STATE_OPEN;
+}
+
+void LegacyWebSocketAdapter::abandonHibernatableUpgrade() {
+  abandonedUpgrade = true;
 }
 
 bool LegacyWebSocketAdapter::isAccepted() {

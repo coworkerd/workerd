@@ -1806,6 +1806,9 @@ server::DurableIdleLifecycle::Time durableIdleNow() {
   return now;
 }
 
+struct DurableTreeContext;
+class DurableActorHooks;
+
 struct ThreadState {
   kj::AsyncIoContext io = kj::setupAsyncIo();
   Entropy entropy;
@@ -1852,6 +1855,8 @@ struct ThreadState {
   std::map<uint64_t, std::map<uint64_t, std::weak_ptr<DurableSessionScope>>> durableSessions;
   struct DurableRoot {
     kj::Own<Worker::Actor> actor;
+    std::shared_ptr<DurableTreeContext> tree;
+    DurableActorHooks *hooks;
     std::shared_ptr<server::DurableIdleLifecycle> idle;
     std::function<bool(bool)> facetsBusy;
     std::function<bool()> facetHasOrdinaryWebSocket;
@@ -4011,8 +4016,17 @@ struct DurableSocketStart {
   std::shared_ptr<server::DurableIdleLifecycle> idle;
   kj::String invocation;
   const kj::HttpHeaderTable& headers;
-  kj::Own<Worker::Actor> actor;
+  std::shared_ptr<DurableTreeContext> tree;
 };
+
+struct StagedDurableUpgrade {
+  uint facet;
+  kj::Own<LegacyHibernationManagerImpl> manager;
+};
+void beginDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation);
+void finishDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation);
+kj::Maybe<StagedDurableUpgrade> findDurableUpgrade(
+    DurableTreeContext &tree, kj::StringPtr token, kj::StringPtr invocation);
 
 class DurableSocketStream final: public kj::WebSocket {
  public:
@@ -4064,6 +4078,8 @@ class DurableHttp final: public kj::HttpService {
     try {
       if (headers.get(kj::HttpHeaderId::UPGRADE) != kj::none) {
         KJ_IF_SOME(start, socket) {
+          beginDurableUpgrade(*start.tree, start.invocation);
+          KJ_DEFER(finishDurableUpgrade(*start.tree, start.invocation));
           struct UpgradingResponse final: Response {
             UpgradingResponse(Response& inner, DurableSocketStart& start): inner(inner), start(start) {}
             kj::Own<kj::AsyncOutputStream> send(uint status, kj::StringPtr text,
@@ -4082,13 +4098,17 @@ class DurableHttp final: public kj::HttpService {
                 }
               });
               KJ_IF_SOME(id, pending) {
-                auto& manager = kj::downcast<LegacyHibernationManagerImpl>(
-                    KJ_REQUIRE_NONNULL(start.actor->getHibernationManager()));
-                outgoing.addPtrPtr(marker, start.invocation);
+                auto upgrade = KJ_REQUIRE_NONNULL(findDurableUpgrade(*start.tree, id, start.invocation),
+                    "node-owned WebSocket is missing from the admitted tree");
+                auto trusted = upgrade.facet == 0 ? kj::str(start.invocation)
+                                                  : kj::str(start.invocation, ":", upgrade.facet);
+                outgoing.addPtrPtr(marker, trusted);
                 auto accepted = inner.acceptWebSocket(outgoing);
                 // The binding channel acknowledges this transport separately
                 // from HTTP-over-Cap'n-Proto's WebSocket pipe.
-                attaching = manager.activateNodeSocket(id, start.invocation).eagerlyEvaluate(nullptr);
+                attaching = upgrade.manager->activateNodeSocket(id, start.invocation)
+                                .attach(kj::mv(upgrade.manager))
+                                .eagerlyEvaluate(nullptr);
                 return accepted;
               }
               auto opened = inner.acceptWebSocket(outgoing);
@@ -4452,6 +4472,14 @@ kj::Promise<kj::Own<WorkerInterface>> openBinding(
   co_return result.attach(kj::mv(connection));
 }
 
+struct DurableSocketSnapshot {
+  uint facet;
+  LegacyHibernationManagerImpl::SocketSnapshot socket;
+};
+
+using DurableFacetStarts = capnp::List<threaded::rpc::ThreadedSocketFacet>;
+using DurableSocketAdoption = capnp::Response<threaded::rpc::ThreadedSocketControl::AdoptResults>;
+
 class DurableNodeSockets final {
  public:
   DurableNodeSockets(ThreadState& state, kj::String address, DurableRoute route, uint64_t walOpen,
@@ -4498,27 +4526,21 @@ class DurableNodeSockets final {
     out.setGeneration(route.open.generation);
   }
 
-  kj::Promise<SocketParkResult> park(LegacyHibernationManagerImpl &manager) {
-    manager.setSocketParking(true);
-    bool release = true;
-    KJ_DEFER(if (release) manager.setSocketParking(false));
-    const auto result = co_await park(manager.snapshotNodeSockets());
-    release = result == SocketParkResult::REFUSED;
-    co_return result;
-  }
-
   kj::Promise<SocketParkResult> park(
-      kj::Array<LegacyHibernationManagerImpl::SocketSnapshot> sockets) {
+      kj::Array<DurableSocketSnapshot> sockets, DurableFacetStarts::Reader facets) {
     if (sockets.size() == 0) co_return SocketParkResult::PARKED;
     co_await ready();
     const auto parkAttempt = ++lastParkAttempt;
     auto call = control.parkRequest();
     writeOpen(call.initOpen());
     call.setAttempt(parkAttempt);
+    call.setFacets(facets);
     auto entries = call.initSockets(sockets.size());
     for (auto index: kj::indices(sockets)) {
       auto entry = entries[index];
-      auto& socket = sockets[index];
+      auto &incoming = sockets[index];
+      auto &socket = incoming.socket;
+      entry.setFacetId(incoming.facet);
       entry.initAuthority().setSocketId(socket.id);
       entry.setLastFrame(socket.lastFrame);
       auto tags = entry.initTags(socket.tags.size());
@@ -4548,11 +4570,11 @@ class DurableNodeSockets final {
     }
   }
 
-  kj::Promise<bool> adopt(LegacyHibernationManagerImpl &manager) {
+  kj::Promise<kj::Maybe<DurableSocketAdoption>> adopt() {
     co_await ready();
     const auto adoption = ++lastAdoptAttempt;
     auto attempt = connected;
-    kj::Maybe<capnp::Response<threaded::rpc::ThreadedSocketControl::AdoptResults>> answer;
+    kj::Maybe<DurableSocketAdoption> answer;
     try {
       answer = co_await clock().timeoutAfter(CONTROL_TIMEOUT, requestAdopt(adoption, false));
     } catch (const kj::Exception &error) {
@@ -4564,34 +4586,22 @@ class DurableNodeSockets final {
         answer = co_await clock().timeoutAfter(CONTROL_TIMEOUT, requestAdopt(adoption, true));
       } catch (const kj::Exception &error) {
         reportDurableFailureForTest("WebSocket adoption resolution", error);
-        co_return false;
+        co_return kj::none;
       }
     }
     auto &result = KJ_ASSERT_NONNULL(answer);
     KJ_REQUIRE(result.getAccepted(), "the node refused to restore the Durable Object's WebSockets");
-    auto entries = result.getSockets();
-    if (entries.size() != 0 && entries[0].getAutoResponseEnabled()) {
-      manager.setWebSocketAutoResponse(entries[0].getAutoRequest(), entries[0].getAutoResponse());
-    }
-    for (auto entry: entries) {
-      auto tags = KJ_MAP(tag, entry.getTags()) { return kj::str(tag); };
-      LegacyHibernationManagerImpl::SocketSnapshot snapshot{
-        .id = kj::str(entry.getAuthority().getSocketId()),
-        .tags = kj::mv(tags),
-        .lastFrame = entry.getLastFrame(),
-        .closedOutgoing = entry.getClosedOutgoing(),
-      };
-      if (entry.getHasAttachment()) {
-        auto attachment = entry.getAttachment();
-        snapshot.attachment = kj::heapArray<kj::byte>(kj::arrayPtr(attachment.begin(), attachment.size()));
-      }
-      if (auto time = entry.getAutoResponseUnixMs()) {
-        KJ_REQUIRE(time <= INT64_MAX / 1000000);
-        snapshot.lastAutoResponse = kj::UNIX_EPOCH + static_cast<int64_t>(time) * kj::MILLISECONDS;
-      }
-      manager.adoptNodeSocket(kj::mv(snapshot), entry.getAuthority().getInvocationId());
-    }
-    co_return true;
+    co_return kj::mv(answer);
+  }
+
+  kj::Promise<void> closeAborted(kj::Array<kj::String> ids) {
+    auto pending = beginWrite();
+    co_await ready();
+    auto call = control.closeAbortedRequest();
+    writeOpen(call.initOpen());
+    auto socketIds = call.initSocketIds(ids.size());
+    for (auto i: kj::indices(ids)) socketIds.set(i, ids[i]);
+    co_await awaitReply(call.send(), clock().now() + CONTROL_TIMEOUT);
   }
 
   kj::Timer& clock() { return state.io.provider->getTimer(); }
@@ -4684,6 +4694,11 @@ class DurableNodeWebSocket final: public LegacyHibernationManagerImpl::NodeSocke
   void startUpgrade() override {
     pendingUpgrade = true;
     upgrading.fulfiller->fulfill();
+  }
+  void abandonUpgrade() override {
+    if (!pendingUpgrade) startUpgrade();
+    attaching.fulfiller->reject(KJ_EXCEPTION(DISCONNECTED, "WebSocket upgrade was abandoned"));
+    if (local) local->abort();
   }
   kj::Promise<void> whenUpgrading() override {
     return upgraded.addBranch();
@@ -5204,11 +5219,20 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
           object(kj::mv(object)),
           props(kj::mv(props)) {}
     kj::Own<WorkerInterface> startRequest(SubrequestMetadata metadata) override {
+      auto current = owner.addRef();
+      // Serialized facet props retain their binding selections. Calls from the same
+      // durable Worker use the event's new lease, even if the facet stayed resident.
+      KJ_IF_SOME(context, IoContext::tryCurrent()) {
+        auto* active = dynamic_cast<Channels*>(&context.getIoChannelFactory());
+        if (active != nullptr && active->state.durableHome != 0 && active->slot == owner->slot) {
+          current = kj::addRef(*active);
+        }
+      }
       KJ_IF_SOME(id, object) {
         return newPromisedWorkerInterface(
-            owner->queuedRequest(false, owner->objectEnvelope(channel, id)).attach(owner.addRef()));
+            current->queuedRequest(false, current->objectEnvelope(channel, id)).attach(current.addRef()));
       }
-      return owner->startRequest(
+      return current->startRequest(
           channel, kj::mv(metadata), props.map([](Frankenvalue &value) { return value.clone(); }));
     }
     void requireAllowsTransfer() override {}
@@ -5614,6 +5638,11 @@ PreparedInvocation prepareInvocation(ThreadState &state,
 }
 
 struct DurableTreeContext {
+  struct SocketManager {
+    Worker::Actor* actor;
+    LegacyHibernationManagerImpl* manager;
+  };
+
   ThreadState &state;
   ThreadedServer &server;
   std::weak_ptr<Slot> slot;
@@ -5623,6 +5652,19 @@ struct DurableTreeContext {
   std::shared_ptr<server::DurableIdleLifecycle> idle;
   std::map<uint, server::DurableLogShipper*> shippers;
   uint liveFacets = 0;
+  std::shared_ptr<DurableNodeSockets> nodeSockets;
+  std::map<uint, SocketManager> socketManagers;
+  std::set<std::string, std::less<>> socketUpgradeInvocations;
+  std::map<uint, PropsMessage> facetStarts;
+  kj::Maybe<DurableSocketAdoption> adoption;
+  std::map<uint, std::vector<threaded::rpc::ThreadedSocketSnapshot::Reader>> dormantSockets;
+
+  void installSocketManager(Worker::Actor &actor, uint facet);
+  void restoreSockets(DurableSocketAdoption response);
+  kj::Promise<SocketParkResult> parkSockets();
+  void forgetFacetSockets(uint facet);
+  void abortFacetSockets(uint facet, kj::Vector<kj::String> &ids);
+  void requireRestorableUpgrade(uint facet);
 
   const server::DurableStorage &storage() {
     return *server.durableStorage;
@@ -5633,6 +5675,230 @@ struct DurableTreeContext {
     return *index;
   }
 };
+
+void beginDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation) {
+  KJ_ASSERT(tree.socketUpgradeInvocations.emplace(invocation.begin(), invocation.end()).second);
+}
+
+void finishDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation) {
+  auto at = tree.socketUpgradeInvocations.find(std::string_view(invocation.begin(), invocation.size()));
+  KJ_ASSERT(at != tree.socketUpgradeInvocations.end());
+  tree.socketUpgradeInvocations.erase(at);
+  for (const auto &[_, socket]: tree.socketManagers) {
+    socket.manager->discardStagedNodeSockets(invocation);
+  }
+}
+
+kj::Maybe<StagedDurableUpgrade> findDurableUpgrade(
+    DurableTreeContext &tree, kj::StringPtr token, kj::StringPtr invocation) {
+  for (const auto &[facet, socket]: tree.socketManagers) {
+    if (socket.manager->hasStagedNodeSocket(token, invocation)) {
+      return StagedDurableUpgrade{facet, kj::addRef(*socket.manager)};
+    }
+  }
+  return kj::none;
+}
+
+kj::StringPtr currentUpgradeInvocation() {
+  auto& channels = kj::downcast<Channels>(IoContext::current().getIoChannelFactory());
+  return field(channels.input(), "invocationId").getString();
+}
+
+LegacyHibernationManagerImpl::SocketSnapshot readSocketSnapshot(
+    threaded::rpc::ThreadedSocketSnapshot::Reader entry) {
+  LegacyHibernationManagerImpl::SocketSnapshot snapshot{
+    .id = kj::str(entry.getAuthority().getSocketId()),
+    .tags = KJ_MAP(tag, entry.getTags()) { return kj::str(tag); },
+    .lastFrame = entry.getLastFrame(),
+    .closedOutgoing = entry.getClosedOutgoing(),
+  };
+  if (entry.getHasAttachment()) {
+    auto attachment = entry.getAttachment();
+    snapshot.attachment =
+        kj::heapArray<kj::byte>(kj::arrayPtr(attachment.begin(), attachment.size()));
+  }
+  if (const auto time = entry.getAutoResponseUnixMs()) {
+    KJ_REQUIRE(time <= INT64_MAX / 1000000);
+    snapshot.lastAutoResponse = kj::UNIX_EPOCH + static_cast<int64_t>(time) * kj::MILLISECONDS;
+  }
+  return snapshot;
+}
+
+void DurableTreeContext::installSocketManager(Worker::Actor &actor, uint facet) {
+  if (!nodeSockets) return;
+  auto manager = kj::refcounted<LegacyHibernationManagerImpl>(actor.getLoopback(), 8,
+      LegacyHibernationManagerImpl::SocketFactory(
+          [sockets = nodeSockets] { return kj::heap<DurableNodeWebSocket>(sockets); }));
+  // The manager's loopback owns this tree even when a request releases its actor.
+  manager->setNodeUpgradeHooks([this, facet] {
+    const auto invocation = currentUpgradeInvocation();
+    JSG_REQUIRE(socketUpgradeInvocations.contains(std::string_view(invocation.begin(), invocation.size())),
+        DOMInvalidStateError, "The Durable Object WebSocket must be returned from its upgrade request.");
+    requireRestorableUpgrade(facet);
+    return invocation;
+  }, [this](kj::StringPtr pending) {
+    return findDurableUpgrade(*this, pending, currentUpgradeInvocation()) != kj::none;
+  });
+  if (auto dormant = dormantSockets.find(facet); dormant != dormantSockets.end()) {
+    const auto first = dormant->second.front();
+    if (first.getAutoResponseEnabled()) {
+      manager->setWebSocketAutoResponse(first.getAutoRequest(), first.getAutoResponse());
+    }
+    for (const auto socket: dormant->second) {
+      manager->adoptNodeSocket(readSocketSnapshot(socket), socket.getAuthority().getInvocationId());
+    }
+    dormantSockets.erase(dormant);
+    if (dormantSockets.empty()) adoption = kj::none;
+  }
+  KJ_ASSERT(socketManagers.emplace(facet, SocketManager{&actor, manager.get()}).second);
+  actor.setHibernationManager(kj::mv(manager));
+}
+
+void DurableTreeContext::requireRestorableUpgrade(uint facet) {
+  if (facet == 0) return;
+  std::set<uint> counted;
+  uint64_t total = 0;
+  auto count = [&](uint id) {
+    for (; id != 0 && counted.insert(id).second;) {
+      auto at = facetStarts.find(id);
+      JSG_REQUIRE(at != facetStarts.end(), DOMNotSupportedError,
+          "The facet's startup options cannot be restored after WebSocket hibernation. "
+          "A facet's options must be serializable and use at most 64 KiB.");
+      auto start = at->second->getRoot<threaded::rpc::ThreadedSocketFacet>().asReader();
+      total += start.totalSize().wordCount;
+      JSG_REQUIRE(total <= threaded::rpc::THREADED_SOCKET_TREE_MAX_WORDS, DOMNotSupportedError,
+          "The Durable Object tree's WebSocket facet startup options exceed 1 MiB.");
+      id = start.getParent();
+    }
+  };
+  count(facet);
+  for (const auto &[id, socket]: socketManagers) {
+    if (id != 0 && socket.manager->hasNodeUpgrades()) count(id);
+  }
+  for (const auto &[id, _]: dormantSockets) count(id);
+}
+
+void DurableTreeContext::restoreSockets(DurableSocketAdoption response) {
+  for (const auto facet: response.getFacets()) {
+    auto start = kj::heap<capnp::MallocMessageBuilder>();
+    start->setRoot(facet);
+    KJ_ASSERT(facetStarts.emplace(facet.getId(), kj::mv(start)).second);
+  }
+  for (const auto socket: response.getSockets()) {
+    dormantSockets[socket.getFacetId()].push_back(socket);
+  }
+  if (!dormantSockets.empty()) adoption = kj::mv(response);
+}
+
+kj::Promise<SocketParkResult> DurableTreeContext::parkSockets() {
+  kj::Vector<DurableSocketSnapshot> sockets;
+  bool release = true;
+  KJ_DEFER(if (release) {
+    for (const auto &[_, socket]: socketManagers) socket.manager->setSocketParking(false);
+  });
+  for (const auto &[facet, socket]: socketManagers) {
+    socket.manager->setSocketParking(true);
+    for (auto &snapshot: socket.manager->snapshotNodeSockets()) {
+      sockets.add(DurableSocketSnapshot{facet, kj::mv(snapshot)});
+    }
+  }
+  for (const auto &[facet, entries]: dormantSockets) {
+    for (const auto entry: entries) {
+      sockets.add(DurableSocketSnapshot{facet, readSocketSnapshot(entry)});
+    }
+  }
+  std::map<uint, threaded::rpc::ThreadedSocketFacet::Reader> starts;
+  for (const auto &entry: sockets) {
+    for (auto id = entry.facet; id != 0;) {
+      auto start = facetStarts.at(id)->getRoot<threaded::rpc::ThreadedSocketFacet>().asReader();
+      if (!starts.emplace(id, start).second) break;
+      id = start.getParent();
+    }
+  }
+  capnp::MallocMessageBuilder message;
+  auto facets = message.initRoot<DurableFacetStarts>(starts.size());
+  size_t index = 0;
+  for (const auto &[_, start]: starts) facets.setWithCaveats(index++, start);
+  const auto result = co_await nodeSockets->park(sockets.releaseAsArray(), facets.asReader());
+  release = result == SocketParkResult::REFUSED;
+  co_return result;
+}
+
+void DurableTreeContext::forgetFacetSockets(uint facet) {
+  if (auto at = socketManagers.find(facet); at != socketManagers.end()) {
+    at->second.manager->discardStagedNodeSockets();
+    socketManagers.erase(at);
+  }
+  facetStarts.erase(facet);
+  dormantSockets.erase(facet);
+  if (dormantSockets.empty()) adoption = kj::none;
+}
+
+void DurableTreeContext::abortFacetSockets(uint facet, kj::Vector<kj::String> &ids) {
+  facetIndex().forEachChild(
+      facet, [&](uint child, kj::StringPtr) { abortFacetSockets(child, ids); });
+  if (auto manager = socketManagers.find(facet); manager != socketManagers.end()) {
+    for (auto &socket: manager->second.manager->snapshotNodeSockets()) ids.add(kj::mv(socket.id));
+  }
+  if (auto dormant = dormantSockets.find(facet); dormant != dormantSockets.end()) {
+    for (const auto socket: dormant->second) ids.add(kj::str(socket.getAuthority().getSocketId()));
+  }
+  forgetFacetSockets(facet);
+}
+
+struct FacetPropChannel {
+  uint channel;
+  kj::Maybe<kj::StringPtr> object;
+  kj::Maybe<Frankenvalue&> props;
+};
+
+bool writeFacetProps(Frankenvalue &value, rpc::Frankenvalue::Builder out, size_t &remaining,
+    kj::FunctionParam<kj::Maybe<FacetPropChannel>(Frankenvalue::CapTableEntry&)> describe) {
+  auto caps = value.getCapTable();
+  const auto bytes = value.estimateSize();
+  if (bytes > remaining) return false;
+  remaining -= bytes;
+  // Every channel adds data and pointer words even if it has no ID or own props.
+  constexpr size_t CHANNEL_BYTES = 3 * sizeof(capnp::word);
+  if (caps.size() > remaining / CHANNEL_BYTES) return false;
+  remaining -= caps.size() * CHANNEL_BYTES;
+  value.toCapnp(out);
+  if (caps.size() == 0) return true;
+  auto table =
+      out.getCapTable().initAs<capnp::List<threaded::rpc::ThreadedSocketPropChannel>>(caps.size());
+  for (auto i: kj::indices(caps)) {
+    auto saved = describe(*caps[i]);
+    if (saved == kj::none) return false;
+    const auto& bound = KJ_ASSERT_NONNULL(saved);
+    auto channel = table[i];
+    channel.setChannel(bound.channel);
+    KJ_IF_SOME(object, bound.object) {
+      if (object.size() > remaining) return false;
+      remaining -= object.size();
+      channel.setHasObject(true);
+      channel.setObjectId(object);
+    }
+    KJ_IF_SOME(props, bound.props) {
+      if (!writeFacetProps(props, channel.initProps(), remaining, describe)) return false;
+    }
+  }
+  return true;
+}
+
+Frankenvalue readFacetProps(rpc::Frankenvalue::Reader value,
+    kj::FunctionParam<kj::Own<Frankenvalue::CapTableEntry>(uint, kj::Maybe<kj::String>,
+        kj::Maybe<Frankenvalue>)> bind) {
+  kj::Vector<kj::Own<Frankenvalue::CapTableEntry>> caps;
+  for (auto channel:
+      value.getCapTable().getAs<capnp::List<threaded::rpc::ThreadedSocketPropChannel>>()) {
+    kj::Maybe<kj::String> object;
+    if (channel.getHasObject()) object = kj::str(channel.getObjectId());
+    kj::Maybe<Frankenvalue> props;
+    if (channel.hasProps()) props = readFacetProps(channel.getProps(), bind);
+    caps.add(bind(channel.getChannel(), kj::mv(object), kj::mv(props)));
+  }
+  return Frankenvalue::fromCapnp(value, kj::mv(caps));
+}
 
 class DurablePendingOperations final: public Worker::Actor::WaitUntilTaskTracker {
  public:
@@ -5706,6 +5972,10 @@ class DurableActorObserver final: public ActorObserver {
     if (actor != nullptr) {
       record("destroyed");
       tree->state.durableActorTrees.erase(actor);
+      auto at = tree->socketManagers.find(facet);
+      if (at != tree->socketManagers.end() && at->second.actor == actor) {
+        tree->socketManagers.erase(at);
+      }
     }
   }
 
@@ -5740,8 +6010,6 @@ class DurableActorObserver final: public ActorObserver {
   uint facet;
   Worker::Actor *actor = nullptr;
 };
-
-class DurableActorHooks;
 
 struct DurableActorHandle {
   kj::Own<Worker::Actor> value;
@@ -5813,7 +6081,13 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
   bool isStopped() const {
     return stopped;
   }
+  uint getFacetId() const {
+    return facet;
+  }
   void stop(const kj::Exception &reason);
+  kj::Promise<kj::Rc<LocalFacet>> openSocketFacet(uint id, kj::StringPtr descriptor);
+  kj::Promise<std::pair<kj::Own<WorkerInterface>, kj::Own<Worker::Actor>>> openSocket(
+      kj::String descriptor);
 
  private:
   struct Invocation {
@@ -5826,7 +6100,8 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
     kj::Own<LocalFacet> owner;
   };
 
-  kj::Promise<void> initialize();
+  kj::Promise<void> initialize(kj::String descriptor);
+  kj::Promise<void> ensureStarted(kj::StringPtr descriptor);
   kj::Promise<kj::Own<WorkerInterface>> open(kj::String descriptor, kj::Own<Invocation> invocation);
 
   std::shared_ptr<DurableTreeContext> tree;
@@ -5864,6 +6139,11 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
 
   kj::Rc<IoChannelFactory::ActorChannel> getFacet(
       kj::StringPtr name, kj::Function<kj::Promise<StartInfo>()> getStartInfo) override {
+    return getLocalFacet(name, kj::mv(getStartInfo));
+  }
+
+  kj::Rc<LocalFacet> getLocalFacet(
+      kj::StringPtr name, kj::Function<kj::Promise<StartInfo>()> getStartInfo) {
     const std::string key(name.begin(), name.size());
     auto at = children.find(key);
     if (at != children.end()) {
@@ -5879,7 +6159,49 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
     return child;
   }
 
+  kj::Promise<kj::Rc<LocalFacet>> getSocketFacet(uint id, kj::StringPtr descriptor) {
+    auto at = tree->facetStarts.find(id);
+    KJ_REQUIRE(at != tree->facetStarts.end(), "the WebSocket's facet is no longer available");
+    auto start = at->second->getRoot<threaded::rpc::ThreadedSocketFacet>();
+    const auto parent = start.getParent();
+    if (parent == facet) {
+      co_return getLocalFacet(start.getName(), []() -> kj::Promise<StartInfo> {
+        KJ_FAIL_REQUIRE("the WebSocket's facet startup options are no longer available");
+      });
+    }
+    auto ancestor = co_await getSocketFacet(parent, descriptor);
+    co_return co_await ancestor->openSocketFacet(id, descriptor);
+  }
+
   void abortFacet(kj::StringPtr name, kj::Exception reason) override {
+    if (tree->nodeSockets) {
+      uint target = 0;
+      auto at = children.find(std::string(name.begin(), name.size()));
+      if (at != children.end()) {
+        target = at->second->getFacetId();
+      } else {
+        for (auto &[id, stored]: tree->facetStarts) {
+          auto start = stored->getRoot<threaded::rpc::ThreadedSocketFacet>();
+          if (start.getParent() == facet && start.getName() == name) {
+            target = id;
+            break;
+          }
+        }
+      }
+      if (target != 0) {
+        kj::Vector<kj::String> ids;
+        tree->abortFacetSockets(target, ids);
+        if (!ids.empty()) {
+          auto sockets = tree->nodeSockets;
+          tree->state.tasks.add(
+              sockets->closeAborted(ids.releaseAsArray()).attach(std::move(sockets)));
+        }
+      }
+    }
+    stopFacet(name, reason);
+  }
+
+  void stopFacet(kj::StringPtr name, const kj::Exception &reason) {
     auto at = children.find(std::string(name.begin(), name.size()));
     if (at == children.end()) return;
     at->second->stop(reason);
@@ -5888,7 +6210,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
 
   void deleteFacet(kj::StringPtr name) override {
     requireIdle(name);
-    abortFacet(name, KJ_EXCEPTION(DISCONNECTED, "Facet was deleted."));
+    stopFacet(name, KJ_EXCEPTION(DISCONNECTED, "Facet was deleted."));
     auto &index = tree->facetIndex();
     deleteStoredFacet(index, index.getId(facet, name));
   }
@@ -5949,6 +6271,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
  private:
   void deleteStoredFacet(server::FacetTreeIndex& index, uint target) {
     kj::Function<void(uint)> report = [&](uint deleted) {
+      tree->forgetFacetSockets(deleted);
       auto shipper = tree->shippers.find(facet);
       if (shipper != tree->shippers.end()) shipper->second->reportFacetDeleted(deleted);
     };
@@ -5978,9 +6301,14 @@ bool LocalFacet::busy(bool includeBackground) {
 }
 
 bool LocalFacet::hasOrdinaryWebSocket() {
+  if (stopped) return false;
   KJ_IF_SOME(opened, actor) {
     KJ_IF_SOME(manager, opened.value->getHibernationManager()) {
-      if (manager.getWebSocketCount() != 0) return true;
+      if (tree->nodeSockets) {
+        if (kj::downcast<LegacyHibernationManagerImpl>(manager).hasLocalSockets()) return true;
+      } else if (manager.getWebSocketCount() != 0) {
+        return true;
+      }
     }
     return opened.value->getNonHibernatableWebSocketCount()->count > 0 ||
         opened.hooks->hasOrdinaryWebSocket();
@@ -6009,33 +6337,125 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
       open(kj::str(channels.document.original), kj::heap<Invocation>(*this)));
 }
 
-kj::Promise<void> LocalFacet::initialize() {
-  auto info = co_await getStartInfo();
-  co_await info.ensureAllResolved();
-  auto *binding = dynamic_cast<LocalActorClass *>(info.actorClass.get());
+kj::Promise<void> LocalFacet::initialize(kj::String descriptor) {
   auto slot = tree->slot.lock();
-  KJ_REQUIRE(!stopped && binding != nullptr && slot && slot == binding->slot.lock(),
-      "durable test facets require a class in the original isolate copy");
-  className = kj::str(binding->name);
+  KJ_REQUIRE(slot != nullptr, "durable test facet lost its isolate copy");
+  // The startup callback is only used once. Its IoContext reentry handle counts as pending I/O.
+  auto startFacet = kj::mv(getStartInfo);
+  Worker::Actor::Id id;
+  Frankenvalue props;
+  PropsMessage saveStart;
+  if (auto saved = tree->facetStarts.find(facet); saved != tree->facetStarts.end()) {
+    const auto start = saved->second->getRoot<threaded::rpc::ThreadedSocketFacet>().asReader();
+    KJ_REQUIRE(start.getParent() == parentFacet && start.getName() == name,
+        "the restored WebSocket facet no longer matches its storage index");
+    className = kj::str(start.getClassName());
+    if (start.getNamespaceId().size() == 0) {
+      id = kj::str(start.getActorId());
+    } else {
+      kj::Maybe<kj::String> actorName;
+      if (start.getHasActorName()) actorName = kj::str(start.getActorName());
+      id = kj::Own<ActorIdFactory::ActorId>(kj::heap<ObjectIdFactory::Id>(
+          kj::str(start.getNamespaceId()), kj::str(start.getActorId()), kj::mv(actorName)));
+    }
+    auto channels = kj::rc<Channels>(tree->state, tree->server, slot, descriptor);
+    props = readFacetProps(start.getProps(), [&](uint channel, kj::Maybe<kj::String> object,
+                              kj::Maybe<Frankenvalue> props) {
+      return kj::rc<Channels::Bound>(channels.addRef(), channel, kj::mv(object), kj::mv(props)).toOwn();
+    });
+  } else {
+    auto info = co_await startFacet();
+    co_await info.ensureAllResolved();
+    auto *binding = dynamic_cast<LocalActorClass *>(info.actorClass.get());
+    KJ_REQUIRE(!stopped && binding != nullptr && slot == binding->slot.lock(),
+        "durable test facets require a class in the original isolate copy");
+    className = kj::str(binding->name);
+    id = kj::mv(info.id);
+    props = binding->props.clone();
+    constexpr size_t MAX_BYTES = threaded::rpc::THREADED_SOCKET_FACET_MAX_WORDS * sizeof(capnp::word);
+    size_t identityBytes = name.size() + className.size();
+    KJ_SWITCH_ONEOF(id) {
+      KJ_CASE_ONEOF(string, kj::String) {
+        identityBytes += string.size();
+      }
+      KJ_CASE_ONEOF(global, kj::Own<ActorIdFactory::ActorId>) {
+        auto &object = kj::downcast<ObjectIdFactory::Id>(*global);
+        identityBytes += object.space.size() + object.id.size();
+        KJ_IF_SOME(value, object.name) { identityBytes += value.size(); }
+      }
+    }
+    if (tree->nodeSockets && identityBytes <= MAX_BYTES) {
+      saveStart = kj::heap<capnp::MallocMessageBuilder>();
+      auto start = saveStart->initRoot<threaded::rpc::ThreadedSocketFacet>();
+      start.setId(facet);
+      start.setParent(parentFacet);
+      start.setName(name);
+      start.setClassName(className);
+      KJ_SWITCH_ONEOF(id) {
+        KJ_CASE_ONEOF(string, kj::String) {
+          start.setActorId(string);
+        }
+        KJ_CASE_ONEOF(global, kj::Own<ActorIdFactory::ActorId>) {
+          auto &object = kj::downcast<ObjectIdFactory::Id>(*global);
+          start.setNamespaceId(object.space);
+          start.setActorId(object.id);
+          KJ_IF_SOME(value, object.name) {
+            start.setHasActorName(true);
+            start.setActorName(value);
+          }
+        }
+      }
+      auto remaining = MAX_BYTES - identityBytes;
+      auto describe = [&](Frankenvalue::CapTableEntry& cap) -> kj::Maybe<FacetPropChannel> {
+        auto* bound = dynamic_cast<Channels::Bound*>(&cap);
+        if (bound == nullptr || bound->owner->slot != slot) return kj::none;
+        return FacetPropChannel{bound->channel, bound->object.map([](auto& id) { return id.asPtr(); }),
+          bound->props.map([](auto& props) -> Frankenvalue& { return props; })};
+      };
+      if (!writeFacetProps(props, start.initProps(), remaining, describe) ||
+          start.asReader().totalSize().wordCount > threaded::rpc::THREADED_SOCKET_FACET_MAX_WORDS) {
+        saveStart = nullptr;
+      }
+    }
+  }
   server::DurableWalPosition position;
   if (tree->state.wal) {
     auto wal = tree->storage().walImage(tree->uniqueKey, tree->storageId, facet);
     position = co_await tree->server.durableLog->prepareOpen(wal.directory, kj::mv(wal.path));
     KJ_REQUIRE(!stopped, "durable facet closed during WAL preparation");
   }
-  actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(info.id), className,
-      binding->props.clone(), facet, depth, reservation, parentFacet, name, position);
+  actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(id), className,
+      kj::mv(props), facet, depth, reservation, parentFacet, name, position);
   if (tree->state.wal) co_await tree->state.wal->waitForOpen(
       tree->shippers.at(facet)->getOpenId(), tree->state.io.provider->getTimer());
+  KJ_REQUIRE(!stopped, "durable facet closed during startup");
+  if (saveStart.get() != nullptr) tree->facetStarts.emplace(facet, kj::mv(saveStart));
+  tree->installSocketManager(*KJ_ASSERT_NONNULL(actor).value, facet);
 }
 
-kj::Promise<kj::Own<WorkerInterface>> LocalFacet::open(
-    kj::String descriptor, kj::Own<Invocation> invocation) {
-  if (actor == kj::none && starting == kj::none) starting = initialize().fork();
+kj::Promise<void> LocalFacet::ensureStarted(kj::StringPtr descriptor) {
+  if (actor == kj::none && starting == kj::none) starting = initialize(kj::str(descriptor)).fork();
   KJ_IF_SOME(load, starting) {
     co_await load.addBranch();
   }
   KJ_REQUIRE(!stopped, "durable test facet is closed");
+}
+
+kj::Promise<kj::Rc<LocalFacet>> LocalFacet::openSocketFacet(uint id, kj::StringPtr descriptor) {
+  Invocation invocation(*this);
+  co_await ensureStarted(descriptor);
+  co_return co_await KJ_ASSERT_NONNULL(actor).hooks->getSocketFacet(id, descriptor);
+}
+
+kj::Promise<std::pair<kj::Own<WorkerInterface>, kj::Own<Worker::Actor>>> LocalFacet::openSocket(
+    kj::String descriptor) {
+  auto entry = co_await open(kj::mv(descriptor), kj::heap<Invocation>(*this));
+  co_return std::make_pair(kj::mv(entry), kj::addRef(*KJ_ASSERT_NONNULL(actor).value));
+}
+
+kj::Promise<kj::Own<WorkerInterface>> LocalFacet::open(
+    kj::String descriptor, kj::Own<Invocation> invocation) {
+  co_await ensureStarted(descriptor);
   auto slot = tree->slot.lock();
   KJ_REQUIRE(slot != nullptr, "durable test facet lost its isolate copy");
   JsonDoc input(descriptor);
@@ -6175,6 +6595,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
                 .emplace(ticket.tree,
                     ThreadState::DurableRoot{
                       .actor = kj::mv(actor.value),
+                      .tree = tree,
+                      .hooks = actor.hooks,
                       .idle = std::move(idle),
                       .facetsBusy =
                           [hooks = actor.hooks](
@@ -6221,35 +6643,37 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
     if (!root.nodeSockets) {
       auto sockets = std::make_shared<DurableNodeSockets>(state, kj::str(server.bindingAddress.c_str()),
           route, root.rootOpenId(), root.idle);
-      auto manager = kj::refcounted<LegacyHibernationManagerImpl>(root.actor->getLoopback(), 8,
-          LegacyHibernationManagerImpl::SocketFactory([sockets] {
-            return kj::heap<DurableNodeWebSocket>(sockets);
-          }));
-      root.parkSockets = [sockets, manager = manager.get()] { return sockets->park(*manager); };
-      root.hasLocalSockets = [manager = manager.get()] { return manager->hasLocalSockets(); };
-      root.actor->setHibernationManager(kj::addRef(*manager));
+      root.tree->nodeSockets = sockets;
+      root.parkSockets = [tree = root.tree] { return tree->parkSockets(); };
+      root.hasLocalSockets = [tree = root.tree] {
+        auto manager = tree->socketManagers.find(0);
+        return manager != tree->socketManagers.end() && manager->second.manager->hasLocalSockets();
+      };
       root.nodeSockets = std::move(sockets);
       root.socketsRestored = !flag(input, "hasNodeSockets");
+      if (root.socketsRestored) root.tree->installSocketManager(*root.actor, 0);
     }
     if (!root.socketsRestored && !root.adopting) {
-      auto &manager = kj::downcast<LegacyHibernationManagerImpl>(
-          KJ_REQUIRE_NONNULL(root.actor->getHibernationManager()));
       const auto tree = ticket.tree;
       root.adopting = std::make_shared<ThreadState::SocketAdoption>(
-          root.nodeSockets->adopt(manager)
-              .then([&state = state, &server = server, tree](bool restored) {
+          root.nodeSockets->adopt()
+              .then([&state = state, &server = server, tree](
+                        kj::Maybe<DurableSocketAdoption> restored) {
         auto current = state.durableRoots.find(tree);
         KJ_REQUIRE(
             current != state.durableRoots.end(), "the Durable Object WebSocket home has ended");
-        if (!restored) {
+        KJ_IF_SOME(response, restored) {
+          current->second.tree->restoreSockets(kj::mv(response));
+          current->second.tree->installSocketManager(*current->second.actor, 0);
+          current->second.socketsRestored = true;
+        } else {
           auto reason =
               KJ_EXCEPTION(DISCONNECTED, "Durable Object could not confirm WebSocket adoption.");
           server.beginDurableReset(state, tree, reason);
           current->second.actor->abort(kj::mv(reason));
           KJ_FAIL_REQUIRE("the node could not confirm WebSocket adoption");
         }
-        current->second.socketsRestored = true;
-      }).attach(kj::addRef(manager)));
+      }).attach(std::shared_ptr(root.nodeSockets)));
       // A client can drop the first event while the node is adopting. Let the
       // home finish the handoff and settle the admission fence anyway.
       auto adopting = root.adopting;
@@ -6278,8 +6702,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
       }
     }
   }
-  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props), nullptr,
-      nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*found->second.actor));
+  auto &root = found->second;
+  kj::Own<WorkerInterface> entry;
   kj::Maybe<DurableAlarmEvent> alarm;
   auto alarmDescriptor = field(input, "durableAlarm");
   if (alarmDescriptor.isObject()) {
@@ -6296,25 +6720,38 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
   auto socketDescriptor = field(input, "durableSocket");
   if (socketDescriptor.isObject()) {
     KJ_REQUIRE(state.wal.get() != nullptr, "persistent storage is required for a socket event");
-    socketEvent = DurableSocketEvent{kj::addRef(*found->second.actor), text(socketDescriptor, "id"),
-      durableNumber(socketDescriptor, "frame")};
+    const auto facetId = durableNumber(socketDescriptor, "facet");
+    KJ_REQUIRE(facetId <= UINT16_MAX, "invalid socket facet");
+    auto socketActor = kj::addRef(*root.actor);
+    if (facetId != 0) {
+      auto facet = co_await root.hooks->getSocketFacet(facetId, descriptor);
+      auto opened = co_await facet->openSocket(kj::str(descriptor));
+      entry = kj::mv(opened.first);
+      socketActor = kj::mv(opened.second);
+    }
+    socketEvent = DurableSocketEvent{
+      kj::mv(socketActor), text(socketDescriptor, "id"), durableNumber(socketDescriptor, "frame")};
+  }
+  if (entry.get() == nullptr) {
+    entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props), nullptr,
+        nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor))
+                .entry;
   }
   auto identity = invocationIdentity(*slot, input);
   kj::Maybe<DurableSocketStart> socket;
   if (state.wal) {
     socket = DurableSocketStart{
       [server = &server, state = &state, ticket = ticket, scope = scope] {
-        server->markDurableSocket(*state, ticket, scope);
-      },
+      server->markDurableSocket(*state, ticket, scope);
+    },
       found->second.idle,
       kj::str(route.invocation.c_str()),
       *state.headers,
-      kj::addRef(*found->second.actor),
+      root.tree,
     };
   }
-  co_return rpc::EventDispatcher::Client(kj::heap<ChannelDispatcher>(state,
-      kj::mv(prepared.entry), std::move(slot), kj::mv(identity), kj::mv(alarm), kj::mv(socket),
-      kj::mv(socketEvent)));
+  co_return rpc::EventDispatcher::Client(kj::heap<ChannelDispatcher>(state, kj::mv(entry),
+      std::move(slot), kj::mv(identity), kj::mv(alarm), kj::mv(socket), kj::mv(socketEvent)));
 }
 
 kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {

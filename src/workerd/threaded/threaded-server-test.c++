@@ -1371,6 +1371,59 @@ KJ_TEST("four simultaneous near-GiB heap objects preserve the process and a neig
   }
 }
 
+KJ_TEST("facet WebSocket startup props round-trip nested binding channels and object identity") {
+  struct Binding final: Frankenvalue::CapTableEntry, kj::Refcounted {
+    Binding(uint channel, kj::Maybe<kj::String> object, kj::Maybe<Frankenvalue> props)
+        : channel(channel), object(kj::mv(object)), props(kj::mv(props)) {}
+    kj::Own<CapTableEntry> clone() override {
+      return kj::addRef(*this);
+    }
+    uint channel;
+    kj::Maybe<kj::String> object;
+    kj::Maybe<Frankenvalue> props;
+  };
+  auto bind = [](uint channel, kj::Maybe<kj::String> object,
+                  kj::Maybe<Frankenvalue> props) -> kj::Own<Frankenvalue::CapTableEntry> {
+    return kj::refcounted<Binding>(channel, kj::mv(object), kj::mv(props));
+  };
+  auto describe = [](Frankenvalue::CapTableEntry& entry) -> kj::Maybe<FacetPropChannel> {
+    auto& binding = kj::downcast<Binding>(entry);
+    return FacetPropChannel{binding.channel,
+      binding.object.map([](auto& id) { return id.asPtr(); }),
+      binding.props.map([](auto& props) -> Frankenvalue& { return props; })};
+  };
+  Frankenvalue serviceProps;
+  serviceProps.setProperty(kj::str("nested"), Frankenvalue::fromCapability(42,
+      bind(15, kj::str("original-object"), kj::none)));
+  Frankenvalue input;
+  input.setProperty(kj::str("service"), Frankenvalue::fromCapability(42,
+      bind(12, kj::none, kj::mv(serviceProps))));
+
+  capnp::MallocMessageBuilder message;
+  auto outbound = message.initRoot<rpc::Frankenvalue>();
+  size_t remaining = 64 * 1024;
+  KJ_REQUIRE(writeFacetProps(input, outbound, remaining, describe));
+  auto restored = readFacetProps(outbound.asReader(), bind);
+  auto bindings = restored.getCapTable();
+  KJ_ASSERT(bindings.size() == 1);
+  auto& service = kj::downcast<Binding>(*bindings[0]);
+  KJ_EXPECT(service.channel == 12 && service.object == kj::none);
+  auto nested = KJ_REQUIRE_NONNULL(service.props).getCapTable();
+  KJ_ASSERT(nested.size() == 1);
+  auto& object = kj::downcast<Binding>(*nested[0]);
+  KJ_EXPECT(object.channel == 15 && KJ_REQUIRE_NONNULL(object.object) == "original-object");
+  KJ_EXPECT(object.props == kj::none);
+
+  remaining = 32;
+  KJ_EXPECT(!writeFacetProps(input, outbound, remaining, describe));
+  remaining = 64 * 1024;
+  KJ_EXPECT(!writeFacetProps(input, outbound, remaining,
+      [&](Frankenvalue::CapTableEntry& entry) -> kj::Maybe<FacetPropChannel> {
+    if (kj::downcast<Binding>(entry).channel == 15) return kj::none;
+    return describe(entry);
+  }));
+}
+
 KJ_TEST("deadline decimal spelling and native refusal mappings") {
   for (auto literal: {"123456789.12345679", "123456789.12345678", "9007199254740991",
          "1.2345678901234567e+12", "1e+09", "0.00100", "0"}) {

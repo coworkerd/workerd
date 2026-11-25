@@ -245,6 +245,12 @@ kj::Maybe<kj::StringPtr> LegacyHibernationManagerImpl::stageNodeSocket(
     KJ_IF_SOME(active, socket->activeOrPackage.tryGet<jsg::Ref<api::WebSocket>>()) {
       if (active->isPeerOf(js, peer)) {
         KJ_REQUIRE(socket->pendingNodeSocket.size() == 0, "WebSocket was already upgraded");
+        try {
+          socket->pendingNodeInvocation = kj::str(KJ_REQUIRE_NONNULL(nodeUpgradeOwner)());
+        } catch (...) {
+          discardNodeUpgrade(*socket);
+          throw;
+        }
         socket->pendingNodeSocket = randomUUID(kj::none);
         socket->nodeSocket->startUpgrade();
         return socket->pendingNodeSocket.asPtr();
@@ -254,12 +260,60 @@ kj::Maybe<kj::StringPtr> LegacyHibernationManagerImpl::stageNodeSocket(
   return kj::none;
 }
 
+bool LegacyHibernationManagerImpl::hasStagedNodeSocket(
+    kj::StringPtr pending, kj::StringPtr invocation) const {
+  for (const auto& socket: allWs) {
+    if (socket->pendingNodeSocket.size() != 0 && socket->pendingNodeSocket == pending &&
+        socket->pendingNodeInvocation == invocation) return true;
+  }
+  return false;
+}
+
+bool LegacyHibernationManagerImpl::hasNodeUpgrades() const {
+  for (const auto& socket: allWs) {
+    if (socket->nodeSocket != nullptr &&
+        (socket->nodeSocket->id().size() != 0 || socket->pendingNodeSocket.size() != 0)) return true;
+  }
+  return false;
+}
+
+void LegacyHibernationManagerImpl::discardStagedNodeSockets(kj::Maybe<kj::StringPtr> invocation) {
+  for (auto it = allWs.begin(); it != allWs.end();) {
+    auto& socket = **it++;
+    if (socket.pendingNodeSocket.size() != 0 &&
+        invocation.orDefault(socket.pendingNodeInvocation.asPtr()) == socket.pendingNodeInvocation) {
+      discardNodeUpgrade(socket);
+    }
+  }
+}
+
+void LegacyHibernationManagerImpl::discardNodeUpgrade(HibernatableWebSocket& socket) {
+  KJ_DEFER(dropHibernatableWebSocket(socket));
+  KJ_IF_SOME(active, socket.activeOrPackage.tryGet<jsg::Ref<api::WebSocket>>()) {
+    active->abandonHibernatableUpgrade();
+  }
+  socket.nodeSocket->abandonUpgrade();
+}
+
+bool LegacyHibernationManagerImpl::canForwardNodeUpgrade(
+    Worker::Actor& actor, kj::StringPtr pending) {
+  KJ_IF_SOME(manager, actor.getHibernationManager()) {
+    KJ_IF_SOME(legacy, kj::tryDowncast<LegacyHibernationManagerImpl>(manager)) {
+      KJ_IF_SOME(lookup, legacy.nodeUpgradeLookup) {
+        return lookup(pending);
+      }
+    }
+  }
+  return false;
+}
+
 kj::Promise<void> LegacyHibernationManagerImpl::activateNodeSocket(
     kj::StringPtr pending, kj::StringPtr invocation) {
   for (auto& socket: allWs) {
-    if (socket->pendingNodeSocket != pending) continue;
+    if (socket->pendingNodeSocket != pending || socket->pendingNodeInvocation != invocation) continue;
     KJ_REQUIRE(socket->nodeSocket != nullptr);
     socket->pendingNodeSocket = nullptr;
+    socket->pendingNodeInvocation = nullptr;
     auto keepAlive = KJ_ASSERT_NONNULL(socket->ws).addRef();
     auto& transport = *socket->nodeSocket;
     transport.attach(invocation, invocation);
