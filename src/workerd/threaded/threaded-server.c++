@@ -2158,7 +2158,10 @@ bool platformDurablePlan(Json::Reader input, Json::Reader plan, Json::Reader sel
   const auto database = field(field(input, "durableObject"), "database");
   const bool isDatabase = database.isString() && database.getString().size() > 0;
   if (isDatabase != (productPlatformPlan(plan) && route.open.className == "SqlDatabase")) return false;
-  if (tenant.size() == 0 || text(input, "workerId") != kj::str(tenant, "/:platform") ||
+  // The plan identifies the code package. The descriptor's Worker identifies the
+  // events and limit records attributed to that package.
+  const auto workerSuffix = isDatabase ? "/__databases"_kj : "/:platform"_kj;
+  if (tenant.size() == 0 || text(input, "workerId") != kj::str(tenant, workerSuffix) ||
       text(input, "format") != "v2" || text(selection, "className") != route.open.className.c_str() ||
       platformCopyKey(input, plan, isDatabase ? &route.key : nullptr) != route.open.definition) return false;
   auto empty = [](Json::Reader value) {
