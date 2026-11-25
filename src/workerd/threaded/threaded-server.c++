@@ -392,6 +392,20 @@ struct ResourceBudget {
     reclaimed.notify_all();
   }
 
+  bool fits(uint64_t memory, uint64_t newMemory, uint64_t address, uint64_t newAddress,
+      uint64_t ceiling) const {
+    return newMemory <= ceiling - kj::min(memory, ceiling) &&
+        newAddress <= addressMaximum - kj::min(address, addressMaximum);
+  }
+
+  bool canReplaceForAdmission(uint64_t returnedMemory, uint64_t newMemory,
+      uint64_t returnedAddress, uint64_t newAddress) {
+    std::lock_guard lock(mutex);
+    return residents.load() <= residentMaximum.load() &&
+        fits(memoryReserved.load() - returnedMemory, newMemory,
+            addressReserved.load() - returnedAddress, newAddress, admissionMaximum);
+  }
+
   bool change(uint64_t oldMemory,
       uint64_t newMemory,
       uint64_t oldAddress,
@@ -402,15 +416,14 @@ struct ResourceBudget {
     auto memory = memoryReserved.load() - oldMemory;
     auto address = addressReserved.load() - oldAddress;
     auto ceiling = admission ? admissionMaximum : memoryMaximum;
-    bool fits = (!admission && newMemory <= oldMemory && newAddress <= oldAddress) ||
-        (newMemory <= ceiling - kj::min(memory, ceiling) &&
-            newAddress <= addressMaximum - kj::min(address, addressMaximum));
-    if (!fits && !observe) return false;
+    const bool accepted = (!admission && newMemory <= oldMemory && newAddress <= oldAddress) ||
+        fits(memory, newMemory, address, newAddress, ceiling);
+    if (!accepted && !observe) return false;
     memoryReserved.store(memory + newMemory);
     addressReserved.store(address + newAddress);
     if (memory + newMemory > admissionMaximum || address + newAddress > addressMaximum)
       requestReclaimLocked();
-    return fits;
+    return accepted;
   }
 };
 
@@ -419,22 +432,32 @@ struct ResourceReservation {
   // The capacity acquisition records heap and RSS deltas to validate this seed
   // and fixed native overhead separately from each isolate's own heap ceiling.
   static constexpr uint64_t NATIVE_OVERHEAD = 512ull << 10;
-  ResourceReservation(std::shared_ptr<ResourceBudget> budget, uint32_t memoryMiB)
+  static constexpr uint64_t PREPARATION_HEAP = 2 * MiB;
+  ResourceReservation(std::shared_ptr<ResourceBudget> budget, uint32_t memoryMiB,
+      bool platformDatabase = false)
       : budget(std::move(budget)),
-        maximumHeap(uint64_t(memoryMiB == 0 ? 128 : memoryMiB) * MiB) {}
+        maximumHeap(uint64_t(memoryMiB == 0 ? 128 : memoryMiB) * MiB),
+        returned(platformDatabase ? std::make_shared<std::atomic<bool>>(false) : nullptr) {}
   ~ResourceReservation() {
     if (!registered) return;
     (void)budget->change(memoryCharge, 0, addressCharge, 0);
     budget->residents.fetch_sub(1);
+    if (returned) returned->store(true);
   }
   std::shared_ptr<ResourceBudget> budget;
   const uint64_t maximumHeap;
+  const std::shared_ptr<std::atomic<bool>> returned;
   std::mutex mutex;
-  uint64_t heap = 2 * MiB, heapPhysical = 0, otherExternal = 0, ownedExternal = 0, source = 0,
+  uint64_t heap = PREPARATION_HEAP, heapPhysical = 0, otherExternal = 0, ownedExternal = 0, source = 0,
            logs = 0;
   uint64_t memoryCharge = 0, addressCharge = 0;
   uint32_t preparing = 0;
   bool registered = false;
+  bool canReplaceWithPreparation() {
+    std::lock_guard lock(mutex);
+    return registered && budget->canReplaceForAdmission(
+        memoryCharge, NATIVE_OVERHEAD + PREPARATION_HEAP, addressCharge, PREPARATION_HEAP);
+  }
   bool resize(bool admission = false, bool observe = false) {
     auto memory = NATIVE_OVERHEAD + source + heap + otherExternal + ownedExternal + logs;
     auto address = kj::max(2 * MiB, heap);
@@ -2527,11 +2550,13 @@ struct ThreadedServer {
     uint64_t home;
     uint64_t tree;
     uint64_t lastUse;
+    std::shared_ptr<std::atomic<bool>> reservationReturned;
+    bool fenced = false;
   };
   // One retirement at a time, so concurrent cold loads can retry against the same release.
   // Both fields are guarded by durableRoutingMutex.
   std::optional<DatabaseVictim> databaseVictim;
-  std::vector<DurableWake> databaseCapacityWaiters;
+  std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<bool>>> databaseCapacityWaiters;
   std::atomic<uint64_t> durableHomeSessions{0};
   std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
   std::atomic<uint64_t> durableAdmissionRetirements{0};
@@ -2579,6 +2604,7 @@ struct ThreadedServer {
       std::set<uint64_t> resident;
       uint64_t databaseLastUse = 0;
       bool databaseCanRetire = false;
+      std::weak_ptr<ResourceReservation> databaseReservation;
     };
     std::optional<DurableHome> home;
     uint64_t homeId = 0;
@@ -2954,7 +2980,7 @@ struct ThreadedServer {
 
   // Called with durableRoutingMutex held. The home still rechecks all the
   // prerequisites locally before it fences admission to the selected tree.
-  bool requestDatabaseRetirement() {
+  bool requestDatabaseRetirement(bool needsPreparationBudget = false) {
     if (databaseVictim) return true;
     for (const auto& thread: threads) {
       const auto& home = *thread->home;
@@ -2964,10 +2990,12 @@ struct ThreadedServer {
         continue;
       }
       const auto tree = *home.resident.begin();
-      if (durableAdmission->isIdleTree(tree, thread->homeId) &&
-          (!databaseVictim || home.databaseLastUse < databaseVictim->lastUse)) {
-        databaseVictim = DatabaseVictim{thread->homeId, tree, home.databaseLastUse};
-      }
+      if (!durableAdmission->isIdleTree(tree, thread->homeId) ||
+          (databaseVictim && home.databaseLastUse >= databaseVictim->lastUse)) continue;
+      const auto reservation = home.databaseReservation.lock();
+      if (!reservation || (needsPreparationBudget && !reservation->canReplaceWithPreparation())) continue;
+      databaseVictim =
+          DatabaseVictim{thread->homeId, tree, home.databaseLastUse, reservation->returned};
     }
     if (!databaseVictim) return false;
     wake(threads[databaseVictim->home - 1]->wake);
@@ -2975,15 +3003,14 @@ struct ThreadedServer {
   }
 
   kj::Promise<bool> reclaimIdleDatabase() {
-    auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
+    auto signal = kj::newPromiseAndCrossThreadFulfiller<bool>();
     {
       std::lock_guard lock(durableRoutingMutex);
-      if (!requestDatabaseRetirement()) co_return false;
+      if (!requestDatabaseRetirement(true)) co_return false;
       std::erase_if(databaseCapacityWaiters, [](auto &waiter) { return !waiter->isWaiting(); });
       databaseCapacityWaiters.push_back(kj::mv(signal.fulfiller));
     }
-    co_await signal.promise;
-    co_return true;
+    co_return co_await signal.promise;
   }
 
   // durableRoutingMutex holds placement and event admission together, before
@@ -3024,19 +3051,20 @@ struct ThreadedServer {
       const DurableRoute &route, uint64_t bytes, server::DurableAdmission::Time deadline) {
     using Admission = server::DurableAdmission;
     if (!ready.load(std::memory_order_acquire)) return {Admission::Status::OVERLOADED};
-    std::lock_guard lock(durableRoutingMutex);
-    auto result =
-        durableAdmission->queue(route.key, route.open, bytes, deadline, Admission::Clock::now());
     const bool database = route.open.className == "SqlDatabase" &&
         route.open.definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
+    std::lock_guard lock(durableRoutingMutex);
+    auto result = durableAdmission->queue(
+        route.key, route.open, bytes, deadline, Admission::Clock::now(), database);
     if (result.ticket && !reserveDurableHome(route, *result.ticket)) {
-      KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket));
+      KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket, !database || !result.needsHome));
       durableAdmission->releaseUnassigned(result.ticket->tree);
       result = {.status = Admission::Status::OVERLOADED, .newTreeCapacityRefused = result.needsHome};
     }
-    if (database && result.newTreeCapacityRefused && requestDatabaseRetirement()) {
+    if (database && result.newTreeCapacityRefused) {
       // The existing pre-dispatch retry waits for idle retirement on its original lease.
-      return {Admission::Status::RETIRING};
+      if (requestDatabaseRetirement()) return {Admission::Status::RETIRING};
+      durableAdmission->recordOverload();
     }
     return result;
   }
@@ -3243,18 +3271,22 @@ struct ThreadedServer {
 
   void retireIdleDurableRoots(ThreadState &state) {
     const auto homeId = state.durableHome;
-    const auto victim = [&]() -> std::optional<DatabaseVictim> {
+    auto victim = [&]() -> std::optional<DatabaseVictim> {
       std::lock_guard lock(durableRoutingMutex);
       if (databaseVictim && databaseVictim->home == homeId) return databaseVictim;
       return std::nullopt;
     }();
     KJ_DEFER(if (victim) {
       const auto root = state.durableRoots.find(victim->tree);
-      if (root == state.durableRoots.end() || !root->second.admissionClosing) {
+      const bool retired = root == state.durableRoots.end() && victim->fenced;
+      // Other home-local handles can outlive the tree and its Slot. Keep the
+      // victim reserved until the budget and resident count have both returned.
+      if ((root == state.durableRoots.end() || !root->second.admissionClosing) &&
+          (!retired || victim->reservationReturned->load())) {
         std::lock_guard lock(durableRoutingMutex);
         databaseVictim.reset();
         for (const auto &waiter: databaseCapacityWaiters) {
-          if (waiter->isWaiting()) waiter->fulfill();
+          if (waiter->isWaiting()) waiter->fulfill(bool(retired));
         }
         databaseCapacityWaiters.clear();
       }
@@ -3324,7 +3356,10 @@ struct ThreadedServer {
         const bool stopped = closeSocketSessions ? durableAdmission->stopIdleTreeWithSockets(tree, homeId)
                                                  : durableAdmission->stopIdleTree(tree, homeId);
         if (!stopped) continue;
-        if (forAdmission) root.admissionClosing = true;
+        if (forAdmission) {
+          root.admissionClosing = true;
+          victim->fenced = databaseVictim->fenced = true;
+        }
       }
       // Park the whole object's node transports before canceling I/O or
       // closing standard sockets. The abort would break the actor and make
@@ -3431,6 +3466,7 @@ struct ThreadedServer {
       auto &home = *threads[homeId - 1]->home;
       home.memory = 0;
       home.warmDefinition.clear();
+      home.databaseReservation.reset();
       if (home.reservedTrees == 0) home.definition.clear();
       if (home.pressure.resetting()) {
         home.pressure.closed();
@@ -4047,19 +4083,27 @@ struct ThreadedServer {
     return worker;
   }
 
-  kj::Promise<std::shared_ptr<Slot>> loadDurableWorkerOnce(
-      ThreadState &state, kj::StringPtr descriptor, const std::string &definition) {
+  kj::Promise<std::shared_ptr<Slot>> loadDurableWorker(
+      ThreadState &state, kj::String descriptor, std::string definition) {
     JsonDoc document(descriptor);
     auto input = document.get();
+    const bool platformDatabase = definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
     auto reservation = std::make_shared<ResourceReservation>(
-        resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"));
-    if (!reservation->registerPreparation()) kj::throwRecoverableException(capacityError());
+        resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), platformDatabase);
+    if (!reservation->registerPreparation()) {
+      // One cold load can initiate at most one database retirement. An error
+      // later in source loading or isolate creation has its usual refusal path.
+      if (!platformDatabase || !(co_await reclaimIdleDatabase()) ||
+          !reservation->registerPreparation()) {
+        kj::throwRecoverableException(capacityError());
+      }
+    }
     auto slot = std::make_shared<Slot>();
     slot->reservation = std::move(reservation);
     slot->instance = ++nextInstance;
     slot->workerId = str(input, "workerId");
     slot->versionId = str(input, "versionId");
-    slot->planRevision = definition;
+    slot->planRevision = std::move(definition);
     slot->isolateLabel = "coworkerd-durable:" + std::to_string(slot->instance);
     slot->homeTurn = [this, homeId = state.durableHome, loaded = slot.get()](bool entering) {
       const auto &memory = *loaded->limits->memory;
@@ -4096,21 +4140,6 @@ struct ThreadedServer {
     co_return slot;
   }
 
-  kj::Promise<std::shared_ptr<Slot>> loadDurableWorker(
-      ThreadState &state, kj::String descriptor, std::string definition) {
-    for (;;) {
-      kj::Maybe<kj::Exception> refusal;
-      try {
-        co_return co_await loadDurableWorkerOnce(state, descriptor, definition);
-      } catch (const kj::Exception &error) {
-        if (!isCapacityError(error) || !definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX)) throw;
-        refusal = error.clone();
-      }
-      if (!(co_await reclaimIdleDatabase()))
-        kj::throwRecoverableException(kj::mv(KJ_ASSERT_NONNULL(refusal)));
-    }
-  }
-
   kj::Promise<std::shared_ptr<Slot>> getDurableWorker(
       ThreadState &state, kj::StringPtr descriptor, const std::string &definition) {
     if (state.durableSlot && state.durableSlot->planRevision == definition) {
@@ -4122,7 +4151,9 @@ struct ThreadedServer {
     state.durableSlot.reset();
     {
       std::lock_guard lock(durableRoutingMutex);
-      threads[state.durableHome - 1]->home->warmDefinition.clear();
+      auto &home = *threads[state.durableHome - 1]->home;
+      home.warmDefinition.clear();
+      home.databaseReservation.reset();
     }
     if (!state.durableLoad) {
       state.durableLoad.emplace(ThreadState::DurableLoad{
@@ -4151,7 +4182,9 @@ struct ThreadedServer {
     state.durableSlot = loaded;
     {
       std::lock_guard lock(durableRoutingMutex);
-      threads[state.durableHome - 1]->home->warmDefinition = loaded->planRevision;
+      auto &home = *threads[state.durableHome - 1]->home;
+      home.warmDefinition = loaded->planRevision;
+      if (loaded->reservation->returned) home.databaseReservation = loaded->reservation;
     }
     co_return loaded;
   }

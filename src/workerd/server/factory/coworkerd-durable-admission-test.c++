@@ -99,12 +99,17 @@ KJ_TEST("capacity recovery can select only a published tree with a drained mailb
   KJ_EXPECT(!table.isIdleTree(active.tree, 1));
   KJ_REQUIRE(table.begin(active, 1, first, open, now) == Delivery::ACCEPTED);
   const auto waiting = queued(table.queue(first, open, 0, deadline, now), false);
-  const auto result = table.queue(second, open, 0, deadline, now);
+  const auto secondWaiting = queued(table.queue(first, open, 0, deadline, now), false);
+  const auto fullMailbox = table.queue(first, open, 0, deadline, now, true);
+  KJ_EXPECT(fullMailbox.status == Status::OVERLOADED && !fullMailbox.newTreeCapacityRefused);
+  const auto result = table.queue(second, open, 0, deadline, now, true);
   KJ_EXPECT(result.status == Status::OVERLOADED && result.newTreeCapacityRefused);
+  KJ_EXPECT(table.state().overloads == 1);
   KJ_EXPECT(!table.queue(second, open, limits.mailboxBytes + 1, deadline, now).newTreeCapacityRefused);
   KJ_REQUIRE(table.complete(active, 1));
   KJ_EXPECT(!table.isIdleTree(active.tree, 1));
   KJ_REQUIRE(table.refuseWaiting(waiting));
+  KJ_REQUIRE(table.refuseWaiting(secondWaiting));
   KJ_EXPECT(table.isIdleTree(active.tree, 1));
   KJ_EXPECT(!table.isIdleTree(active.tree, 2));
   KJ_REQUIRE(table.stopIdleTree(active.tree, 1));
@@ -112,6 +117,18 @@ KJ_TEST("capacity recovery can select only a published tree with a drained mailb
   KJ_EXPECT(table.queue(second, open, 0, deadline, now).status == Status::OVERLOADED);
   KJ_REQUIRE(table.releaseTree(active.tree, 1));
   queued(table.queue(second, open, 0, deadline, now), true);
+}
+
+KJ_TEST("failure to reserve an event for a new tree can request capacity recovery") {
+  auto constrained = limits;
+  constrained.capacity.descriptors = limits.tree.descriptors + limits.event.descriptors;
+  Admission table(constrained, 1);
+  queued(table.queue(first, open, 0, deadline, now), true);
+  const auto refused = table.queue(second, open, 0, deadline, now, true);
+  KJ_EXPECT(refused.status == Status::OVERLOADED && refused.newTreeCapacityRefused);
+  KJ_EXPECT(table.state().overloads == 0);
+  table.recordOverload();
+  KJ_EXPECT(table.state().overloads == 1);
 }
 
 KJ_TEST("durable admission fences the generation, identity, home and queued event") {

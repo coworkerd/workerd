@@ -108,6 +108,41 @@ KJ_TEST("an exclusive database copy keeps its isolate while the home has a reser
   KJ_EXPECT(shouldReleaseDurableCopy(0, false, tenant, true));
 }
 
+KJ_TEST("tenant memory growth can block a database preparation even after returning an idle copy") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  const auto budget = std::make_shared<ResourceBudget>(128 * MiB, 10, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto idleDatabase = std::make_shared<ResourceReservation>(budget, 64, true);
+  auto ordinary = std::make_shared<ResourceReservation>(budget, 64);
+  ResourceReservation incoming(budget, 64, true);
+  KJ_REQUIRE(idleDatabase->registerPreparation());
+  KJ_REQUIRE(ordinary->registerPreparation());
+  const auto ordinaryGrowth = budget->admissionMaximum + MiB - budget->memoryReserved.load();
+  KJ_REQUIRE(ordinary->allocateExternal(ordinaryGrowth));
+  KJ_EXPECT(!incoming.registerPreparation());
+  KJ_EXPECT(!idleDatabase->canReplaceWithPreparation());
+  KJ_EXPECT(!idleDatabase->returned->load());
+  KJ_EXPECT(budget->residents.load() == 2);
+}
+
+KJ_TEST("the database release notice follows the final reservation holder") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  const auto budget = std::make_shared<ResourceBudget>(128 * MiB, 1, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto idleDatabase = std::make_shared<ResourceReservation>(budget, 64, true);
+  KJ_REQUIRE(idleDatabase->registerPreparation());
+  KJ_EXPECT(idleDatabase->canReplaceWithPreparation());
+  const auto returned = idleDatabase->returned;
+  auto lastHolder = idleDatabase;
+  idleDatabase.reset();
+  KJ_EXPECT(!returned->load());
+  KJ_EXPECT(budget->residents.load() == 1);
+  lastHolder.reset();
+  KJ_EXPECT(returned->load());
+  KJ_EXPECT(budget->residents.load() == 0);
+  KJ_EXPECT(budget->memoryReserved.load() == budget->baselineMemory);
+}
+
 KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
   int fds[2];
   KJ_SYSCALL(pipe(fds));

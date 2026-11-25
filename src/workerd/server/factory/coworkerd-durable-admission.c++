@@ -49,7 +49,8 @@ DurableAdmission::DurableAdmission(Limits limits, uint64_t generation)
 }
 
 DurableAdmission::Result DurableAdmission::queue(
-    const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now) {
+    const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now,
+    bool deferNewTreeOverload) {
   if (open.generation != generation) return {Status::STALE};
   if (deadline <= now) {
     ++counters.expired;
@@ -63,7 +64,7 @@ DurableAdmission::Result DurableAdmission::queue(
   }
 
   auto refuse = [&](bool newTreeCapacityRefused = false) -> Result {
-    ++counters.overloads;
+    if (!deferNewTreeOverload || !newTreeCapacityRefused) recordOverload();
     return {.status = Status::OVERLOADED, .newTreeCapacityRefused = newTreeCapacityRefused};
   };
   if (bytes > limits.mailboxBytes ||
@@ -187,14 +188,14 @@ DurableAdmission::Cancellation DurableAdmission::cancel(Ticket ticket) {
   return Cancellation::RELEASED;
 }
 
-bool DurableAdmission::refuseWaiting(Ticket ticket) {
+bool DurableAdmission::refuseWaiting(Ticket ticket, bool countOverload) {
   auto entry = trees.find(ticket.tree);
   if (entry == trees.end()) return false;
   auto& tree = entry->second;
   auto event = tree.events.find(ticket.event);
   if (event == tree.events.end() || event->second.phase != Phase::WAITING) return false;
   releaseEvent(tree, event);
-  ++counters.overloads;
+  if (countOverload) recordOverload();
   return true;
 }
 

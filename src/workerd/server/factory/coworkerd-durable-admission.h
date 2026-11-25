@@ -86,7 +86,8 @@ class DurableAdmission {
 
   DurableAdmission(Limits limits, uint64_t generation);
 
-  Result queue(const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now);
+  Result queue(const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now,
+      bool deferNewTreeOverload = false);
   bool publishHome(uint64_t tree, uint64_t home);
   std::optional<uint64_t> homeFor(uint64_t tree) const;
   // Check the full descriptor and route the first live waiting event to an already published home.
@@ -96,7 +97,8 @@ class DurableAdmission {
   Delivery begin(Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now);
   Cancellation cancel(Ticket ticket);
   // Refuse a waiting call before acknowledging it, returning its event reservation.
-  bool refuseWaiting(Ticket ticket);
+  bool refuseWaiting(Ticket ticket, bool countOverload = true);
+  void recordOverload() { ++counters.overloads; }
   bool complete(Ticket ticket, uint64_t home);
   bool markSocket(Ticket ticket, uint64_t home);
   std::vector<Ticket> expire(Time now);
