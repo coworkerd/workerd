@@ -18,6 +18,7 @@
 #include <memory>
 
 struct sqlite3;
+struct sqlite3_file;
 struct sqlite3_vfs;
 struct sqlite3_stmt;
 
@@ -107,6 +108,7 @@ class SqliteDatabase {
   class Lock;
   class LockManager;
   struct VfsOptions;
+  class WalTransactionLimit;
   class Regulator;
 
   // StaticRegulator is a wrapper type that asserts (using consteval) that the Regulator is
@@ -310,6 +312,8 @@ class SqliteDatabase {
 
   // Returns true if a transaction was automatically rolled due to a critical error.
   bool observedCriticalError();
+  WalTransactionLimit* getWalTransactionLimit() const;
+  void rollbackWalTransaction();
 
   // Invoke the onWrite() callback.
   //
@@ -538,6 +542,7 @@ class SqliteDatabase {
   // Called immediately after a statement executes, to update our understanding of the current
   // state.
   void applyChange(const StateChange& change);
+  void clearRolledBackTransaction();
 
   void handleCriticalError(kj::Maybe<int> errorCode,
       kj::StringPtr errorMessage,
@@ -932,6 +937,27 @@ class SqliteDatabase::Query final: private ResetListener {
   void nextRow(bool first);
 };
 
+// One SQL connection, used only on its home thread. SQLite rewrites spilled
+// pages in place, so measure the WAL frame span from its first write.
+class SqliteDatabase::WalTransactionLimit {
+ public:
+  explicit WalTransactionLimit(uint64_t frameBytes): frameBytes(frameBytes) {}
+  uint64_t capacity() const { return frameBytes; }
+  bool wasRefused() const { return active && refused; }
+  void setPageSize(uint32_t pageSize);
+  void begin();
+  void end(SqliteDatabase& db);
+  int checkWrite(sqlite3_file* file, int64_t offset, int length) noexcept;
+
+ private:
+  const uint64_t frameBytes;
+  uint64_t wholeFrameBytes = 0;
+  kj::Maybe<uint64_t> firstFrameByte;
+  kj::Maybe<int64_t> originalSize;
+  bool active = false;
+  bool refused = false;
+};
+
 // Options affecting SqliteDatabase::Vfs onstructor.
 struct SqliteDatabase::VfsOptions {
 
@@ -958,6 +984,7 @@ struct SqliteDatabase::VfsOptions {
   // need not survive the machine, such as those of tests, where a sync can stall for seconds on a
   // busy disk.
   bool sync = true;
+  WalTransactionLimit* walTransactionLimit = nullptr;
 };
 
 // Implements a SQLite VFS based on a KJ directory.

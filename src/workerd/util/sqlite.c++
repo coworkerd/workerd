@@ -916,6 +916,76 @@ bool SqliteDatabase::observedCriticalError() {
   return criticalErrorOccurred;
 }
 
+SqliteDatabase::WalTransactionLimit* SqliteDatabase::getWalTransactionLimit() const {
+  return vfs.options.walTransactionLimit;
+}
+
+void SqliteDatabase::rollbackWalTransaction() {
+  if (!sqlite3_get_autocommit(*this)) {
+    run("ROLLBACK TRANSACTION");
+  } else {
+    // SQLITE_FULL can roll back the entire transaction, including its savepoints.
+    clearRolledBackTransaction();
+  }
+}
+
+void SqliteDatabase::WalTransactionLimit::setPageSize(uint32_t pageSize) {
+  KJ_REQUIRE(!active && pageSize >= 512 && pageSize <= 65536);
+  const uint64_t frameSize = pageSize + 24;
+  // SQLite writes the frame header and page separately. Refuse at the start
+  // of an excess frame, before it can write a header carrying a commit marker.
+  wholeFrameBytes = frameBytes - frameBytes % frameSize;
+}
+
+void SqliteDatabase::WalTransactionLimit::begin() {
+  KJ_ASSERT(!active && wholeFrameBytes != 0);
+  active = true;
+  refused = false;
+  firstFrameByte = kj::none;
+  originalSize = kj::none;
+}
+
+int SqliteDatabase::WalTransactionLimit::checkWrite(
+    sqlite3_file* file, int64_t offset, int length) noexcept {
+  constexpr uint64_t WAL_HEADER_BYTES = 32;
+  if (!active) return SQLITE_OK;
+  if (refused) return SQLITE_FULL;
+  if (originalSize == kj::none) {
+    sqlite3_int64 size = 0;
+    const int result = file->pMethods->xFileSize(file, &size);
+    if (result != SQLITE_OK) return result;
+    originalSize = size;
+  }
+  const uint64_t end = uint64_t(offset) + length;
+  if (end <= WAL_HEADER_BYTES) return SQLITE_OK;
+  if (firstFrameByte == kj::none) {
+    firstFrameByte = kj::max(uint64_t(offset), WAL_HEADER_BYTES);
+  }
+  if (end > KJ_ASSERT_NONNULL(firstFrameByte) + wholeFrameBytes) {
+    refused = true;
+    return SQLITE_FULL;
+  }
+  return SQLITE_OK;
+}
+
+void SqliteDatabase::WalTransactionLimit::end(SqliteDatabase& db) {
+  if (!active) return;
+  active = false;
+  if (!refused) return;
+  KJ_REQUIRE(sqlite3_get_autocommit(db), "the refused SQL transaction must be rolled back");
+  sqlite3_file* wal = nullptr;
+  KJ_REQUIRE(sqlite3_file_control(db, "main", SQLITE_FCNTL_JOURNAL_POINTER, &wal) == SQLITE_OK);
+  if (wal == nullptr || wal->pMethods == nullptr) return;
+  // SQLite's WAL index ignores the uncommitted tail after rollback. Return
+  // any space it added, preserving the file's entire pre-transaction extent.
+  sqlite3_int64 now = 0;
+  KJ_REQUIRE(wal->pMethods->xFileSize(wal, &now) == SQLITE_OK);
+  const auto before = KJ_ASSERT_NONNULL(originalSize);
+  if (now > before) {
+    KJ_REQUIRE(wal->pMethods->xTruncate(wal, before) == SQLITE_OK);
+  }
+}
+
 void SqliteDatabase::notifyWrite(bool allowUnconfirmed) {
   KJ_IF_SOME(cb, onWriteCallback) {
     cb(allowUnconfirmed);
@@ -926,6 +996,9 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
     kj::StringPtr errorMessage,
     kj::Maybe<const kj::Exception&> maybeException) {
   KJ_IF_SOME(code, errorCode) {
+    if (code == SQLITE_FULL) {
+      if (auto* limit = getWalTransactionLimit(); limit != nullptr && limit->wasRefused()) return;
+    }
     // Only errors listed in https://www.sqlite.org/lang_transaction.html#response_to_errors_within_a_transaction
     // should be considered here as SQLITE auto rollbacks the transaction when we hit these errors
     if (code == SQLITE_FULL || code == SQLITE_IOERR || code == SQLITE_NOMEM ||
@@ -1034,17 +1107,19 @@ void SqliteDatabase::applyChange(const StateChange& change) {
           savepoints.removeLast();
         }
       } else {
-        KJ_ASSERT(inTransaction, "ROLLBACK TRANSACTION without BEGIN TRANSACTION?");
-
-        savepoints.clear();
-        inTransaction = false;
-
-        while (!rollbackCallbacks.empty()) {
-          rollbackCallbacks.back()();
-          rollbackCallbacks.removeLast();
-        }
+        KJ_ASSERT(inTransaction || !savepoints.empty(), "ROLLBACK without an open transaction?");
+        clearRolledBackTransaction();
       }
     }
+  }
+}
+
+void SqliteDatabase::clearRolledBackTransaction() {
+  savepoints.clear();
+  inTransaction = false;
+  while (!rollbackCallbacks.empty()) {
+    rollbackCallbacks.back()();
+    rollbackCallbacks.removeLast();
   }
 }
 
@@ -2234,6 +2309,7 @@ static int replaced_lstat(const char* path, struct stat* stats) {
 struct SqliteDatabase::Vfs::WrappedNativeFileImpl: public sqlite3_file {
   const Vfs* vfs;
   int rootFd;
+  bool wal;
 
   // It's expected that the wrapped sqlite_file begins in memory immediately after this object.
   sqlite3_file* getWrapped() {
@@ -2294,7 +2370,15 @@ const sqlite3_io_methods SqliteDatabase::Vfs::WrappedNativeFileImpl::METHOD_TABL
 
   WRAP(xClose),
   WRAP(xRead),
-  WRAP(xWrite),
+  .xWrite = [](sqlite3_file* file, const void* data, int size, sqlite3_int64 offset) noexcept {
+    auto& wrapped = *static_cast<WrappedNativeFileImpl*>(file);
+    if (auto* limit = wrapped.vfs->options.walTransactionLimit; wrapped.wal && limit != nullptr) {
+      const int result = limit->checkWrite(file, offset, size);
+      if (result != SQLITE_OK) return result;
+    }
+    return MethodWrapperHack<decltype(&sqlite3_io_methods::xWrite),
+        &sqlite3_io_methods::xWrite>::wrapper(file, data, size, offset);
+  },
   WRAP(xTruncate),
   .xSync = [](sqlite3_file* file, int flags) noexcept -> int {
     // Also skips the directory sync that the native xSync does after creating a journal or WAL.
@@ -2397,6 +2481,7 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
         wrapper->pMethods = &WrappedNativeFileImpl::METHOD_TABLE;
         wrapper->vfs = &self;
         wrapper->rootFd = self.rootFd;
+        wrapper->wal = (flags & SQLITE_OPEN_WAL) != 0;
       }
 
       return result;
@@ -2455,6 +2540,7 @@ struct SqliteDatabase::Vfs::FileImpl: public sqlite3_file {
   const Vfs& vfs;
   kj::Maybe<const kj::File&> writableFile;
   kj::Own<const kj::ReadableFile> file;
+  bool wal = false;
 
   kj::Maybe<kj::Own<Lock>> lock;
   // Rather complicatedly, SQLite doesn't consider the -shm file to be a separate file that it
@@ -2516,6 +2602,10 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
       [](sqlite3_file* file, const void* buffer, int iAmt, sqlite3_int64 iOfst) noexcept -> int {
     WRAP_METHOD(SQLITE_IOERR_WRITE, {
       KJ_IF_SOME(writableFile, self.writableFile) {
+        if (auto* limit = self.vfs.options.walTransactionLimit; self.wal && limit != nullptr) {
+          const int result = limit->checkWrite(file, iOfst, iAmt);
+          if (result != SQLITE_OK) return result;
+        }
         auto bytes = kj::arrayPtr(reinterpret_cast<const byte*>(buffer), iAmt);
         writableFile.write(iOfst, bytes);
         return SQLITE_OK;
@@ -2759,6 +2849,7 @@ sqlite3_vfs SqliteDatabase::Vfs::makeKjVfs() {
 
           kj::ctor(target, self, kj::mv(kjFile), kj::mv(lock));
         }
+        target.wal = (flags & SQLITE_OPEN_WAL) != 0;
 
         // In theory if read-write was requested, but failed, we should retry read-only, and then
         // alter the pOutFlags to reflect this... I'm not going to bother.

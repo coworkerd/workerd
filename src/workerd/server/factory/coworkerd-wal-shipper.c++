@@ -576,6 +576,9 @@ void DurableLogShipper::configure(SqliteDatabase& database) {
   // node's peers hold its frames (docs/s3-truth-and-durable-objects.md, section 5.3).
   database.run(SqliteDatabase::QueryOptions{.regulator = SqliteDatabase::TRUSTED},
       "PRAGMA synchronous=OFF;"_kj);
+  if (auto* limit = database.getWalTransactionLimit()) {
+    limit->setPageSize(database.run("PRAGMA page_size").getInt(0));
+  }
   // Only to count: the hook's frame count is SQLite's own mxFrame, which says whether the WAL holds a frame this
   // shipper has not read (a rolled back overflow frame stays in the file, so its size does not say).
   sqlite3_wal_hook(handle, &DurableLogShipper::walHook, this);
@@ -662,11 +665,17 @@ void DurableLogShipper::readNewFrames() {
   uint64_t lastCommitEnd = 0;
   uint32_t lastCommitCk1 = cksum1, lastCommitCk2 = cksum2;
   uint32_t commitsHere = 0;
+  const auto* transactionLimit = db->getWalTransactionLimit();
   for (uint64_t i = 0; i < available; i++) {
     const kj::byte* f = buffer.begin() + i * frameSize;
     if (!readWalFrame(f, magic, pageSize, salt1, salt2, s1, s2)) break;
     if (getBe32(f + 4) != 0) {
-      lastCommitEnd = (i + 1) * frameSize;
+      const auto end = (i + 1) * frameSize;
+      // Group complete commits only while the combined frame bytes fit the
+      // node's record. A large individual SQL transaction still travels whole.
+      if (transactionLimit != nullptr && commitsHere != 0 &&
+          pendingFrames.size() + end > transactionLimit->capacity()) break;
+      lastCommitEnd = end;
       lastCommitCk1 = s1;
       lastCommitCk2 = s2;
       ++commitsHere;
