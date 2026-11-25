@@ -5147,9 +5147,12 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
       root.setString(value);
       return encode(root.asReader());
     };
+    auto target = field(input(), "durableObject");
     auto object = kj::str("{\"namespaceId\":", quoted(route.space),
         ",\"className\":", quoted(route.className), ",\"objectId\":", quoted(objectId),
-        ",\"callerNamespaceId\":\"\",\"callerObjectId\":\"\",\"database\":", quoted(route.database),
+        ",\"callerNamespaceId\":", quoted(text(target, "namespaceId")),
+        ",\"callerObjectId\":", quoted(text(target, "objectId")),
+        ",\"database\":", quoted(route.database),
         "}");
     return envelope(input(), "", false, kj::mv(object));
   }
@@ -5173,7 +5176,8 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
     if (channel < IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT) {
       auto identity =
           kj::str(server.egressToken.c_str(), " {\"workerId\":", encode(field(input(), "workerId")),
-              ",\"versionId\":", encode(field(input(), "versionId")), "}");
+              ",\"versionId\":", encode(field(input(), "versionId")),
+              ",\"invocationId\":", encode(field(input(), "invocationId")), "}");
       return newPromisedWorkerInterface(
           queuedRequest(true, kj::mv(identity)).attach(kj::addRef(*this)));
     }

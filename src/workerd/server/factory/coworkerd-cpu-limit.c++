@@ -1,4 +1,5 @@
 #include "coworkerd-cpu-limit.h"
+#include <workerd/io/io-context.h>
 #include <workerd/util/autogate.h>
 #include <workerd/util/sqlite.h>
 #include <csignal>
@@ -321,6 +322,26 @@ class RequestLimits final: public LimitEnforcer {
       if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
       return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); }, &gcExcluded);
     }
+    kj::Own<void> enterActorEvent(jsg::Lock& js, IoContext::IncomingRequest& request) override {
+      if (!isActor) return {};
+      auto token = jsg::wrapOpaque(js.v8Context(), request.addWeak());
+      return kj::heap<jsg::AsyncContextFrame::StorageScope>(js, actorEventKey().addRef(), js.v8Ref(token));
+    }
+    kj::Maybe<IoContext::IncomingRequest&> getActorEventRequest() override {
+      auto* isolate = v8::Isolate::TryGetCurrent();
+      if (!isActor || isolate == nullptr) return kj::none;
+      KJ_IF_SOME(frame, jsg::AsyncContextFrame::current(isolate)) {
+        KJ_IF_SOME(value, frame.get(*actorEventKey())) {
+          v8::HandleScope handles(isolate);
+          auto handle = value.getHandle(jsg::Lock::from(isolate));
+          if (!handle->IsUndefined()) {
+            auto& request = jsg::unwrapOpaqueRef<kj::Weak<IoContext::IncomingRequest>>(isolate, handle);
+            return KJ_REQUIRE_NONNULL(request.tryGet(), "the durable event that started this work has ended");
+          }
+        }
+      }
+      return kj::none;
+    }
     // Each new event a request receives starts with its CPU topped up: a message of a WebSocket it accepted, a call on
     // an RPC target it handed out, and -- upstream's contract, which tops up actors only -- an actor's request (an
     // actor's requests share one IoContext, and this enforcer, for the actor's whole life). A connection's messages are
@@ -370,6 +391,10 @@ class RequestLimits final: public LimitEnforcer {
     }
     size_t getSqliteMemoryUsage() const override { return accounting ? 0 : fallback->getSqliteMemoryUsage(); }
    private:
+    static const kj::Arc<jsg::AsyncContextFrame::StorageKey>& actorEventKey() {
+      static const auto key = kj::arc<jsg::AsyncContextFrame::StorageKey>();
+      return key;
+    }
     kj::Own<LimitEnforcer> fallback;
     kj::Own<CpuIsolateLimitEnforcer> limits;
     kj::Function<void()> abortIsolate;
