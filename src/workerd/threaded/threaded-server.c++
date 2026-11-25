@@ -80,6 +80,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <map>
@@ -1592,8 +1593,8 @@ struct RequestLimits final: LimitEnforcer {
   }
   kj::Maybe<IoContext::IncomingRequest &> getActorEventRequest() override {
     if (scope == nullptr || !scope->event) return kj::none;
-    return KJ_REQUIRE_NONNULL(KJ_REQUIRE_NONNULL(scope->event->request).tryGet(),
-        "the durable event that started this work has ended");
+    KJ_IF_SOME(request, scope->event->request) { return request.tryGet(); }
+    return kj::none;
   }
   struct EventToken {
     const std::weak_ptr<int> owner;
@@ -2278,6 +2279,15 @@ class DescriptorQueue {
 };
 
 struct ThreadedServer;
+using BudgetLifetime = std::shared_ptr<void>;
+
+struct DurableBudgetRelease {
+  DurableBudgetRelease(ThreadedServer& server, uint64_t ticket): server(server), ticket(ticket) {}
+  ~DurableBudgetRelease();
+
+  ThreadedServer& server;
+  uint64_t ticket;
+};
 
 // The server's maintenance entry: its pass runs inside the budget's maintenance
 // mark, so that a reclaim the pass itself triggers never waits for that pass.
@@ -2303,11 +2313,13 @@ struct InvocationState: kj::Refcounted {
 
 class Invocation final: public kj::HttpService {
  public:
-  Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props)
+  Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
+      BudgetLifetime budgetLifetime)
       : server(server),
         state(state),
         descriptor(kj::mv(descriptor)),
-        props(kj::mv(props)) {}
+        props(kj::mv(props)),
+        budgetLifetime(kj::mv(budgetLifetime)) {}
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
       const kj::HttpHeaders &headers,
@@ -2319,21 +2331,24 @@ class Invocation final: public kj::HttpService {
   ThreadState &state;
   kj::String descriptor;
   Frankenvalue props;
+  BudgetLifetime budgetLifetime;
   bool used = false;
 };
 
 class Dispatcher final: public rpc::EventDispatcher::Server {
  public:
-  Dispatcher(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props)
+  Dispatcher(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
+      BudgetLifetime budgetLifetime)
       : server(server),
         state(state),
         descriptor(kj::mv(descriptor)),
-        props(kj::mv(props)) {}
+        props(kj::mv(props)),
+        budgetLifetime(kj::mv(budgetLifetime)) {}
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
     KJ_REQUIRE(!used, "NOT_SUPPORTED: one HTTP event per invocation");
     used = true;
     context.initResults().setHttp(state.http.kjToCapnp(
-        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props))));
+        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props), kj::mv(budgetLifetime))));
     return kj::READY_NOW;
   }
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override;
@@ -2343,6 +2358,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
   ThreadState &state;
   kj::String descriptor;
   Frankenvalue props;
+  BudgetLifetime budgetLifetime;
   bool used = false;
 };
 
@@ -2355,8 +2371,9 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
     auto params = context.getParams();
     KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
         "NOT_SUPPORTED: persistent objects and handoff");
-    context.initResults().setDispatcher(
-        kj::heap<Dispatcher>(server, state, kj::str(params.getCfBlobJson()), Frankenvalue()));
+    context.initResults().setDispatcher(kj::heap<Dispatcher>(server, state,
+        kj::str(params.getCfBlobJson()), Frankenvalue(),
+        std::make_shared<capnp::Capability::Client>(params.getBudgetLifetime())));
     return kj::READY_NOW;
   }
 
@@ -2365,7 +2382,8 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
     used = true;
     auto params = context.getParams();
     context.getResults().setDispatcher(kj::heap<Dispatcher>(server, state,
-        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps())));
+        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()),
+        std::make_shared<capnp::Capability::Client>(params.getBudgetLifetime())));
     return kj::READY_NOW;
   }
 
@@ -2411,7 +2429,8 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
   std::shared_ptr<DurableSessionScope> scope;
   bool used = false;
 
-  kj::Promise<rpc::EventDispatcher::Client> prepare(kj::String descriptor, Frankenvalue props);
+  kj::Promise<rpc::EventDispatcher::Client> prepare(kj::String descriptor, Frankenvalue props,
+      BudgetLifetime budgetLifetime);
 };
 
 struct SubrequestBudget {
@@ -2528,6 +2547,9 @@ struct ThreadedServer {
   };
   std::vector<std::unique_ptr<Thread>> threads;
   int managerWake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  const int parent;
+  std::mutex budgetReleaseMutex;
+  std::deque<uint64_t> budgetReleases;
   std::atomic<bool> ready{false};
   std::atomic<uint32_t> liveThreads{0};
   std::atomic<uint64_t> growthFailures{0};
@@ -2544,6 +2566,7 @@ struct ThreadedServer {
   ThreadedServer(uint limit,
       std::string sourceAddress,
       std::string identity,
+      int parent,
       kj::Own<const kj::Directory> durableDirectory = {},
       kj::Own<server::ThreadedWalLog> durableLog = {})
       : sourceAddress(std::move(sourceAddress)),
@@ -2580,6 +2603,7 @@ struct ThreadedServer {
                                  : ResourceBudget::ReclaimMode::BACKGROUND)),
         tenantBudget(std::make_shared<TenantBudget>(
             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
+        parent(parent),
         subrequestBudget(limit, tenantBudget->limit) {
     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
     if (this->durableStorage) {
@@ -2821,6 +2845,62 @@ struct ThreadedServer {
       n = write(fd, &one, sizeof(one));
     } while (n < 0 && errno == EINTR);
     KJ_REQUIRE(n == sizeof(one) || (n < 0 && errno == EAGAIN));
+  }
+  BudgetLifetime retainDurableBudget(uint64_t ticket) {
+    if (ticket == 0) return {};
+    KJ_REQUIRE(parent >= 0, "durable budget ticket requires the parent socket");
+    return std::make_shared<DurableBudgetRelease>(*this, ticket);
+  }
+  void queueBudgetRelease(uint64_t ticket) {
+    std::lock_guard lock(budgetReleaseMutex);
+    const bool needsWake = budgetReleases.empty();
+    budgetReleases.push_back(ticket);
+    if (needsWake) wake(managerWake);
+  }
+  // The durable pool manager already sets up the homes. After readiness it can drain the
+  // per-process mailbox without blocking a home or keeping a per-invocation connection open.
+  void serveBudgetReleases() {
+    if (parent < 0) return;
+    size_t offset = 0;
+    for (;;) {
+      bool pending;
+      bool retry = false;
+      {
+        std::lock_guard lock(budgetReleaseMutex);
+        while (!budgetReleases.empty()) {
+          const auto* bytes = reinterpret_cast<const char*>(&budgetReleases.front());
+          const auto written = send(parent, bytes + offset, sizeof(uint64_t) - offset,
+              MSG_DONTWAIT | MSG_NOSIGNAL);
+          if (written < 0 && errno == EINTR) continue;
+          if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+          if (written <= 0) {
+            if (written < 0 && (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)) return;
+            retry = true;
+            break;
+          }
+          offset += written;
+          if (offset == sizeof(uint64_t)) {
+            budgetReleases.pop_front();
+            offset = 0;
+          }
+        }
+        pending = !budgetReleases.empty();
+      }
+      // Keep a partially sent ticket at the front until the parent receives it.
+      if (retry) {
+        (void)poll(nullptr, 0, 10);
+        continue;
+      }
+      pollfd waits[] = {{managerWake, POLLIN, 0}, {parent, short(pending ? POLLOUT : 0), 0}};
+      int result;
+      do {
+        result = poll(waits, 2, -1);
+      } while (result < 0 && errno == EINTR);
+      if (result >= 0 && (waits[1].revents & POLLHUP)) return;
+      if (result < 0 || (waits[1].revents & (POLLERR | POLLNVAL))) (void)poll(nullptr, 0, 10);
+      uint64_t count;
+      while (read(managerWake, &count, sizeof(count)) > 0) {}
+    }
   }
   bool enqueue(int fd) {
     if (!pending.push(fd)) return false;
@@ -3295,7 +3375,7 @@ struct ThreadedServer {
     for (auto &item: threads)
       while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
     ready.store(true, std::memory_order_release);
-    if (durableAdmission) return;
+    if (durableAdmission) return serveBudgetReleases();
     int held = -1;
     auto nextMaintenance = nowNs();
     auto idleMs = configuredCount("COWORKERD_THREADED_THREAD_IDLE_MS", 60000);
@@ -4060,6 +4140,10 @@ struct ThreadedServer {
     }
   }
 };
+
+DurableBudgetRelease::~DurableBudgetRelease() {
+  server.queueBudgetRelease(ticket);
+}
 
 struct DurableSocketStart {
   std::function<void()> opened;
@@ -5102,6 +5186,7 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
   ThreadState &state;
   ThreadedServer &server;
   std::shared_ptr<Slot> slot;
+  std::weak_ptr<void> budgetLifetime;
   uint64_t sequence = 0;
   std::shared_ptr<uint32_t> subrequests = std::make_shared<uint32_t>(0);
   threaded::InvocationLogBudget logBudget;
@@ -5197,9 +5282,14 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
       root.setString(value);
       return encode(root.asReader());
     };
+    auto target = field(input(), "durableObject");
+    const auto callerNamespace = target.isObject() ? text(target, "namespaceId") : kj::str("");
+    const auto callerObject = target.isObject() ? text(target, "objectId") : kj::str("");
     auto object = kj::str("{\"namespaceId\":", quoted(route.space),
         ",\"className\":", quoted(route.className), ",\"objectId\":", quoted(objectId),
-        ",\"callerNamespaceId\":\"\",\"callerObjectId\":\"\",\"database\":", quoted(route.database),
+        ",\"callerNamespaceId\":", quoted(callerNamespace),
+        ",\"callerObjectId\":", quoted(callerObject),
+        ",\"database\":", quoted(route.database),
         "}");
     return envelope(input(), "", false, kj::mv(object));
   }
@@ -5223,7 +5313,8 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
     if (channel < IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT) {
       auto identity =
           kj::str(server.egressToken.c_str(), " {\"workerId\":", encode(field(input(), "workerId")),
-              ",\"versionId\":", encode(field(input(), "versionId")), "}");
+              ",\"versionId\":", encode(field(input(), "versionId")),
+              ",\"invocationId\":", encode(field(input(), "invocationId")), "}");
       return newPromisedWorkerInterface(
           queuedRequest(true, kj::mv(identity)).attach(kj::addRef(*this)));
     }
@@ -5633,6 +5724,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
     std::shared_ptr<Slot> slot,
     Json::Reader input,
     kj::StringPtr raw,
+    BudgetLifetime budgetLifetime,
     Frankenvalue props,
     std::shared_ptr<ResourcePreparation> preparation,
     std::shared_ptr<TenantPermit> tenant,
@@ -5661,6 +5753,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
     entrypoint.assign(name.begin(), name.size());
   }
   auto channels = kj::rc<Channels>(state, server, slot, raw);
+  channels->budgetLifetime = budgetLifetime;
   auto tracer = kj::rc<TenantTracer>(channels.addRef());
   auto identity = kj::str("\"workerId\":", encode(field(input, "workerId")),
       ",\"versionId\":", encode(field(input, "versionId")),
@@ -5670,6 +5763,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
     observer = kj::refcounted<DurableEventObserver>(
         std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
   }
+  observer = kj::mv(observer).attachToThisReference(std::move(budgetLifetime));
   auto limits =
       kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
   if (slot->resetDurableRoot) {
@@ -6137,7 +6231,7 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
   void stop(const kj::Exception &reason);
   kj::Promise<kj::Rc<LocalFacet>> openSocketFacet(uint id, kj::StringPtr descriptor);
   kj::Promise<std::pair<kj::Own<WorkerInterface>, kj::Own<Worker::Actor>>> openSocket(
-      kj::String descriptor);
+      kj::String descriptor, BudgetLifetime budgetLifetime);
 
  private:
   struct Invocation {
@@ -6152,7 +6246,8 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
 
   kj::Promise<void> initialize(kj::String descriptor);
   kj::Promise<void> ensureStarted(kj::StringPtr descriptor);
-  kj::Promise<kj::Own<WorkerInterface>> open(kj::String descriptor, kj::Own<Invocation> invocation);
+  kj::Promise<kj::Own<WorkerInterface>> open(kj::String descriptor, kj::Own<Invocation> invocation,
+      BudgetLifetime budgetLifetime);
 
   std::shared_ptr<DurableTreeContext> tree;
   std::shared_ptr<DurableFacetReservation> reservation;
@@ -6384,7 +6479,8 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
       KJ_ASSERT_NONNULL(dynamic_cast<Channels *>(&IoContext::current().getIoChannelFactory()));
   KJ_REQUIRE(tree->slot.lock() == channels.slot, "facet request must stay on the original home");
   return newPromisedWorkerInterface(
-      open(kj::str(channels.document.original), kj::heap<Invocation>(*this)));
+      open(kj::str(channels.document.original), kj::heap<Invocation>(*this),
+          channels.budgetLifetime.lock()));
 }
 
 kj::Promise<void> LocalFacet::initialize(kj::String descriptor) {
@@ -6498,19 +6594,19 @@ kj::Promise<kj::Rc<LocalFacet>> LocalFacet::openSocketFacet(uint id, kj::StringP
 }
 
 kj::Promise<std::pair<kj::Own<WorkerInterface>, kj::Own<Worker::Actor>>> LocalFacet::openSocket(
-    kj::String descriptor) {
-  auto entry = co_await open(kj::mv(descriptor), kj::heap<Invocation>(*this));
+    kj::String descriptor, BudgetLifetime budgetLifetime) {
+  auto entry = co_await open(kj::mv(descriptor), kj::heap<Invocation>(*this), kj::mv(budgetLifetime));
   co_return std::make_pair(kj::mv(entry), kj::addRef(*KJ_ASSERT_NONNULL(actor).value));
 }
 
 kj::Promise<kj::Own<WorkerInterface>> LocalFacet::open(
-    kj::String descriptor, kj::Own<Invocation> invocation) {
+    kj::String descriptor, kj::Own<Invocation> invocation, BudgetLifetime budgetLifetime) {
   co_await ensureStarted(descriptor);
   auto slot = tree->slot.lock();
   KJ_REQUIRE(slot != nullptr, "durable test facet lost its isolate copy");
   JsonDoc input(descriptor);
   auto prepared = prepareInvocation(tree->state, tree->server, std::move(slot), input.get(),
-      descriptor, Frankenvalue(), nullptr, nullptr, kj::refcounted<RequestObserver>(),
+      descriptor, kj::mv(budgetLifetime), Frankenvalue(), nullptr, nullptr, kj::refcounted<RequestObserver>(),
       kj::addRef(*KJ_ASSERT_NONNULL(actor).value), className.asPtr());
   co_return kj::mv(prepared.entry).attach(kj::mv(invocation));
 }
@@ -6593,7 +6689,7 @@ kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
 }
 
 kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
-    kj::String descriptor, Frankenvalue props) {
+    kj::String descriptor, Frankenvalue props, BudgetLifetime budgetLifetime) {
   KJ_REQUIRE(!used, "one event per durable connection");
   used = true;
   KJ_REQUIRE(!server.durableLog || server.durableLog->ready(), "durable WAL channel unavailable");
@@ -6777,7 +6873,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
     auto socketActor = kj::addRef(*root.actor);
     if (facetId != 0) {
       auto facet = co_await root.hooks->getSocketFacet(facetId, descriptor);
-      auto opened = co_await facet->openSocket(kj::str(descriptor));
+      auto opened = co_await facet->openSocket(kj::str(descriptor), kj::mv(budgetLifetime));
       entry = kj::mv(opened.first);
       socketActor = kj::mv(opened.second);
     }
@@ -6785,7 +6881,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
       kj::mv(socketActor), text(socketDescriptor, "id"), durableNumber(socketDescriptor, "frame")};
   }
   if (entry.get() == nullptr) {
-    entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props), nullptr,
+    entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props), nullptr,
         nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor))
                 .entry;
   }
@@ -6812,9 +6908,12 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
       "unsupported durable test event origin");
   try {
     KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
-    auto dispatcher =
-        co_await scope->preparing.wrap(prepare(kj::str(params.getCfBlobJson()), Frankenvalue()));
-    context.getResults().setDispatcher(kj::mv(dispatcher));
+    const auto ticket = params.getBudgetTicket();
+    auto dispatcher = co_await scope->preparing.wrap(prepare(kj::str(params.getCfBlobJson()),
+        Frankenvalue(), server.retainDurableBudget(ticket)));
+    auto result = context.getResults();
+    result.setDispatcher(kj::mv(dispatcher));
+    result.setBudgetAccepted(ticket != 0);
     if (accepted->isWaiting()) accepted->fulfill();
   } catch (const kj::Exception &error) {
     reportDurableFailureForTest("event preparation", error);
@@ -6826,9 +6925,13 @@ kj::Promise<void> DurableBootstrap::startNativeEvent(StartNativeEventContext con
   auto params = context.getParams();
   try {
     KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
+    const auto ticket = params.getBudgetTicket();
     auto dispatcher = co_await scope->preparing.wrap(prepare(
-        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps())));
-    context.getResults().setDispatcher(kj::mv(dispatcher));
+        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()),
+        server.retainDurableBudget(ticket)));
+    auto result = context.getResults();
+    result.setDispatcher(kj::mv(dispatcher));
+    result.setBudgetAccepted(ticket != 0);
     if (accepted->isWaiting()) accepted->fulfill();
   } catch (const kj::Exception &error) {
     reportDurableFailureForTest("native event preparation", error);
@@ -6875,7 +6978,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
     co_await server.confirmDecision(input, state, "load-rejected", error.getDescription(), stage);
     kj::throwRecoverableException(error.clone());
   }
-  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props),
+  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props),
       std::move(preparation), std::move(tenant));
   auto identity = invocationIdentity(*slot, input);
   startBoundRpcSession(context.getResults(),
@@ -7016,7 +7119,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
     co_await output->write(report.asBytes());
     co_return;
   }
-  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props),
+  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props),
       std::move(preparation), std::move(tenant),
       httpEntryObserver(input, entrypoint.c_str(), headers, state.placementCallId));
   auto &invocation = prepared.invocation;
@@ -7368,6 +7471,8 @@ int main(int argc, char **argv) {
   util::Autogate::initAutogateNamesForTest({}, util::IgnoreAllAutogatesEnv(true));
   setenv("COWORKERD_THREADED", "1", 1);
   const int listener = strtol(argv[1], nullptr, 10);
+  const char *parentEnv = getenv("COWORKERD_PARENT_FD");
+  const int parent = parentEnv == nullptr ? -1 : strtol(parentEnv, nullptr, 10);
   ThreadedServer *server;
   try {
     kj::Own<const kj::Directory> directory;
@@ -7392,7 +7497,7 @@ int main(int argc, char **argv) {
     } else if (disposable) {
       directory = newDurableTestDirectory(listener);
     }
-    server = new ThreadedServer(limit, argv[2], argv[3], kj::mv(directory), kj::mv(wal));
+    server = new ThreadedServer(limit, argv[2], argv[3], parent, kj::mv(directory), kj::mv(wal));
   } catch (...) {
     fprintf(stderr,
         "[threaded-start] "
@@ -7400,7 +7505,6 @@ int main(int argc, char **argv) {
         "initialization\"}\n");
     return 78;
   }
-  const char *parent = getenv("COWORKERD_PARENT_FD");
-  acceptLoop(*server, listener, parent == nullptr ? -1 : strtol(parent, nullptr, 10));
+  acceptLoop(*server, listener, parent);
   return 0;
 }
