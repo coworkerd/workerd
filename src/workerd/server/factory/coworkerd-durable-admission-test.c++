@@ -89,6 +89,31 @@ KJ_TEST("retiring idle sockets fences admission and waits for their session cred
   KJ_EXPECT(table.releaseTree(socket.tree, 1));
 }
 
+KJ_TEST("capacity recovery can select only a published tree with a drained mailbox") {
+  auto oneTree = limits;
+  oneTree.residentTarget = 1;
+  Admission table(oneTree, 1);
+  const auto active = queued(table.queue(first, open, 0, deadline, now), true);
+  KJ_EXPECT(!table.isIdleTree(active.tree, 1));
+  KJ_REQUIRE(table.publishHome(active.tree, 1));
+  KJ_EXPECT(!table.isIdleTree(active.tree, 1));
+  KJ_REQUIRE(table.begin(active, 1, first, open, now) == Delivery::ACCEPTED);
+  const auto waiting = queued(table.queue(first, open, 0, deadline, now), false);
+  const auto result = table.queue(second, open, 0, deadline, now);
+  KJ_EXPECT(result.status == Status::OVERLOADED && result.newTreeCapacityRefused);
+  KJ_EXPECT(!table.queue(second, open, limits.mailboxBytes + 1, deadline, now).newTreeCapacityRefused);
+  KJ_REQUIRE(table.complete(active, 1));
+  KJ_EXPECT(!table.isIdleTree(active.tree, 1));
+  KJ_REQUIRE(table.refuseWaiting(waiting));
+  KJ_EXPECT(table.isIdleTree(active.tree, 1));
+  KJ_EXPECT(!table.isIdleTree(active.tree, 2));
+  KJ_REQUIRE(table.stopIdleTree(active.tree, 1));
+  KJ_EXPECT(!table.isIdleTree(active.tree, 1));
+  KJ_EXPECT(table.queue(second, open, 0, deadline, now).status == Status::OVERLOADED);
+  KJ_REQUIRE(table.releaseTree(active.tree, 1));
+  queued(table.queue(second, open, 0, deadline, now), true);
+}
+
 KJ_TEST("durable admission fences the generation, identity, home and queued event") {
   Admission table(limits, 1);
   auto stale = open;

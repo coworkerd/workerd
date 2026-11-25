@@ -68,6 +68,7 @@ class DurableAdmission {
     Status status;
     std::optional<Ticket> ticket = std::nullopt;
     bool needsHome = false;
+    bool newTreeCapacityRefused = false;
   };
 
   enum class Cancellation { GONE, RELEASED, SIGNAL_HOME };
@@ -103,6 +104,7 @@ class DurableAdmission {
   // Reset closes admission immediately, releases waiting calls, and retains active credits
   // until their home completes them. The home still owns every actor handle until releaseTree().
   bool beginReset(uint64_t tree, uint64_t home);
+  bool isIdleTree(uint64_t tree, uint64_t home) const;
   // Idle close requires an empty mailbox and no active calls. It is also the drain check for
   // a reset already in progress. Keep the tree reservation until the home releases its handles.
   bool stopIdleTree(uint64_t tree, uint64_t home);
@@ -167,6 +169,7 @@ class DurableIdleLifecycle {
   void eventFinished(Time now);
   Pending pendingStarted(Time now);
   void pendingFinished(Pending pending, Time now);
+  bool hasPending() const { return !pending.empty(); }
   Decision check(Time now, bool hasOrdinarySocket, bool pressured);
 
  private:

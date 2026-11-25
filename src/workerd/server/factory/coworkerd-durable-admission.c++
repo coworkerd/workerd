@@ -62,9 +62,9 @@ DurableAdmission::Result DurableAdmission::queue(
     if (tree->closing) return {tree->idleClosing ? Status::RETIRING : Status::STALE};
   }
 
-  auto refuse = [&]() -> Result {
+  auto refuse = [&](bool newTreeCapacityRefused = false) -> Result {
     ++counters.overloads;
-    return {Status::OVERLOADED};
+    return {.status = Status::OVERLOADED, .newTreeCapacityRefused = newTreeCapacityRefused};
   };
   if (bytes > limits.mailboxBytes ||
       (tree != nullptr &&
@@ -72,16 +72,16 @@ DurableAdmission::Result DurableAdmission::queue(
               bytes > limits.mailboxBytes - tree->waitingBytes))) {
     return refuse();
   }
+  const bool newTree = tree == nullptr;
   auto reserved = counters.reserved;
   if (!reserve(reserved, limits.capacity, limits.event) ||
       !reserve(reserved, limits.capacity, {.memory = bytes})) {
-    return refuse();
+    return refuse(newTree);
   }
-  const bool newTree = tree == nullptr;
   if (newTree &&
       ((limits.residentTarget != 0 && counters.trees >= limits.residentTarget) ||
           !reserve(reserved, limits.capacity, limits.tree))) {
-    return refuse();
+    return refuse(true);
   }
 
   KJ_ASSERT(nextTree != 0 && nextEvent != 0);
@@ -243,6 +243,12 @@ bool DurableAdmission::beginReset(uint64_t tree, uint64_t home) {
     if (event->second.phase == Phase::WAITING) releaseEvent(pending, event);
   }
   return true;
+}
+
+bool DurableAdmission::isIdleTree(uint64_t tree, uint64_t home) const {
+  auto entry = trees.find(tree);
+  return home != 0 && entry != trees.end() && entry->second.home == home &&
+      !entry->second.closing && entry->second.events.empty();
 }
 
 bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home) {
