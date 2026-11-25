@@ -169,6 +169,7 @@ KJ_TEST("SQLite deadline covers multiple statements and interrupts an active cur
    public:
     mutable std::shared_ptr<SqlExecutionBudget> budget;
     std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() const override { return budget; }
+    bool isAllowedTrigger(kj::StringPtr name) const override { return name == "r"; }
   } regulator;
   KJ_DEFER(regulator.budget.reset());
   auto dir = kj::newInMemoryDirectory(kj::nullClock());

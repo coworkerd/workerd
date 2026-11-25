@@ -218,7 +218,7 @@ struct HomeSession {
       kj::Function<void(uint64_t, CloseReason)> onClose = [](uint64_t, CloseReason) {
         KJ_FAIL_EXPECT("unexpected close request");
       }) {
-    return kj::heap<Home>(shared, kj::mv(onClose));
+    return kj::heap<Home>(shared, kj::mv(onClose), clock);
   }
 
   void advance(kj::Duration duration) {
@@ -287,6 +287,25 @@ KJ_TEST("threaded WAL home gives up a pending write at its deadline after caller
   test.link.expectGiveUp(root.id(), request, root.shipper.getKey());
   root.shipper.reportAlarm(kj::none);
   test.link.receive(MSG_ALARM, root.id());
+}
+
+KJ_TEST("threaded WAL starts confirmation after synchronous work with a stale home timer") {
+  HomeSession test;
+  kj::TimerImpl precise{test.clock.now()};
+  Home home(test.shared, [](uint64_t, CloseReason) { KJ_FAIL_EXPECT("unexpected close request"); },
+      precise);
+  TestRoot root(test, home, "namespace/after-sql/epoch"_kj);
+  acceptOpen(test, home, root);
+
+  // Model a turn that ran SQLite without polling the event port.
+  const auto synchronousTime = 30 * kj::SECONDS;
+  precise.advanceTo(precise.now() + synchronousTime);
+  const auto request = home.nextRequest();
+  auto caller = sendFrames(test, home, root, request);
+  test.advance(synchronousTime + JUST_BEFORE_TIMEOUT);
+  KJ_EXPECT(!caller.poll(test.link.io.waitScope));
+  test.link.ack(request);
+  test.link.wait(kj::mv(caller));
 }
 
 KJ_TEST("threaded WAL home suppresses a timed-out give-up when the session receives a late ACK") {
