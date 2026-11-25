@@ -924,6 +924,15 @@ impl RootRegistry {
             .root_binding(&target.service, target.entrypoint.as_deref(), props)
     }
 
+    fn budget_target(&self, target: &RootTarget, props: Value) -> Rc<dyn Channel> {
+        Rc::new(BudgetedRootTarget {
+            server: self.server.borrow().clone(),
+            service: target.service.clone(),
+            entrypoint: target.entrypoint.clone(),
+            props,
+        })
+    }
+
     fn root_props(&self, selection: &RootOrigin) -> Result<KjOwn<ffi::Frankenvalue>> {
         let plan = self
             .plans
@@ -942,7 +951,7 @@ impl RootRegistry {
                 json!({"namespaceId": selection.namespace_id, "objectId": selection.object_id});
             target_props["workerId"] = json!(plan.deployment.worker_id);
             target_props["versionId"] = json!(plan.deployment.version_id);
-            let channel = self.target(&binding.target, &target_props)?;
+            let channel = self.budget_target(&binding.target, target_props);
             let mut entry = ffi::frankenvalue_from_json(&binding.metadata.to_string());
             ffi::frankenvalue_set_service_stub(
                 entry.pin_mut(),
@@ -1099,9 +1108,10 @@ impl RootRegistry {
         }
         cf.insert("workerId".to_owned(), json!(plan.deployment.worker_id));
         cf.insert("versionId".to_owned(), json!(plan.deployment.version_id));
-        let cf = Value::Object(cf).to_string();
-        ffi::request_metadata_set_cf_blob_json(metadata.pin_mut(), &cf);
-        ffi::request_metadata_set_coworkerd_invocation_identity(metadata.pin_mut(), &cf);
+        ffi::request_metadata_set_cf_blob_json(metadata.pin_mut(), &json!(cf).to_string());
+        cf.insert("leaseDeadline".to_owned(), json!(selection.lease_deadline));
+        cf.insert("requiresChildSequence".to_owned(), json!(selection.requires_child_sequence));
+        ffi::request_metadata_set_coworkerd_invocation_identity(metadata.pin_mut(), &json!(cf).to_string());
         Ok(())
     }
 
@@ -1277,7 +1287,7 @@ impl RootRegistry {
             return Err(kj::failed!("root worker binding kind is not implemented"));
         }
         let global = match &plan.deployment.global_outbound {
-            Some(target) => self.target(target, &target.props)?,
+            Some(target) => self.budget_target(target, target.props.clone()),
             None => Rc::new(Denied) as Rc<dyn Channel>,
         };
         let streaming_tails = match &plan.deployment.streaming_tail {
@@ -2408,6 +2418,34 @@ impl Channel for Denied {
     }
     fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
         Err(not_transferable("Root outbound"))
+    }
+}
+
+// Only platform-owned routes use the current invocation, from the caller's I/O
+// context. The tenant's headers, cf and channel props cannot select a lease.
+struct BudgetedRootTarget {
+    server: Weak<crate::config::Server>,
+    service: String,
+    entrypoint: Option<String>,
+    props: Value,
+}
+
+impl Channel for BudgetedRootTarget {
+    fn start_request(&self, metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
+        let identity = ffi::coworkerd_current_invocation_identity();
+        let mut props = self.props.clone();
+        if !identity.is_empty() {
+            props["callerInvocation"] = serde_json::from_str(&identity)
+                .map_err(|error| kj::failed!("invalid budget caller identity: {error}"))?;
+        }
+        self.server.upgrade().ok_or_else(|| kj::disconnected!("root server gone"))?
+            .root_binding(&self.service, self.entrypoint.as_deref(), &props)?
+            .start_request(metadata)
+    }
+
+    fn require_allows_transfer(&self) -> Result<()> { Err(not_transferable("Private budgeted binding")) }
+    fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
+        Err(not_transferable("Private budgeted binding"))
     }
 }
 

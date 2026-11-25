@@ -251,6 +251,7 @@ class IoChannelFactory: public virtual kj::Refcounted {
     // Bound by a Coworkerd platform dynamic entrypoint, never inferred from cf or props.
     // Reporting identity only; it does not change the request or context lifetime.
     kj::Maybe<kj::String> coworkerdInvocationIdentity;
+    capnp::Capability::Client coworkerdBudgetLifetime = nullptr;
   };
 
   // Parameters that can influence the version of a worker that is used to serve a subrequest.
@@ -541,6 +542,9 @@ class IoChannelFactory: public virtual kj::Refcounted {
   virtual rpc::WorkerdDebugPort::Client getWorkerdDebugPort() {
     JSG_FAIL_REQUIRE(Error, "WorkerdDebugPort bindings are not supported by this runtime.");
   }
+
+  // For the trusted local Coworkerd root loader to carry the same budget into the selected event.
+  virtual capnp::Capability::Client getCoworkerdBudgetLifetime() { return nullptr; }
 
   // Converts a token created with {SubrequestChannel,ActorClassChannel}::getToken() back into a
   // live channel. Default implementations throw.

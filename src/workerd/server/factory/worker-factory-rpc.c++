@@ -28,14 +28,16 @@ class WorkerdBootstrapImpl::EventDispatcherImpl final: public rpc::EventDispatch
       Persistent fromPersistentStub,
       FromHandoff fromHandoff,
       kj::Maybe<kj::String> forwardedBy,
-      kj::Array<kj::String> causedBy)
+      kj::Array<kj::String> causedBy,
+      capnp::Capability::Client budgetLifetime)
       : httpOverCapnpFactory(httpOverCapnpFactory),
         service(kj::mv(service)),
         cfBlobJson(kj::mv(cfBlobJson)),
         fromPersistentStub(fromPersistentStub),
         fromHandoff(fromHandoff),
         forwardedBy(kj::mv(forwardedBy)),
-        causedBy(kj::mv(causedBy)) {}
+        causedBy(kj::mv(causedBy)),
+        budgetLifetime(kj::mv(budgetLifetime)) {}
 
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
     IoChannelFactory::SubrequestMetadata metadata;
@@ -44,6 +46,7 @@ class WorkerdBootstrapImpl::EventDispatcherImpl final: public rpc::EventDispatch
     metadata.fromHandoff = fromHandoff;
     metadata.forwardedBy = kj::mv(forwardedBy);
     metadata.causedBy = kj::mv(causedBy);
+    metadata.coworkerdBudgetLifetime = kj::mv(budgetLifetime);
     context.initResults(capnp::MessageSize{4, 1})
         .setHttp(httpOverCapnpFactory.kjToCapnp(getService()->startRequest(kj::mv(metadata))));
     return kj::READY_NOW;
@@ -105,6 +108,7 @@ class WorkerdBootstrapImpl::EventDispatcherImpl final: public rpc::EventDispatch
   FromHandoff fromHandoff;
   kj::Maybe<kj::String> forwardedBy;
   kj::Array<kj::String> causedBy;
+  capnp::Capability::Client budgetLifetime;
 
   kj::Rc<IoChannelFactory::SubrequestChannel> getService() {
     auto result =
@@ -119,6 +123,7 @@ class WorkerdBootstrapImpl::EventDispatcherImpl final: public rpc::EventDispatch
     metadata.fromHandoff = fromHandoff;
     metadata.forwardedBy = kj::mv(forwardedBy);
     metadata.causedBy = kj::mv(causedBy);
+    metadata.coworkerdBudgetLifetime = kj::mv(budgetLifetime);
     return getService()->startRequest(kj::mv(metadata));
   }
 
@@ -143,7 +148,8 @@ kj::Promise<void> WorkerdBootstrapImpl::startEvent(StartEventContext context) {
           kj::heap<EventDispatcherImpl>(httpOverCapnpFactory, service->addRef(), kj::mv(cfBlobJson),
               Persistent(params.getFromPersistentStub()), FromHandoff(params.getFromHandoff()),
               kj::mv(forwardedBy),
-              KJ_MAP(object, params.getCausedBy()) { return kj::str(object); }));
+              KJ_MAP(object, params.getCausedBy()) { return kj::str(object); },
+              params.getBudgetLifetime()));
   return kj::READY_NOW;
 }
 

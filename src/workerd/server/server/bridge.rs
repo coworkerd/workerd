@@ -658,6 +658,7 @@ pub mod ffi {
             metadata: Pin<&mut RequestMetadata>,
             identity: &str,
         );
+        fn coworkerd_current_invocation_identity() -> String;
         /// Makes stubs the request creates for the actor itself restorable: they encode the
         /// actor's namespace and id.
         fn request_metadata_set_actor_self_token(
