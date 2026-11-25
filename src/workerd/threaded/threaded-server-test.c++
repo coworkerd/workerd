@@ -45,6 +45,8 @@ KJ_TEST("platform durable plans pin the class and copy to the tenant") {
       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
   JsonDoc otherTenant(kj::str(R"({"workerId":"beta/:platform","format":"v2","versionId":"build-a",
       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
+  JsonDoc databaseWorker(kj::str(R"({"workerId":"alpha/__databases","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
   JsonDoc bound(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
       "variables":[{"name":"TENANT_SECRET","value":"fixture"}]})"));
@@ -56,6 +58,7 @@ KJ_TEST("platform durable plans pin the class and copy to the tenant") {
   route.open.className = "Store";
   route.open.definition = platformCopyKey(input.get(), alpha.get());
   KJ_EXPECT(platformDurablePlan(input.get(), alpha.get(), selection.get(), route));
+  KJ_EXPECT(!platformDurablePlan(databaseWorker.get(), alpha.get(), selection.get(), route));
   KJ_EXPECT(platformCopyKey(otherTenant.get(), beta.get()) != route.open.definition);
   KJ_EXPECT(!platformDurablePlan(otherTenant.get(), beta.get(), selection.get(), route));
   KJ_EXPECT(!platformDurablePlan(input.get(), beta.get(), selection.get(), route));
