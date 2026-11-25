@@ -769,9 +769,20 @@ kj::Own<AccessInfo> parseAccessBlob(
 // C++ (a dynamic worker's env tables, channel tokens, the debug port).
 class RustIoChannelFactory final: public IoChannelFactory {
  public:
-  RustIoChannelFactory(kj::Own<CompiledWorker::Impl> worker, ::rust::Box<ChannelFactory> channels)
-      : worker(kj::mv(worker)),
+  RustIoChannelFactory(kj::Own<CompiledWorker::Impl> worker, ::rust::Box<ChannelFactory> channels,
+      kj::Maybe<kj::String> coworkerdIdentity = kj::none,
+      std::weak_ptr<capnp::Capability::Client> budgetLifetime = {})
+      : coworkerdIdentity(kj::mv(coworkerdIdentity)),
+        budgetLifetime(std::move(budgetLifetime)),
+        worker(kj::mv(worker)),
         channels(kj::mv(channels)) {}
+
+  kj::Maybe<kj::String> coworkerdIdentity;
+
+  capnp::Capability::Client getCoworkerdBudgetLifetime() override {
+    if (auto token = budgetLifetime.lock()) return capnp::Capability::Client(*token);
+    return nullptr;
+  }
 
   ~RustIoChannelFactory() noexcept(false) {
     // A request's drain task runs in the worker's own task set and may hold the worker's last
@@ -957,6 +968,7 @@ class RustIoChannelFactory final: public IoChannelFactory {
   }
 
  private:
+  std::weak_ptr<capnp::Capability::Client> budgetLifetime;
   kj::Own<CompiledWorker::Impl> worker;
   ::rust::Box<ChannelFactory> channels;
 
@@ -1148,6 +1160,7 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
 
   kj::Own<RequestObserver> observer =
       kj::refcounted<RequestObserverWithTracer>(workerTracer.clone());
+  auto budget = std::make_shared<capnp::Capability::Client>(kj::mv(metadata.coworkerdBudgetLifetime));
 
   kj::Maybe<tracing::InvocationSpanContext> triggerContext;
   KJ_IF_SOME(ctx, metadata.userSpanParent.toSpanContext()) {
@@ -1157,7 +1170,10 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
     }
   }
 
-  auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
+  auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels),
+      metadata.coworkerdInvocationIdentity.map([](const auto& value) { return kj::str(value); }), budget);
+  // The factory can outlive the request through actor limits. Only the incoming request holds it strongly.
+  observer = kj::mv(observer).attachToThisReference(std::move(budget));
   auto& invocationIdentity = metadata.coworkerdInvocationIdentity != kj::none
       ? metadata.coworkerdInvocationIdentity : metadata.cfBlobJson;
   auto requestLimits = wrapCpuRequestLimits(kj::refcounted<NullLimitEnforcer>(),
@@ -1313,6 +1329,24 @@ void request_metadata_set_cause(
 void request_metadata_set_coworkerd_invocation_identity(
     RequestMetadata& metadata, ::rust::Str identity) {
   metadata.coworkerdInvocationIdentity = kj::str(identity);
+}
+
+::rust::String coworkerd_current_invocation_identity() noexcept {
+  try {
+    KJ_IF_SOME(context, IoContext::tryCurrent()) {
+      if (context.hasCurrentIncomingRequest()) {
+        auto* channel = dynamic_cast<RustIoChannelFactory*>(&context.getIoChannelFactory());
+        if (channel != nullptr) {
+          KJ_IF_SOME(identity, channel->coworkerdIdentity) {
+            return ::rust::String(identity.begin(), identity.size());
+          }
+        }
+      }
+    }
+  } catch (...) {
+    // The Rust FFI returns a string, so unavailable identity stays on the Rust error path.
+  }
+  return {};
 }
 
 namespace {
