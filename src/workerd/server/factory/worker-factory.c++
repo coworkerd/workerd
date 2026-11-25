@@ -770,12 +770,19 @@ kj::Own<AccessInfo> parseAccessBlob(
 class RustIoChannelFactory final: public IoChannelFactory {
  public:
   RustIoChannelFactory(kj::Own<CompiledWorker::Impl> worker, ::rust::Box<ChannelFactory> channels,
-      kj::Maybe<kj::String> coworkerdIdentity = kj::none)
+      kj::Maybe<kj::String> coworkerdIdentity = kj::none,
+      std::weak_ptr<capnp::Capability::Client> budgetLifetime = {})
       : coworkerdIdentity(kj::mv(coworkerdIdentity)),
+        budgetLifetime(std::move(budgetLifetime)),
         worker(kj::mv(worker)),
         channels(kj::mv(channels)) {}
 
   kj::Maybe<kj::String> coworkerdIdentity;
+
+  capnp::Capability::Client getCoworkerdBudgetLifetime() override {
+    if (auto token = budgetLifetime.lock()) return capnp::Capability::Client(*token);
+    return nullptr;
+  }
 
   ~RustIoChannelFactory() noexcept(false) {
     // A request's drain task runs in the worker's own task set and may hold the worker's last
@@ -961,6 +968,7 @@ class RustIoChannelFactory final: public IoChannelFactory {
   }
 
  private:
+  std::weak_ptr<capnp::Capability::Client> budgetLifetime;
   kj::Own<CompiledWorker::Impl> worker;
   ::rust::Box<ChannelFactory> channels;
 
@@ -1152,8 +1160,7 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
 
   kj::Own<RequestObserver> observer =
       kj::refcounted<RequestObserverWithTracer>(workerTracer.clone());
-  // Keep the token on the incoming request, even if actor limits keep its channel factory alive.
-  observer = kj::mv(observer).attach(kj::mv(metadata.coworkerdBudgetLifetime));
+  auto budget = std::make_shared<capnp::Capability::Client>(kj::mv(metadata.coworkerdBudgetLifetime));
 
   kj::Maybe<tracing::InvocationSpanContext> triggerContext;
   KJ_IF_SOME(ctx, metadata.userSpanParent.toSpanContext()) {
@@ -1164,7 +1171,9 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
   }
 
   auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels),
-      metadata.coworkerdInvocationIdentity.map([](const auto& value) { return kj::str(value); }));
+      metadata.coworkerdInvocationIdentity.map([](const auto& value) { return kj::str(value); }), budget);
+  // The factory can outlive the request through actor limits. Only the incoming request holds it strongly.
+  observer = kj::mv(observer).attachToThisReference(std::move(budget));
   auto& invocationIdentity = metadata.coworkerdInvocationIdentity != kj::none
       ? metadata.coworkerdInvocationIdentity : metadata.cfBlobJson;
   auto requestLimits = wrapCpuRequestLimits(kj::refcounted<NullLimitEnforcer>(),

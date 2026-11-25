@@ -1088,8 +1088,8 @@ interface WorkerdBootstrap {
   # Bootstrap interface exposed by workerd when serving Cap'n Proto RPC.
 
   startEvent @0 (cfBlobJson :Text, fromPersistentStub :Bool, fromHandoff :Bool,
-                 forwardedBy :Text, causedBy :List(Text), budgetLifetime :Capability)
-      -> (dispatcher :EventDispatcher);
+                 forwardedBy :Text, causedBy :List(Text), budgetLifetime :Capability, budgetTicket :UInt64)
+      -> (dispatcher :EventDispatcher, budgetAccepted :Bool);
   # Start a new event. Exactly one event should be delivered to the returned EventDispatcher.
   #
   # If the event is an HTTP request, `cfBlobJson` optionally carries the JSON-encoded `request.cf`

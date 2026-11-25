@@ -543,6 +543,9 @@ class IoChannelFactory: public virtual kj::Refcounted {
     JSG_FAIL_REQUIRE(Error, "WorkerdDebugPort bindings are not supported by this runtime.");
   }
 
+  // For the trusted local Coworkerd root loader to carry the same budget into the selected event.
+  virtual capnp::Capability::Client getCoworkerdBudgetLifetime() { return nullptr; }
+
   // Converts a token created with {SubrequestChannel,ActorClassChannel}::getToken() back into a
   // live channel. Default implementations throw.
   virtual kj::Rc<SubrequestChannel> subrequestChannelFromToken(

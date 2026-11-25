@@ -276,11 +276,13 @@ kj::Own<WorkerInterface> WorkerEntrypoint::construct(ThreadContext& threadContex
   auto obj = kj::heap<WorkerEntrypoint>(kj::Badge<WorkerEntrypoint>(), threadContext,
       waitUntilTasks, canceler, tunnelExceptions, isDynamicDispatch, kj::mv(entrypointName),
       kj::mv(props), kj::mv(cfBlobJson), kj::mv(versionInfo), kj::mv(clientAddress));
+  auto wrapperMetrics = kj::addRef(*metrics);
+  // Attachments belong to the original reference. Keep it with the incoming request's drain.
   obj->init(kj::mv(worker), kj::mv(actor), kj::mv(limitEnforcer), kj::mv(ioContextDependency),
-      kj::mv(ioChannelFactory), kj::addRef(*metrics), kj::mv(workerTracer),
+      kj::mv(ioChannelFactory), kj::mv(metrics), kj::mv(workerTracer),
       kj::mv(maybeTriggerInvocationSpan), kj::mv(accessInfo), kj::mv(selfTokenFactory));
-  auto& wrapper = metrics->wrapWorkerInterface(*obj);
-  return kj::attachRef(wrapper, kj::mv(obj), kj::mv(metrics));
+  auto& wrapper = wrapperMetrics->wrapWorkerInterface(*obj);
+  return kj::attachRef(wrapper, kj::mv(obj), kj::mv(wrapperMetrics));
 }
 
 WorkerEntrypoint::WorkerEntrypoint(kj::Badge<WorkerEntrypoint> badge,
