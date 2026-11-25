@@ -14,6 +14,7 @@
 #include <kj/string.h>
 
 #include <utility>
+#include <functional>
 #include <memory>
 
 struct sqlite3;
@@ -35,16 +36,20 @@ using SqliteQueryId = uint64_t;
 // Owned by an event, shared by all of its tenant SQL calls. Internal SQL never acquires it.
 class SqlExecutionBudget {
  public:
-  enum class Cause { NONE, CPU, WALL };
+  enum class Cause { NONE, CPU, WALL, DISCONNECTED };
   static bool isEnabled();
   SqlExecutionBudget();
   SqlExecutionBudget(uint64_t eventCpuLimitNs, uint64_t threadCpuDeadlineNs);
+  SqlExecutionBudget(uint64_t wallLimitNs, std::function<Cause()> checkDeadline);
+  bool hasDeadline() const { return bool(deadlineCheck); }
+  bool checkDeadline() noexcept;
   Cause getCause() const { return cause; }
   kj::String describe() const;
 
  private:
   uint64_t cpuLimitNs, wallLimitNs;
   kj::Maybe<uint64_t> threadCpuDeadline;
+  std::function<Cause()> deadlineCheck;
   uint64_t cpuUsedNs = 0, wallUsedNs = 0;
   Cause cause = Cause::NONE;
   friend class SqliteDatabase;
@@ -269,6 +274,16 @@ class SqliteDatabase {
   //
   // Note that the write callback is NOT called before (or at any point during) a reset(). Use the
   // `ResetListener` mechanism or `afterReset()` instead for that case.
+  // The actor's implicit transaction can commit after the JavaScript turn.
+  // A platform query may install its final check before that point.
+  void setCommitCheck(kj::Function<void()> check) { commitCheck = kj::mv(check); }
+  void clearCommitCheck() { commitCheck = kj::none; }
+  void checkCommit() {
+    auto check = kj::mv(commitCheck);
+    clearCommitCheck();
+    KJ_IF_SOME(run, check) { run(); }
+  }
+
   void onWrite(kj::Function<void(bool allowUnconfirmed)> callback) {
     onWriteCallback = kj::mv(callback);
   }
@@ -464,6 +479,7 @@ class SqliteDatabase {
   ExecutionScope* activeExecutionScope = nullptr;
   uint64_t executionRandomState = 0;
   bool sampleSqlExecution();
+  kj::Maybe<kj::Function<void()>> commitCheck;
   static int progressCallback(void* database) noexcept;
   void handleExecutionLimit(kj::Maybe<int> errorCode, StaticRegulator regulator);
 

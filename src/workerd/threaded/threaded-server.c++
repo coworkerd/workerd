@@ -1075,13 +1075,14 @@ class CpuWatchdog {
     KJ_REQUIRE(found != entries.end());
     entries.erase(found);
   }
-  bool switchAccount(Entry &entry, uint64_t started, uint64_t used, kj::StringPtr identity) {
+  bool switchAccount(Entry &entry, uint64_t started, uint64_t used, kj::StringPtr identity,
+      bool sqlDeadline) {
     std::lock_guard lock(mutex);
     if (entry.cause.load() != LimitCause::NONE) return false;
     const uint64_t maximum = uint64_t(entry.cpuMs) * 1000000;
     entry.started = started;
     entry.previousCpu = used;
-    entry.allowance = maximum == 0 ? UINT64_MAX : maximum - std::min(maximum, used);
+    entry.allowance = maximum == 0 || sqlDeadline ? UINT64_MAX : maximum - std::min(maximum, used);
     entry.due = nowNs() + (entry.allowance == UINT64_MAX ? 1000000 : entry.allowance);
     entry.identity = identity;
     changed.notify_one();
@@ -1435,6 +1436,7 @@ struct DurableEventCpu {
   kj::String identity, oomReport;
   kj::Maybe<kj::Weak<IoContext::IncomingRequest>> request;
   server::DurableCpuAccount account;
+  std::shared_ptr<SqlExecutionBudget> sqlDeadline;
 };
 
 class DurableEventObserver final: public RequestObserver {
@@ -1519,7 +1521,7 @@ struct RequestLimits final: LimitEnforcer {
       auto &charged = account();
       charged.charge(segmentStart, now);
       const auto maximum = uint64_t(slot.limits->cpuMs) * 1000000;
-      if ((maximum != 0 && charged.remaining(maximum) == 0) ||
+      if ((maximum != 0 && !(event && event->sqlDeadline) && charged.remaining(maximum) == 0) ||
           (owner.sqlBudget && owner.sqlBudget->getCause() == SqlExecutionBudget::Cause::CPU)) {
         auto expected = LimitCause::NONE;
         measurement.limitCause.compare_exchange_strong(expected, LimitCause::CPU);
@@ -1551,7 +1553,8 @@ struct RequestLimits final: LimitEnforcer {
       const auto used = (next ? next->account : turnOverhead).consumed();
       if (execution.registered &&
           !CpuWatchdog::instance().switchAccount(
-              execution.entry, now, used, next ? next->identity : owner.identity)) {
+              execution.entry, now, used, next ? next->identity : owner.identity,
+              next && next->sqlDeadline)) {
         return;
       }
       currentOomReport = next ? next->oomReport.cStr() : owner.oomReport.cStr();
@@ -1617,7 +1620,9 @@ struct RequestLimits final: LimitEnforcer {
     return nullptr;
   }
   std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() override {
-    if (!scope || slot.limits->cpuMs == 0) return {};
+    if (!scope) return {};
+    if (scope->event && scope->event->sqlDeadline) return scope->event->sqlDeadline;
+    if (slot.limits->cpuMs == 0) return {};
     if (!sqlBudget) {
       const uint64_t maximum = uint64_t(slot.limits->cpuMs) * 1000000;
       const auto left = scope->account().remaining(maximum);
@@ -2400,6 +2405,17 @@ struct DurableSessionScope {
   kj::Canceler preparing;
   kj::Canceler transport;
   bool ended = false;
+  int socketFd = -1;
+  uint64_t nextSqlDisconnectCheck = 0;
+
+  bool sqlClientDisconnected(uint64_t now) noexcept {
+    if (ended) return true;
+    if (now < nextSqlDisconnectCheck) return false;
+    nextSqlDisconnectCheck = now + 1000000;
+    pollfd pending{socketFd, POLLRDHUP, 0};
+    return poll(&pending, 1, 0) > 0 &&
+        (pending.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0;
+  }
 };
 
 class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
@@ -3067,6 +3083,7 @@ struct ThreadedServer {
     // Runs before the release above: an event this session was still preparing ends here,
     // and with it the waiter it has on a cold load.
     auto scope = std::make_shared<DurableSessionScope>();
+    scope->socketFd = call.socket.get();
     auto &sessions = state.durableSessions[call.ticket.tree];
     KJ_ASSERT(sessions.emplace(call.ticket.event, scope).second);
     KJ_DEFER({
@@ -5730,7 +5747,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
     std::shared_ptr<TenantPermit> tenant,
     kj::Own<RequestObserver> observer = kj::refcounted<RequestObserver>(),
     kj::Maybe<kj::Own<Worker::Actor>> actor = kj::none,
-    kj::Maybe<kj::StringPtr> localActorClass = kj::none) {
+    kj::Maybe<kj::StringPtr> localActorClass = kj::none,
+    std::shared_ptr<SqlExecutionBudget> sqlDeadline = {}) {
   if (!preparation) preparation = server.prepareSlot(slot);
   auto invocation = kj::refcounted<InvocationState>(slot, std::move(tenant));
   invocation->measurement.preparation = std::move(preparation);
@@ -5760,8 +5778,9 @@ PreparedInvocation prepareInvocation(ThreadState &state,
       ",\"invocationId\":", encode(field(input, "invocationId")), ",\"isolate\":\"",
       slot->isolateLabel.c_str(), "\",");
   if (slot->resetDurableRoot) {
-    observer = kj::refcounted<DurableEventObserver>(
-        std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
+    auto event = std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB);
+    event->sqlDeadline = std::move(sqlDeadline);
+    observer = kj::refcounted<DurableEventObserver>(std::move(event));
   }
   observer = kj::mv(observer).attachToThisReference(std::move(budgetLifetime));
   auto limits =
@@ -6708,7 +6727,34 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
           str(plan, "versionFingerprint") == route.open.definition &&
           route.uniqueKey == "coworkerd-do-root-v1-" + route.key.namespaceId,
       "durable routing descriptor mismatch");
+  std::shared_ptr<SqlExecutionBudget> sqlDeadline;
+  if (field(input, "sqlDeadlineMonotonicNs").isString()) {
+    KJ_REQUIRE(kind == "platformDurable" && productPlatformPlan(plan) &&
+        route.open.className == "SqlDatabase" && !field(input, "durableAlarm").isObject(),
+        "SQL deadline requires a platform database query");
+    constexpr uint64_t SQL_LIMIT_NS = 30000000000;
+    const auto expires = durableNumber(input, "sqlDeadlineMonotonicNs");
+    KJ_REQUIRE(expires <= nowNs() + SQL_LIMIT_NS, "invalid SQL deadline");
+    sqlDeadline = std::make_shared<SqlExecutionBudget>(SQL_LIMIT_NS,
+        [expires, weak = std::weak_ptr(scope)]() noexcept {
+      const auto now = nowNs();
+      if (const auto session = weak.lock(); !session || session->sqlClientDisconnected(now))
+        return SqlExecutionBudget::Cause::DISCONNECTED;
+      if (now >= expires) return SqlExecutionBudget::Cause::WALL;
+      return SqlExecutionBudget::Cause::NONE;
+    });
+  }
+  auto checkSqlDeadline = [&]() {
+    if (sqlDeadline && sqlDeadline->checkDeadline()) {
+      if (sqlDeadline->getCause() == SqlExecutionBudget::Cause::DISCONNECTED)
+        kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "SQL client disconnected before execution"));
+      kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+          KJ_EXCEPTION(OVERLOADED, sqlDeadline->describe()), "SQL_LIMIT_EXCEEDED"));
+    }
+  };
+  checkSqlDeadline();
   co_await server.admitDurableEvent(state, route, ticket);
+  checkSqlDeadline();
   auto slot = co_await server.getDurableWorker(state, descriptor, route.open.definition);
   KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
       "durable class missing from pinned Worker");
@@ -6881,8 +6927,9 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
       kj::mv(socketActor), text(socketDescriptor, "id"), durableNumber(socketDescriptor, "frame")};
   }
   if (entry.get() == nullptr) {
+    checkSqlDeadline();
     entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props), nullptr,
-        nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor))
+        nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor), kj::none, std::move(sqlDeadline))
                 .entry;
   }
   auto identity = invocationIdentity(*slot, input);
