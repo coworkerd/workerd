@@ -2551,7 +2551,7 @@ struct ThreadedServer {
     uint64_t tree;
     uint64_t lastUse;
     std::shared_ptr<std::atomic<bool>> reservationReturned;
-    bool fenced = false;
+    bool preferDatabase;
   };
   // One retirement at a time, so concurrent cold loads can retry against the same release.
   // Both fields are guarded by durableRoutingMutex.
@@ -2605,6 +2605,7 @@ struct ThreadedServer {
       uint64_t databaseLastUse = 0;
       bool databaseCanRetire = false;
       std::weak_ptr<ResourceReservation> databaseReservation;
+      server::DurableAdmission::Time databasePreferredUntil{};
     };
     std::optional<DurableHome> home;
     uint64_t homeId = 0;
@@ -2981,7 +2982,10 @@ struct ThreadedServer {
   // Called with durableRoutingMutex held. The home still rechecks all the
   // prerequisites locally before it fences admission to the selected tree.
   bool requestDatabaseRetirement(bool needsPreparationBudget = false) {
-    if (databaseVictim) return true;
+    if (databaseVictim) {
+      if (!needsPreparationBudget) databaseVictim->preferDatabase = true;
+      return true;
+    }
     for (const auto& thread: threads) {
       const auto& home = *thread->home;
       if (!home.databaseCanRetire || home.reservedTrees != 1 || home.resident.size() != 1 ||
@@ -2995,7 +2999,8 @@ struct ThreadedServer {
       const auto reservation = home.databaseReservation.lock();
       if (!reservation || (needsPreparationBudget && !reservation->canReplaceWithPreparation())) continue;
       databaseVictim =
-          DatabaseVictim{thread->homeId, tree, home.databaseLastUse, reservation->returned};
+          DatabaseVictim{thread->homeId, tree, home.databaseLastUse, reservation->returned,
+            !needsPreparationBudget};
     }
     if (!databaseVictim) return false;
     wake(threads[databaseVictim->home - 1]->wake);
@@ -3015,7 +3020,8 @@ struct ThreadedServer {
 
   // durableRoutingMutex holds placement and event admission together, before
   // the accept loop acknowledges a connection or reads its dispatch bytes.
-  bool reserveDurableHome(const DurableRoute &route, server::DurableAdmission::Ticket ticket) {
+  bool reserveDurableHome(
+      const DurableRoute &route, server::DurableAdmission::Ticket ticket, bool database) {
     auto assigned = durableAdmission->homeFor(ticket.tree);
     if (!assigned) {
       std::vector<server::DurableCopyCandidate> candidates;
@@ -3025,6 +3031,7 @@ struct ThreadedServer {
         if (!threads[i]->home) continue;
         if (databaseVictim && databaseVictim->home == i + 1) continue;
         auto &home = *threads[i]->home;
+        if (!database && now < home.databasePreferredUntil) continue;
         // An empty copy keeps its definition until its isolate is released.
         // Prefer a matching warm copy, then an unused home, then a different empty copy.
         if (home.reservedTrees == 0 && !home.pressure.resetting() &&
@@ -3041,6 +3048,7 @@ struct ThreadedServer {
       assigned = choice.value_or(spare);
       auto &home = *threads[*assigned - 1]->home;
       if (!choice) home.definition = route.open.definition;
+      home.databasePreferredUntil = {};
       KJ_ASSERT(durableAdmission->publishHome(ticket.tree, *assigned));
       ++home.reservedTrees;
     }
@@ -3056,7 +3064,7 @@ struct ThreadedServer {
     std::lock_guard lock(durableRoutingMutex);
     auto result = durableAdmission->queue(
         route.key, route.open, bytes, deadline, Admission::Clock::now(), database);
-    if (result.ticket && !reserveDurableHome(route, *result.ticket)) {
+    if (result.ticket && !reserveDurableHome(route, *result.ticket, database)) {
       KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket, !database || !result.needsHome));
       durableAdmission->releaseUnassigned(result.ticket->tree);
       result = {.status = Admission::Status::OVERLOADED, .newTreeCapacityRefused = result.needsHome};
@@ -3271,19 +3279,23 @@ struct ThreadedServer {
 
   void retireIdleDurableRoots(ThreadState &state) {
     const auto homeId = state.durableHome;
-    auto victim = [&]() -> std::optional<DatabaseVictim> {
+    const auto victim = [&]() -> std::optional<DatabaseVictim> {
       std::lock_guard lock(durableRoutingMutex);
       if (databaseVictim && databaseVictim->home == homeId) return databaseVictim;
       return std::nullopt;
     }();
     KJ_DEFER(if (victim) {
       const auto root = state.durableRoots.find(victim->tree);
-      const bool retired = root == state.durableRoots.end() && victim->fenced;
+      const bool retired = root == state.durableRoots.end();
       // Other home-local handles can outlive the tree and its Slot. Keep the
       // victim reserved until the budget and resident count have both returned.
-      if ((root == state.durableRoots.end() || !root->second.admissionClosing) &&
-          (!retired || victim->reservationReturned->load())) {
+      if (retired ? victim->reservationReturned->load() : !root->second.admissionClosing) {
         std::lock_guard lock(durableRoutingMutex);
+        if (retired && databaseVictim->preferDatabase) {
+          // Leave time for the native preface retry, whose backoff is capped at 50 ms.
+          threads[homeId - 1]->home->databasePreferredUntil =
+              server::DurableAdmission::Clock::now() + std::chrono::milliseconds(100);
+        }
         databaseVictim.reset();
         for (const auto &waiter: databaseCapacityWaiters) {
           if (waiter->isWaiting()) waiter->fulfill(bool(retired));
@@ -3356,10 +3368,7 @@ struct ThreadedServer {
         const bool stopped = closeSocketSessions ? durableAdmission->stopIdleTreeWithSockets(tree, homeId)
                                                  : durableAdmission->stopIdleTree(tree, homeId);
         if (!stopped) continue;
-        if (forAdmission) {
-          root.admissionClosing = true;
-          victim->fenced = databaseVictim->fenced = true;
-        }
+        if (forAdmission) root.admissionClosing = true;
       }
       // Park the whole object's node transports before canceling I/O or
       // closing standard sockets. The abort would break the actor and make
