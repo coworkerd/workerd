@@ -91,6 +91,7 @@ class DurableAdmission {
   // Check the full descriptor and route the first live waiting event to an already published home.
   // Starting an event returns waiting credit while retaining its execution reservation.
   std::optional<Ticket> next(uint64_t tree) const;
+  bool hasActiveEvent(uint64_t tree) const;
   Delivery begin(Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now);
   Cancellation cancel(Ticket ticket);
   // Refuse a waiting call before acknowledging it, returning its event reservation.

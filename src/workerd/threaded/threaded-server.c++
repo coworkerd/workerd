@@ -1075,13 +1075,14 @@ class CpuWatchdog {
     KJ_REQUIRE(found != entries.end());
     entries.erase(found);
   }
-  bool switchAccount(Entry &entry, uint64_t started, uint64_t used, kj::StringPtr identity) {
+  bool switchAccount(Entry &entry, uint64_t started, uint64_t used, kj::StringPtr identity,
+      bool sqlDeadline) {
     std::lock_guard lock(mutex);
     if (entry.cause.load() != LimitCause::NONE) return false;
     const uint64_t maximum = uint64_t(entry.cpuMs) * 1000000;
     entry.started = started;
     entry.previousCpu = used;
-    entry.allowance = maximum == 0 ? UINT64_MAX : maximum - std::min(maximum, used);
+    entry.allowance = maximum == 0 || sqlDeadline ? UINT64_MAX : maximum - std::min(maximum, used);
     entry.due = nowNs() + (entry.allowance == UINT64_MAX ? 1000000 : entry.allowance);
     entry.identity = identity;
     changed.notify_one();
@@ -1435,6 +1436,7 @@ struct DurableEventCpu {
   kj::String identity, oomReport;
   kj::Maybe<kj::Weak<IoContext::IncomingRequest>> request;
   server::DurableCpuAccount account;
+  std::shared_ptr<SqlExecutionBudget> sqlDeadline;
 };
 
 class DurableEventObserver final: public RequestObserver {
@@ -1519,7 +1521,7 @@ struct RequestLimits final: LimitEnforcer {
       auto &charged = account();
       charged.charge(segmentStart, now);
       const auto maximum = uint64_t(slot.limits->cpuMs) * 1000000;
-      if ((maximum != 0 && charged.remaining(maximum) == 0) ||
+      if ((maximum != 0 && !(event && event->sqlDeadline) && charged.remaining(maximum) == 0) ||
           (owner.sqlBudget && owner.sqlBudget->getCause() == SqlExecutionBudget::Cause::CPU)) {
         auto expected = LimitCause::NONE;
         measurement.limitCause.compare_exchange_strong(expected, LimitCause::CPU);
@@ -1551,7 +1553,8 @@ struct RequestLimits final: LimitEnforcer {
       const auto used = (next ? next->account : turnOverhead).consumed();
       if (execution.registered &&
           !CpuWatchdog::instance().switchAccount(
-              execution.entry, now, used, next ? next->identity : owner.identity)) {
+              execution.entry, now, used, next ? next->identity : owner.identity,
+              next && next->sqlDeadline)) {
         return;
       }
       currentOomReport = next ? next->oomReport.cStr() : owner.oomReport.cStr();
@@ -1617,7 +1620,9 @@ struct RequestLimits final: LimitEnforcer {
     return nullptr;
   }
   std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() override {
-    if (!scope || slot.limits->cpuMs == 0) return {};
+    if (!scope) return {};
+    if (scope->event && scope->event->sqlDeadline) return scope->event->sqlDeadline;
+    if (slot.limits->cpuMs == 0) return {};
     if (!sqlBudget) {
       const uint64_t maximum = uint64_t(slot.limits->cpuMs) * 1000000;
       const auto left = scope->account().remaining(maximum);
@@ -1918,6 +1923,8 @@ struct JsonDoc {
     return arena.getRoot<Json>();
   }
 };
+
+constexpr auto DATABASE_SQL_WALL_LIMIT = 30 * kj::SECONDS;
 
 struct DurableRoute {
   server::DurableAdmission::Key key;
@@ -2400,6 +2407,17 @@ struct DurableSessionScope {
   kj::Canceler preparing;
   kj::Canceler transport;
   bool ended = false;
+  int socketFd = -1;
+  uint64_t nextSqlDisconnectCheck = 0;
+
+  bool sqlClientDisconnected(uint64_t now) noexcept {
+    if (ended) return true;
+    if (now < nextSqlDisconnectCheck) return false;
+    nextSqlDisconnectCheck = now + 1000000;
+    pollfd pending{socketFd, POLLRDHUP, 0};
+    return poll(&pending, 1, 0) > 0 &&
+        (pending.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0;
+  }
 };
 
 class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
@@ -3017,8 +3035,8 @@ struct ThreadedServer {
     durableWaiters.erase(at);
   }
 
-  kj::Promise<void> admitDurableEvent(
-      ThreadState &state, const DurableRoute &route, server::DurableAdmission::Ticket ticket) {
+  kj::Promise<void> admitDurableEvent(ThreadState &state, const DurableRoute &route,
+      server::DurableAdmission::Ticket ticket, bool platformDatabase) {
     using Admission = server::DurableAdmission;
     for (;;) {
       auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
@@ -3029,7 +3047,9 @@ struct ThreadedServer {
           kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
               KJ_EXCEPTION(OVERLOADED, "durable object reset is draining"), "DO_UNAVAILABLE"));
         }
-        if (first == ticket) {
+        // Let the previous database response leave its home before the next
+        // synchronous query can block that home's event loop.
+        if (first == ticket && !(platformDatabase && durableAdmission->hasActiveEvent(ticket.tree))) {
           const auto delivery = durableAdmission->begin(
               ticket, state.durableHome, route.key, route.open, Admission::Clock::now());
           if (delivery == Admission::Delivery::EXPIRED) {
@@ -3067,6 +3087,7 @@ struct ThreadedServer {
     // Runs before the release above: an event this session was still preparing ends here,
     // and with it the waiter it has on a cold load.
     auto scope = std::make_shared<DurableSessionScope>();
+    scope->socketFd = call.socket.get();
     auto &sessions = state.durableSessions[call.ticket.tree];
     KJ_ASSERT(sessions.emplace(call.ticket.event, scope).second);
     KJ_DEFER({
@@ -5730,7 +5751,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
     std::shared_ptr<TenantPermit> tenant,
     kj::Own<RequestObserver> observer = kj::refcounted<RequestObserver>(),
     kj::Maybe<kj::Own<Worker::Actor>> actor = kj::none,
-    kj::Maybe<kj::StringPtr> localActorClass = kj::none) {
+    kj::Maybe<kj::StringPtr> localActorClass = kj::none,
+    std::shared_ptr<SqlExecutionBudget> sqlDeadline = {}) {
   if (!preparation) preparation = server.prepareSlot(slot);
   auto invocation = kj::refcounted<InvocationState>(slot, std::move(tenant));
   invocation->measurement.preparation = std::move(preparation);
@@ -5760,8 +5782,9 @@ PreparedInvocation prepareInvocation(ThreadState &state,
       ",\"invocationId\":", encode(field(input, "invocationId")), ",\"isolate\":\"",
       slot->isolateLabel.c_str(), "\",");
   if (slot->resetDurableRoot) {
-    observer = kj::refcounted<DurableEventObserver>(
-        std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
+    auto event = std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB);
+    event->sqlDeadline = std::move(sqlDeadline);
+    observer = kj::refcounted<DurableEventObserver>(std::move(event));
   }
   observer = kj::mv(observer).attachToThisReference(std::move(budgetLifetime));
   auto limits =
@@ -6190,7 +6213,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     std::shared_ptr<DurableFacetReservation> reservation = nullptr,
     uint parentFacet = 0,
     kj::StringPtr facetName = ""_kj,
-    server::DurableWalPosition position = {});
+    server::DurableWalPosition position = {},
+    bool platformDatabase = false);
 
 class LocalFacet final: public IoChannelFactory::ActorChannel {
  public:
@@ -6621,7 +6645,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     std::shared_ptr<DurableFacetReservation> reservation,
     uint parentFacet,
     kj::StringPtr facetName,
-    server::DurableWalPosition position) {
+    server::DurableWalPosition position,
+    bool platformDatabase) {
   auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth);
   auto *borrowedHooks = hooks.get();
   auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
@@ -6670,6 +6695,12 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
       className, kj::mv(props), kj::mv(makeStorage), kj::mv(hooks), tree->state.timer,
       kj::mv(observer), kj::none, kj::none, kj::none, jsg::Dict<kj::String>{}, *borrowedHooks,
       kj::none, kj::none, kj::heap<DurablePendingOperations>(tree->idle));
+  if (platformDatabase && tree->server.durableLog) {
+    // The output gate locks on the first write. Let both the SQL work and
+    // the subsequent WAL confirmation use their separate time windows.
+    actor->setOutputGateTimeout(
+        DATABASE_SQL_WALL_LIMIT + tree->server.durableLog->confirmationTimeout() + kj::SECONDS);
+  }
   borrowedObserver->bind(*actor);
   return {kj::mv(actor), borrowedHooks};
 }
@@ -6708,7 +6739,45 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
           str(plan, "versionFingerprint") == route.open.definition &&
           route.uniqueKey == "coworkerd-do-root-v1-" + route.key.namespaceId,
       "durable routing descriptor mismatch");
-  co_await server.admitDurableEvent(state, route, ticket);
+  const bool platformDatabase = kind == "platformDurable" && productPlatformPlan(plan) &&
+      route.open.className == "SqlDatabase";
+  std::shared_ptr<SqlExecutionBudget> sqlDeadline;
+  kj::Maybe<kj::TimePoint> sqlExpires;
+  if (field(input, "sqlDeadlineMonotonicNs").isString()) {
+    KJ_REQUIRE(platformDatabase && !field(input, "durableAlarm").isObject(),
+        "SQL deadline requires a platform database query");
+    constexpr uint64_t SQL_LIMIT_NS = DATABASE_SQL_WALL_LIMIT / kj::NANOSECONDS;
+    const auto expires = durableNumber(input, "sqlDeadlineMonotonicNs");
+    const auto now = nowNs();
+    KJ_REQUIRE(expires <= now + SQL_LIMIT_NS, "invalid SQL deadline");
+    sqlExpires = kj::systemPreciseMonotonicClock().now() + (expires > now ? expires - now : 0) * kj::NANOSECONDS;
+    sqlDeadline = std::make_shared<SqlExecutionBudget>(SQL_LIMIT_NS,
+        [expires, weak = std::weak_ptr(scope)]() noexcept {
+      const auto now = nowNs();
+      if (const auto session = weak.lock(); !session || session->sqlClientDisconnected(now))
+        return SqlExecutionBudget::Cause::DISCONNECTED;
+      if (now >= expires) return SqlExecutionBudget::Cause::WALL;
+      return SqlExecutionBudget::Cause::NONE;
+    });
+  }
+  auto checkSqlDeadline = [&]() {
+    if (sqlDeadline && sqlDeadline->checkDeadline()) {
+      if (sqlDeadline->getCause() == SqlExecutionBudget::Cause::DISCONNECTED)
+        kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "SQL client disconnected before execution"));
+      kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+          KJ_EXCEPTION(OVERLOADED, sqlDeadline->describe()), "SQL_LIMIT_EXCEEDED"));
+    }
+  };
+  checkSqlDeadline();
+  auto admission = server.admitDurableEvent(state, route, ticket, platformDatabase);
+  KJ_IF_SOME(expires, sqlExpires) {
+    admission = admission.exclusiveJoin(state.io.provider->getTimer().atTime(expires).then([] {
+      kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+          KJ_EXCEPTION(OVERLOADED, "SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded"), "SQL_LIMIT_EXCEEDED"));
+    }));
+  }
+  co_await admission;
+  checkSqlDeadline();
   auto slot = co_await server.getDurableWorker(state, descriptor, route.open.definition);
   KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
       "durable class missing from pinned Worker");
@@ -6738,7 +6807,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
     });
     auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
         Worker::Actor::Id(kj::mv(actorId)), route.open.className.c_str(), Frankenvalue(), 0, 0,
-        nullptr, 0, ""_kj, position);
+        nullptr, 0, ""_kj, position, platformDatabase);
     found = state.durableRoots
                 .emplace(ticket.tree,
                     ThreadState::DurableRoot{
@@ -6881,8 +6950,9 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
       kj::mv(socketActor), text(socketDescriptor, "id"), durableNumber(socketDescriptor, "frame")};
   }
   if (entry.get() == nullptr) {
+    checkSqlDeadline();
     entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props), nullptr,
-        nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor))
+        nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor), kj::none, std::move(sqlDeadline))
                 .entry;
   }
   auto identity = invocationIdentity(*slot, input);

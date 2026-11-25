@@ -768,7 +768,20 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
       JSG_REQUIRE(!sqlite.observedCriticalError(), Error,
           "Cannot commit transaction due to an earlier SQL critical error");
 
-      sqlite.run("RELEASE _cf_sync_savepoint");
+      auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
+      if (budget && budget->hasDeadline()) {
+        auto check = [budget = std::move(budget)] {
+          static constexpr SqlStorageRegulator regulator;
+          if (budget->checkDeadline()) {
+            kj::throwRecoverableException(regulator.sqlExecutionLimitException(*budget));
+          }
+        };
+        check();
+        sqlite.run("RELEASE _cf_sync_savepoint");
+        sqlite.setCommitCheck(kj::mv(check));
+      } else {
+        sqlite.run("RELEASE _cf_sync_savepoint");
+      }
       syncExternalTxn.commit();
       return kj::mv(result);
     }, [&](jsg::Value exception) -> jsg::JsRef<jsg::JsValue> {

@@ -85,7 +85,14 @@ SqlExecutionBudget::SqlExecutionBudget(uint64_t eventCpuLimitNs, uint64_t thread
     : cpuLimitNs(eventCpuLimitNs),
       wallLimitNs(kj::maxValue),
       threadCpuDeadline(threadCpuDeadlineNs) {}
+SqlExecutionBudget::SqlExecutionBudget(uint64_t wallLimitNs, std::function<Cause()> checkDeadline)
+    : cpuLimitNs(0), wallLimitNs(wallLimitNs), deadlineCheck(std::move(checkDeadline)) {}
+bool SqlExecutionBudget::checkDeadline() noexcept {
+  if (cause == Cause::NONE && deadlineCheck) cause = deadlineCheck();
+  return cause != Cause::NONE;
+}
 kj::String SqlExecutionBudget::describe() const {
+  if (cause == Cause::DISCONNECTED) return kj::str("SQL client disconnected");
   const bool cpu = cause == Cause::CPU;
   return kj::str("SQL_LIMIT_EXCEEDED: ", cpu ? "cpu" : "wall", " limit ",
       (cpu ? cpuLimitNs : wallLimitNs) / 1000000, "ms exceeded",
@@ -122,7 +129,8 @@ struct SqliteDatabase::ExecutionScope {
         previous(database.activeExecutionScope) {
     // Acquire entropy before installing this stack scope: the random source may throw.
     const bool enter = budget && !check(CheckMode::BOUNDARY);
-    if (enter && budget->threadCpuDeadline == kj::none) sampled = database.sampleSqlExecution();
+    if (enter && !budget->hasDeadline() && budget->threadCpuDeadline == kj::none)
+      sampled = database.sampleSqlExecution();
     if (previous != nullptr) previous->pause();
     database.activeExecutionScope = this;
     if (enter && !check(CheckMode::BOUNDARY)) resume();
@@ -142,7 +150,7 @@ struct SqliteDatabase::ExecutionScope {
     if (previous != nullptr) previous->resume();
   }
   void resume() noexcept {
-    if (!budget) return;
+    if (!budget || budget->hasDeadline()) return;
     wallStarted = lastCpuSampleWall = sqlWallNow();
     cpuStarted = sampled || sawCallback ? sqlCpuNow() : 0;
     running = true;
@@ -159,6 +167,7 @@ struct SqliteDatabase::ExecutionScope {
   }
   bool check(CheckMode mode = CheckMode::PROGRESS) noexcept {
     if (!budget) return false;
+    if (budget->hasDeadline()) return budget->checkDeadline();
     if (budget->cause != SqlExecutionBudget::Cause::NONE) return true;
     KJ_IF_SOME(deadline, budget->threadCpuDeadline) {
       const auto wall = sqlWallNow();
@@ -191,7 +200,7 @@ struct SqliteDatabase::ExecutionScope {
   }
   bool progress() noexcept {
     if (!budget) return false;
-    if (budget->threadCpuDeadline != kj::none) return check();
+    if (budget->hasDeadline() || budget->threadCpuDeadline != kj::none) return check();
     if (!sawCallback) {
       sawCallback = true;
       if (!sampled) {

@@ -256,8 +256,10 @@ class Session {
 class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
  public:
   Home(std::shared_ptr<Shared> shared,
-      kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose)
+      kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose,
+      const kj::MonotonicClock& clock)
       : shared(kj::mv(shared)),
+        clock(clock),
         inbox(std::make_shared<Inbox>()),
         requestClose(kj::mv(requestClose)),
         tasks(*this) {
@@ -322,6 +324,7 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
     kj::ForkedPromise<void> ready;
   };
   std::shared_ptr<Shared> shared;
+  const kj::MonotonicClock& clock;
   std::shared_ptr<Inbox> inbox;
   std::map<uint64_t, Registration> shippers;
   kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose;
@@ -343,9 +346,11 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
 
   kj::Promise<void> waitForAck(uint64_t openId, uint64_t request, kj::String key,
       kj::Timer& timer, kj::Promise<uint8_t> answer) {
+    // The home timer can still hold its pre-JavaScript time after synchronous SQL.
+    const auto deadline = kj::max(clock.now(), timer.now()) + shared->confirmationTimeout;
     const auto status = co_await answer.catch_([](kj::Exception&&) {
       return uint8_t(ACK_DISCONNECTED);
-    }).exclusiveJoin(timer.afterDelay(shared->confirmationTimeout).then([] { return uint8_t(ACK_TIMEOUT); }));
+    }).exclusiveJoin(timer.atTime(deadline).then([] { return uint8_t(ACK_TIMEOUT); }));
     const auto found = shippers.find(openId);
     if (status != ACK_OK && found != shippers.end()) found->second.shipper->onRefused(request);
     if (status == ACK_TIMEOUT) {
@@ -447,9 +452,11 @@ ThreadedWalLog::~ThreadedWalLog() noexcept(false) = default;
 
 bool ThreadedWalLog::ready() const { return impl->shared->negotiated(); }
 
+kj::Duration ThreadedWalLog::confirmationTimeout() const { return impl->shared->confirmationTimeout; }
+
 kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
     kj::Function<void(uint64_t, CloseReason)> requestClose) {
-  return kj::heap<Home>(impl->shared, kj::mv(requestClose));
+  return kj::heap<Home>(impl->shared, kj::mv(requestClose), kj::systemPreciseMonotonicClock());
 }
 
 kj::Promise<DurableWalPosition> ThreadedWalLog::prepareOpen(

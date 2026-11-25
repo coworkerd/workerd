@@ -163,6 +163,36 @@ class DefaultRegulatorForTest: public SqliteDatabase::Regulator {
 };
 static constexpr DefaultRegulatorForTest DEFAULT_REGULATOR_FOR_TEST;
 
+KJ_TEST("SQLite deadline covers multiple statements and interrupts an active cursor") {
+  using Cause = SqlExecutionBudget::Cause;
+  static const class DeadlineRegulator final: public SqliteDatabase::Regulator {
+   public:
+    mutable std::shared_ptr<SqlExecutionBudget> budget;
+    std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() const override { return budget; }
+    bool isAllowedTrigger(kj::StringPtr name) const override { return name == "r"; }
+  } regulator;
+  KJ_DEFER(regulator.budget.reset());
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"deadline"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  const SqliteDatabase::QueryOptions options{.regulator = regulator};
+
+  Cause stop = Cause::NONE;
+  regulator.budget = std::make_shared<SqlExecutionBudget>(30000000000, [&]() { return stop; });
+  KJ_EXPECT(db.run(options, "SELECT 1").getInt(0) == 1);
+  stop = Cause::WALL;
+  KJ_EXPECT_THROW_MESSAGE("SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded", db.run(options, "SELECT 2"));
+
+  uint32_t checks = 0;
+  regulator.budget = std::make_shared<SqlExecutionBudget>(30000000000,
+      [&]() { return ++checks >= 25 ? Cause::DISCONNECTED : Cause::NONE; });
+  KJ_EXPECT_THROW_MESSAGE("SQL client disconnected", db.run(options,
+      "WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n < 1000000) SELECT sum(n) FROM r"));
+  KJ_EXPECT(checks == 25);
+  regulator.budget.reset();
+  KJ_EXPECT(db.run(options, "SELECT 3").getInt(0) == 3);
+}
+
 KJ_TEST("SQLite backed by in-memory directory") {
   auto dir = kj::newInMemoryDirectory(kj::nullClock());
   SqliteDatabase::Vfs vfs(*dir);
