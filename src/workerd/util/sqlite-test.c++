@@ -203,16 +203,21 @@ KJ_TEST("SQL deadline and client disconnect leave a rolled-back WAL transaction 
   SqliteDatabase::WalTransactionLimit limit(1024 * 1024);
   SqliteDatabase::Vfs vfs(*dir, {.walTransactionLimit = &limit});
   SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
-  db.run("PRAGMA page_size = 4096; PRAGMA journal_mode = WAL; CREATE TABLE ledger(id INTEGER)");
+  db.run("PRAGMA page_size = 4096; PRAGMA journal_mode = WAL; "
+         "CREATE TABLE ledger(id INTEGER, payload BLOB)");
   limit.setPageSize(4096);
-  db.run("INSERT INTO ledger VALUES (1)");
+  db.run("INSERT INTO ledger(id) VALUES (1)");
+  const auto walPath = kj::Path({"db-wal"});
+  const auto confirmedWal = dir->openFile(walPath)->readAllBytes();
   db.onCriticalError([](kj::StringPtr message, kj::Maybe<kj::Exception>) {
     KJ_FAIL_EXPECT("an expected SQL interruption marked the database broken", message);
   });
 
   for (auto cause: {Cause::WALL, Cause::DISCONNECTED}) {
     limit.begin();
-    db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (2)");
+    db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (2, zeroblob(65536))");
+    KJ_REQUIRE(sqlite3_db_cacheflush(db) == SQLITE_OK);
+    KJ_ASSERT(dir->openFile(walPath)->stat().size > confirmedWal.size(), "the write must spill");
     bool rolledBack = false;
     db.onRollback([&] { rolledBack = true; });
     uint32_t checks = 0;
@@ -224,18 +229,19 @@ KJ_TEST("SQL deadline and client disconnect leave a rolled-back WAL transaction 
         : "SQL client disconnected";
     KJ_EXPECT_THROW_MESSAGE(message, db.run(options,
         "WITH RECURSIVE r(n) AS (VALUES(3) UNION ALL SELECT n+1 FROM r WHERE n < 1000000) "
-        "INSERT INTO ledger SELECT n FROM r"));
+        "INSERT INTO ledger(id) SELECT n FROM r"));
     KJ_ASSERT(sqlite3_get_autocommit(db), "SQLite should have rolled back the whole transaction");
     KJ_EXPECT(!db.observedCriticalError());
     db.rollbackWalTransaction();
-    limit.end(db);
+    limit.end(db, /*rolledBack=*/true);
     KJ_EXPECT(rolledBack);
+    KJ_EXPECT(dir->openFile(walPath)->readAllBytes() == confirmedWal.asPtr());
     KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 1);
     KJ_EXPECT(db.run("SELECT id FROM ledger").getInt(0) == 1);
   }
 
   limit.begin();
-  db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (3); RELEASE ledger");
+  db.run("SAVEPOINT ledger; INSERT INTO ledger(id) VALUES (3); RELEASE ledger");
   limit.end(db);
   KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 2);
 }

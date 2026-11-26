@@ -968,11 +968,12 @@ int SqliteDatabase::WalTransactionLimit::checkWrite(
   return SQLITE_OK;
 }
 
-void SqliteDatabase::WalTransactionLimit::end(SqliteDatabase& db) {
+void SqliteDatabase::WalTransactionLimit::end(SqliteDatabase& db, bool rolledBack) {
   if (!active) return;
   active = false;
-  if (!refused) return;
-  KJ_REQUIRE(sqlite3_get_autocommit(db), "the refused SQL transaction must be rolled back");
+  if (!refused && !rolledBack) return;
+  KJ_REQUIRE(sqlite3_get_autocommit(db), "the SQL transaction must be rolled back before WAL cleanup");
+  const auto before = KJ_UNWRAP_OR(originalSize, return);
   sqlite3_file* wal = nullptr;
   KJ_REQUIRE(sqlite3_file_control(db, "main", SQLITE_FCNTL_JOURNAL_POINTER, &wal) == SQLITE_OK);
   if (wal == nullptr || wal->pMethods == nullptr) return;
@@ -980,7 +981,6 @@ void SqliteDatabase::WalTransactionLimit::end(SqliteDatabase& db) {
   // any space it added, preserving the file's entire pre-transaction extent.
   sqlite3_int64 now = 0;
   KJ_REQUIRE(wal->pMethods->xFileSize(wal, &now) == SQLITE_OK);
-  const auto before = KJ_ASSERT_NONNULL(originalSize);
   if (now > before) {
     KJ_REQUIRE(wal->pMethods->xTruncate(wal, before) == SQLITE_OK);
   }
