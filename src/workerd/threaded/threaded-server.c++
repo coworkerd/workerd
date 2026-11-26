@@ -419,13 +419,13 @@ struct ResourceBudget {
     const auto memory = memoryReserved.load();
     const auto addressAfterRelease = addressReserved.load() - returnedAddress;
     const auto memoryAfterRelease = memory - returnedMemory;
-    const auto hardCeiling = memoryMaximum - kj::min(lent, memoryMaximum);
     if (fits(memoryAfterRelease, PREPARATION_MEMORY,
-            addressAfterRelease, PREPARATION_HEAP, kj::min(admissionMaximum, hardCeiling))) {
+            addressAfterRelease, PREPARATION_HEAP, admissionMaximum)) {
       return admissionMaximum;
     }
     // Above the admission ceiling, a single replacement may reuse the returning
     // charge. It cannot add to that total or exceed the hard memory budget.
+    const auto hardCeiling = memoryMaximum - kj::min(lent, memoryMaximum);
     if (returnedMemory < PREPARATION_MEMORY ||
         !fits(memoryAfterRelease, PREPARATION_MEMORY,
             addressAfterRelease, PREPARATION_HEAP, hardCeiling)) {
@@ -456,9 +456,12 @@ struct ResourceBudget {
     }
     const uint64_t preparations = keepCredit ? 2 : 1;
     const bool mayReplace = database && replacement != nullptr && !replacement->used;
-    const auto ceiling = mayReplace
-        ? kj::min(replacement->ceiling, memoryMaximum - kj::min(lent, memoryMaximum))
-        : admissionMaximum;
+    auto ceiling = admissionMaximum;
+    if (mayReplace) {
+      // Lent headroom reduces only the band available for a replacement.
+      const auto hardCeiling = memoryMaximum - kj::min(lent, memoryMaximum);
+      ceiling = kj::max(admissionMaximum, kj::min(replacement->ceiling, hardCeiling));
+    }
     if (count + preparations > residentMaximum.load() ||
         !fits(memory, preparations * PREPARATION_MEMORY,
             address, preparations * PREPARATION_HEAP, ceiling)) {

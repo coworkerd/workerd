@@ -265,6 +265,30 @@ KJ_TEST("a database replacement counts heap headroom lent after the victim was s
   KJ_EXPECT(budget->memoryReserved.load() + budget->lent == budget->memoryMaximum);
 }
 
+KJ_TEST("lent heap leaves the ordinary admission ceiling available to a database replacement") {
+  const auto budget = std::make_shared<ResourceBudget>(128 * ResourceBudget::MiB, 2, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto victim = std::make_shared<ResourceReservation>(budget, 64, true);
+  ResourceReservation live(budget, 64);
+  KJ_REQUIRE(victim->registerPreparation());
+  KJ_REQUIRE(live.registerPreparation());
+  KJ_REQUIRE(live.allocateExternal(budget->admissionMaximum - budget->memoryReserved.load()));
+
+  // Simulate the emergency headroom from an isolate's first near-heap-limit raise.
+  budget->lent = MAX_SINGLE_HEAP_OBJECT;
+  KJ_EXPECT(victim->replacementCeiling() == budget->admissionMaximum);
+  victim.reset();
+  {
+    ResourceReservation ordinary(budget, 64, true);
+    KJ_REQUIRE(ordinary.registerPreparation());
+    KJ_EXPECT(budget->memoryReserved.load() == budget->admissionMaximum);
+  }
+  DatabasePreparationReplacement replacement{budget->admissionMaximum};
+  ResourceReservation incoming(budget, 64, true);
+  KJ_EXPECT(incoming.registerPreparation(&replacement));
+  KJ_EXPECT(budget->memoryReserved.load() == budget->admissionMaximum);
+}
+
 // Exercise the server's routing and accounting without starting homes or creating actors.
 struct DatabaseAdmissionFixture {
   using Admission = server::DurableAdmission;
