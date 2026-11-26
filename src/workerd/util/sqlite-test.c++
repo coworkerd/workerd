@@ -1942,6 +1942,163 @@ KJ_TEST("SQLite VFS skips syncs when its sync option is off") {
   KJ_EXPECT(commitAndCountSyncs({.sync = false}) == 0);
 }
 
+KJ_TEST("SQLite spill budgets charge only changes in extent") {
+  SqliteSpillBudget process(12);
+  SqliteSpillTracker first(process, 8);
+  SqliteSpillTracker second(process, 8);
+  KJ_REQUIRE(first.resize(0, 5));  // WAL
+  KJ_REQUIRE(first.resize(0, 3));  // A separate temporary file.
+  KJ_EXPECT(!first.resize(3, 4));
+  KJ_REQUIRE(second.resize(0, 4));
+  KJ_EXPECT(!second.resize(4, 5));
+  KJ_EXPECT(process.getUsed() == 12);
+  KJ_REQUIRE(first.resize(3, 2));
+  KJ_REQUIRE(second.resize(4, 5));
+  KJ_EXPECT(process.getUsed() == 12);
+  KJ_REQUIRE(first.resize(5, 0));
+  KJ_REQUIRE(first.resize(2, 0));
+  KJ_REQUIRE(second.resize(5, 0));
+  KJ_EXPECT(process.getUsed() == 0);
+}
+
+KJ_TEST("SQLite settles WAL spill after commit, ordinary rollback and refusal on disk") {
+  constexpr uint64_t frame = 4096 + 24;
+  TempDirOnDisk directory;
+  SqliteSpillBudget process(16 * frame);
+  SqliteDatabase::WalTransactionLimit limit(128 * frame, process, 8 * frame);
+  SqliteDatabase::Vfs vfs(*directory, {.walTransactionLimit = &limit});
+  const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
+  SqliteDatabase db(vfs, kj::Path({"db"}), mode);
+  db.run("PRAGMA page_size=4096; PRAGMA journal_mode=WAL; "
+         "CREATE TABLE ledger(id INTEGER PRIMARY KEY, value BLOB); "
+         "INSERT INTO ledger VALUES (1, zeroblob(65536))");
+  limit.setPageSize(4096);
+  auto wal = kj::Path({"db-wal"});
+  const auto before = directory->openFile(wal)->readAllBytes();
+  KJ_REQUIRE(before.size() > 8 * frame);
+
+  auto flush = [&]() {
+    auto scope = db.enterMemoryScope();
+    return sqlite3_db_cacheflush(db);
+  };
+
+  limit.begin();
+  db.run("BEGIN; INSERT INTO ledger VALUES (2, x'01')");
+  KJ_REQUIRE(flush() == SQLITE_OK);
+  KJ_EXPECT(process.getUsed() == frame);
+  db.run("UPDATE ledger SET value=x'02' WHERE id=2");
+  KJ_REQUIRE(flush() == SQLITE_OK);
+  KJ_EXPECT(process.getUsed() == frame, "rewriting a spilled page reuses its charge");
+  db.rollbackWalTransaction();
+  limit.end(db, /*rolledBack=*/true);
+  KJ_EXPECT(process.getUsed() == 0);
+  KJ_EXPECT(directory->openFile(wal)->readAllBytes() == before.asPtr());
+
+  limit.begin();
+  db.run("BEGIN; INSERT INTO ledger VALUES (2, zeroblob(65536))");
+  KJ_EXPECT(flush() == SQLITE_FULL);
+  KJ_EXPECT(limit.wasSpillRefused() && !limit.wasRefused());
+  KJ_EXPECT(process.getUsed() == 8 * frame);
+  db.rollbackWalTransaction();
+  limit.end(db, /*rolledBack=*/true);
+  KJ_EXPECT(process.getUsed() == 0);
+  KJ_EXPECT(directory->openFile(wal)->readAllBytes() == before.asPtr());
+  KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 1);
+
+  limit.begin();
+  db.run("BEGIN; INSERT INTO ledger VALUES (3, x'03'); COMMIT");
+  KJ_EXPECT(process.getUsed() > 0);
+  limit.end(db);
+  KJ_EXPECT(process.getUsed() == 0);
+  KJ_EXPECT(db.run("SELECT sum(id) FROM ledger").getInt(0) == 4);
+}
+
+KJ_TEST("SQLite refuses to trim a WAL after a successful commit in the settlement window") {
+  constexpr uint64_t MiB = 1ull << 20;
+  TempDirOnDisk directory;
+  SqliteSpillBudget process(MiB);
+  SqliteDatabase::WalTransactionLimit limit(MiB, process, MiB);
+  SqliteDatabase::Vfs vfs(*directory, {.walTransactionLimit = &limit});
+  const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
+  SqliteDatabase db(vfs, kj::Path({"db"}), mode);
+  db.run("PRAGMA journal_mode=WAL; CREATE TABLE ledger(id INTEGER PRIMARY KEY)");
+  limit.setPageSize(db.run("PRAGMA page_size").getInt(0));
+
+  int confirmedFrames = 0;
+  db.setWalHook([](void* arg, sqlite3*, const char*, int frames) {
+    *static_cast<int*>(arg) = frames;
+    return SQLITE_OK;
+  }, &confirmedFrames);
+  limit.begin();
+  db.run("BEGIN; INSERT INTO ledger VALUES(1); COMMIT");
+  KJ_EXPECT(confirmedFrames > 0);
+  KJ_EXPECT(process.getUsed() > 0);
+  auto wal = kj::Path({"db-wal"});
+  const auto committed = directory->openFile(wal)->readAllBytes();
+  KJ_EXPECT_THROW_MESSAGE("UNIQUE constraint failed", db.run("INSERT INTO ledger VALUES(1)"));
+  KJ_EXPECT_LOG(ERROR, "skipping WAL rollback cleanup after a commit");
+  limit.end(db, /*rolledBack=*/true);
+  KJ_EXPECT(directory->openFile(wal)->readAllBytes() == committed.asPtr());
+  KJ_EXPECT(process.getUsed() == 0);
+  KJ_EXPECT(db.run("SELECT id FROM ledger").getInt(0) == 1);
+}
+
+KJ_TEST("SQLite charges simultaneous file-backed sorters until their files close") {
+  constexpr uint64_t MiB = 1ull << 20;
+  TempDirOnDisk directory;
+  SqliteSpillBudget process(7 * MiB);
+  SqliteDatabase::WalTransactionLimit firstLimit(64 * MiB, process, 6 * MiB);
+  SqliteDatabase::WalTransactionLimit secondLimit(64 * MiB, process, 6 * MiB);
+  SqliteDatabase::Vfs firstVfs(*directory, {.walTransactionLimit = &firstLimit});
+  SqliteDatabase::Vfs secondVfs(*directory, {.walTransactionLimit = &secondLimit});
+  const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
+  SqliteDatabase first(firstVfs, kj::Path({"first"}), mode);
+  SqliteDatabase second(secondVfs, kj::Path({"second"}), mode);
+  static const DeadlineRegulator regulator;
+  const SqliteDatabase::QueryOptions options{.regulator = regulator};
+  for (auto* db: {&first, &second}) {
+    db->run("PRAGMA journal_mode=WAL; CREATE TABLE records(id INTEGER, payload TEXT)");
+    db->run(options,
+        "WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n<512) "
+        "INSERT INTO records SELECT n, printf('%08d', 513-n) || hex(zeroblob(4092)) FROM r");
+  }
+  firstLimit.setPageSize(first.run("PRAGMA page_size").getInt(0));
+  secondLimit.setPageSize(second.run("PRAGMA page_size").getInt(0));
+  constexpr auto sort = "SELECT id FROM records ORDER BY payload"_kj;
+
+  firstLimit.begin();
+  {
+    auto rows = first.run(options, sort);
+    KJ_EXPECT(rows.getInt(0) == 512);
+    const auto held = process.getUsed();
+    KJ_REQUIRE(held > 3 * MiB && held <= 6 * MiB, held);
+    {
+      auto outsideTransaction = second.run(options, sort);
+      KJ_EXPECT(outsideTransaction.getInt(0) == 512);
+      KJ_EXPECT(process.getUsed() == held);
+    }
+    secondLimit.begin();
+    KJ_EXPECT_THROW_MESSAGE("database or disk is full", second.run(options, sort));
+    KJ_EXPECT(secondLimit.wasSpillRefused());
+    KJ_EXPECT(!second.observedCriticalError());
+    secondLimit.end(second, /*rolledBack=*/true);
+    KJ_EXPECT(process.getUsed() == held);
+    rows.nextRow();
+    KJ_EXPECT(rows.getInt(0) == 511);
+  }
+  firstLimit.end(first);
+  KJ_EXPECT(process.getUsed() == 0);
+
+  secondLimit.begin();
+  {
+    auto rows = second.run(options, sort);
+    KJ_EXPECT(rows.getInt(0) == 512);
+    KJ_EXPECT(process.getUsed() > 3 * MiB);
+  }
+  secondLimit.end(second);
+  KJ_EXPECT(process.getUsed() == 0);
+}
+
 KJ_TEST("SQLite realloc accepts the exact growth and returns credit on shrink and free") {
   static constexpr int small = 1024;
   static constexpr int large = 4096;

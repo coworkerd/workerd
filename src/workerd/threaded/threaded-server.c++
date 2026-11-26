@@ -2758,7 +2758,9 @@ struct ThreadedServer {
         sourceAddress(std::move(sourceAddress)),
         identity(std::move(identity)),
         durableStorage(durableDirectory
-                ? std::make_unique<server::DurableStorage>(kj::mv(durableDirectory))
+                ? std::make_unique<server::DurableStorage>(kj::mv(durableDirectory),
+                    configuredCount("COWORKERD_DO_SQL_DATABASE_SPILL_BYTES", 1ull << 30),
+                    configuredCount("COWORKERD_DO_SQL_PROCESS_SPILL_BYTES", 0))
                 : nullptr),
         durableLog(kj::mv(durableLog)),
         durablePlacement{
@@ -3739,6 +3741,8 @@ struct ThreadedServer {
         ",\"placementClosedHomes\":" + std::to_string(placementClosedHomes) +
         ",\"resettingHomes\":" + std::to_string(resettingHomes) +
         ",\"maxHomeMemoryBytes\":" + std::to_string(maxHomeMemory) +
+        ",\"sqlSpillBytes\":" + std::to_string(durableStorage->getSqlSpillBudget().getUsed()) +
+        ",\"sqlSpillMaximum\":" + std::to_string(durableStorage->getSqlSpillBudget().getCapacity()) +
         ",\"workerThreads\":" + std::to_string(liveThreads.load()) +
         ",\"waiting\":" + std::to_string(state.waiting) +
         ",\"running\":" + std::to_string(state.active) +
