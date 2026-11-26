@@ -766,13 +766,14 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
           static constexpr SqlStorageRegulator regulator;
           kj::throwRecoverableException(regulator.sqlExecutionLimitException(*budget));
         }
+        JSG_REQUIRE(!limit->isRefusingWrites(), Error, "Cannot commit a refused SQL transaction");
         KJ_REQUIRE(txn->commit() == kj::none, "synchronous SQL commit unexpectedly deferred");
         syncExternalTxn.commit();
         limit->end(sqlite);
         return kj::mv(result);
       }, [&](jsg::Value exception) -> jsg::JsRef<jsg::JsValue> {
         txn = nullptr;  // Roll back before translating the error.
-        if (limit->wasRefused()) {
+        if (!sqlite.observedCriticalError() && limit->wasRefused()) {
           limit->end(sqlite);
           kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
               KJ_EXCEPTION(FAILED, "jsg.Error: the transaction exceeds one recoverable WAL record"),

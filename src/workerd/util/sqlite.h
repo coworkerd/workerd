@@ -948,12 +948,20 @@ class SqliteDatabase::WalTransactionLimit {
   explicit WalTransactionLimit(uint64_t frameBytes): frameBytes(frameBytes) {}
   uint64_t capacity() const { return frameBytes; }
   bool isActive() const { return active; }
-  bool wasRefused() const { return active && refused; }
+  bool isRefusingWrites() const {
+    return active && refusal != Refusal::NONE;
+  }
+  bool wasRefused() const {
+    return active && refusal == Refusal::WAL_LIMIT;
+  }
   bool wasMemoryRefused() const {
-    return active && memoryRefused;
+    return active && refusal == Refusal::MEMORY_LIMIT;
   }
   void noteMemoryRefusal() {
-    memoryRefused = true;
+    noteRefusal(Refusal::MEMORY_LIMIT);
+  }
+  void noteInterruption() {
+    noteRefusal(Refusal::INTERRUPTED);
   }
   void setPageSize(uint32_t pageSize);
   void begin();
@@ -967,8 +975,12 @@ class SqliteDatabase::WalTransactionLimit {
   kj::Maybe<uint64_t> firstFrameByte;
   kj::Maybe<int64_t> originalSize;
   bool active = false;
-  bool refused = false;
-  bool memoryRefused = false;
+  enum class Refusal { NONE, WAL_LIMIT, MEMORY_LIMIT, INTERRUPTED };
+  Refusal refusal = Refusal::NONE;
+
+  void noteRefusal(Refusal cause) {
+    if (refusal == Refusal::NONE) refusal = cause;
+  }
 };
 
 // Options affecting SqliteDatabase::Vfs onstructor.
