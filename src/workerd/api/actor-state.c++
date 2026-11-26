@@ -787,8 +787,10 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
                   FAILED, "jsg.Error: the statement exceeds the database SQLite memory limit"),
               "SQL_MEMORY_LIMIT_EXCEEDED"));
         }
-        if (!sqlite.observedCriticalError() && budget && budget->hasDeadline() &&
-            budget->getCause() != SqlExecutionBudget::Cause::NONE) {
+        if (!sqlite.observedCriticalError() &&
+            (limit->isRefusingWrites() ||
+                (budget && budget->hasDeadline() &&
+                    budget->getCause() != SqlExecutionBudget::Cause::NONE))) {
           limit->end(sqlite, /*rolledBack=*/true);
         }
         js.throwException(kj::mv(exception));

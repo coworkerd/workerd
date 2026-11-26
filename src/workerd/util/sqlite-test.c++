@@ -2044,6 +2044,41 @@ KJ_TEST("SQLite local heap refusal rolls back a platform write on the same conne
   KJ_EXPECT(db.run("SELECT sum(id) FROM ledger").getInt(0) == 4);
 }
 
+KJ_TEST("SQLite conflict rollback blocks later writes until the platform transaction ends") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::WalTransactionLimit limit(1024 * 1024);
+  SqliteDatabase::Vfs vfs(*dir, {.walTransactionLimit = &limit});
+  SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  db.run("PRAGMA page_size = 4096; PRAGMA journal_mode = WAL; "
+         "CREATE TABLE ledger(id INTEGER PRIMARY KEY, payload BLOB); INSERT INTO ledger(id) VALUES (1)");
+  limit.setPageSize(4096);
+  auto walPath = kj::Path({"db-wal"});
+  auto before = dir->openFile(walPath)->readAllBytes();
+
+  limit.begin();
+  db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (2, zeroblob(65536))");
+  {
+    auto memoryScope = db.enterMemoryScope();
+    KJ_REQUIRE(sqlite3_db_cacheflush(db) == SQLITE_OK);
+  }
+  KJ_ASSERT(dir->openFile(walPath)->stat().size > before.size());
+  KJ_EXPECT_THROW_MESSAGE(
+      "UNIQUE constraint failed", db.run("INSERT OR ROLLBACK INTO ledger(id) VALUES (1)"));
+  KJ_ASSERT(sqlite3_get_autocommit(db));
+  KJ_EXPECT(limit.isRefusingWrites() && !limit.wasRefused() && !limit.wasMemoryRefused());
+  KJ_EXPECT_THROW_MESSAGE("database or disk is full", db.run("INSERT INTO ledger(id) VALUES (99)"));
+  KJ_EXPECT(!db.observedCriticalError());
+  db.rollbackWalTransaction();
+  limit.end(db, /*rolledBack=*/true);
+  KJ_EXPECT(dir->openFile(walPath)->readAllBytes() == before.asPtr());
+  KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 1);
+
+  limit.begin();
+  db.run("SAVEPOINT ledger; INSERT INTO ledger(id) VALUES (3); RELEASE ledger");
+  limit.end(db);
+  KJ_EXPECT(db.run("SELECT sum(id) FROM ledger").getInt(0) == 4);
+}
+
 KJ_TEST("SQLite meters materialized columns and accounts for open connections independently") {
   static constexpr size_t capacity = 512 * 1024;
   auto dir = kj::newInMemoryDirectory(kj::nullClock());

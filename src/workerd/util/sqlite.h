@@ -963,6 +963,9 @@ class SqliteDatabase::WalTransactionLimit {
   void noteInterruption() {
     noteRefusal(Refusal::INTERRUPTED);
   }
+  void noteStatementRollback() {
+    noteRefusal(Refusal::STATEMENT_ROLLBACK);
+  }
   void setPageSize(uint32_t pageSize);
   void begin();
   void end(SqliteDatabase& db, bool rolledBack = false);
@@ -975,7 +978,7 @@ class SqliteDatabase::WalTransactionLimit {
   kj::Maybe<uint64_t> firstFrameByte;
   kj::Maybe<int64_t> originalSize;
   bool active = false;
-  enum class Refusal { NONE, WAL_LIMIT, MEMORY_LIMIT, INTERRUPTED };
+  enum class Refusal { NONE, WAL_LIMIT, MEMORY_LIMIT, INTERRUPTED, STATEMENT_ROLLBACK };
   Refusal refusal = Refusal::NONE;
 
   void noteRefusal(Refusal cause) {

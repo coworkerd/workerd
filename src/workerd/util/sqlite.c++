@@ -1020,9 +1020,10 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
     kj::StringPtr errorMessage,
     kj::Maybe<const kj::Exception&> maybeException) {
   KJ_IF_SOME(code, errorCode) {
+    if (code == SQLITE_OK) return;
     auto* limit = getWalTransactionLimit();
-    const bool platformCanSettle =
-        limit != nullptr && limit->isActive() && maybeException == kj::none;
+    const bool platformTransaction = limit != nullptr && limit->isActive();
+    const bool platformCanSettle = platformTransaction && maybeException == kj::none;
     if (platformCanSettle) {
       if (code == SQLITE_FULL && limit->isRefusingWrites()) return;
       if (code == SQLITE_NOMEM && SqliteMemoryScope::wasLimitRefused()) {
@@ -1031,37 +1032,31 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
         return;
       }
     }
-    // Only errors listed in https://www.sqlite.org/lang_transaction.html#response_to_errors_within_a_transaction
-    // should be considered here as SQLITE auto rollbacks the transaction when we hit these errors
+    // A failed statement can have already rolled back the whole transaction, including
+    // through a conflict clause or trigger. The platform still owns its savepoints.
+    if ((!inTransaction && savepoints.empty()) || sqlite3_get_autocommit(*this) == 0) return;
+    auto* budget = activeExecutionScope == nullptr ? nullptr : activeExecutionScope->budget.get();
+    const bool budgetInterrupted = code == SQLITE_INTERRUPT && budget != nullptr &&
+        budget->getCause() != SqlExecutionBudget::Cause::NONE;
+    if (platformCanSettle && budgetInterrupted && budget->hasDeadline()) {
+      limit->noteInterruption();
+      return;
+    }
+    if (platformTransaction && !savepoints.empty()) {
+      limit->noteStatementRollback();
+    }
+    // Preserve the critical path for the errors SQLite can roll back unexpectedly.
     if (code == SQLITE_FULL || code == SQLITE_IOERR || code == SQLITE_NOMEM ||
         code == SQLITE_INTERRUPT) {
-
-      sqlite3* db = *this;
-      // We are in a transaction
-      if (inTransaction || !savepoints.empty()) {
-        // SQLite automatically rolled back the whole transaction.
-        if (sqlite3_get_autocommit(db) != 0) {
-          auto* budget =
-              activeExecutionScope == nullptr ? nullptr : activeExecutionScope->budget.get();
-          const bool budgetInterrupted = code == SQLITE_INTERRUPT && budget != nullptr &&
-              budget->getCause() != SqlExecutionBudget::Cause::NONE;
-          if (platformCanSettle && budgetInterrupted && budget->hasDeadline()) {
-            // The platform's explicit transaction will clear the rolled-back savepoints
-            // and callbacks. Keep writes blocked while the actor settles the refusal.
-            limit->noteInterruption();
-            return;
-          }
-          criticalErrorOccurred = true;
-          KJ_IF_SOME(cb, onCriticalErrorCallback) {
-            if (budgetInterrupted && maybeException == kj::none) {
-              auto error = KJ_REQUIRE_NONNULL(currentRegulator)->sqlExecutionLimitException(*budget);
-              auto description = kj::str(error.getDescription());
-              cb(description, kj::mv(error));
-              return;
-            }
-            cb(errorMessage, maybeException.map([](const kj::Exception& e) { return e.clone(); }));
-          }
+      criticalErrorOccurred = true;
+      KJ_IF_SOME(cb, onCriticalErrorCallback) {
+        if (budgetInterrupted && maybeException == kj::none) {
+          auto error = KJ_REQUIRE_NONNULL(currentRegulator)->sqlExecutionLimitException(*budget);
+          auto description = kj::str(error.getDescription());
+          cb(description, kj::mv(error));
+          return;
         }
+        cb(errorMessage, maybeException.map([](const kj::Exception& e) { return e.clone(); }));
       }
     }
   }
