@@ -101,6 +101,7 @@ class SqliteDatabase {
  public:
   // Allow 34 bytes of padding for V8 serialization overhead beyond the 8 MiB row limit.
   static constexpr int MAX_ROW_LENGTH = 8 * 1024 * 1024 + 34;
+  static constexpr size_t PLATFORM_SQL_HEAP_LIMIT_BYTES = 32 * 1024 * 1024;
 
   class Vfs;
   class Query;
@@ -314,6 +315,7 @@ class SqliteDatabase {
   bool observedCriticalError();
   WalTransactionLimit* getWalTransactionLimit() const;
   void rollbackWalTransaction();
+  void releaseCachedMemory();
 
   // Invoke the onWrite() callback.
   //
@@ -934,6 +936,8 @@ class SqliteDatabase::Query final: private ResetListener {
 
   void beforeSqliteClose(CloseReason reason) override;
 
+  void checkColumnMemoryLimit(sqlite3_stmt* statement);
+
   void nextRow(bool first);
 };
 
@@ -944,7 +948,24 @@ class SqliteDatabase::WalTransactionLimit {
   explicit WalTransactionLimit(uint64_t frameBytes): frameBytes(frameBytes) {}
   uint64_t capacity() const { return frameBytes; }
   bool isActive() const { return active; }
-  bool wasRefused() const { return active && refused; }
+  bool isRefusingWrites() const {
+    return active && refusal != Refusal::NONE;
+  }
+  bool wasRefused() const {
+    return active && refusal == Refusal::WAL_LIMIT;
+  }
+  bool wasMemoryRefused() const {
+    return active && refusal == Refusal::MEMORY_LIMIT;
+  }
+  void noteMemoryRefusal() {
+    noteRefusal(Refusal::MEMORY_LIMIT);
+  }
+  void noteInterruption() {
+    noteRefusal(Refusal::INTERRUPTED);
+  }
+  void noteStatementRollback() {
+    noteRefusal(Refusal::STATEMENT_ROLLBACK);
+  }
   void setPageSize(uint32_t pageSize);
   void begin();
   void end(SqliteDatabase& db, bool rolledBack = false);
@@ -957,7 +978,12 @@ class SqliteDatabase::WalTransactionLimit {
   kj::Maybe<uint64_t> firstFrameByte;
   kj::Maybe<int64_t> originalSize;
   bool active = false;
-  bool refused = false;
+  enum class Refusal { NONE, WAL_LIMIT, MEMORY_LIMIT, INTERRUPTED, STATEMENT_ROLLBACK };
+  Refusal refusal = Refusal::NONE;
+
+  void noteRefusal(Refusal cause) {
+    if (refusal == Refusal::NONE) refusal = cause;
+  }
 };
 
 // Options affecting SqliteDatabase::Vfs onstructor.
