@@ -48,8 +48,13 @@ DurableAdmission::DurableAdmission(Limits limits, uint64_t generation)
       "durable tree and event metadata require memory reservations");
 }
 
+void DurableAdmission::limitDatabaseTreePreference(Time until) {
+  databaseTreePreferredUntil = std::min(until, databaseTreePreferredUntil);
+}
+
 DurableAdmission::Result DurableAdmission::queue(
-    const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now) {
+    const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now,
+    bool database) {
   if (open.generation != generation) return {Status::STALE};
   if (deadline <= now) {
     ++counters.expired;
@@ -62,9 +67,9 @@ DurableAdmission::Result DurableAdmission::queue(
     if (tree->closing) return {tree->idleClosing ? Status::RETIRING : Status::STALE};
   }
 
-  auto refuse = [&]() -> Result {
-    ++counters.overloads;
-    return {Status::OVERLOADED};
+  auto refuse = [&](bool newTreeCapacityRefused = false) -> Result {
+    if (!database || !newTreeCapacityRefused) recordOverload();
+    return {.status = Status::OVERLOADED, .newTreeCapacityRefused = newTreeCapacityRefused};
   };
   if (bytes > limits.mailboxBytes ||
       (tree != nullptr &&
@@ -72,16 +77,23 @@ DurableAdmission::Result DurableAdmission::queue(
               bytes > limits.mailboxBytes - tree->waitingBytes))) {
     return refuse();
   }
+  const bool newTree = tree == nullptr;
   auto reserved = counters.reserved;
   if (!reserve(reserved, limits.capacity, limits.event) ||
       !reserve(reserved, limits.capacity, {.memory = bytes})) {
-    return refuse();
+    return refuse(newTree);
   }
-  const bool newTree = tree == nullptr;
   if (newTree &&
       ((limits.residentTarget != 0 && counters.trees >= limits.residentTarget) ||
           !reserve(reserved, limits.capacity, limits.tree))) {
-    return refuse();
+    return refuse(true);
+  }
+  if (newTree && !database && now < databaseTreePreferredUntil) {
+    auto includingPreferredTree = reserved;
+    if ((limits.residentTarget != 0 && counters.trees + 1 >= limits.residentTarget) ||
+        !reserve(includingPreferredTree, limits.capacity, limits.tree)) {
+      return refuse(true);
+    }
   }
 
   KJ_ASSERT(nextTree != 0 && nextEvent != 0);
@@ -187,14 +199,14 @@ DurableAdmission::Cancellation DurableAdmission::cancel(Ticket ticket) {
   return Cancellation::RELEASED;
 }
 
-bool DurableAdmission::refuseWaiting(Ticket ticket) {
+bool DurableAdmission::refuseWaiting(Ticket ticket, bool countOverload) {
   auto entry = trees.find(ticket.tree);
   if (entry == trees.end()) return false;
   auto& tree = entry->second;
   auto event = tree.events.find(ticket.event);
   if (event == tree.events.end() || event->second.phase != Phase::WAITING) return false;
   releaseEvent(tree, event);
-  ++counters.overloads;
+  if (countOverload) recordOverload();
   return true;
 }
 
@@ -243,6 +255,12 @@ bool DurableAdmission::beginReset(uint64_t tree, uint64_t home) {
     if (event->second.phase == Phase::WAITING) releaseEvent(pending, event);
   }
   return true;
+}
+
+bool DurableAdmission::isIdleTree(uint64_t tree, uint64_t home) const {
+  auto entry = trees.find(tree);
+  return home != 0 && entry != trees.end() && entry->second.home == home &&
+      !entry->second.closing && entry->second.events.empty();
 }
 
 bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home) {
