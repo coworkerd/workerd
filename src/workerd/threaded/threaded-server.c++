@@ -2669,8 +2669,7 @@ struct ThreadedServer {
             .residentTarget = uint32_t(configuredCount("COWORKERD_DO_RESIDENT_OBJECTS", 4096)),
             .mailboxDepth = uint32_t(boundedDurableSetting(
                 "COWORKERD_DO_TEST_MAILBOX_EVENTS", defaultMailboxDepth, 65536)),
-            .mailboxBytes =
-                configuredCount("COWORKERD_DO_TEST_MAILBOX_BYTES", defaultMailboxBytes),
+            .mailboxBytes = configuredCount("COWORKERD_DO_TEST_MAILBOX_BYTES", defaultMailboxBytes),
           },
           durableNumber(std::string_view(this->identity).substr(colon + 1)));
     }
