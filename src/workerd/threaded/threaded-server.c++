@@ -1798,28 +1798,36 @@ const char *durableLifecycleTestDirectory() {
   return directory;
 }
 
-bool refuseCopyReservationForTest() {
+uint32_t readDurableLifecycleSetting(kj::StringPtr name) {
   const auto *directory = durableLifecycleTestDirectory();
-  if (directory == nullptr) return false;
-  auto path = kj::str(directory, "/copy-reservation/refuse");
-  // The fixture arms one refusal for the next cold copy across its threaded children.
-  return unlink(path.cStr()) == 0;
+  if (directory == nullptr) return 0;
+  auto path = kj::str(directory, "/", name);
+  int fd = open(path.cStr(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+  if (fd < 0) return 0;
+  KJ_DEFER(close(fd));
+  char bytes[16];
+  auto size = read(fd, bytes, sizeof(bytes));
+  if (size <= 0) return 0;
+  uint32_t value = 0;
+  auto parsed = std::from_chars(bytes, bytes + size, value);
+  return parsed.ec == std::errc() ? value : 0;
+}
+
+bool refuseCopyReservationForTest() {
+  const auto request = readDurableLifecycleSetting("copy-reservation-refusal");
+  static std::atomic<uint32_t> lastRefusal = 0;
+  auto last = lastRefusal.load();
+  // A fixture request is consumed once, even when several homes attempt a cold copy.
+  while (request > last) {
+    if (lastRefusal.compare_exchange_weak(last, request)) return true;
+  }
+  return false;
 }
 
 server::DurableIdleLifecycle::Time durableIdleNow() {
   auto now = server::DurableAdmission::Clock::now();
-  const auto *directory = durableLifecycleTestDirectory();
-  if (directory == nullptr) return now;
-  auto path = kj::str(directory, "/idle-offset-ms");
-  int fd = open(path.cStr(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-  if (fd < 0) return now;
-  KJ_DEFER(close(fd));
-  char bytes[16];
-  auto size = read(fd, bytes, sizeof(bytes));
-  if (size <= 0) return now;
-  uint32_t offset = 0;
-  auto parsed = std::from_chars(bytes, bytes + size, offset);
-  if (parsed.ec == std::errc() && offset <= 86'400'000) now += std::chrono::milliseconds(offset);
+  const auto offset = readDurableLifecycleSetting("idle-offset-ms");
+  if (offset <= 86'400'000) now += std::chrono::milliseconds(offset);
   return now;
 }
 
