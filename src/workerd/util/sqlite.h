@@ -943,10 +943,11 @@ class SqliteDatabase::WalTransactionLimit {
  public:
   explicit WalTransactionLimit(uint64_t frameBytes): frameBytes(frameBytes) {}
   uint64_t capacity() const { return frameBytes; }
+  bool isActive() const { return active; }
   bool wasRefused() const { return active && refused; }
   void setPageSize(uint32_t pageSize);
   void begin();
-  void end(SqliteDatabase& db);
+  void end(SqliteDatabase& db, bool rolledBack = false);
   void abandon(SqliteDatabase& db) noexcept;
   int checkWrite(sqlite3_file* file, int64_t offset, int length) noexcept;
 
