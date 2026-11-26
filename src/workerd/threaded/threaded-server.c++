@@ -299,6 +299,17 @@ kj::Exception limitException(LimitCause cause);
 // V8 sandbox build): the 4 GiB cage less what V8 keeps in it, as for the shared cage below.
 constexpr uint64_t OWN_CAGE_HEAP = (4ull << 30) - (256ull << 20);
 
+struct DatabasePreparationReplacement {
+  const uint64_t ceiling;
+  bool used = false;  // Protected by the resource budget mutex.
+};
+
+struct DatabaseReservationReturn {
+  uint64_t memoryBeforeRelease = 0;
+  // Published last, after the memory charge and resident count are both returned.
+  std::atomic<uint64_t> releasedMemory{0};
+};
+
 struct ResourceBudget {
   enum class ReclaimMode { BACKGROUND, NONE };
   static constexpr uint64_t MiB = 1ull << 20;
@@ -402,12 +413,24 @@ struct ResourceBudget {
         newAddress <= addressMaximum - kj::min(address, addressMaximum);
   }
 
-  bool canReplaceForAdmission(uint64_t returnedMemory, uint64_t newMemory,
-      uint64_t returnedAddress, uint64_t newAddress) {
+  std::optional<uint64_t> replacementCeiling(uint64_t returnedMemory, uint64_t returnedAddress) {
     std::lock_guard lock(mutex);
-    return residents.load() <= residentMaximum.load() &&
-        fits(memoryReserved.load() - returnedMemory, newMemory,
-            addressReserved.load() - returnedAddress, newAddress, admissionMaximum);
+    if (residents.load() > residentMaximum.load()) return std::nullopt;
+    const auto memory = memoryReserved.load();
+    const auto addressAfterRelease = addressReserved.load() - returnedAddress;
+    const auto memoryAfterRelease = memory - returnedMemory;
+    if (fits(memoryAfterRelease, PREPARATION_MEMORY,
+            addressAfterRelease, PREPARATION_HEAP, admissionMaximum)) {
+      return admissionMaximum;
+    }
+    // Above the admission ceiling, a single replacement may reuse the returning
+    // charge. It cannot add to that total or exceed the hard memory budget.
+    if (returnedMemory < PREPARATION_MEMORY ||
+        !fits(memoryAfterRelease, PREPARATION_MEMORY,
+            addressAfterRelease, PREPARATION_HEAP, memoryMaximum)) {
+      return std::nullopt;
+    }
+    return kj::min(memory, memoryMaximum);
   }
 
   void preferDatabasePreparation(server::DurableAdmission::Time until) {
@@ -420,7 +443,7 @@ struct ResourceBudget {
     databasePreparationPreferredUntil = kj::min(until, databasePreparationPreferredUntil);
   }
 
-  bool registerPreparation(bool database) {
+  bool registerPreparation(bool database, DatabasePreparationReplacement* replacement) {
     std::lock_guard lock(mutex);
     const auto count = residents.load();
     const auto memory = memoryReserved.load();
@@ -428,15 +451,18 @@ struct ResourceBudget {
     const bool keepCredit = !database &&
         server::DurableAdmission::Clock::now() < databasePreparationPreferredUntil;
     const uint64_t preparations = keepCredit ? 2 : 1;
+    const bool mayReplace = database && replacement != nullptr && !replacement->used;
+    const auto ceiling = mayReplace ? replacement->ceiling : admissionMaximum;
     if (count + preparations > residentMaximum.load() ||
         !fits(memory, preparations * PREPARATION_MEMORY,
-            address, preparations * PREPARATION_HEAP, admissionMaximum)) {
+            address, preparations * PREPARATION_HEAP, ceiling)) {
       return false;
     }
     memoryReserved.store(memory + PREPARATION_MEMORY);
     addressReserved.store(address + PREPARATION_HEAP);
     residents.fetch_add(1);
     if (database) databasePreparationPreferredUntil = {};
+    if (mayReplace) replacement->used = true;
     return true;
   }
 
@@ -445,9 +471,12 @@ struct ResourceBudget {
       uint64_t oldAddress,
       uint64_t newAddress,
       bool admission = false,
-      bool observe = false) {
+      bool observe = false,
+      uint64_t* memoryBeforeRelease = nullptr) {
     std::lock_guard lock(mutex);
-    auto memory = memoryReserved.load() - oldMemory;
+    const auto reserved = memoryReserved.load();
+    if (memoryBeforeRelease != nullptr) *memoryBeforeRelease = reserved;
+    auto memory = reserved - oldMemory;
     auto address = addressReserved.load() - oldAddress;
     auto ceiling = admission ? admissionMaximum : memoryMaximum;
     const bool accepted = (!admission && newMemory <= oldMemory && newAddress <= oldAddress) ||
@@ -471,26 +500,26 @@ struct ResourceReservation {
       bool platformDatabase = false)
       : budget(std::move(budget)),
         maximumHeap(uint64_t(memoryMiB == 0 ? 128 : memoryMiB) * MiB),
-        returned(platformDatabase ? std::make_shared<std::atomic<bool>>(false) : nullptr) {}
+        returned(platformDatabase ? std::make_shared<DatabaseReservationReturn>() : nullptr) {}
   ~ResourceReservation() {
     if (!registered) return;
-    (void)budget->change(memoryCharge, 0, addressCharge, 0);
+    (void)budget->change(memoryCharge, 0, addressCharge, 0, false, false,
+        returned ? &returned->memoryBeforeRelease : nullptr);
     budget->residents.fetch_sub(1);
-    if (returned) returned->store(true);
+    if (returned) returned->releasedMemory.store(memoryCharge);
   }
   std::shared_ptr<ResourceBudget> budget;
   const uint64_t maximumHeap;
-  const std::shared_ptr<std::atomic<bool>> returned;
+  const std::shared_ptr<DatabaseReservationReturn> returned;
   std::mutex mutex;
   uint64_t heap = PREPARATION_HEAP, heapPhysical = 0, otherExternal = 0, ownedExternal = 0, source = 0,
            logs = 0;
   uint64_t memoryCharge = 0, addressCharge = 0;
   uint32_t preparing = 0;
   bool registered = false;
-  bool canReplaceWithPreparation() {
+  std::optional<uint64_t> replacementCeiling() {
     std::lock_guard lock(mutex);
-    return registered && budget->canReplaceForAdmission(
-        memoryCharge, ResourceBudget::PREPARATION_MEMORY, addressCharge, PREPARATION_HEAP);
+    return registered ? budget->replacementCeiling(memoryCharge, addressCharge) : std::nullopt;
   }
   bool resize(bool admission = false, bool observe = false) {
     auto memory = NATIVE_OVERHEAD + source + heap + otherExternal + ownedExternal + logs;
@@ -513,10 +542,10 @@ struct ResourceReservation {
         ",\"memoryCharge\":" + std::to_string(memoryCharge) +
         ",\"preparations\":" + std::to_string(preparing) + "}";
   }
-  bool registerPreparation() {
+  bool registerPreparation(DatabasePreparationReplacement* replacement = nullptr) {
     std::lock_guard lock(mutex);
     KJ_ASSERT(!registered);
-    if (!budget->registerPreparation(bool(returned))) return false;
+    if (!budget->registerPreparation(bool(returned), replacement)) return false;
     memoryCharge = ResourceBudget::PREPARATION_MEMORY;
     addressCharge = PREPARATION_HEAP;
     registered = true;
@@ -2558,16 +2587,17 @@ struct DatabaseRetirement {
   uint64_t home;
   uint64_t tree;
   uint64_t lastUse;
-  std::shared_ptr<std::atomic<bool>> reservationReturned;
+  std::shared_ptr<DatabaseReservationReturn> reservationReturned;
   Time deadline;
   bool preferDatabase;
+  std::optional<uint64_t> preparationCeiling;
   bool treePreferred = false;
   bool preparationPreferred = false;
 
   Outcome outcome(Time now, bool hasTree, bool closing) const {
     if (now >= deadline) return Outcome::EXPIRED;
     if (hasTree) return closing ? Outcome::PENDING : Outcome::REFUSED;
-    return reservationReturned->load() ? Outcome::RELEASED : Outcome::PENDING;
+    return reservationReturned->releasedMemory.load() > 0 ? Outcome::RELEASED : Outcome::PENDING;
   }
 };
 
@@ -2575,8 +2605,10 @@ template <typename Retire>
 kj::Promise<bool> registerDurablePreparation(
     ResourceReservation& reservation, bool platformDatabase, Retire retire) {
   if (reservation.registerPreparation()) co_return true;
+  if (!platformDatabase) co_return false;
   // A cold load retries the reservation once after reclaiming a single copy.
-  co_return platformDatabase && (co_await retire()) && reservation.registerPreparation();
+  const auto replacement = co_await retire();
+  co_return replacement && reservation.registerPreparation(replacement.get());
 }
 
 // The maintenance pass's view of the residents, which it formats into the
@@ -2608,7 +2640,8 @@ struct ThreadedServer {
   // One retirement at a time, so concurrent cold loads can retry against the same release.
   // Both fields are guarded by durableRoutingMutex.
   std::optional<DatabaseRetirement> databaseVictim;
-  std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<bool>>> databaseCapacityWaiters;
+  using DatabaseReplacement = std::shared_ptr<DatabasePreparationReplacement>;
+  std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<DatabaseReplacement>>> databaseCapacityWaiters;
   std::atomic<uint64_t> durableHomeSessions{0};
   std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
   std::atomic<uint64_t> durableAdmissionRetirements{0};
@@ -3036,6 +3069,12 @@ struct ThreadedServer {
   bool requestDatabaseRetirement(bool needsPreparationBudget = false) {
     if (databaseVictim) {
       if (!needsPreparationBudget) databaseVictim->preferDatabase = true;
+      if (needsPreparationBudget && !databaseVictim->preparationCeiling) {
+        const auto reservation = threads[databaseVictim->home - 1]->home->databaseReservation.lock();
+        if (!reservation) return false;
+        databaseVictim->preparationCeiling = reservation->replacementCeiling();
+        if (!databaseVictim->preparationCeiling) return false;
+      }
       return true;
     }
     const auto deadline = server::DurableAdmission::Clock::now() + std::chrono::seconds(1);
@@ -3050,10 +3089,13 @@ struct ThreadedServer {
       if (!durableAdmission->isIdleTree(tree, thread->homeId) ||
           (databaseVictim && home.databaseLastUse >= databaseVictim->lastUse)) continue;
       const auto reservation = home.databaseReservation.lock();
-      if (!reservation || (needsPreparationBudget && !reservation->canReplaceWithPreparation())) continue;
+      if (!reservation) continue;
+      const auto preparationCeiling =
+          needsPreparationBudget ? reservation->replacementCeiling() : std::nullopt;
+      if (needsPreparationBudget && !preparationCeiling) continue;
       databaseVictim =
           DatabaseRetirement{thread->homeId, tree, home.databaseLastUse, reservation->returned,
-            deadline, !needsPreparationBudget};
+            deadline, !needsPreparationBudget, preparationCeiling};
     }
     if (!databaseVictim) return false;
     wake(threads[databaseVictim->home - 1]->wake);
@@ -3084,9 +3126,19 @@ struct ThreadedServer {
       KJ_LOG(WARNING, "idle database admission retirement timed out",
           databaseVictim->home, databaseVictim->tree);
     }
+    DatabaseReplacement replacement;
+    if (outcome == Outcome::RELEASED && databaseVictim->preparationCeiling) {
+      const auto& returned = *databaseVictim->reservationReturned;
+      // Recheck the actual return. The copy's charge may have changed after selection.
+      const auto ceiling = returned.releasedMemory.load() < ResourceBudget::PREPARATION_MEMORY
+          ? resources->admissionMaximum
+          : kj::max(resources->admissionMaximum,
+                kj::min(*databaseVictim->preparationCeiling, returned.memoryBeforeRelease));
+      replacement = std::make_shared<DatabasePreparationReplacement>(ceiling);
+    }
     databaseVictim.reset();
     for (const auto &waiter: databaseCapacityWaiters) {
-      if (waiter->isWaiting()) waiter->fulfill(outcome == Outcome::RELEASED);
+      if (waiter->isWaiting()) waiter->fulfill(DatabaseReplacement(replacement));
     }
     databaseCapacityWaiters.clear();
   }
@@ -3097,11 +3149,11 @@ struct ThreadedServer {
     }
   }
 
-  kj::Promise<bool> reclaimIdleDatabase() {
-    auto signal = kj::newPromiseAndCrossThreadFulfiller<bool>();
+  kj::Promise<DatabaseReplacement> reclaimIdleDatabase() {
+    auto signal = kj::newPromiseAndCrossThreadFulfiller<DatabaseReplacement>();
     {
       std::lock_guard lock(durableRoutingMutex);
-      if (!requestDatabaseRetirement(true)) co_return false;
+      if (!requestDatabaseRetirement(true)) co_return DatabaseReplacement{};
       if (!databaseVictim->preparationPreferred) {
         // Leave one preparation's credit for a database as soon as the victim
         // drops its charge. Existing copies keep their regular growth limits.
