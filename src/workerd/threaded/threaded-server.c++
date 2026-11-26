@@ -1926,7 +1926,6 @@ struct JsonDoc {
 };
 
 constexpr auto DATABASE_SQL_WALL_LIMIT = 30 * kj::SECONDS;
-constexpr size_t DATABASE_SQL_MEMORY_LIMIT = size_t(32) << 20;
 
 struct DurableRoute {
   server::DurableAdmission::Key key;
@@ -6678,8 +6677,9 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
     const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
     const auto memoryLimit = sqlWalFrameLimitBytes != 0
-        ? boundedDurableSetting("COWORKERD_DO_TEST_SQL_MEMORY_BYTES", DATABASE_SQL_MEMORY_LIMIT,
-              DATABASE_SQL_MEMORY_LIMIT)
+        ? boundedDurableSetting("COWORKERD_DO_TEST_SQL_MEMORY_BYTES",
+              SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES,
+              SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES)
         : kj::maxValue;
     auto database = tree->storage().open(
         tree->uniqueKey, tree->storageId, observer, facet, sqlWalFrameLimitBytes, memoryLimit);

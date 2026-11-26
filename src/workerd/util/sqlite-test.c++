@@ -2031,6 +2031,77 @@ KJ_TEST("SQLite meters materialized columns and accounts for open connections in
   KJ_EXPECT(other.getSqliteMemoryBytes() == 0);
 }
 
+KJ_TEST(
+    "Threaded platform SQLite builds an index and sorts a 100 MiB table within its heap limit") {
+  static constexpr int rowCount = 6400;
+  static constexpr int rowsPerInsert = 400;
+  static const DeadlineRegulator regulator;
+  const SqliteDatabase::QueryOptions options{.regulator = regulator};
+  TempDirOnDisk directory;
+  SqliteDatabase::WalTransactionLimit walLimit(64 * 1024 * 1024);
+  SqliteDatabase::Vfs vfs(*directory, {.walTransactionLimit = &walLimit});
+  SqliteDatabase db(vfs, kj::Path({"data.sqlite"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY,
+      SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES);
+  db.run("PRAGMA journal_mode=WAL; CREATE TABLE records("
+         "id INTEGER PRIMARY KEY, index_key TEXT, sort_key TEXT)");
+  walLimit.setPageSize(db.run("PRAGMA page_size").getInt(0));
+  // Each row contains 16 KiB of text across its two keys.
+  for (int row = 1; row <= rowCount; row += rowsPerInsert) {
+    db.run(options,
+        "WITH RECURSIVE r(n) AS (VALUES(?) UNION ALL SELECT n+1 FROM r WHERE n < ?) "
+        "INSERT INTO records SELECT n, printf('%06d', n) || hex(zeroblob(2300)), "
+        "printf('%06d', ? - n) || hex(zeroblob(5886)) FROM r",
+        row, row + rowsPerInsert - 1, rowCount + 1);
+  }
+  KJ_EXPECT(db.run("SELECT sum(length(index_key) + length(sort_key)) FROM records").getInt64(0) ==
+      100 * 1024 * 1024);
+
+  auto takeSpillBytes = [&]() {
+    sqlite3_int64 written = 0, unused = 0;
+    KJ_REQUIRE(
+        sqlite3_db_status64(db, SQLITE_DBSTATUS_TEMPBUF_SPILL, &written, &unused, 1) == SQLITE_OK);
+    return written;
+  };
+  auto measure = [&](kj::StringPtr operation, auto&& execute) {
+    takeSpillBytes();
+    size_t sampledPeak = db.getSqliteMemoryBytes();
+    // This is the only open connection. SQLite's high-water mark also covers
+    // allocations made and freed between progress callbacks.
+    const auto otherBytes = getSqliteProcessMemoryUsed() - sampledPeak;
+    sqlite3_memory_highwater(1);
+    regulator.budget = std::make_shared<SqlExecutionBudget>(30000000000, [&]() {
+      sampledPeak = kj::max(sampledPeak, db.getSqliteMemoryBytes());
+      return SqlExecutionBudget::Cause::NONE;
+    });
+    KJ_DEFER(regulator.budget.reset());
+    execute();
+    const auto peak = static_cast<size_t>(sqlite3_memory_highwater(1)) - otherBytes;
+    const auto spillBytes = takeSpillBytes();
+    KJ_LOG(INFO, "SQLite disk-backed workload", operation, sampledPeak, peak, spillBytes);
+    KJ_EXPECT(sampledPeak <= peak);
+    KJ_EXPECT(peak < SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES);
+    KJ_EXPECT(spillBytes > 0);
+  };
+
+  walLimit.begin();
+  measure("create index"_kj, [&]() {
+    db.run("SAVEPOINT build_index");
+    db.run(options, "CREATE INDEX records_index ON records(index_key)");
+    db.run("RELEASE build_index");
+  });
+  walLimit.end(db);
+
+  measure("order by the unindexed key"_kj, [&]() {
+    auto rows = db.run(options, "SELECT id FROM records ORDER BY sort_key");
+    for (int row = rowCount; row > 0; --row) {
+      KJ_REQUIRE(!rows.isDone());
+      KJ_EXPECT(rows.getInt(0) == row);
+      rows.nextRow();
+    }
+    KJ_EXPECT(rows.isDone());
+  });
+}
+
 KJ_TEST("SQLite PRAGMA quick_check succeeds on a schema with many tables") {
   auto dir = kj::newInMemoryDirectory(kj::nullClock());
   SqliteDatabase::Vfs vfs(*dir);

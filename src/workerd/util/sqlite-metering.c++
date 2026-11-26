@@ -111,24 +111,21 @@ void* sqliteMemRealloc(void* ptr, int newSize) {
     // must to hit this branch, then scope should not be a nullptr. If we see this, then something
     // is wrong with our memory metering.
     KJ_LOG(ERROR, "sqliteMemRealloc did not find a valid scope.");
+    return realloc(ptr, static_cast<size_t>(newSize));
   }
-
-  if (scope == nullptr) return realloc(ptr, static_cast<size_t>(newSize));
 
   const auto oldActual = usableSize(ptr);
   const auto requested = static_cast<size_t>(newSize);
   if (requested > oldActual && !scope->permitsGrowth(requested - oldActual)) return nullptr;
 
-  void* newPtr;
-  if (scope->maxMemoryBytes == kj::maxValue) {
-    newPtr = realloc(ptr, requested);
-    if (newPtr == nullptr) return nullptr;
-  } else {
+  const bool hasLimit = scope->maxMemoryBytes != kj::maxValue;
+  void* newPtr = hasLimit ? malloc(requested) : realloc(ptr, requested);
+  if (newPtr == nullptr) return nullptr;
+
+  const auto newActual = usableSize(newPtr);
+  if (hasLimit) {
     // The allocator's usable size can exceed the request. Hold on to the
     // original until we know the actual growth fits. Charge only the delta.
-    newPtr = malloc(requested);
-    if (newPtr == nullptr) return nullptr;
-    const auto newActual = usableSize(newPtr);
     if (newActual > oldActual && !scope->permitsGrowth(newActual - oldActual)) {
       free(newPtr);
       return nullptr;
@@ -137,7 +134,6 @@ void* sqliteMemRealloc(void* ptr, int newSize) {
     free(ptr);
   }
 
-  const auto newActual = usableSize(newPtr);
   if (scope->memoryBytes >= oldActual) {
     scope->memoryBytes = scope->memoryBytes - oldActual + newActual;
   } else {

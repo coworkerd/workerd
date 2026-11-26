@@ -101,6 +101,7 @@ class SqliteDatabase {
  public:
   // Allow 34 bytes of padding for V8 serialization overhead beyond the 8 MiB row limit.
   static constexpr int MAX_ROW_LENGTH = 8 * 1024 * 1024 + 34;
+  static constexpr size_t PLATFORM_SQL_HEAP_LIMIT_BYTES = 32 * 1024 * 1024;
 
   class Vfs;
   class Query;

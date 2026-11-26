@@ -923,7 +923,8 @@ SqliteDatabase::WalTransactionLimit* SqliteDatabase::getWalTransactionLimit() co
 
 void SqliteDatabase::rollbackWalTransaction() {
   // A failed statement may have left little headroom. Account for cleanup
-  // allocations while allowing the trusted rollback to finish.
+  // allocations while allowing the trusted rollback to finish. The platform
+  // transaction calls this after leaving the failed SQLite call's memory scope.
   SqliteMemoryScope memoryScope(sqliteMemoryBytes, kj::maxValue);
   if (!sqlite3_get_autocommit(*this)) {
     run("ROLLBACK TRANSACTION");
