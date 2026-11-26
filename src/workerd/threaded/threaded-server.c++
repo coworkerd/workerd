@@ -2781,6 +2781,10 @@ struct ThreadedServer {
           boundedDurableSetting("COWORKERD_DO_TEST_FD_HEADROOM", 256, 65536) + uint64_t(limit) * 5;
       KJ_REQUIRE(
           files.rlim_cur > fdHeadroom, "durable test descriptors leave no admission headroom");
+      // Match the node's default process in-flight limit and allow 4 KiB of
+      // declared bytes per waiting event on average.
+      constexpr uint32_t defaultMailboxDepth = 512;
+      constexpr uint64_t defaultMailboxBytes = uint64_t(defaultMailboxDepth) * 4096;
       durableAdmission.emplace(
           server::DurableAdmission::Limits{
             .capacity = {.threads = limit,
@@ -2789,9 +2793,9 @@ struct ThreadedServer {
             .tree = {.descriptors = 4, .memory = 16 * 1024},
             .event = {.descriptors = 1, .memory = 4096},
             .residentTarget = uint32_t(configuredCount("COWORKERD_DO_RESIDENT_OBJECTS", 4096)),
-            .mailboxDepth =
-                uint32_t(boundedDurableSetting("COWORKERD_DO_TEST_MAILBOX_EVENTS", 4, 65536)),
-            .mailboxBytes = configuredCount("COWORKERD_DO_TEST_MAILBOX_BYTES", 64 * 1024),
+            .mailboxDepth = uint32_t(boundedDurableSetting(
+                "COWORKERD_DO_TEST_MAILBOX_EVENTS", defaultMailboxDepth, 65536)),
+            .mailboxBytes = configuredCount("COWORKERD_DO_TEST_MAILBOX_BYTES", defaultMailboxBytes),
           },
           durableNumber(std::string_view(this->identity).substr(colon + 1)));
     }
