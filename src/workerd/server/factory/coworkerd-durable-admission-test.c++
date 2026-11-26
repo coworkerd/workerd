@@ -89,6 +89,78 @@ KJ_TEST("retiring idle sockets fences admission and waits for their session cred
   KJ_EXPECT(table.releaseTree(socket.tree, 1));
 }
 
+KJ_TEST("capacity recovery can select only a published tree with a drained mailbox") {
+  auto oneTree = limits;
+  oneTree.residentTarget = 1;
+  Admission table(oneTree, 1);
+  const auto active = queued(table.queue(first, open, 0, deadline, now), true);
+  KJ_EXPECT(!table.isIdleTree(active.tree, 1));
+  KJ_REQUIRE(table.publishHome(active.tree, 1));
+  KJ_EXPECT(!table.isIdleTree(active.tree, 1));
+  KJ_REQUIRE(table.begin(active, 1, first, open, now) == Delivery::ACCEPTED);
+  const auto waiting = queued(table.queue(first, open, 0, deadline, now), false);
+  const auto secondWaiting = queued(table.queue(first, open, 0, deadline, now), false);
+  const auto fullMailbox = table.queue(first, open, 0, deadline, now, true);
+  KJ_EXPECT(fullMailbox.status == Status::OVERLOADED && !fullMailbox.newTreeCapacityRefused);
+  const auto result = table.queue(second, open, 0, deadline, now, true);
+  KJ_EXPECT(result.status == Status::OVERLOADED && result.newTreeCapacityRefused);
+  KJ_EXPECT(table.state().overloads == 1);
+  KJ_EXPECT(!table.queue(second, open, limits.mailboxBytes + 1, deadline, now).newTreeCapacityRefused);
+  KJ_REQUIRE(table.complete(active, 1));
+  KJ_EXPECT(!table.isIdleTree(active.tree, 1));
+  KJ_REQUIRE(table.refuseWaiting(waiting));
+  KJ_REQUIRE(table.refuseWaiting(secondWaiting));
+  KJ_EXPECT(table.isIdleTree(active.tree, 1));
+  KJ_EXPECT(!table.isIdleTree(active.tree, 2));
+  KJ_REQUIRE(table.stopIdleTree(active.tree, 1));
+  KJ_EXPECT(!table.isIdleTree(active.tree, 1));
+  KJ_EXPECT(table.queue(second, open, 0, deadline, now).status == Status::OVERLOADED);
+  KJ_REQUIRE(table.releaseTree(active.tree, 1));
+  queued(table.queue(second, open, 0, deadline, now), true);
+}
+
+KJ_TEST("the last tree at a resident ceiling waits briefly for a database") {
+  auto twoTrees = limits;
+  twoTrees.residentTarget = 2;
+  Admission table(twoTrees, 1);
+  table.preferDatabaseTree(now + 100ms);
+  const auto ordinary = queued(table.queue(first, open, 0, deadline, now), true);
+  KJ_REQUIRE(table.publishHome(ordinary.tree, 1));
+  // A warm tenant can still open another request in its existing tree.
+  queued(table.queue(first, open, 0, deadline, now), false);
+  KJ_EXPECT(table.queue(second, open, 0, deadline, now + 99ms).status == Status::OVERLOADED);
+  queued(table.queue(second, open, 0, deadline, now + 99ms, true), true);
+}
+
+KJ_TEST("a tree preference protects available credits and obeys its endpoint") {
+  auto credits = limits;
+  credits.residentTarget = 0;
+  credits.capacity.descriptors = limits.tree.descriptors + limits.event.descriptors;
+  Admission table(credits, 1);
+  table.preferDatabaseTree(now + 1s);
+  table.limitDatabaseTreePreference(now + 100ms);
+  KJ_EXPECT(table.queue(first, open, 0, deadline, now + 99ms).status == Status::OVERLOADED);
+  queued(table.queue(first, open, 0, deadline, now + 100ms), true);
+
+  Admission consumed(credits, 1);
+  consumed.preferDatabaseTree(now + 1s);
+  consumed.claimDatabaseTree();
+  consumed.limitDatabaseTreePreference(now + 100ms);
+  queued(consumed.queue(first, open, 0, deadline, now), true);
+}
+
+KJ_TEST("failure to reserve an event for a new tree can request capacity recovery") {
+  auto constrained = limits;
+  constrained.capacity.descriptors = limits.tree.descriptors + limits.event.descriptors;
+  Admission table(constrained, 1);
+  queued(table.queue(first, open, 0, deadline, now), true);
+  const auto refused = table.queue(second, open, 0, deadline, now, true);
+  KJ_EXPECT(refused.status == Status::OVERLOADED && refused.newTreeCapacityRefused);
+  KJ_EXPECT(table.state().overloads == 0);
+  table.recordOverload();
+  KJ_EXPECT(table.state().overloads == 1);
+}
+
 KJ_TEST("durable admission fences the generation, identity, home and queued event") {
   Admission table(limits, 1);
   auto stale = open;
