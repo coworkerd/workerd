@@ -39,106 +39,72 @@ thread_local SqliteMemoryScope* SqliteMemoryScope::threadLocalScope = nullptr;
 void* sqliteMemMalloc(int size) {
   if (size <= 0) return nullptr;
 
-  SqliteMemoryScope* scope = SqliteMemoryScope::threadLocalScope;
-  if (scope != nullptr) {
-    if (!scope->permitsGrowth(static_cast<size_t>(size))) return nullptr;
-  } else {
-    // This branch is a defensive measure, if we have custom sqlite3_mem_methods installed, and we
-    // must to hit this branch, then scope should not be a nullptr. If we see this, then something
-    // is wrong with our memory metering.
+  auto* scope = SqliteMemoryScope::threadLocalScope;
+  const auto requested = static_cast<size_t>(size);
+  if (scope == nullptr) {
     KJ_LOG(ERROR, "sqliteMemMalloc did not find a valid scope.");
+    return malloc(requested);
   }
 
-  void* ptr = malloc(static_cast<size_t>(size));
-  if (ptr == nullptr) return nullptr;
-  if (scope != nullptr) {
-    size_t actual = usableSize(ptr);
-    if (actual > 0) {
-      // We have already checked that allocating the requested size will not exceed maxMemoryBytes,
-      // but we still have to check that the actual size allocated does not exceed maxMemoryBytes.
-      if (!scope->permitsGrowth(actual)) {
-        free(ptr);
-        return nullptr;
-      }
-      scope->memoryBytes += actual;
-    }
-  }
-  return ptr;
+  // Reserve the request before allocating, then reconcile the allocator's usable size.
+  if (!scope->resize(0, requested)) return nullptr;
+  auto* ptr = malloc(requested);
+  if (scope->resize(requested, usableSize(ptr))) return ptr;
+  free(ptr);
+  scope->resize(requested, 0);
+  return nullptr;
 }
 
 void sqliteMemFree(void* ptr) {
   if (ptr == nullptr) return;
-  SqliteMemoryScope* scope = SqliteMemoryScope::threadLocalScope;
+  auto* scope = SqliteMemoryScope::threadLocalScope;
+  auto bytes = usableSize(ptr);
+  free(ptr);
   if (scope != nullptr) {
-    size_t actual = usableSize(ptr);
-    if (actual > 0) {
-      if (scope->memoryBytes >= actual) {
-        scope->memoryBytes -= actual;
-      } else {
-        // This branch is a defensive measure, but it is important since scope->memoryBytes is a size_t
-        // and an underflow would result in all subsequent allocations failing with SQLITE_NOMEM.
-        // If we see this, then something is wrong with our memory metering.
-        KJ_LOG(ERROR, "sqliteMemFree would have triggered a memoryBytes underflow.");
-        scope->memoryBytes = 0;
-      }
-    }
+    scope->resize(bytes, 0);
   } else {
-    // This branch is a defensive measure, if we have custom sqlite3_mem_methods installed, and we
-    // must to hit this branch, then scope should not be a nullptr. If we see this, then something
-    // is wrong with our memory metering.
     KJ_LOG(ERROR, "sqliteMemFree did not find a valid scope.");
   }
-  free(ptr);
 }
 
 void* sqliteMemRealloc(void* ptr, int newSize) {
-  // SQLite assumes that sqliteMemRealloc(ptr, newSize) where newSize <= 0 is equivalent to
-  // sqliteMemFree(ptr).
   if (newSize <= 0) {
     sqliteMemFree(ptr);
     return nullptr;
   }
+  if (ptr == nullptr) return sqliteMemMalloc(newSize);
 
-  // SQLite assumes that sqliteMemRealloc(nullptr, newSize) is equivalent to
-  // sqliteMemMalloc(newSize).
-  if (ptr == nullptr) {
-    return sqliteMemMalloc(newSize);
-  }
-
-  SqliteMemoryScope* scope = SqliteMemoryScope::threadLocalScope;
+  auto* scope = SqliteMemoryScope::threadLocalScope;
+  const auto requested = static_cast<size_t>(newSize);
   if (scope == nullptr) {
-    // This branch is a defensive measure, if we have custom sqlite3_mem_methods installed, and we
-    // must to hit this branch, then scope should not be a nullptr. If we see this, then something
-    // is wrong with our memory metering.
     KJ_LOG(ERROR, "sqliteMemRealloc did not find a valid scope.");
-    return realloc(ptr, static_cast<size_t>(newSize));
+    return realloc(ptr, requested);
   }
 
   const auto oldActual = usableSize(ptr);
-  const auto requested = static_cast<size_t>(newSize);
-  if (requested > oldActual && !scope->permitsGrowth(requested - oldActual)) return nullptr;
+  const auto reserved = kj::max(oldActual, requested);
+  if (!scope->resize(oldActual, reserved)) return nullptr;
+  const bool canRefuse =
+      scope->maxMemoryBytes != kj::maxValue || (scope->processBudget != nullptr && !scope->cleanup);
+  auto* newPtr = canRefuse ? malloc(requested) : realloc(ptr, requested);
+  if (newPtr == nullptr) {
+    scope->resize(reserved, oldActual);
+    return nullptr;
+  }
 
-  const bool hasLimit = scope->maxMemoryBytes != kj::maxValue;
-  void* newPtr = hasLimit ? malloc(requested) : realloc(ptr, requested);
-  if (newPtr == nullptr) return nullptr;
-
-  const auto newActual = usableSize(newPtr);
-  if (hasLimit) {
-    // The allocator's usable size can exceed the request. Hold on to the
-    // original until we know the actual growth fits. Charge only the delta.
-    if (newActual > oldActual && !scope->permitsGrowth(newActual - oldActual)) {
+  const auto actual = usableSize(newPtr);
+  if (canRefuse) {
+    // With a limit, the original block remains live until its replacement fits.
+    if (actual > reserved && !scope->resize(reserved, actual)) {
       free(newPtr);
+      scope->resize(reserved, oldActual);
       return nullptr;
     }
     memcpy(newPtr, ptr, kj::min(oldActual, requested));
     free(ptr);
-  }
-
-  if (scope->memoryBytes >= oldActual) {
-    scope->memoryBytes = scope->memoryBytes - oldActual + newActual;
+    if (actual < reserved) scope->resize(reserved, actual);
   } else {
-    KJ_LOG(ERROR, "sqliteMemRealloc would have triggered a memoryBytes underflow.");
-    scope->memoryBytes = 0;
+    scope->resize(reserved, actual);
   }
   return newPtr;
 }
@@ -177,10 +143,32 @@ static const sqlite3_mem_methods kSqliteMemMethods = {
 
 }  // namespace
 
-bool SqliteMemoryScope::permitsGrowth(size_t bytes) noexcept {
-  if (memoryBytes <= maxMemoryBytes && bytes <= maxMemoryBytes - memoryBytes) return true;
-  limitRefused = true;
-  return false;
+bool SqliteMemoryScope::resize(size_t previous, size_t replacement) noexcept {
+  if (previous == replacement) return true;
+  if (previous > memoryBytes) {
+    KJ_LOG(ERROR,
+        replacement == 0 ? "sqliteMemFree would have triggered a memoryBytes underflow."
+                         : "sqliteMemRealloc would have triggered a memoryBytes underflow.");
+    previous = memoryBytes;
+  }
+  const auto retained = memoryBytes - previous;
+  if (replacement > size_t(kj::maxValue) - retained ||
+      (replacement > previous && retained + replacement > maxMemoryBytes)) {
+    limitRefused = true;
+    return false;
+  }
+  const auto next = retained + replacement;
+  if (processBudget != nullptr) {
+    const auto oldCharge = SqliteProcessMemoryBudget::chargeFor(memoryBytes);
+    const auto newCharge = SqliteProcessMemoryBudget::chargeFor(next);
+    if (oldCharge != newCharge &&
+        !processBudget->resizeSqliteMemory(oldCharge, newCharge, cleanup)) {
+      limitRefused = true;
+      return false;
+    }
+  }
+  memoryBytes = next;
+  return true;
 }
 
 void SqliteMemoryScope::clearLimitRefusal() noexcept {
@@ -191,9 +179,14 @@ bool SqliteMemoryScope::wasLimitRefused() noexcept {
   return threadLocalScope != nullptr && threadLocalScope->limitRefused;
 }
 
-SqliteMemoryScope::SqliteMemoryScope(size_t& memoryBytes, size_t maxMemoryBytes)
+SqliteMemoryScope::SqliteMemoryScope(size_t& memoryBytes,
+    size_t maxMemoryBytes,
+    SqliteProcessMemoryBudget* processBudget,
+    bool cleanup)
     : memoryBytes(memoryBytes),
-      maxMemoryBytes(maxMemoryBytes) {
+      maxMemoryBytes(maxMemoryBytes),
+      processBudget(processBudget),
+      cleanup(cleanup) {
   if (threadLocalScope == nullptr) {
     threadLocalScope = this;
   }

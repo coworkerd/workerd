@@ -154,7 +154,8 @@ class SqliteDatabase {
       size_t sqliteMaxMemoryBytes = kj::maxValue,
       size_t sqliteMaxMemoryPerProcessBytes = kj::maxValue,
       SqliteObserver& sqliteObserver = SqliteObserver::DEFAULT,
-      kj::Maybe<const ActorAccountLimits&> actorAccountLimits = kj::none);
+      kj::Maybe<const ActorAccountLimits&> actorAccountLimits = kj::none,
+      std::shared_ptr<SqliteProcessMemoryBudget> processMemoryBudget = {});
 
   // Returns the current value of the per-actor SQLite memory byte counter for metrics reporting.
   size_t getSqliteMemoryBytes() const {
@@ -459,6 +460,7 @@ class SqliteDatabase {
 
   // The amount of memory in bytes used by this database for use by sqlite3_mem_methods.
   size_t sqliteMemoryBytes = 0;
+  std::shared_ptr<SqliteProcessMemoryBudget> processMemoryBudget;
 
   // The maximum amount of memory in bytes that can be used by this database for use by
   // sqlite3_mem_methods (from WorkerLimits::sqliteMaxMemoryMb). This is set to kj::maxValue to

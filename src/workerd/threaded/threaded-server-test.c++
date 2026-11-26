@@ -235,6 +235,133 @@ KJ_TEST("a returned preparation credit is available to the waiting database firs
   KJ_EXPECT(competitor.registerPreparation());
 }
 
+KJ_TEST("SQLite allocations share the copy reservation with V8 and return only their net change") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  const auto budget =
+      std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
+  ResourceReservation copy(budget, 64, true);
+  KJ_REQUIRE(copy.registerPreparation());
+  const auto baseline = budget->memoryReserved.load();
+  size_t bytes = 0;
+  SqliteMemoryScope scope(bytes, 4 * MiB, &copy);
+  auto* block = sqliteMemMalloc(4096);
+  KJ_REQUIRE(block != nullptr);
+  KJ_DEFER(sqliteMemFree(block));
+  const auto original = bytes;
+  KJ_EXPECT(original >= 4096);
+  KJ_EXPECT(budget->memoryReserved.load() == baseline + MiB);
+
+  // Saturate the process with the copy's independently accounted ArrayBuffers.
+  const auto buffers = budget->memoryMaximum - budget->memoryReserved.load();
+  KJ_REQUIRE(copy.allocateExternal(buffers));
+  KJ_EXPECT(sqliteMemRealloc(block, MiB + 4096) == nullptr);
+  KJ_EXPECT(SqliteMemoryScope::wasLimitRefused());
+  KJ_EXPECT(bytes == original);
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == MiB);
+  KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum);
+  copy.freeExternal(buffers);
+
+  auto* grown = sqliteMemRealloc(block, MiB + 4096);
+  KJ_REQUIRE(grown != nullptr);
+  block = grown;
+  const auto growth = bytes;
+  KJ_EXPECT(growth >= MiB + 4096);
+  KJ_EXPECT(budget->memoryReserved.load() == baseline + 2 * MiB);
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == 2 * MiB);
+
+  auto* shrunk = sqliteMemRealloc(block, 1024);
+  KJ_REQUIRE(shrunk != nullptr);
+  block = shrunk;
+  KJ_EXPECT(bytes >= 1024 && bytes < original);
+  KJ_EXPECT(budget->memoryReserved.load() == baseline + MiB);
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == MiB);
+  sqliteMemFree(block);
+  block = nullptr;
+  KJ_EXPECT(bytes == 0);
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
+  KJ_EXPECT(budget->memoryReserved.load() == baseline);
+}
+
+KJ_TEST("SQLite heap held by multiple databases meets the process ceiling and returns on close") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  constexpr int queryBytes = int(MiB) + 192 * 1024;
+  const auto budget =
+      std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
+  auto firstCopy = std::make_shared<ResourceReservation>(budget, 64, true);
+  auto secondCopy = std::make_shared<ResourceReservation>(budget, 64, true);
+  ResourceReservation competitor(budget, 64);
+  KJ_REQUIRE(firstCopy->registerPreparation());
+  KJ_REQUIRE(secondCopy->registerPreparation());
+  KJ_REQUIRE(competitor.registerPreparation());
+
+  installSqliteCustomAllocator();
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::WalTransactionLimit firstLimit(MiB), secondLimit(MiB);
+  SqliteDatabase::Vfs firstVfs(*dir, {.walTransactionLimit = &firstLimit});
+  SqliteDatabase::Vfs secondVfs(*dir, {.walTransactionLimit = &secondLimit});
+  const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
+  auto openFirst = [&] {
+    return kj::heap<SqliteDatabase>(firstVfs, kj::Path({"one.db"}), mode, 4 * MiB, kj::maxValue,
+        SqliteObserver::DEFAULT, kj::none, firstCopy);
+  };
+  const auto beforeOpen = budget->memoryReserved.load();
+  auto first = openFirst();
+  auto second = kj::heap<SqliteDatabase>(secondVfs, kj::Path({"two.db"}), mode, 4 * MiB,
+      kj::maxValue, SqliteObserver::DEFAULT, kj::none, secondCopy);
+  auto verify = [&] {
+    const auto firstCharge = SqliteProcessMemoryBudget::chargeFor(first->getSqliteMemoryBytes());
+    const auto secondCharge = SqliteProcessMemoryBudget::chargeFor(second->getSqliteMemoryBytes());
+    KJ_EXPECT(firstCopy->sqliteMemoryCharge() == firstCharge);
+    KJ_EXPECT(secondCopy->sqliteMemoryCharge() == secondCharge);
+    KJ_EXPECT(budget->sqliteMemoryReserved.load() == firstCharge + secondCharge);
+    return firstCharge + secondCharge;
+  };
+  auto idleBytes = verify();
+  KJ_REQUIRE(idleBytes == 2 * MiB);
+  KJ_EXPECT(budget->memoryReserved.load() == beforeOpen + idleBytes);
+  const auto buffers = budget->memoryMaximum - budget->memoryReserved.load() - MiB;
+  KJ_REQUIRE(competitor.allocateExternal(buffers));
+
+  firstLimit.setPageSize(4096);
+  secondLimit.setPageSize(4096);
+  {
+    auto held = first->run("SELECT randomblob(?)", queryBytes);
+    KJ_REQUIRE(held.getBlob(0).size() == queryBytes);
+    const auto holdingBytes = verify();
+    KJ_EXPECT(holdingBytes == 3 * MiB);
+    KJ_EXPECT(budget->memoryReserved.load() == beforeOpen + holdingBytes + buffers);
+    secondLimit.begin();
+    second->run("SAVEPOINT pending");
+    KJ_EXPECT_THROW_MESSAGE("out of memory", second->run("SELECT randomblob(?)", queryBytes));
+    KJ_EXPECT(secondLimit.wasMemoryRefused());
+    second->rollbackWalTransaction();
+    secondLimit.end(*second, /*rolledBack=*/true);
+    KJ_EXPECT(!second->observedCriticalError());
+    KJ_EXPECT(held.getBlob(0).size() == queryBytes);
+    KJ_EXPECT(budget->withinMaximum());
+  }
+  KJ_EXPECT(verify() == idleBytes);
+  {
+    auto admitted = second->run("SELECT randomblob(?)", queryBytes);
+    KJ_EXPECT(admitted.getBlob(0).size() == queryBytes);
+  }
+
+  // The copy can outlive its connection. Its SQLite bytes must be available
+  // before the copy returns its own reservation to the process.
+  first->close();
+  KJ_EXPECT(firstCopy->sqliteMemoryCharge() == 0);
+  KJ_EXPECT(verify() == MiB);
+  first = openFirst();
+  KJ_EXPECT(first->run("SELECT 1").getInt(0) == 1);
+  KJ_EXPECT(verify() == 2 * MiB);
+  first = nullptr;
+  second = nullptr;
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
+  KJ_EXPECT(budget->memoryReserved.load() == beforeOpen + buffers);
+  competitor.freeExternal(buffers);
+  KJ_EXPECT(budget->memoryReserved.load() == beforeOpen);
+}
+
 KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
   int fds[2];
   KJ_SYSCALL(pipe(fds));

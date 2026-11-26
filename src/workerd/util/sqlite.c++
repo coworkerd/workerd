@@ -816,11 +816,13 @@ SqliteDatabase::SqliteDatabase(const Vfs& vfs,
     size_t sqliteMaxMemoryBytes,
     size_t sqliteMaxMemoryPerProcessBytes,
     SqliteObserver& sqliteObserver,
-    kj::Maybe<const ActorAccountLimits&> actorAccountLimits)
+    kj::Maybe<const ActorAccountLimits&> actorAccountLimits,
+    std::shared_ptr<SqliteProcessMemoryBudget> processMemoryBudget)
     : vfs(vfs),
       path(kj::mv(path)),
       readOnly(maybeMode == kj::none),
       sqliteObserver(sqliteObserver),
+      processMemoryBudget(std::move(processMemoryBudget)),
       sqliteMaxMemoryBytes(sqliteMaxMemoryBytes),
       sqliteMaxMemoryPerProcessBytes(sqliteMaxMemoryPerProcessBytes),
       actorAccountLimits(actorAccountLimits) {
@@ -883,6 +885,12 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
 SqliteDatabase::~SqliteDatabase() noexcept(false) {
   sqlite3* db = &KJ_UNWRAP_OR(maybeDb, return);
 
+  if (processMemoryBudget != nullptr) {
+    // Finalize tracked statements and close while the allocator charge is still live.
+    close();
+    KJ_IF_SOME(closed, afterCloseCallback) closed();
+    return;
+  }
   auto memoryScope = enterMemoryScope();
 
   sqlite3_progress_handler(db, 0, nullptr, nullptr);
@@ -910,7 +918,7 @@ SqliteDatabase::operator sqlite3*() {
 }
 
 SqliteMemoryScope SqliteDatabase::enterMemoryScope() {
-  return SqliteMemoryScope(sqliteMemoryBytes, sqliteMaxMemoryBytes);
+  return SqliteMemoryScope(sqliteMemoryBytes, sqliteMaxMemoryBytes, processMemoryBudget.get());
 }
 
 bool SqliteDatabase::observedCriticalError() {
@@ -925,7 +933,8 @@ void SqliteDatabase::rollbackWalTransaction() {
   // A failed statement may have left little headroom. Account for cleanup
   // allocations while allowing the trusted rollback to finish. The platform
   // transaction calls this after leaving the failed SQLite call's memory scope.
-  SqliteMemoryScope memoryScope(sqliteMemoryBytes, kj::maxValue);
+  SqliteMemoryScope memoryScope(sqliteMemoryBytes, kj::maxValue, processMemoryBudget.get(),
+      /*cleanup=*/true);
   if (!sqlite3_get_autocommit(*this)) {
     run("ROLLBACK TRANSACTION");
   } else {
@@ -1436,7 +1445,9 @@ void SqliteDatabase::close() noexcept {
   KJ_ASSERT(currentStatement == kj::none, "close() called while a query is executing");
   KJ_ASSERT(currentRegulator == kj::none, "close() called while a query is compiling");
 
-  auto memoryScope = enterMemoryScope();
+  SqliteMemoryScope memoryScope(sqliteMemoryBytes,
+      processMemoryBudget == nullptr ? sqliteMaxMemoryBytes : size_t(kj::maxValue),
+      processMemoryBudget.get(), /*cleanup=*/true);
 
   KJ_IF_SOME(db, maybeDb) {
     for (auto& listener: resetListeners) {

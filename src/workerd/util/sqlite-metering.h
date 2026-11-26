@@ -10,6 +10,19 @@
 
 namespace workerd {
 
+// Optional embedder charge for the live SQLite heap of an open connection.
+class SqliteProcessMemoryBudget {
+ public:
+  static constexpr size_t STEP_BYTES = 1 << 20;
+  static constexpr size_t chargeFor(size_t bytes) {
+    return (bytes / STEP_BYTES + (bytes % STEP_BYTES != 0)) * STEP_BYTES;
+  }
+
+  virtual ~SqliteProcessMemoryBudget() noexcept = default;
+  // Only called when the rounded charge changes. Decreases cannot be refused.
+  virtual bool resizeSqliteMemory(size_t oldCharge, size_t newCharge, bool cleanup) noexcept = 0;
+};
+
 // This module implements per-database SQLite memory metering.
 //
 // SQLite uses a single process-wide memory allocator, but we want to account allocations against
@@ -35,7 +48,10 @@ class SqliteMemoryScope {
   // maxMemoryBytes: the per-database cap from WorkerLimits::sqliteMaxMemoryMb.
   //
   // If a scope is already active on this thread, this constructor is a no-op (idempotent).
-  explicit SqliteMemoryScope(size_t& memoryBytes, size_t maxMemoryBytes);
+  explicit SqliteMemoryScope(size_t& memoryBytes,
+      size_t maxMemoryBytes,
+      SqliteProcessMemoryBudget* processBudget = nullptr,
+      bool cleanup = false);
 
   ~SqliteMemoryScope() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(SqliteMemoryScope);
@@ -50,7 +66,9 @@ class SqliteMemoryScope {
   size_t& memoryBytes;
   const size_t maxMemoryBytes;
   bool limitRefused = false;
-  bool permitsGrowth(size_t bytes) noexcept;
+  SqliteProcessMemoryBudget* const processBudget;
+  const bool cleanup;
+  bool resize(size_t previous, size_t replacement) noexcept;
 
   // Thread-local pointer to the active scope. Set to this on construction (if not already set),
   // cleared on destruction (if we set it).
