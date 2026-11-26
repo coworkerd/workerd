@@ -45,6 +45,8 @@ KJ_TEST("platform durable plans pin the class and copy to the tenant") {
       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
   JsonDoc otherTenant(kj::str(R"({"workerId":"beta/:platform","format":"v2","versionId":"build-a",
       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
+  JsonDoc databaseWorker(kj::str(R"({"workerId":"alpha/__databases","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
   JsonDoc bound(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
       "variables":[{"name":"TENANT_SECRET","value":"fixture"}]})"));
@@ -56,6 +58,7 @@ KJ_TEST("platform durable plans pin the class and copy to the tenant") {
   route.open.className = "Store";
   route.open.definition = platformCopyKey(input.get(), alpha.get());
   KJ_EXPECT(platformDurablePlan(input.get(), alpha.get(), selection.get(), route));
+  KJ_EXPECT(!platformDurablePlan(databaseWorker.get(), alpha.get(), selection.get(), route));
   KJ_EXPECT(platformCopyKey(otherTenant.get(), beta.get()) != route.open.definition);
   KJ_EXPECT(!platformDurablePlan(otherTenant.get(), beta.get(), selection.get(), route));
   KJ_EXPECT(!platformDurablePlan(input.get(), beta.get(), selection.get(), route));
@@ -65,11 +68,16 @@ KJ_TEST("platform durable plans pin the class and copy to the tenant") {
   KJ_EXPECT(!platformDurablePlan(input.get(), alpha.get(), selection.get(), route));
 }
 
-KJ_TEST("platform databases require a copy pinned to the specific object") {
-  JsonDoc input(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
+KJ_TEST("platform databases use the database Worker and a copy pinned to the specific object") {
+  JsonDoc input(kj::str(R"({"workerId":"alpha/__databases","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
+      "durableObject":{"database":"first"}})"));
+  JsonDoc platformWorker(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
       "durableObject":{"database":"first"}})"));
   JsonDoc plan(kj::str(R"({"kind":"platformDurable","definitionName":"coworkerd:platform","tenant":"alpha"})"));
+  JsonDoc otherTenant(kj::str(R"({"kind":"platformDurable","definitionName":"coworkerd:platform","tenant":"beta"})"));
+  JsonDoc fixture(kj::str(R"({"kind":"platformDurable","definitionName":"coworkerd:platform-test","tenant":"alpha"})"));
   JsonDoc selection(kj::str(R"({"className":"SqlDatabase"})"));
   DurableRoute route{};
   route.key = {"namespace-one", "object-one"};
@@ -78,6 +86,12 @@ KJ_TEST("platform databases require a copy pinned to the specific object") {
   KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
   route.open.definition = platformCopyKey(input.get(), plan.get(), &route.key);
   KJ_EXPECT(platformDurablePlan(input.get(), plan.get(), selection.get(), route));
+  KJ_EXPECT(!platformDurablePlan(platformWorker.get(), plan.get(), selection.get(), route));
+  route.open.definition = platformCopyKey(input.get(), otherTenant.get(), &route.key);
+  KJ_EXPECT(!platformDurablePlan(input.get(), otherTenant.get(), selection.get(), route));
+  route.open.definition = platformCopyKey(input.get(), fixture.get(), &route.key);
+  KJ_EXPECT(!platformDurablePlan(input.get(), fixture.get(), selection.get(), route));
+  route.open.definition = platformCopyKey(input.get(), plan.get(), &route.key);
   route.key.namespaceId = "namespace-two";
   KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
   route.key = {"namespace-one", "object-two"};
