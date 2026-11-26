@@ -751,6 +751,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
       // The actor still owns WAL confirmation and locks its output gate.
       limit->begin();
       KJ_DEFER(limit->abandon(sqlite));
+      auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
       auto started = cache->startTransaction();
       auto& txn = KJ_REQUIRE_NONNULL(started.tryGet<kj::Own<ActorCacheInterface::Transaction>>());
       StoredExternalHandler::SyncNestedTransaction syncExternalTxn(
@@ -759,7 +760,6 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
         auto result = callback(js);
         JSG_REQUIRE(!sqlite.observedCriticalError(), Error,
             "Cannot commit transaction due to an earlier SQL critical error");
-        auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
         if (budget && budget->hasDeadline() && budget->checkDeadline()) {
           static constexpr SqlStorageRegulator regulator;
           kj::throwRecoverableException(regulator.sqlExecutionLimitException(*budget));
@@ -775,6 +775,10 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
           kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
               KJ_EXCEPTION(FAILED, "jsg.Error: the transaction exceeds one recoverable WAL record"),
               "SQL_TRANSACTION_TOO_LARGE"));
+        }
+        if (!sqlite.observedCriticalError() && budget && budget->hasDeadline() &&
+            budget->getCause() != SqlExecutionBudget::Cause::NONE) {
+          limit->end(sqlite, /*rolledBack=*/true);
         }
         js.throwException(kj::mv(exception));
       });
