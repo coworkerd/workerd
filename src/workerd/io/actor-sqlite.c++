@@ -137,13 +137,11 @@ ActorSqlite::ExplicitTxn::ExplicitTxn(ActorSqlite& actorSqlite): actorSqlite(act
       KJ_REQUIRE(!exp->hasChild,
           "critical section should have blocked creation of more than one child at a time");
       parent = kj::addRef(*exp);
-      exp->hasChild = true;
       depth = exp->depth + 1;
       alarmDirty = exp->alarmDirty;
       someWriteConfirmed = exp->someWriteConfirmed;
     }
   }
-  actorSqlite.currentTxn = this;
 
   // To support nested transactions, we assign each savepoint a name based on its nesting depth.
   // Unfortunately this means we cannot prepare the statement, unless we prepare a series of
@@ -151,6 +149,11 @@ ActorSqlite::ExplicitTxn::ExplicitTxn(ActorSqlite& actorSqlite): actorSqlite(act
   // depth 0 specifically, but I'm not going to try it for now.)
   actorSqlite.db->run(
       {.regulator = SqliteDatabase::TRUSTED}, kj::str("SAVEPOINT _cf_savepoint_", depth));
+  // Publish the new transaction only after SQLite accepts the savepoint.
+  KJ_IF_SOME(p, parent) {
+    p->hasChild = true;
+  }
+  actorSqlite.currentTxn = this;
 }
 ActorSqlite::ExplicitTxn::~ExplicitTxn() noexcept(false) {
   KJ_DEFER([&]() noexcept {

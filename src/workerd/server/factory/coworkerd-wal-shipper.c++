@@ -850,7 +850,11 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
   if (hookFrames != readFrames) return;
   int64_t start = monoNs();
   int logFrames = -1, checkpointed = -1;
-  int rc = sqlite3_wal_checkpoint_v2(handle, "main", SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &checkpointed);
+  int rc;
+  {
+    auto memoryScope = db->enterMemoryScope();
+    rc = sqlite3_wal_checkpoint_v2(handle, "main", SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &checkpointed);
+  }
   int64_t took = monoNs() - start;
   if (rc != SQLITE_OK) {
     logRow(kj::str("{\"event\":\"checkpoint-failed\",\"object\":", jsonString(key), ",\"rc\":", rc,

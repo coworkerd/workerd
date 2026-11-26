@@ -40,10 +40,17 @@ class SqliteMemoryScope {
   ~SqliteMemoryScope() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(SqliteMemoryScope);
 
+  // The wrapper clears this at the start of a SQLite call. SQLITE_NOMEM can
+  // also come from SQLite's own limits or a system allocation failure.
+  static void clearLimitRefusal() noexcept;
+  static bool wasLimitRefused() noexcept;
+
  private:
   // These are accessed by the allocator functions via threadLocalScope.
   size_t& memoryBytes;
   const size_t maxMemoryBytes;
+  bool limitRefused = false;
+  bool permitsGrowth(size_t bytes) noexcept;
 
   // Thread-local pointer to the active scope. Set to this on construction (if not already set),
   // cleared on destruction (if we set it).
