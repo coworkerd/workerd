@@ -13,9 +13,10 @@
 #include <kj/one-of.h>
 #include <kj/string.h>
 
-#include <utility>
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <utility>
 
 struct sqlite3;
 struct sqlite3_file;
@@ -315,6 +316,11 @@ class SqliteDatabase {
   // Returns true if a transaction was automatically rolled due to a critical error.
   bool observedCriticalError();
   WalTransactionLimit* getWalTransactionLimit() const;
+
+  // Durable WAL consumers use this to keep the transaction guard's observation
+  // of completed commits installed alongside their own callback.
+  using WalHook = int (*)(void*, sqlite3*, const char*, int);
+  void setWalHook(WalHook callback, void* context);
   void rollbackWalTransaction();
   void releaseCachedMemory();
 
@@ -527,6 +533,8 @@ class SqliteDatabase {
   bool inTransaction = false;
 
   void init(kj::Maybe<kj::WriteMode> maybeMode);
+  WalHook walHook = nullptr;
+  void* walHookContext = nullptr;
 
   // Describes various kinds of interesting state changes which a statement might apply, which we
   // need to track to implement the SqliteDatabse interface. In particular, we must track
@@ -943,11 +951,54 @@ class SqliteDatabase::Query final: private ResetListener {
   void nextRow(bool first);
 };
 
+// Shared by the database connections of one durable process.
+class SqliteSpillBudget {
+ public:
+  explicit SqliteSpillBudget(uint64_t capacity): capacity(capacity) {}
+
+  bool tryCharge(uint64_t bytes) noexcept;
+  void release(uint64_t bytes) noexcept;
+  uint64_t getCapacity() const {
+    return capacity;
+  }
+  uint64_t getUsed() const {
+    return used.load(std::memory_order_relaxed);
+  }
+
+ private:
+  const uint64_t capacity;
+  std::atomic<uint64_t> used{0};
+};
+
+// A home-thread-only charge for both the current WAL transaction and SQLite's
+// live temporary files. Each owner supplies its old and new extent.
+class SqliteSpillTracker {
+ public:
+  SqliteSpillTracker(SqliteSpillBudget& process, uint64_t capacity)
+      : process(process),
+        capacity(capacity) {}
+  KJ_DISALLOW_COPY_AND_MOVE(SqliteSpillTracker);
+  ~SqliteSpillTracker() noexcept {
+    process.release(used);
+  }
+
+  bool resize(uint64_t before, uint64_t after) noexcept;
+
+ private:
+  SqliteSpillBudget& process;
+  const uint64_t capacity;
+  uint64_t used = 0;
+};
+
 // One SQL connection, used only on its home thread. SQLite rewrites spilled
 // pages in place, so measure the WAL frame span from its first write.
 class SqliteDatabase::WalTransactionLimit {
  public:
   explicit WalTransactionLimit(uint64_t frameBytes): frameBytes(frameBytes) {}
+  WalTransactionLimit(uint64_t frameBytes, SqliteSpillBudget& process, uint64_t databaseSpillBytes)
+      : frameBytes(frameBytes) {
+    spill.emplace(process, databaseSpillBytes);
+  }
   uint64_t capacity() const { return frameBytes; }
   bool isActive() const { return active; }
   bool isRefusingWrites() const {
@@ -959,6 +1010,13 @@ class SqliteDatabase::WalTransactionLimit {
   bool wasMemoryRefused() const {
     return active && refusal == Refusal::MEMORY_LIMIT;
   }
+  bool wasSpillRefused() const {
+    return active && refusal == Refusal::SPILL_LIMIT;
+  }
+  bool tracksSpill() const {
+    return spill != kj::none;
+  }
+  bool resizeSpill(uint64_t before, uint64_t after) noexcept;
   void noteMemoryRefusal() {
     noteRefusal(Refusal::MEMORY_LIMIT);
   }
@@ -969,6 +1027,9 @@ class SqliteDatabase::WalTransactionLimit {
     noteRefusal(Refusal::STATEMENT_ROLLBACK);
   }
   void setPageSize(uint32_t pageSize);
+  void noteCommit() {
+    if (active) committed = true;
+  }
   void begin();
   void end(SqliteDatabase& db, bool rolledBack = false);
   void abandon(SqliteDatabase& db) noexcept;
@@ -976,12 +1037,19 @@ class SqliteDatabase::WalTransactionLimit {
 
  private:
   const uint64_t frameBytes;
+  kj::Maybe<SqliteSpillTracker> spill;
+  uint64_t frameSize = 0;
   uint64_t wholeFrameBytes = 0;
+  uint64_t walSpillBytes = 0;
+  uint64_t walHeaderBytes = 0;
   kj::Maybe<uint64_t> firstFrameByte;
   kj::Maybe<int64_t> originalSize;
   bool active = false;
-  enum class Refusal { NONE, WAL_LIMIT, MEMORY_LIMIT, INTERRUPTED, STATEMENT_ROLLBACK };
+  bool committed = false;
+  enum class Refusal { NONE, WAL_LIMIT, SPILL_LIMIT, MEMORY_LIMIT, INTERRUPTED, STATEMENT_ROLLBACK };
   Refusal refusal = Refusal::NONE;
+
+  void releaseWalSpill() noexcept;
 
   void noteRefusal(Refusal cause) {
     if (refusal == Refusal::NONE) refusal = cause;

@@ -880,17 +880,20 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
   sqlite3_progress_handler(db, SQL_PROGRESS_INSTRUCTIONS, &progressCallback, this);
 
   maybeDb = *db;
+  if (getWalTransactionLimit() != nullptr) setWalHook(nullptr, nullptr);
 }
 
 SqliteDatabase::~SqliteDatabase() noexcept(false) {
   sqlite3* db = &KJ_UNWRAP_OR(maybeDb, return);
 
-  if (processMemoryBudget != nullptr) {
-    // Finalize tracked statements and close while the allocator charge is still live.
+  if (getWalTransactionLimit() != nullptr || processMemoryBudget != nullptr) {
+    // Finalize tracked statements and close the handle while the VFS, its limit,
+    // and the SQLite heap reservation are still live.
     close();
     KJ_IF_SOME(closed, afterCloseCallback) closed();
     return;
   }
+
   auto memoryScope = enterMemoryScope();
 
   sqlite3_progress_handler(db, 0, nullptr, nullptr);
@@ -929,6 +932,21 @@ SqliteDatabase::WalTransactionLimit* SqliteDatabase::getWalTransactionLimit() co
   return vfs.options.walTransactionLimit;
 }
 
+void SqliteDatabase::setWalHook(WalHook callback, void* context) {
+  if (getWalTransactionLimit() == nullptr) {
+    sqlite3_wal_hook(*this, callback, context);
+    return;
+  }
+  walHook = callback;
+  walHookContext = context;
+  sqlite3_wal_hook(*this, [](void* arg, sqlite3* db, const char* schema, int frames) {
+    auto& self = *static_cast<SqliteDatabase*>(arg);
+    self.getWalTransactionLimit()->noteCommit();
+    if (self.walHook != nullptr) return self.walHook(self.walHookContext, db, schema, frames);
+    return SQLITE_OK;
+  }, this);
+}
+
 void SqliteDatabase::rollbackWalTransaction() {
   // A failed statement may have left little headroom. Account for cleanup
   // allocations while allowing the trusted rollback to finish. The platform
@@ -948,17 +966,47 @@ void SqliteDatabase::releaseCachedMemory() {
   sqlite3_db_release_memory(*this);
 }
 
+bool SqliteSpillBudget::tryCharge(uint64_t bytes) noexcept {
+  auto current = used.load(std::memory_order_relaxed);
+  do {
+    if (bytes > capacity - current) return false;
+  } while (!used.compare_exchange_weak(current, current + bytes, std::memory_order_relaxed));
+  return true;
+}
+
+void SqliteSpillBudget::release(uint64_t bytes) noexcept {
+  if (bytes != 0) {
+    const auto previous = used.fetch_sub(bytes, std::memory_order_relaxed);
+    KJ_ASSERT(previous >= bytes);
+  }
+}
+
+bool SqliteSpillTracker::resize(uint64_t before, uint64_t after) noexcept {
+  KJ_DASSERT(before <= used);
+  if (after > before) {
+    const auto growth = after - before;
+    if (growth > capacity - used || !process.tryCharge(growth)) return false;
+    used += growth;
+  } else {
+    const auto released = before - after;
+    used -= released;
+    process.release(released);
+  }
+  return true;
+}
+
 void SqliteDatabase::WalTransactionLimit::setPageSize(uint32_t pageSize) {
   KJ_REQUIRE(!active && pageSize >= 512 && pageSize <= 65536);
-  const uint64_t frameSize = pageSize + 24;
+  frameSize = pageSize + 24;
   // SQLite writes the frame header and page separately. Refuse at the start
   // of an excess frame, before it can write a header carrying a commit marker.
   wholeFrameBytes = frameBytes - frameBytes % frameSize;
 }
 
 void SqliteDatabase::WalTransactionLimit::begin() {
-  KJ_ASSERT(!active && wholeFrameBytes != 0);
+  KJ_ASSERT(!active && wholeFrameBytes != 0 && walSpillBytes == 0);
   active = true;
+  committed = false;
   refusal = Refusal::NONE;
   firstFrameByte = kj::none;
   originalSize = kj::none;
@@ -978,23 +1026,68 @@ int SqliteDatabase::WalTransactionLimit::checkWrite(
     originalSize = size;
   }
   const uint64_t end = uint64_t(offset) + length;
-  if (end <= WAL_HEADER_BYTES) return SQLITE_OK;
-  if (firstFrameByte == kj::none) {
-    firstFrameByte = kj::max(uint64_t(offset), WAL_HEADER_BYTES);
+  uint64_t frames = 0;
+  if (end > WAL_HEADER_BYTES) {
+    if (firstFrameByte == kj::none) {
+      firstFrameByte = kj::max(uint64_t(offset), WAL_HEADER_BYTES);
+    }
+    const auto first = KJ_ASSERT_NONNULL(firstFrameByte);
+    if (end > first + wholeFrameBytes) {
+      noteRefusal(Refusal::WAL_LIMIT);
+      return SQLITE_FULL;
+    }
+    // Reserve the whole frame before its header can be written, including
+    // when SQLite reuses space in the WAL or rewrites a spilled page.
+    if (tracksSpill() && end > first) {
+      frames = (end - first + frameSize - 1) / frameSize * frameSize;
+    }
   }
-  if (end > KJ_ASSERT_NONNULL(firstFrameByte) + wholeFrameBytes) {
-    noteRefusal(Refusal::WAL_LIMIT);
-    return SQLITE_FULL;
+  if (tracksSpill()) {
+    const auto header = offset < WAL_HEADER_BYTES
+        ? kj::max(walHeaderBytes, kj::min(WAL_HEADER_BYTES, end))
+        : walHeaderBytes;
+    const auto growth = end > uint64_t(KJ_ASSERT_NONNULL(originalSize))
+        ? end - uint64_t(KJ_ASSERT_NONNULL(originalSize))
+        : 0;
+    const auto updated = kj::max(walSpillBytes, kj::max(header + frames, growth));
+    if (!resizeSpill(walSpillBytes, updated)) return SQLITE_FULL;
+    walSpillBytes = updated;
+    walHeaderBytes = header;
   }
   return SQLITE_OK;
+}
+
+bool SqliteDatabase::WalTransactionLimit::resizeSpill(uint64_t before, uint64_t after) noexcept {
+  KJ_IF_SOME(tracker, spill) {
+    if (!tracker.resize(before, after)) {
+      KJ_DASSERT(active && after > before);
+      noteRefusal(Refusal::SPILL_LIMIT);
+      return false;
+    }
+  }
+  return true;
+}
+
+void SqliteDatabase::WalTransactionLimit::releaseWalSpill() noexcept {
+  resizeSpill(walSpillBytes, 0);
+  walSpillBytes = 0;
+  walHeaderBytes = 0;
 }
 
 void SqliteDatabase::WalTransactionLimit::end(SqliteDatabase& db, bool rolledBack) {
   if (!active) return;
   active = false;
+  KJ_DEFER(releaseWalSpill());
   if (refusal == Refusal::NONE && !rolledBack) return;
-  KJ_REQUIRE(sqlite3_get_autocommit(db), "the SQL transaction must be rolled back before WAL cleanup");
+  if (committed) {
+    KJ_LOG(ERROR, "skipping WAL rollback cleanup after a commit");
+    return;
+  }
   const auto before = KJ_UNWRAP_OR(originalSize, return);
+  if (!sqlite3_get_autocommit(db)) {
+    KJ_LOG(ERROR, "skipping WAL rollback cleanup while a transaction is still open");
+    return;
+  }
   sqlite3_file* wal = nullptr;
   KJ_REQUIRE(sqlite3_file_control(db, "main", SQLITE_FCNTL_JOURNAL_POINTER, &wal) == SQLITE_OK);
   if (wal == nullptr || wal->pMethods == nullptr) return;
@@ -1010,6 +1103,7 @@ void SqliteDatabase::WalTransactionLimit::end(SqliteDatabase& db, bool rolledBac
 void SqliteDatabase::WalTransactionLimit::abandon(SqliteDatabase& db) noexcept {
   const bool unfinishedRefusal = isRefusingWrites();
   active = false;
+  releaseWalSpill();
   if (unfinishedRefusal) {
     // Rollback can fail while another exception is unwinding. Record the
     // SQLite state while preserving the original exception.
@@ -2179,9 +2273,10 @@ void SqliteDatabase::Query::nextRow(bool first) {
     } else if (err != SQLITE_ROW) {
       KJ_ON_SCOPE_FAILURE({
         if (auto* limit = db.getWalTransactionLimit();
-            limit != nullptr && limit->wasMemoryRefused()) {
+            limit != nullptr && (limit->wasMemoryRefused() || limit->wasSpillRefused())) {
           // A failing iterator can outlive the JS callback. Release the VM's
-          // allocations now so rollback and the next statement have room.
+          // allocations and temporary files now, so rollback and the next
+          // statement have room.
           sqlite3_reset(statement);
         }
       });
@@ -2333,6 +2428,37 @@ void SqliteDatabase::Query::beforeSqliteClose(CloseReason reason) {
 // we want to leverage all that code. If we can just make it interpret paths differently, then we
 // can reuse the rest of the implementation.
 
+// SQLite keeps sorter and other transient files open even after unlinking
+// them. Charge their logical extent through growth, truncation and close.
+struct SqliteTemporaryFileSpill {
+  SqliteDatabase::WalTransactionLimit* limit = nullptr;
+  uint64_t size = 0;
+
+  static SqliteTemporaryFileSpill forOpen(SqliteDatabase::WalTransactionLimit* limit, int flags) {
+    if ((flags & SQLITE_OPEN_DELETEONCLOSE) && limit != nullptr && limit->tracksSpill()) {
+      return {limit};
+    }
+    return {};
+  }
+
+  bool resize(uint64_t newSize) noexcept {
+    if (limit == nullptr) return true;
+    if (newSize > size) {
+      // Only platform transactions can route SQLITE_FULL back to the caller.
+      // Live charges remain attached to the file until it shrinks or closes.
+      if (!limit->isActive()) return true;
+      if (limit->isRefusingWrites()) return false;
+    }
+    if (!limit->resizeSpill(size, newSize)) return false;
+    size = newSize;
+    return true;
+  }
+
+  bool grow(uint64_t extent) noexcept {
+    return extent <= size || resize(extent);
+  }
+};
+
 #if !_WIN32
 namespace {
 
@@ -2461,7 +2587,17 @@ const sqlite3_io_methods SqliteDatabase::Vfs::WrappedNativeFileImpl::METHOD_TABL
   WRAP(xLock),
   WRAP(xUnlock),
   WRAP(xCheckReservedLock),
-  WRAP(xFileControl),
+  .xFileControl = [](sqlite3_file* file, int op, void* arg) noexcept {
+    auto& wrapped = *static_cast<WrappedNativeFileImpl*>(file);
+    auto* limit = wrapped.vfs->options.walTransactionLimit;
+    if (wrapped.wal && limit != nullptr && limit->tracksSpill()) {
+      // Keep preallocation and rounded native truncation from extending a
+      // metered file outside xWrite and xTruncate.
+      if (op == SQLITE_FCNTL_SIZE_HINT || op == SQLITE_FCNTL_CHUNK_SIZE) return SQLITE_OK;
+    }
+    return MethodWrapperHack<decltype(&sqlite3_io_methods::xFileControl),
+        &sqlite3_io_methods::xFileControl>::wrapper(file, op, arg);
+  },
   WRAP(xSectorSize),
   .xDeviceCharacteristics = [](sqlite3_file* file) noexcept -> int {
     auto wrapper = static_cast<WrappedNativeFileImpl*>(file);
@@ -2515,7 +2651,8 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
   // wrapped so that it sets `currentVfsRoot` while running.
   return {
     .iVersion = kj::min(3, native.iVersion),
-    .szOsFile = native.szOsFile + static_cast<int>(sizeof(WrappedNativeFileImpl)),
+    .szOsFile = kj::max(native.szOsFile + static_cast<int>(sizeof(WrappedNativeFileImpl)),
+        makeKjVfs().szOsFile),
     .mxPathname = native.mxPathname,
     .pNext = nullptr,
     .zName = name.cStr(),
@@ -2523,6 +2660,16 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
 
     .xOpen = [](sqlite3_vfs* vfs, sqlite3_filename zName, sqlite3_file* file, int flags,
                  int* pOutFlags) -> int {
+      auto& self = *static_cast<SqliteDatabase::Vfs*>(vfs->pAppData);
+      auto* limit = self.options.walTransactionLimit;
+      if ((flags & SQLITE_OPEN_DELETEONCLOSE) && limit != nullptr && limit->tracksSpill()) {
+        // Open guarded temporary files through the directory capability. The
+        // native VFS finds unnamed files via a process-wide temp search path.
+        file->pMethods = nullptr;
+        auto local = self.makeKjVfs();
+        return local.xOpen(&local, zName, file, flags, pOutFlags);
+      }
+
       // We have to wrap xOpen explicitly because we need to further wrap each created file.
       //
       // My trick here is to prefix the native file with a second vtable. So the layout of the
@@ -2535,7 +2682,6 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
       file->pMethods = nullptr;
 
       // Set up currentVfsRoot.
-      auto& self = *reinterpret_cast<const SqliteDatabase::Vfs*>(vfs->pAppData);
       KJ_ASSERT(currentVfsRoot == AT_FDCWD);
       currentVfsRoot = self.rootFd;
       KJ_DEFER(currentVfsRoot = AT_FDCWD);
@@ -2610,6 +2756,7 @@ struct SqliteDatabase::Vfs::FileImpl: public sqlite3_file {
   kj::Maybe<const kj::File&> writableFile;
   kj::Own<const kj::ReadableFile> file;
   bool wal = false;
+  SqliteTemporaryFileSpill temporarySpill;
 
   kj::Maybe<kj::Own<Lock>> lock;
   // Rather complicatedly, SQLite doesn't consider the -shm file to be a separate file that it
@@ -2647,6 +2794,8 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
       auto& self = *static_cast<FileImpl*>(file);
 
       // Caller will free the object's memory, but knows nothing of destructors.
+      auto temporarySpill = self.temporarySpill;
+      KJ_DEFER(temporarySpill.resize(0));
       kj::dtor(self);
 
       return SQLITE_OK;  // return value is ignored by SQLite
@@ -2675,6 +2824,7 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
           const int result = limit->checkWrite(file, iOfst, iAmt);
           if (result != SQLITE_OK) return result;
         }
+        if (!self.temporarySpill.grow(uint64_t(iOfst) + iAmt)) return SQLITE_FULL;
         auto bytes = kj::arrayPtr(reinterpret_cast<const byte*>(buffer), iAmt);
         writableFile.write(iOfst, bytes);
         return SQLITE_OK;
@@ -2687,7 +2837,9 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
   .xTruncate = [](sqlite3_file* file, sqlite3_int64 size) noexcept -> int {
     WRAP_METHOD(SQLITE_IOERR_TRUNCATE, {
       KJ_IF_SOME(writableFile, self.writableFile) {
+        if (!self.temporarySpill.grow(size)) return SQLITE_FULL;
         writableFile.truncate(size);
+        self.temporarySpill.resize(size);
         return SQLITE_OK;
       } else {
         return SQLITE_READONLY;
@@ -2919,6 +3071,8 @@ sqlite3_vfs SqliteDatabase::Vfs::makeKjVfs() {
           kj::ctor(target, self, kj::mv(kjFile), kj::mv(lock));
         }
         target.wal = (flags & SQLITE_OPEN_WAL) != 0;
+        target.temporarySpill =
+            SqliteTemporaryFileSpill::forOpen(self.options.walTransactionLimit, flags);
 
         // In theory if read-write was requested, but failed, we should retry read-only, and then
         // alter the pOutFlags to reflect this... I'm not going to bother.

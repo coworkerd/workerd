@@ -16,7 +16,13 @@ namespace workerd::server {
 class DurableStorage {
  public:
   DurableStorage();
-  explicit DurableStorage(kj::Own<const kj::Directory> directory);
+  explicit DurableStorage(kj::Own<const kj::Directory> directory,
+      uint64_t sqlDatabaseSpillBytes = 1ull << 30,
+      uint64_t sqlProcessSpillBytes = 0);
+
+  const SqliteSpillBudget& getSqlSpillBudget() const {
+    return sqlSpillBudget;
+  }
 
   kj::Own<SqliteDatabase> open(kj::StringPtr uniqueKey,
       kj::StringPtr storageId,
@@ -48,6 +54,8 @@ class DurableStorage {
   void ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
   kj::Own<const kj::Directory> directory;
   SqliteDatabase::Vfs vfs;
+  const uint64_t sqlDatabaseSpillBytes;
+  mutable SqliteSpillBudget sqlSpillBudget;
 };
 
 }  // namespace workerd::server
