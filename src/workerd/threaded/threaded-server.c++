@@ -555,6 +555,8 @@ void noSandboxRoom(ResourceBudget &budget) {
 }
 
 constexpr kj::Exception::DetailTypeId CAPACITY_DETAIL = 0x9f232974b0ac7143ull;
+// The node reads this detail on the private durable bootstrap, before it has an event dispatcher.
+constexpr kj::Exception::DetailTypeId DURABLE_COPY_RESERVATION_REFUSED = 0xe05c5dbb242a7eb4ull;
 enum class CapacityScope { PROCESS, TENANT };
 bool isCapacityError(const kj::Exception &error) {
   return error.getDetail(CAPACITY_DETAIL) != kj::none;
@@ -1794,6 +1796,14 @@ enum class SocketParkResult { REFUSED, PARKED, UNKNOWN };
 const char *durableLifecycleTestDirectory() {
   static const auto directory = getenv("COWORKERD_DO_TEST_LIFECYCLE_DIR");
   return directory;
+}
+
+bool refuseCopyReservationForTest() {
+  const auto *directory = durableLifecycleTestDirectory();
+  if (directory == nullptr) return false;
+  auto path = kj::str(directory, "/copy-reservation/refuse");
+  // The fixture arms one refusal for the next cold copy across its threaded children.
+  return unlink(path.cStr()) == 0;
 }
 
 server::DurableIdleLifecycle::Time durableIdleNow() {
@@ -3940,7 +3950,11 @@ struct ThreadedServer {
     auto input = document.get();
     auto reservation = std::make_shared<ResourceReservation>(
         resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"));
-    if (!reservation->registerPreparation()) kj::throwRecoverableException(capacityError());
+    if (refuseCopyReservationForTest() || !reservation->registerPreparation()) {
+      auto error = capacityError();
+      error.setDetail(DURABLE_COPY_RESERVATION_REFUSED, kj::heapArray<kj::byte>(0));
+      kj::throwRecoverableException(kj::mv(error));
+    }
     auto slot = std::make_shared<Slot>();
     slot->reservation = std::move(reservation);
     slot->instance = ++nextInstance;
