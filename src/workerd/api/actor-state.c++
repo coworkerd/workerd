@@ -752,11 +752,13 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
       limit->begin();
       KJ_DEFER(limit->abandon(sqlite));
       auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
-      auto started = cache->startTransaction();
-      auto& txn = KJ_REQUIRE_NONNULL(started.tryGet<kj::Own<ActorCacheInterface::Transaction>>());
+      kj::Own<ActorCacheInterface::Transaction> txn;
       StoredExternalHandler::SyncNestedTransaction syncExternalTxn(
           context.getActorOrThrow().getOrCreateStoredExternalHandler());
       return js.tryCatch([&]() {
+        auto started = cache->startTransaction();
+        txn =
+            kj::mv(KJ_REQUIRE_NONNULL(started.tryGet<kj::Own<ActorCacheInterface::Transaction>>()));
         auto result = callback(js);
         JSG_REQUIRE(!sqlite.observedCriticalError(), Error,
             "Cannot commit transaction due to an earlier SQL critical error");
@@ -775,6 +777,14 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
           kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
               KJ_EXCEPTION(FAILED, "jsg.Error: the transaction exceeds one recoverable WAL record"),
               "SQL_TRANSACTION_TOO_LARGE"));
+        }
+        if (!sqlite.observedCriticalError() && limit->wasMemoryRefused()) {
+          limit->end(sqlite, /*rolledBack=*/true);
+          sqlite.releaseCachedMemory();
+          kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+              KJ_EXCEPTION(
+                  FAILED, "jsg.Error: the statement exceeds the database SQLite memory limit"),
+              "SQL_MEMORY_LIMIT_EXCEEDED"));
         }
         if (!sqlite.observedCriticalError() && budget && budget->hasDeadline() &&
             budget->getCause() != SqlExecutionBudget::Cause::NONE) {

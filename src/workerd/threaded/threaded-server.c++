@@ -36,6 +36,7 @@
 #include <workerd/threaded/protocol.capnp.h>
 #include <workerd/util/autogate.h>
 #include <workerd/util/entropy.h>
+#include <workerd/util/sqlite-metering.h>
 #include <workerd/util/stream-utils.h>
 
 #include <arpa/inet.h>
@@ -1925,6 +1926,7 @@ struct JsonDoc {
 };
 
 constexpr auto DATABASE_SQL_WALL_LIMIT = 30 * kj::SECONDS;
+constexpr size_t DATABASE_SQL_MEMORY_LIMIT = size_t(32) << 20;
 
 struct DurableRoute {
   server::DurableAdmission::Key key;
@@ -6675,7 +6677,12 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
                        ActorCache::Hooks &,
                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
     const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
-    auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet, sqlWalFrameLimitBytes);
+    const auto memoryLimit = sqlWalFrameLimitBytes != 0
+        ? boundedDurableSetting("COWORKERD_DO_TEST_SQL_MEMORY_BYTES", DATABASE_SQL_MEMORY_LIMIT,
+              DATABASE_SQL_MEMORY_LIMIT)
+        : kj::maxValue;
+    auto database = tree->storage().open(
+        tree->uniqueKey, tree->storageId, observer, facet, sqlWalFrameLimitBytes, memoryLimit);
     if (tree->state.wal) {
       auto shipper = tree->storage().ship(tree->uniqueKey,
           {.objectName = kj::str(tree->objectName), .storageId = kj::str(tree->storageId),
@@ -7571,6 +7578,7 @@ int main(int argc, char **argv) {
     kj::Own<const kj::Directory> directory;
     kj::Own<server::ThreadedWalLog> wal;
     if (persistent) {
+      installSqliteCustomAllocator();
       auto path = getenv("COWORKERD_DO_STORAGE_DIR");
       KJ_REQUIRE(path != nullptr && path[0] == '/', "persistent durable storage requires a volume");
       auto filesystem = kj::newDiskFilesystem();

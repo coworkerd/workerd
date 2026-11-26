@@ -314,6 +314,7 @@ class SqliteDatabase {
   bool observedCriticalError();
   WalTransactionLimit* getWalTransactionLimit() const;
   void rollbackWalTransaction();
+  void releaseCachedMemory();
 
   // Invoke the onWrite() callback.
   //
@@ -934,6 +935,8 @@ class SqliteDatabase::Query final: private ResetListener {
 
   void beforeSqliteClose(CloseReason reason) override;
 
+  void checkColumnMemoryLimit(sqlite3_stmt* statement);
+
   void nextRow(bool first);
 };
 
@@ -945,6 +948,12 @@ class SqliteDatabase::WalTransactionLimit {
   uint64_t capacity() const { return frameBytes; }
   bool isActive() const { return active; }
   bool wasRefused() const { return active && refused; }
+  bool wasMemoryRefused() const {
+    return active && memoryRefused;
+  }
+  void noteMemoryRefusal() {
+    memoryRefused = true;
+  }
   void setPageSize(uint32_t pageSize);
   void begin();
   void end(SqliteDatabase& db, bool rolledBack = false);
@@ -958,6 +967,7 @@ class SqliteDatabase::WalTransactionLimit {
   kj::Maybe<int64_t> originalSize;
   bool active = false;
   bool refused = false;
+  bool memoryRefused = false;
 };
 
 // Options affecting SqliteDatabase::Vfs onstructor.

@@ -435,6 +435,7 @@ void reportVfsErrorCaught(kj::Exception&& e) {
 class SqliteCallScope {
  public:
   SqliteCallScope() {
+    SqliteMemoryScope::clearLimitRefusal();
     KJ_DASSERT(vfsErrorListener == nullptr);
     vfsErrorListener = &error;
   }
@@ -921,12 +922,20 @@ SqliteDatabase::WalTransactionLimit* SqliteDatabase::getWalTransactionLimit() co
 }
 
 void SqliteDatabase::rollbackWalTransaction() {
+  // A failed statement may have left little headroom. Account for cleanup
+  // allocations while allowing the trusted rollback to finish.
+  SqliteMemoryScope memoryScope(sqliteMemoryBytes, kj::maxValue);
   if (!sqlite3_get_autocommit(*this)) {
     run("ROLLBACK TRANSACTION");
   } else {
     // SQLite can roll back the entire transaction, including its savepoints.
     clearRolledBackTransaction();
   }
+}
+
+void SqliteDatabase::releaseCachedMemory() {
+  auto memoryScope = enterMemoryScope();
+  sqlite3_db_release_memory(*this);
 }
 
 void SqliteDatabase::WalTransactionLimit::setPageSize(uint32_t pageSize) {
@@ -941,6 +950,7 @@ void SqliteDatabase::WalTransactionLimit::begin() {
   KJ_ASSERT(!active && wholeFrameBytes != 0);
   active = true;
   refused = false;
+  memoryRefused = false;
   firstFrameByte = kj::none;
   originalSize = kj::none;
 }
@@ -1010,6 +1020,13 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
   KJ_IF_SOME(code, errorCode) {
     if (code == SQLITE_FULL) {
       if (auto* limit = getWalTransactionLimit(); limit != nullptr && limit->wasRefused()) return;
+    }
+    if (code == SQLITE_NOMEM && SqliteMemoryScope::wasLimitRefused()) {
+      if (auto* limit = getWalTransactionLimit(); limit != nullptr && limit->isActive()) {
+        // The active platform transaction owns rollback and error translation.
+        limit->noteMemoryRefusal();
+        return;
+      }
     }
     // Only errors listed in https://www.sqlite.org/lang_transaction.html#response_to_errors_within_a_transaction
     // should be considered here as SQLITE auto rollbacks the transaction when we hit these errors
@@ -2151,6 +2168,14 @@ void SqliteDatabase::Query::nextRow(bool first) {
     if (err == SQLITE_DONE) {
       done = true;
     } else if (err != SQLITE_ROW) {
+      KJ_ON_SCOPE_FAILURE({
+        if (auto* limit = db.getWalTransactionLimit();
+            limit != nullptr && limit->wasMemoryRefused()) {
+          // A failing iterator can outlive the JS callback. Release the VM's
+          // allocations now so rollback and the next statement have room.
+          sqlite3_reset(statement);
+        }
+      });
       SQLITE_CALL_FAILED("sqlite3_step()", err);
     }
   }
@@ -2198,17 +2223,33 @@ kj::StringPtr SqliteDatabase::Query::getColumnName(uint column) {
   return sqlite3_column_name(statement, column);
 }
 
+void SqliteDatabase::Query::checkColumnMemoryLimit(sqlite3_stmt* statement) {
+  if (!SqliteMemoryScope::wasLimitRefused() || sqlite3_errcode(db) != SQLITE_NOMEM) return;
+  if (auto* limit = db.getWalTransactionLimit(); limit != nullptr && limit->isActive()) {
+    // A column accessor can allocate, for example when it expands a zero BLOB.
+    // Finalize this execution now rather than returning a bogus empty value.
+    limit->noteMemoryRefusal();
+    sqlite3_reset(statement);
+    kj::throwRecoverableException(
+        KJ_EXCEPTION(FAILED, "SQLite failed", sqlite3_errstr(SQLITE_NOMEM)));
+  }
+}
+
 kj::ArrayPtr<const byte> SqliteDatabase::Query::getBlob(uint column) {
   auto memoryScope = db.enterMemoryScope();
   sqlite3_stmt* statement = getStatement();
+  SqliteMemoryScope::clearLimitRefusal();
   const byte* ptr = reinterpret_cast<const byte*>(sqlite3_column_blob(statement, column));
+  if (ptr == nullptr) checkColumnMemoryLimit(statement);
   return kj::arrayPtr(ptr, sqlite3_column_bytes(statement, column));
 }
 
 kj::StringPtr SqliteDatabase::Query::getText(uint column) {
   auto memoryScope = db.enterMemoryScope();
   sqlite3_stmt* statement = getStatement();
+  SqliteMemoryScope::clearLimitRefusal();
   const char* ptr = reinterpret_cast<const char*>(sqlite3_column_text(statement, column));
+  if (ptr == nullptr) checkColumnMemoryLimit(statement);
   return kj::StringPtr(ptr, sqlite3_column_bytes(statement, column));
 }
 
