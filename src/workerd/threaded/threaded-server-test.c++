@@ -125,22 +125,77 @@ KJ_TEST("tenant memory growth can block a database preparation even after return
   KJ_EXPECT(budget->residents.load() == 2);
 }
 
-KJ_TEST("the database release notice follows the final reservation holder") {
+KJ_TEST("database retirement waits for the final reservation holder only until its deadline") {
+  using Outcome = DatabaseRetirement::Outcome;
   constexpr auto MiB = ResourceBudget::MiB;
   const auto budget = std::make_shared<ResourceBudget>(128 * MiB, 1, 4,
       ResourceBudget::ReclaimMode::NONE);
   auto idleDatabase = std::make_shared<ResourceReservation>(budget, 64, true);
   KJ_REQUIRE(idleDatabase->registerPreparation());
   KJ_EXPECT(idleDatabase->canReplaceWithPreparation());
-  const auto returned = idleDatabase->returned;
+  const auto now = server::DurableAdmission::Clock::now();
+  const auto deadline = now + std::chrono::seconds(1);
+  const DatabaseRetirement victim{1, 1, 0, idleDatabase->returned, deadline, false};
+  KJ_EXPECT(victim.outcome(now, true, false) == Outcome::REFUSED);
+  KJ_EXPECT(victim.outcome(now, true, true) == Outcome::PENDING);
   auto lastHolder = idleDatabase;
   idleDatabase.reset();
-  KJ_EXPECT(!returned->load());
+  KJ_EXPECT(victim.outcome(now, false, false) == Outcome::PENDING);
+  KJ_EXPECT(victim.outcome(deadline, false, false) == Outcome::EXPIRED);
   KJ_EXPECT(budget->residents.load() == 1);
   lastHolder.reset();
-  KJ_EXPECT(returned->load());
+  KJ_EXPECT(victim.outcome(now, false, false) == Outcome::RELEASED);
+  KJ_EXPECT(victim.outcome(deadline, false, false) == Outcome::EXPIRED);
   KJ_EXPECT(budget->residents.load() == 0);
   KJ_EXPECT(budget->memoryReserved.load() == budget->baselineMemory);
+}
+
+KJ_TEST("a database preparation retires only one copy when competing work claims its budget") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  const auto budget = std::make_shared<ResourceBudget>(128 * MiB, 2, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto first = std::make_shared<ResourceReservation>(budget, 64, true);
+  auto second = std::make_shared<ResourceReservation>(budget, 64, true);
+  KJ_REQUIRE(first->registerPreparation());
+  KJ_REQUIRE(second->registerPreparation());
+  ResourceReservation competitor(budget, 64);
+  ResourceReservation incoming(budget, 64, true);
+  unsigned retirements = 0;
+  auto retire = [&]() -> kj::Promise<bool> {
+    if (++retirements == 1) {
+      first.reset();
+      KJ_REQUIRE(competitor.registerPreparation());
+    } else {
+      second.reset();
+    }
+    return true;
+  };
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  KJ_EXPECT(!registerDurablePreparation(incoming, true, retire).wait(waitScope));
+  KJ_EXPECT(retirements == 1);
+  KJ_EXPECT(budget->residents.load() == 2);
+  KJ_EXPECT(!incoming.registered);
+}
+
+KJ_TEST("a returned preparation credit is available to the waiting database first") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  const auto budget = std::make_shared<ResourceBudget>(128 * MiB, 10, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto victim = std::make_shared<ResourceReservation>(budget, 64, true);
+  ResourceReservation live(budget, 64);
+  ResourceReservation competitor(budget, 64);
+  ResourceReservation incoming(budget, 64, true);
+  KJ_REQUIRE(victim->registerPreparation());
+  KJ_REQUIRE(live.registerPreparation());
+  KJ_REQUIRE(live.allocateExternal(budget->admissionMaximum - budget->memoryReserved.load()));
+  budget->preferDatabasePreparation(server::DurableAdmission::Time::max());
+  victim.reset();
+  KJ_EXPECT(!competitor.registerPreparation());
+  KJ_EXPECT(incoming.registerPreparation());
+  KJ_EXPECT(budget->memoryReserved.load() == budget->admissionMaximum);
+  live.freeExternal(ResourceBudget::PREPARATION_MEMORY);
+  KJ_EXPECT(competitor.registerPreparation());
 }
 
 KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {

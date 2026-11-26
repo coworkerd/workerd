@@ -48,9 +48,13 @@ DurableAdmission::DurableAdmission(Limits limits, uint64_t generation)
       "durable tree and event metadata require memory reservations");
 }
 
+void DurableAdmission::limitDatabaseTreePreference(Time until) {
+  databaseTreePreferredUntil = std::min(until, databaseTreePreferredUntil);
+}
+
 DurableAdmission::Result DurableAdmission::queue(
     const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now,
-    bool deferNewTreeOverload) {
+    bool database) {
   if (open.generation != generation) return {Status::STALE};
   if (deadline <= now) {
     ++counters.expired;
@@ -64,7 +68,7 @@ DurableAdmission::Result DurableAdmission::queue(
   }
 
   auto refuse = [&](bool newTreeCapacityRefused = false) -> Result {
-    if (!deferNewTreeOverload || !newTreeCapacityRefused) recordOverload();
+    if (!database || !newTreeCapacityRefused) recordOverload();
     return {.status = Status::OVERLOADED, .newTreeCapacityRefused = newTreeCapacityRefused};
   };
   if (bytes > limits.mailboxBytes ||
@@ -83,6 +87,13 @@ DurableAdmission::Result DurableAdmission::queue(
       ((limits.residentTarget != 0 && counters.trees >= limits.residentTarget) ||
           !reserve(reserved, limits.capacity, limits.tree))) {
     return refuse(true);
+  }
+  if (newTree && !database && now < databaseTreePreferredUntil) {
+    auto includingPreferredTree = reserved;
+    if ((limits.residentTarget != 0 && counters.trees + 1 >= limits.residentTarget) ||
+        !reserve(includingPreferredTree, limits.capacity, limits.tree)) {
+      return refuse(true);
+    }
   }
 
   KJ_ASSERT(nextTree != 0 && nextEvent != 0);

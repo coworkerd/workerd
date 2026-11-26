@@ -87,7 +87,10 @@ class DurableAdmission {
   DurableAdmission(Limits limits, uint64_t generation);
 
   Result queue(const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now,
-      bool deferNewTreeOverload = false);
+      bool database = false);
+  void preferDatabaseTree(Time until) { databaseTreePreferredUntil = until; }
+  void limitDatabaseTreePreference(Time until);
+  void claimDatabaseTree() { databaseTreePreferredUntil = {}; }
   bool publishHome(uint64_t tree, uint64_t home);
   std::optional<uint64_t> homeFor(uint64_t tree) const;
   // Check the full descriptor and route the first live waiting event to an already published home.
@@ -154,6 +157,7 @@ class DurableAdmission {
   const Limits limits;
   const uint64_t generation;
   State counters;
+  Time databaseTreePreferredUntil{};
   uint64_t nextTree = 1, nextEvent = 1;
   std::map<Key, uint64_t> objects;
   std::map<uint64_t, Tree> trees;

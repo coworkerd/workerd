@@ -119,6 +119,36 @@ KJ_TEST("capacity recovery can select only a published tree with a drained mailb
   queued(table.queue(second, open, 0, deadline, now), true);
 }
 
+KJ_TEST("the last tree at a resident ceiling waits briefly for a database") {
+  auto twoTrees = limits;
+  twoTrees.residentTarget = 2;
+  Admission table(twoTrees, 1);
+  table.preferDatabaseTree(now + 100ms);
+  const auto ordinary = queued(table.queue(first, open, 0, deadline, now), true);
+  KJ_REQUIRE(table.publishHome(ordinary.tree, 1));
+  // A warm tenant can still open another request in its existing tree.
+  queued(table.queue(first, open, 0, deadline, now), false);
+  KJ_EXPECT(table.queue(second, open, 0, deadline, now + 99ms).status == Status::OVERLOADED);
+  queued(table.queue(second, open, 0, deadline, now + 99ms, true), true);
+}
+
+KJ_TEST("a tree preference protects available credits and obeys its endpoint") {
+  auto credits = limits;
+  credits.residentTarget = 0;
+  credits.capacity.descriptors = limits.tree.descriptors + limits.event.descriptors;
+  Admission table(credits, 1);
+  table.preferDatabaseTree(now + 1s);
+  table.limitDatabaseTreePreference(now + 100ms);
+  KJ_EXPECT(table.queue(first, open, 0, deadline, now + 99ms).status == Status::OVERLOADED);
+  queued(table.queue(first, open, 0, deadline, now + 100ms), true);
+
+  Admission consumed(credits, 1);
+  consumed.preferDatabaseTree(now + 1s);
+  consumed.claimDatabaseTree();
+  consumed.limitDatabaseTreePreference(now + 100ms);
+  queued(consumed.queue(first, open, 0, deadline, now), true);
+}
+
 KJ_TEST("failure to reserve an event for a new tree can request capacity recovery") {
   auto constrained = limits;
   constrained.capacity.descriptors = limits.tree.descriptors + limits.event.descriptors;
