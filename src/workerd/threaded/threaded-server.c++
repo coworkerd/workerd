@@ -299,9 +299,23 @@ kj::Exception limitException(LimitCause cause);
 // V8 sandbox build): the 4 GiB cage less what V8 keeps in it, as for the shared cage below.
 constexpr uint64_t OWN_CAGE_HEAP = (4ull << 30) - (256ull << 20);
 
+struct DatabasePreparationReplacement {
+  const uint64_t ceiling;
+  bool used = false;  // Protected by the resource budget mutex.
+};
+
+struct DatabaseReservationReturn {
+  uint64_t memoryBeforeRelease = 0;
+  // Published last, after the memory charge and resident count are both returned.
+  std::atomic<uint64_t> releasedMemory{0};
+};
+
 struct ResourceBudget {
   enum class ReclaimMode { BACKGROUND, NONE };
   static constexpr uint64_t MiB = 1ull << 20;
+  static constexpr uint64_t NATIVE_OVERHEAD = 512ull << 10;
+  static constexpr uint64_t PREPARATION_HEAP = 2 * MiB;
+  static constexpr uint64_t PREPARATION_MEMORY = NATIVE_OVERHEAD + PREPARATION_HEAP;
   ResourceBudget(uint64_t maximum,
       uint32_t residents,
       uint32_t callThreads,
@@ -334,6 +348,7 @@ struct ResourceBudget {
   const uint32_t configuredResidentMaximum;
   std::atomic<uint32_t> residentMaximum;
   std::mutex mutex;
+  server::DurableAdmission::Time databasePreparationPreferredUntil{};
   std::atomic<uint64_t> memoryReserved{0}, addressReserved{0};
   // Heap headroom near-heap-limit raises granted above what their isolates
   // used, until each call's termination takes effect (MemoryBudget::raise()):
@@ -392,25 +407,86 @@ struct ResourceBudget {
     reclaimed.notify_all();
   }
 
+  bool fits(uint64_t memory, uint64_t newMemory, uint64_t address, uint64_t newAddress,
+      uint64_t ceiling) const {
+    return newMemory <= ceiling - kj::min(memory, ceiling) &&
+        newAddress <= addressMaximum - kj::min(address, addressMaximum);
+  }
+
+  std::optional<uint64_t> replacementCeiling(uint64_t returnedMemory, uint64_t returnedAddress) {
+    std::lock_guard lock(mutex);
+    if (residents.load() > residentMaximum.load()) return std::nullopt;
+    const auto memory = memoryReserved.load();
+    const auto addressAfterRelease = addressReserved.load() - returnedAddress;
+    const auto memoryAfterRelease = memory - returnedMemory;
+    if (fits(memoryAfterRelease, PREPARATION_MEMORY,
+            addressAfterRelease, PREPARATION_HEAP, admissionMaximum)) {
+      return admissionMaximum;
+    }
+    // Above the admission ceiling, a single replacement may reuse the returning
+    // charge. It cannot add to that total or exceed the hard memory budget.
+    if (returnedMemory < PREPARATION_MEMORY ||
+        !fits(memoryAfterRelease, PREPARATION_MEMORY,
+            addressAfterRelease, PREPARATION_HEAP, memoryMaximum)) {
+      return std::nullopt;
+    }
+    return kj::min(memory, memoryMaximum);
+  }
+
+  void preferDatabasePreparation(server::DurableAdmission::Time until) {
+    std::lock_guard lock(mutex);
+    databasePreparationPreferredUntil = until;
+  }
+
+  void limitDatabasePreparationPreference(server::DurableAdmission::Time until) {
+    std::lock_guard lock(mutex);
+    databasePreparationPreferredUntil = kj::min(until, databasePreparationPreferredUntil);
+  }
+
+  bool registerPreparation(bool database, DatabasePreparationReplacement* replacement) {
+    std::lock_guard lock(mutex);
+    const auto count = residents.load();
+    const auto memory = memoryReserved.load();
+    const auto address = addressReserved.load();
+    const bool keepCredit = !database &&
+        server::DurableAdmission::Clock::now() < databasePreparationPreferredUntil;
+    const uint64_t preparations = keepCredit ? 2 : 1;
+    const bool mayReplace = database && replacement != nullptr && !replacement->used;
+    const auto ceiling = mayReplace ? replacement->ceiling : admissionMaximum;
+    if (count + preparations > residentMaximum.load() ||
+        !fits(memory, preparations * PREPARATION_MEMORY,
+            address, preparations * PREPARATION_HEAP, ceiling)) {
+      return false;
+    }
+    memoryReserved.store(memory + PREPARATION_MEMORY);
+    addressReserved.store(address + PREPARATION_HEAP);
+    residents.fetch_add(1);
+    if (database) databasePreparationPreferredUntil = {};
+    if (mayReplace) replacement->used = true;
+    return true;
+  }
+
   bool change(uint64_t oldMemory,
       uint64_t newMemory,
       uint64_t oldAddress,
       uint64_t newAddress,
       bool admission = false,
-      bool observe = false) {
+      bool observe = false,
+      uint64_t* memoryBeforeRelease = nullptr) {
     std::lock_guard lock(mutex);
-    auto memory = memoryReserved.load() - oldMemory;
+    const auto reserved = memoryReserved.load();
+    if (memoryBeforeRelease != nullptr) *memoryBeforeRelease = reserved;
+    auto memory = reserved - oldMemory;
     auto address = addressReserved.load() - oldAddress;
     auto ceiling = admission ? admissionMaximum : memoryMaximum;
-    bool fits = (!admission && newMemory <= oldMemory && newAddress <= oldAddress) ||
-        (newMemory <= ceiling - kj::min(memory, ceiling) &&
-            newAddress <= addressMaximum - kj::min(address, addressMaximum));
-    if (!fits && !observe) return false;
+    const bool accepted = (!admission && newMemory <= oldMemory && newAddress <= oldAddress) ||
+        fits(memory, newMemory, address, newAddress, ceiling);
+    if (!accepted && !observe) return false;
     memoryReserved.store(memory + newMemory);
     addressReserved.store(address + newAddress);
     if (memory + newMemory > admissionMaximum || address + newAddress > addressMaximum)
       requestReclaimLocked();
-    return fits;
+    return accepted;
   }
 };
 
@@ -418,23 +494,33 @@ struct ResourceReservation {
   static constexpr uint64_t MiB = ResourceBudget::MiB;
   // The capacity acquisition records heap and RSS deltas to validate this seed
   // and fixed native overhead separately from each isolate's own heap ceiling.
-  static constexpr uint64_t NATIVE_OVERHEAD = 512ull << 10;
-  ResourceReservation(std::shared_ptr<ResourceBudget> budget, uint32_t memoryMiB)
+  static constexpr uint64_t NATIVE_OVERHEAD = ResourceBudget::NATIVE_OVERHEAD;
+  static constexpr uint64_t PREPARATION_HEAP = ResourceBudget::PREPARATION_HEAP;
+  ResourceReservation(std::shared_ptr<ResourceBudget> budget, uint32_t memoryMiB,
+      bool platformDatabase = false)
       : budget(std::move(budget)),
-        maximumHeap(uint64_t(memoryMiB == 0 ? 128 : memoryMiB) * MiB) {}
+        maximumHeap(uint64_t(memoryMiB == 0 ? 128 : memoryMiB) * MiB),
+        returned(platformDatabase ? std::make_shared<DatabaseReservationReturn>() : nullptr) {}
   ~ResourceReservation() {
     if (!registered) return;
-    (void)budget->change(memoryCharge, 0, addressCharge, 0);
+    (void)budget->change(memoryCharge, 0, addressCharge, 0, false, false,
+        returned ? &returned->memoryBeforeRelease : nullptr);
     budget->residents.fetch_sub(1);
+    if (returned) returned->releasedMemory.store(memoryCharge);
   }
   std::shared_ptr<ResourceBudget> budget;
   const uint64_t maximumHeap;
+  const std::shared_ptr<DatabaseReservationReturn> returned;
   std::mutex mutex;
-  uint64_t heap = 2 * MiB, heapPhysical = 0, otherExternal = 0, ownedExternal = 0, source = 0,
+  uint64_t heap = PREPARATION_HEAP, heapPhysical = 0, otherExternal = 0, ownedExternal = 0, source = 0,
            logs = 0;
   uint64_t memoryCharge = 0, addressCharge = 0;
   uint32_t preparing = 0;
   bool registered = false;
+  std::optional<uint64_t> replacementCeiling() {
+    std::lock_guard lock(mutex);
+    return registered ? budget->replacementCeiling(memoryCharge, addressCharge) : std::nullopt;
+  }
   bool resize(bool admission = false, bool observe = false) {
     auto memory = NATIVE_OVERHEAD + source + heap + otherExternal + ownedExternal + logs;
     auto address = kj::max(2 * MiB, heap);
@@ -456,16 +542,12 @@ struct ResourceReservation {
         ",\"memoryCharge\":" + std::to_string(memoryCharge) +
         ",\"preparations\":" + std::to_string(preparing) + "}";
   }
-  bool registerPreparation() {
+  bool registerPreparation(DatabasePreparationReplacement* replacement = nullptr) {
     std::lock_guard lock(mutex);
-    if (budget->residents.fetch_add(1) >= budget->residentMaximum.load()) {
-      budget->residents.fetch_sub(1);
-      return false;
-    }
-    if (!resize(true)) {
-      budget->residents.fetch_sub(1);
-      return false;
-    }
+    KJ_ASSERT(!registered);
+    if (!budget->registerPreparation(bool(returned), replacement)) return false;
+    memoryCharge = ResourceBudget::PREPARATION_MEMORY;
+    addressCharge = PREPARATION_HEAP;
     registered = true;
     preparing = 1;
     return true;
@@ -1875,6 +1957,7 @@ struct ThreadState {
     bool closeRequested = false;
     bool idleClosing = false;
     bool cancelExpiredWork = false;
+    bool admissionClosing = false;
     std::shared_ptr<class DurableNodeSockets> nodeSockets;
     kj::Function<bool()> hasLocalSockets;
     kj::Function<kj::Promise<SocketParkResult>()> parkSockets;
@@ -2496,6 +2579,38 @@ bool canEvict(const std::shared_ptr<Slot> &slot, Slot *exclude) {
       slot->contexts.load() == 0;
 }
 
+constexpr auto DATABASE_ADMISSION_GRACE = std::chrono::milliseconds(100);
+
+struct DatabaseRetirement {
+  using Time = server::DurableAdmission::Time;
+  enum class Outcome { PENDING, RELEASED, REFUSED, EXPIRED };
+  uint64_t home;
+  uint64_t tree;
+  uint64_t lastUse;
+  std::shared_ptr<DatabaseReservationReturn> reservationReturned;
+  Time deadline;
+  bool preferDatabase;
+  std::optional<uint64_t> preparationCeiling;
+  bool treePreferred = false;
+  bool preparationPreferred = false;
+
+  Outcome outcome(Time now, bool hasTree, bool closing) const {
+    if (now >= deadline) return Outcome::EXPIRED;
+    if (hasTree) return closing ? Outcome::PENDING : Outcome::REFUSED;
+    return reservationReturned->releasedMemory.load() > 0 ? Outcome::RELEASED : Outcome::PENDING;
+  }
+};
+
+template <typename Retire>
+kj::Promise<bool> registerDurablePreparation(
+    ResourceReservation& reservation, bool platformDatabase, Retire retire) {
+  if (reservation.registerPreparation()) co_return true;
+  if (!platformDatabase) co_return false;
+  // A cold load retries the reservation once after reclaiming a single copy.
+  const auto replacement = co_await retire();
+  co_return replacement && reservation.registerPreparation(replacement.get());
+}
+
 // The maintenance pass's view of the residents, which it formats into the
 // lifecycle row outside the registry lock (tens of milliseconds with hundreds
 // of residents, every 100 ms). Weak references: a strong one made every idle
@@ -2522,8 +2637,14 @@ struct ThreadedServer {
   std::mutex durableRoutingMutex;
   using DurableWake = kj::Own<kj::CrossThreadPromiseFulfiller<void>>;
   std::map<uint64_t, std::map<uint64_t, DurableWake>> durableWaiters;
+  // One retirement at a time, so concurrent cold loads can retry against the same release.
+  // Both fields are guarded by durableRoutingMutex.
+  std::optional<DatabaseRetirement> databaseVictim;
+  using DatabaseReplacement = std::shared_ptr<DatabasePreparationReplacement>;
+  std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<DatabaseReplacement>>> databaseCapacityWaiters;
   std::atomic<uint64_t> durableHomeSessions{0};
   std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
+  std::atomic<uint64_t> durableAdmissionRetirements{0};
   std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
   std::atomic<uint64_t> nextDurableActor{0};
   std::atomic<uint64_t> durablePendingCommits{0};
@@ -2566,6 +2687,10 @@ struct ThreadedServer {
       server::DurablePressure pressure;
       std::vector<DurableIncoming> incoming;
       std::set<uint64_t> resident;
+      uint64_t databaseLastUse = 0;
+      bool databaseCanRetire = false;
+      std::weak_ptr<ResourceReservation> databaseReservation;
+      server::DurableAdmission::Time databasePreferredUntil{};
     };
     std::optional<DurableHome> home;
     uint64_t homeId = 0;
@@ -2943,9 +3068,112 @@ struct ThreadedServer {
     return true;
   }
 
+  // Called with durableRoutingMutex held. The home still rechecks all the
+  // prerequisites locally before it fences admission to the selected tree.
+  bool requestDatabaseRetirement(bool needsPreparationBudget = false) {
+    if (databaseVictim) {
+      if (!needsPreparationBudget) databaseVictim->preferDatabase = true;
+      if (needsPreparationBudget && !databaseVictim->preparationCeiling) {
+        const auto reservation = threads[databaseVictim->home - 1]->home->databaseReservation.lock();
+        if (!reservation) return false;
+        databaseVictim->preparationCeiling = reservation->replacementCeiling();
+        if (!databaseVictim->preparationCeiling) return false;
+      }
+      return true;
+    }
+    const auto deadline = server::DurableAdmission::Clock::now() + std::chrono::seconds(1);
+    for (const auto& thread: threads) {
+      const auto& home = *thread->home;
+      if (!home.databaseCanRetire || home.reservedTrees != 1 || home.resident.size() != 1 ||
+          !home.warmDefinition.starts_with(PLATFORM_DATABASE_COPY_PREFIX) ||
+          home.pressure.resetting()) {
+        continue;
+      }
+      const auto tree = *home.resident.begin();
+      if (!durableAdmission->isIdleTree(tree, thread->homeId) ||
+          (databaseVictim && home.databaseLastUse >= databaseVictim->lastUse)) continue;
+      const auto reservation = home.databaseReservation.lock();
+      if (!reservation) continue;
+      const auto preparationCeiling =
+          needsPreparationBudget ? reservation->replacementCeiling() : std::nullopt;
+      if (needsPreparationBudget && !preparationCeiling) continue;
+      databaseVictim =
+          DatabaseRetirement{thread->homeId, tree, home.databaseLastUse, reservation->returned,
+            deadline, !needsPreparationBudget, preparationCeiling};
+    }
+    if (!databaseVictim) return false;
+    wake(threads[databaseVictim->home - 1]->wake);
+    return true;
+  }
+
+  // The routing lock serializes the completion pass and the accept loop's deadline.
+  void finishDatabaseRetirement(DatabaseRetirement::Outcome outcome,
+      server::DurableAdmission::Time now) {
+    using Outcome = DatabaseRetirement::Outcome;
+    if (outcome == Outcome::PENDING) return;
+    auto& home = *threads[databaseVictim->home - 1]->home;
+    if (outcome == Outcome::RELEASED && databaseVictim->preferDatabase) {
+      // Leave time for the native preface retry, whose backoff is capped at 50 ms.
+      home.databasePreferredUntil = now + DATABASE_ADMISSION_GRACE;
+    }
+    if (databaseVictim->treePreferred) {
+      durableAdmission->limitDatabaseTreePreference(
+          outcome == Outcome::RELEASED ? now + DATABASE_ADMISSION_GRACE : now);
+    }
+    if (databaseVictim->preparationPreferred) {
+      resources->limitDatabasePreparationPreference(
+          outcome == Outcome::RELEASED ? now + DATABASE_ADMISSION_GRACE : now);
+    }
+    if (outcome == Outcome::EXPIRED) {
+      home.databaseCanRetire = false;
+      durableAdmission->recordOverload();
+      KJ_LOG(WARNING, "idle database admission retirement timed out",
+          databaseVictim->home, databaseVictim->tree);
+    }
+    DatabaseReplacement replacement;
+    if (outcome == Outcome::RELEASED && databaseVictim->preparationCeiling) {
+      const auto& returned = *databaseVictim->reservationReturned;
+      // Recheck the actual return. The copy's charge may have changed after selection.
+      const auto ceiling = returned.releasedMemory.load() < ResourceBudget::PREPARATION_MEMORY
+          ? resources->admissionMaximum
+          : kj::max(resources->admissionMaximum,
+                kj::min(*databaseVictim->preparationCeiling, returned.memoryBeforeRelease));
+      replacement = std::make_shared<DatabasePreparationReplacement>(ceiling);
+    }
+    databaseVictim.reset();
+    for (const auto &waiter: databaseCapacityWaiters) {
+      if (waiter->isWaiting()) waiter->fulfill(DatabaseReplacement(replacement));
+    }
+    databaseCapacityWaiters.clear();
+  }
+
+  void expireDatabaseRetirement(server::DurableAdmission::Time now) {
+    if (databaseVictim && now >= databaseVictim->deadline) {
+      finishDatabaseRetirement(DatabaseRetirement::Outcome::EXPIRED, now);
+    }
+  }
+
+  kj::Promise<DatabaseReplacement> reclaimIdleDatabase() {
+    auto signal = kj::newPromiseAndCrossThreadFulfiller<DatabaseReplacement>();
+    {
+      std::lock_guard lock(durableRoutingMutex);
+      if (!requestDatabaseRetirement(true)) co_return DatabaseReplacement{};
+      if (!databaseVictim->preparationPreferred) {
+        // Leave one preparation's credit for a database as soon as the victim
+        // drops its charge. Existing copies keep their regular growth limits.
+        resources->preferDatabasePreparation(databaseVictim->deadline + DATABASE_ADMISSION_GRACE);
+        databaseVictim->preparationPreferred = true;
+      }
+      std::erase_if(databaseCapacityWaiters, [](auto &waiter) { return !waiter->isWaiting(); });
+      databaseCapacityWaiters.push_back(kj::mv(signal.fulfiller));
+    }
+    co_return co_await signal.promise;
+  }
+
   // durableRoutingMutex holds placement and event admission together, before
   // the accept loop acknowledges a connection or reads its dispatch bytes.
-  bool reserveDurableHome(const DurableRoute &route, server::DurableAdmission::Ticket ticket) {
+  bool reserveDurableHome(
+      const DurableRoute &route, server::DurableAdmission::Ticket ticket, bool database) {
     auto assigned = durableAdmission->homeFor(ticket.tree);
     if (!assigned) {
       std::vector<server::DurableCopyCandidate> candidates;
@@ -2953,7 +3181,9 @@ struct ThreadedServer {
       const auto now = server::DurableAdmission::Clock::now();
       for (size_t i = 0; i < threads.size(); ++i) {
         if (!threads[i]->home) continue;
+        if (databaseVictim && databaseVictim->home == i + 1) continue;
         auto &home = *threads[i]->home;
+        if (!database && now < home.databasePreferredUntil) continue;
         // An empty copy keeps its definition until its isolate is released.
         // Prefer a matching warm copy, then an unused home, then a different empty copy.
         if (home.reservedTrees == 0 && !home.pressure.resetting() &&
@@ -2970,6 +3200,7 @@ struct ThreadedServer {
       assigned = choice.value_or(spare);
       auto &home = *threads[*assigned - 1]->home;
       if (!choice) home.definition = route.open.definition;
+      home.databasePreferredUntil = {};
       KJ_ASSERT(durableAdmission->publishHome(ticket.tree, *assigned));
       ++home.reservedTrees;
     }
@@ -2980,13 +3211,22 @@ struct ThreadedServer {
       const DurableRoute &route, uint64_t bytes, server::DurableAdmission::Time deadline) {
     using Admission = server::DurableAdmission;
     if (!ready.load(std::memory_order_acquire)) return {Admission::Status::OVERLOADED};
+    const bool database = route.open.className == "SqlDatabase" &&
+        route.open.definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
     std::lock_guard lock(durableRoutingMutex);
-    auto result =
-        durableAdmission->queue(route.key, route.open, bytes, deadline, Admission::Clock::now());
-    if (result.ticket && !reserveDurableHome(route, *result.ticket)) {
-      KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket));
+    auto result = durableAdmission->queue(
+        route.key, route.open, bytes, deadline, Admission::Clock::now(), database);
+    if (result.ticket && !reserveDurableHome(route, *result.ticket, database)) {
+      KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket, !database || !result.needsHome));
       durableAdmission->releaseUnassigned(result.ticket->tree);
-      return {Admission::Status::OVERLOADED};
+      result = {.status = Admission::Status::OVERLOADED, .newTreeCapacityRefused = result.needsHome};
+    } else if (database && result.ticket && result.needsHome) {
+      durableAdmission->claimDatabaseTree();
+    }
+    if (database && result.newTreeCapacityRefused) {
+      // The existing pre-dispatch retry waits for idle retirement on its original lease.
+      if (requestDatabaseRetirement()) return {Admission::Status::RETIRING};
+      durableAdmission->recordOverload();
     }
     return result;
   }
@@ -3023,7 +3263,7 @@ struct ThreadedServer {
     root.idle->eventFinished(durableIdleNow());
   }
 
-  bool finishDurable(server::DurableAdmission::Ticket ticket) {
+  bool finishDurable(server::DurableAdmission::Ticket ticket, bool databaseCanRetire = false) {
     std::lock_guard lock(durableRoutingMutex);
     durableAdmission->cancel(ticket);
     wakeDurableTree(ticket.tree);
@@ -3034,7 +3274,14 @@ struct ThreadedServer {
     }
     const auto finished = durableAdmission->complete(ticket, *assigned);
     auto &home = *threads[*assigned - 1]->home;
-    if (home.resident.contains(ticket.tree) || !durableAdmission->stopIdleTree(ticket.tree, *assigned))
+    if (home.resident.contains(ticket.tree)) {
+      if (finished && home.warmDefinition.starts_with(PLATFORM_DATABASE_COPY_PREFIX)) {
+        home.databaseLastUse = nowNs();
+        home.databaseCanRetire = databaseCanRetire;
+      }
+      return finished;
+    }
+    if (!durableAdmission->stopIdleTree(ticket.tree, *assigned))
       return finished;
     KJ_ASSERT(durableAdmission->releaseTree(ticket.tree, *assigned));
     if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
@@ -3092,9 +3339,12 @@ struct ThreadedServer {
   }
 
   kj::Promise<void> startDurableSession(ThreadState &state, DurableIncoming call) {
+    const bool database = call.route.open.definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
     KJ_DEFER({
-      if (finishDurable(call.ticket)) {
-        auto root = state.durableRoots.find(call.ticket.tree);
+      auto root = state.durableRoots.find(call.ticket.tree);
+      const bool databaseCanRetire = database &&
+          root != state.durableRoots.end() && canRetireDatabase(root->second);
+      if (finishDurable(call.ticket, databaseCanRetire)) {
         if (root != state.durableRoots.end() && !root->second.resetting) {
           root->second.sockets.erase(call.ticket.event);
           root->second.idle->eventFinished(durableIdleNow());
@@ -3167,10 +3417,40 @@ struct ThreadedServer {
     }));
   }
 
+  static bool canRetireDatabase(ThreadState::DurableRoot &root) {
+    if (root.resetting || root.closeRequested || root.idleClosing || root.adopting ||
+        root.parking != kj::none || root.parked != kj::none || root.idle->hasPending() ||
+        !root.sockets.empty() || root.actor->getNonHibernatableWebSocketCount()->count > 0 ||
+        root.facetHasOrdinaryWebSocket() || (root.nodeSockets && root.hasLocalSockets()) ||
+        root.facetsBusy(true)) {
+      return false;
+    }
+    KJ_IF_SOME(context, root.actor->getIoContext()) {
+      if (context.hasCurrentIncomingRequest()) return false;
+    }
+    return true;
+  }
+
   void retireIdleDurableRoots(ThreadState &state) {
+    const auto homeId = state.durableHome;
+    const auto victim = [&]() -> std::optional<DatabaseRetirement> {
+      std::lock_guard lock(durableRoutingMutex);
+      if (databaseVictim && databaseVictim->home == homeId) return databaseVictim;
+      return std::nullopt;
+    }();
+    KJ_DEFER(if (victim) {
+      const auto root = state.durableRoots.find(victim->tree);
+      const bool hasTree = root != state.durableRoots.end();
+      std::lock_guard lock(durableRoutingMutex);
+      if (databaseVictim && databaseVictim->tree == victim->tree &&
+          databaseVictim->deadline == victim->deadline) {
+        const auto now = server::DurableAdmission::Clock::now();
+        finishDatabaseRetirement(
+            victim->outcome(now, hasTree, hasTree && root->second.admissionClosing), now);
+      }
+    });
     if (!state.durableSlot) return;
     const auto now = durableIdleNow();
-    const auto homeId = state.durableHome;
     auto &memory = *state.durableSlot->limits->memory;
     const auto accounted = [&] { return memory.heap.load() + memory.external.load(); };
     const auto placementLimit = kj::min(durablePlacement.placementBytes, memory.maximum * 3 / 4);
@@ -3181,6 +3461,9 @@ struct ThreadedServer {
       using Decision = server::DurableIdleLifecycle::Decision;
       auto& root = current->second;
       auto& actor = *root.actor;
+      const auto tree = current->first;
+      const bool forAdmission = victim && victim->tree == tree;
+      if (forAdmission && !root.admissionClosing && !canRetireDatabase(root)) continue;
       if (root.adopting) continue;
       if (root.parking != kj::none && root.parked == kj::none) continue;
       KJ_IF_SOME(parked, root.parked) {
@@ -3188,6 +3471,7 @@ struct ThreadedServer {
         if (!parked) {
           root.parked = kj::none;
           root.cancelExpiredWork = false;
+          root.admissionClosing = false;
           if (!root.resetting && !root.closeRequested) {
             std::lock_guard lock(durableRoutingMutex);
             KJ_ASSERT(durableAdmission->resumeIdleTree(current->first, homeId));
@@ -3203,7 +3487,8 @@ struct ThreadedServer {
       auto decision = Decision::RETIRE;
       if (!explicitClose) {
         if (root.parked == kj::none)
-          decision = root.idle->check(now, ordinarySocket, pressured);
+          decision = root.idle->check(now, ordinarySocket,
+              pressured || forAdmission || root.admissionClosing);
         else if (root.cancelExpiredWork)
           decision = Decision::CANCEL_PENDING;
       }
@@ -3220,12 +3505,20 @@ struct ThreadedServer {
           if (context.hasCurrentIncomingRequest()) continue;
         }
       }
-      const auto tree = current->first;
       {
         std::lock_guard lock(durableRoutingMutex);
+        if (forAdmission && !root.admissionClosing &&
+            (!databaseVictim || databaseVictim->tree != tree ||
+                databaseVictim->deadline != victim->deadline ||
+                server::DurableAdmission::Clock::now() >= victim->deadline ||
+                threads[homeId - 1]->home->databaseLastUse != victim->lastUse ||
+                !durableAdmission->isIdleTree(tree, homeId))) {
+          continue;
+        }
         const bool stopped = closeSocketSessions ? durableAdmission->stopIdleTreeWithSockets(tree, homeId)
                                                  : durableAdmission->stopIdleTree(tree, homeId);
         if (!stopped) continue;
+        if (forAdmission) root.admissionClosing = true;
       }
       // Park the whole object's node transports before canceling I/O or
       // closing standard sockets. The abort would break the actor and make
@@ -3233,7 +3526,7 @@ struct ThreadedServer {
       if (!explicitClose && root.parked == kj::none && root.nodeSockets) {
         root.cancelExpiredWork = cancelPending;
         root.parking = root.parkSockets()
-                           .then([this, &state, &root, tree](SocketParkResult result) {
+                           .then([this, &state, &root, tree, forAdmission](SocketParkResult result) {
           if (result == SocketParkResult::UNKNOWN && !root.resetting) {
             auto reason =
                 KJ_EXCEPTION(DISCONNECTED, "Durable Object could not confirm WebSocket parking.");
@@ -3241,9 +3534,11 @@ struct ThreadedServer {
             root.actor->abort(kj::mv(reason));
           }
           root.parked = result == SocketParkResult::PARKED;
-        }, [&root](kj::Exception &&exception) {
+          if (forAdmission) wake(threads[state.durableHome - 1]->wake);
+        }, [this, &root, homeId, forAdmission](kj::Exception &&exception) {
           reportDurableFailureForTest("WebSocket parking", exception);
           root.parked = false;
+          if (forAdmission) wake(threads[homeId - 1]->wake);
         }).eagerlyEvaluate(nullptr);
         continue;
       }
@@ -3262,7 +3557,10 @@ struct ThreadedServer {
         actor.abort(KJ_EXCEPTION(DISCONNECTED, "Durable Object retired after its idle deadline."));
         continue;
       }
-      if (!explicitClose || root.idleClosing) {
+      const bool admissionClosing = root.admissionClosing;
+      if (admissionClosing) {
+        durableAdmissionRetirements.fetch_add(1);
+      } else if (!explicitClose || root.idleClosing) {
         if (pressured && !root.idleClosing) {
           durablePressureRetirements.fetch_add(1);
           reclaimed = true;
@@ -3277,8 +3575,17 @@ struct ThreadedServer {
       {
         std::lock_guard lock(durableRoutingMutex);
         KJ_ASSERT(durableAdmission->releaseTree(tree, homeId));
+        if (admissionClosing && databaseVictim && databaseVictim->tree == tree &&
+            databaseVictim->preferDatabase) {
+          // Keep the tree credit while the reservation is still returning. The
+          // completion pass shortens this to the same retry window as the home.
+          durableAdmission->preferDatabaseTree(databaseVictim->deadline + DATABASE_ADMISSION_GRACE);
+          databaseVictim->treePreferred = true;
+        }
         auto &home = *threads[homeId - 1]->home;
         home.resident.erase(tree);
+        home.databaseCanRetire = false;
+        home.databaseLastUse = 0;
         if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
         if (home.resident.empty()) state.durableSlot->lastUseNs.store(nowNs());
       }
@@ -3292,11 +3599,14 @@ struct ThreadedServer {
         memory.observe(true);
       });
     }
+    const bool databaseCanRetire = state.durableSlot->planRevision.starts_with(PLATFORM_DATABASE_COPY_PREFIX) &&
+        state.durableRoots.size() == 1 && canRetireDatabase(state.durableRoots.begin()->second);
     server::DurablePressure::Action pressureAction;
     bool releaseCopy;
     {
       std::lock_guard lock(durableRoutingMutex);
       auto &home = *threads[homeId - 1]->home;
+      home.databaseCanRetire = databaseCanRetire;
       home.memory = accounted();
       const bool rejectedGrowth =
           memory.cause->load() == LimitCause::MEMORY || memory.durableProcessPressure.load();
@@ -3318,11 +3628,24 @@ struct ThreadedServer {
       }
     }
     if (releaseCopy) {
+      if (victim && !state.durableRoots.contains(victim->tree)) {
+        if (const auto* directory = durableLifecycleTestDirectory()) {
+          const auto path = kj::str(directory, "/hold-database-reservation");
+          const auto fd = open(path.cStr(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+          if (fd >= 0) {
+            close(fd);
+            // Exercise the deadline while a real reservation outlives the copy.
+            state.tasks.add(state.io.provider->getTimer().afterDelay(10 * kj::SECONDS).then(
+                [hold = state.durableSlot->reservation]() mutable { hold.reset(); }));
+          }
+        }
+      }
       state.durableSlot.reset();
       std::lock_guard lock(durableRoutingMutex);
       auto &home = *threads[homeId - 1]->home;
       home.memory = 0;
       home.warmDefinition.clear();
+      home.databaseReservation.reset();
       if (home.reservedTrees == 0) home.definition.clear();
       if (home.pressure.resetting()) {
         home.pressure.closed();
@@ -3372,6 +3695,7 @@ struct ThreadedServer {
         ",\"groupCreationRefusals\":" + std::to_string(sandboxRefusals.load()) +
         ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
         ",\"pressureRetirements\":" + std::to_string(durablePressureRetirements.load()) +
+        ",\"admissionRetirements\":" + std::to_string(durableAdmissionRetirements.load()) +
         ",\"actorResets\":" + std::to_string(durableActorResets.load()) +
         ",\"isolateResets\":" + std::to_string(durableIsolateResets.load()) +
         ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
@@ -3942,9 +4266,13 @@ struct ThreadedServer {
       ThreadState &state, kj::String descriptor, std::string definition) {
     JsonDoc document(descriptor);
     auto input = document.get();
+    const bool platformDatabase = definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
     auto reservation = std::make_shared<ResourceReservation>(
-        resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"));
-    if (!reservation->registerPreparation()) kj::throwRecoverableException(capacityError());
+        resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), platformDatabase);
+    if (!(co_await registerDurablePreparation(
+            *reservation, platformDatabase, [this] { return reclaimIdleDatabase(); }))) {
+      kj::throwRecoverableException(capacityError());
+    }
     auto slot = std::make_shared<Slot>();
     slot->reservation = std::move(reservation);
     slot->instance = ++nextInstance;
@@ -3998,7 +4326,9 @@ struct ThreadedServer {
     state.durableSlot.reset();
     {
       std::lock_guard lock(durableRoutingMutex);
-      threads[state.durableHome - 1]->home->warmDefinition.clear();
+      auto &home = *threads[state.durableHome - 1]->home;
+      home.warmDefinition.clear();
+      home.databaseReservation.reset();
     }
     if (!state.durableLoad) {
       state.durableLoad.emplace(ThreadState::DurableLoad{
@@ -4027,7 +4357,9 @@ struct ThreadedServer {
     state.durableSlot = loaded;
     {
       std::lock_guard lock(durableRoutingMutex);
-      threads[state.durableHome - 1]->home->warmDefinition = loaded->planRevision;
+      auto &home = *threads[state.durableHome - 1]->home;
+      home.warmDefinition = loaded->planRevision;
+      if (loaded->reservation->returned) home.databaseReservation = loaded->reservation;
     }
     co_return loaded;
   }
@@ -7484,7 +7816,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
     if (server.durableAdmission) {
       const auto expired = [&] {
         std::lock_guard lock(server.durableRoutingMutex);
-        return server.durableAdmission->expire(Admission::Clock::now());
+        const auto now = Admission::Clock::now();
+        server.expireDatabaseRetirement(now);
+        return server.durableAdmission->expire(now);
       }();
       for (const auto &ticket: expired) {
         auto socket = durableWaiting.find(ticket.event);
