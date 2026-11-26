@@ -924,7 +924,7 @@ void SqliteDatabase::rollbackWalTransaction() {
   if (!sqlite3_get_autocommit(*this)) {
     run("ROLLBACK TRANSACTION");
   } else {
-    // SQLITE_FULL can roll back the entire transaction, including its savepoints.
+    // SQLite can roll back the entire transaction, including its savepoints.
     clearRolledBackTransaction();
   }
 }
@@ -1019,15 +1019,22 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
       sqlite3* db = *this;
       // We are in a transaction
       if (inTransaction || !savepoints.empty()) {
-        // The transaction was auto-rolledback, re-enabling the auto commit mode, so we should fail
+        // SQLite automatically rolled back the whole transaction.
         if (sqlite3_get_autocommit(db) != 0) {
+          auto* budget =
+              activeExecutionScope == nullptr ? nullptr : activeExecutionScope->budget.get();
+          const bool budgetInterrupted = code == SQLITE_INTERRUPT && budget != nullptr &&
+              budget->getCause() != SqlExecutionBudget::Cause::NONE;
+          if (auto* limit = getWalTransactionLimit();
+              budgetInterrupted && budget->hasDeadline() && limit != nullptr && limit->isActive()) {
+            // The platform's explicit transaction will clear the rolled-back savepoints
+            // and callbacks. Report the interruption to its caller without breaking the actor.
+            return;
+          }
           criticalErrorOccurred = true;
           KJ_IF_SOME(cb, onCriticalErrorCallback) {
-            if (code == SQLITE_INTERRUPT && activeExecutionScope != nullptr &&
-                activeExecutionScope->budget &&
-                activeExecutionScope->budget->getCause() != SqlExecutionBudget::Cause::NONE) {
-              auto error = KJ_REQUIRE_NONNULL(currentRegulator)->sqlExecutionLimitException(
-                  *activeExecutionScope->budget);
+            if (budgetInterrupted) {
+              auto error = KJ_REQUIRE_NONNULL(currentRegulator)->sqlExecutionLimitException(*budget);
               auto description = kj::str(error.getDescription());
               cb(description, kj::mv(error));
               return;

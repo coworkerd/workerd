@@ -163,14 +163,16 @@ class DefaultRegulatorForTest: public SqliteDatabase::Regulator {
 };
 static constexpr DefaultRegulatorForTest DEFAULT_REGULATOR_FOR_TEST;
 
+class DeadlineRegulator final: public SqliteDatabase::Regulator {
+ public:
+  mutable std::shared_ptr<SqlExecutionBudget> budget;
+  std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() const override { return budget; }
+  bool isAllowedTrigger(kj::StringPtr name) const override { return name == "r"; }
+};
+
 KJ_TEST("SQLite deadline covers multiple statements and interrupts an active cursor") {
   using Cause = SqlExecutionBudget::Cause;
-  static const class DeadlineRegulator final: public SqliteDatabase::Regulator {
-   public:
-    mutable std::shared_ptr<SqlExecutionBudget> budget;
-    std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() const override { return budget; }
-    bool isAllowedTrigger(kj::StringPtr name) const override { return name == "r"; }
-  } regulator;
+  static const DeadlineRegulator regulator;
   KJ_DEFER(regulator.budget.reset());
   auto dir = kj::newInMemoryDirectory(kj::nullClock());
   SqliteDatabase::Vfs vfs(*dir);
@@ -191,6 +193,51 @@ KJ_TEST("SQLite deadline covers multiple statements and interrupts an active cur
   KJ_EXPECT(checks == 25);
   regulator.budget.reset();
   KJ_EXPECT(db.run(options, "SELECT 3").getInt(0) == 3);
+}
+
+KJ_TEST("SQL deadline and client disconnect leave a rolled-back WAL transaction usable") {
+  using Cause = SqlExecutionBudget::Cause;
+  static const DeadlineRegulator regulator;
+  const SqliteDatabase::QueryOptions options{.regulator = regulator};
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::WalTransactionLimit limit(1024 * 1024);
+  SqliteDatabase::Vfs vfs(*dir, {.walTransactionLimit = &limit});
+  SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  db.run("PRAGMA page_size = 4096; PRAGMA journal_mode = WAL; CREATE TABLE ledger(id INTEGER)");
+  limit.setPageSize(4096);
+  db.run("INSERT INTO ledger VALUES (1)");
+  db.onCriticalError([](kj::StringPtr message, kj::Maybe<kj::Exception>) {
+    KJ_FAIL_EXPECT("an expected SQL interruption marked the database broken", message);
+  });
+
+  for (auto cause: {Cause::WALL, Cause::DISCONNECTED}) {
+    limit.begin();
+    db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (2)");
+    bool rolledBack = false;
+    db.onRollback([&] { rolledBack = true; });
+    uint32_t checks = 0;
+    regulator.budget = std::make_shared<SqlExecutionBudget>(
+        30000000000, [&]() { return ++checks >= 25 ? cause : Cause::NONE; });
+    KJ_DEFER(regulator.budget.reset());
+    const auto message = cause == Cause::WALL
+        ? "SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded"
+        : "SQL client disconnected";
+    KJ_EXPECT_THROW_MESSAGE(message, db.run(options,
+        "WITH RECURSIVE r(n) AS (VALUES(3) UNION ALL SELECT n+1 FROM r WHERE n < 1000000) "
+        "INSERT INTO ledger SELECT n FROM r"));
+    KJ_ASSERT(sqlite3_get_autocommit(db), "SQLite should have rolled back the whole transaction");
+    KJ_EXPECT(!db.observedCriticalError());
+    db.rollbackWalTransaction();
+    limit.end(db);
+    KJ_EXPECT(rolledBack);
+    KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 1);
+    KJ_EXPECT(db.run("SELECT id FROM ledger").getInt(0) == 1);
+  }
+
+  limit.begin();
+  db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (3); RELEASE ledger");
+  limit.end(db);
+  KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 2);
 }
 
 KJ_TEST("SQLite backed by in-memory directory") {
@@ -1985,7 +2032,8 @@ void testCriticalError(const char* expectedErrorMessage,
 
 KJ_TEST("SQLite critical error handling for SQLITE_IOERR") {
   auto dir = kj::atomicRefcounted<ErrorInjectableDirectory>();
-  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase::WalTransactionLimit limit(1024 * 1024);
+  SqliteDatabase::Vfs vfs(*dir, {.walTransactionLimit = &limit});
   SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
 
   // Create a tracker to verify our callback is called
@@ -2011,6 +2059,9 @@ KJ_TEST("SQLite critical error handling for SQLITE_IOERR") {
     INSERT INTO things(value) VALUES (123);
   )"));
 
+  limit.setPageSize(db.run("PRAGMA page_size").getInt(0));
+  limit.begin();
+  KJ_DEFER(limit.abandon(db));
   db.run("BEGIN TRANSACTION");
 
   // Now arrange for an error on write().
