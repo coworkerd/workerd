@@ -541,7 +541,7 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
 
 DurableLogShipper::~DurableLogShipper() noexcept(false) {
   KJ_DEFER(channel.unregisterShipper(*this));
-  sqlite3_wal_hook(*db, nullptr, nullptr);
+  db->setWalHook(nullptr, nullptr);
   if (!channel.enabled()) return;
   Writer w;
   w.u8(MSG_CLOSED);
@@ -569,7 +569,6 @@ void DurableLogShipper::configure(SqliteDatabase& database) {
   sqlite3* handle = database;
   // No checkpoint but the ones below: not after a commit, and not when the last connection closes -- the WAL must
   // keep every frame that has not been handed on.
-  sqlite3_wal_autocheckpoint(handle, 0);
   int previous = -1;
   sqlite3_db_config(handle, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, &previous);
   // The owner does not wait for its own disk: this machine's files are a cache, and the write is durable once the
@@ -581,7 +580,7 @@ void DurableLogShipper::configure(SqliteDatabase& database) {
   }
   // Only to count: the hook's frame count is SQLite's own mxFrame, which says whether the WAL holds a frame this
   // shipper has not read (a rolled back overflow frame stays in the file, so its size does not say).
-  sqlite3_wal_hook(handle, &DurableLogShipper::walHook, this);
+  database.setWalHook(&DurableLogShipper::walHook, this);
 }
 
 void DurableLogShipper::afterReset(SqliteDatabase& database) {
