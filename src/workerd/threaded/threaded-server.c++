@@ -638,6 +638,8 @@ void noSandboxRoom(ResourceBudget &budget) {
 }
 
 constexpr kj::Exception::DetailTypeId CAPACITY_DETAIL = 0x9f232974b0ac7143ull;
+// The node reads this detail on the private durable bootstrap, before it has an event dispatcher.
+constexpr kj::Exception::DetailTypeId DURABLE_COPY_RESERVATION_REFUSED = 0xe05c5dbb242a7eb4ull;
 enum class CapacityScope { PROCESS, TENANT };
 bool isCapacityError(const kj::Exception &error) {
   return error.getDetail(CAPACITY_DETAIL) != kj::none;
@@ -1879,20 +1881,36 @@ const char *durableLifecycleTestDirectory() {
   return directory;
 }
 
-server::DurableIdleLifecycle::Time durableIdleNow() {
-  auto now = server::DurableAdmission::Clock::now();
+uint32_t readDurableLifecycleSetting(kj::StringPtr name) {
   const auto *directory = durableLifecycleTestDirectory();
-  if (directory == nullptr) return now;
-  auto path = kj::str(directory, "/idle-offset-ms");
+  if (directory == nullptr) return 0;
+  auto path = kj::str(directory, "/", name);
   int fd = open(path.cStr(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-  if (fd < 0) return now;
+  if (fd < 0) return 0;
   KJ_DEFER(close(fd));
   char bytes[16];
   auto size = read(fd, bytes, sizeof(bytes));
-  if (size <= 0) return now;
-  uint32_t offset = 0;
-  auto parsed = std::from_chars(bytes, bytes + size, offset);
-  if (parsed.ec == std::errc() && offset <= 86'400'000) now += std::chrono::milliseconds(offset);
+  if (size <= 0) return 0;
+  uint32_t value = 0;
+  auto parsed = std::from_chars(bytes, bytes + size, value);
+  return parsed.ec == std::errc() ? value : 0;
+}
+
+bool refuseCopyReservationForTest() {
+  const auto request = readDurableLifecycleSetting("copy-reservation-refusal");
+  static std::atomic<uint32_t> lastRefusal = 0;
+  auto last = lastRefusal.load();
+  // A fixture request is consumed once, even when several homes attempt a cold copy.
+  while (request > last) {
+    if (lastRefusal.compare_exchange_weak(last, request)) return true;
+  }
+  return false;
+}
+
+server::DurableIdleLifecycle::Time durableIdleNow() {
+  auto now = server::DurableAdmission::Clock::now();
+  const auto offset = readDurableLifecycleSetting("idle-offset-ms");
+  if (offset <= 86'400'000) now += std::chrono::milliseconds(offset);
   return now;
 }
 
@@ -4270,9 +4288,11 @@ struct ThreadedServer {
     const bool platformDatabase = definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
     auto reservation = std::make_shared<ResourceReservation>(
         resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), platformDatabase);
-    if (!(co_await registerDurablePreparation(
+    if (refuseCopyReservationForTest() || !(co_await registerDurablePreparation(
             *reservation, platformDatabase, [this] { return reclaimIdleDatabase(); }))) {
-      kj::throwRecoverableException(capacityError());
+      auto error = capacityError();
+      error.setDetail(DURABLE_COPY_RESERVATION_REFUSED, kj::heapArray<kj::byte>(0));
+      kj::throwRecoverableException(kj::mv(error));
     }
     auto slot = std::make_shared<Slot>();
     slot->reservation = std::move(reservation);
