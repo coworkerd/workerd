@@ -4,6 +4,8 @@
 #include "threaded-server.c++"
 #undef main
 
+#include <workerd/server/factory/coworkerd-wal-wire.h>
+
 #include <spawn.h>
 #include <sys/wait.h>
 
@@ -2137,6 +2139,114 @@ KJ_TEST("a call thread cancels background work that outlives the drain limit") {
   if (returned) backstop.wait(waitScope);
   KJ_EXPECT(canceled && tasks.isEmpty());
   KJ_EXPECT(BACKGROUND_BACKSTOP > WAIT_UNTIL_LIMIT);
+}
+
+class TeardownWalChannel final: public server::DurableWalChannel {
+ public:
+  kj::Vector<kj::StringPtr> events;
+
+  bool enabled() const override {
+    return true;
+  }
+  uint64_t nextRequest() override {
+    return ++request;
+  }
+
+  uint64_t registerShipper(server::DurableLogShipper&) override {
+    events.add("register shipper"_kj);
+    return nextRequest();
+  }
+  void unregisterShipper(server::DurableLogShipper& shipper) override {
+    KJ_EXPECT(shipper.getOpenId() == 1);
+    events.add("unregister shipper"_kj);
+  }
+  void send(uint64_t openId, kj::Array<kj::byte> message) override {
+    KJ_REQUIRE(message.size() >= 13);
+    KJ_EXPECT(openId == 1 && server::wal::getLe64(message.begin() + 5) == openId);
+    switch (message[4]) {
+      case server::wal::MSG_OPEN:
+        events.add("OPEN"_kj);
+        break;
+      case server::wal::MSG_CLOSED:
+        events.add("CLOSED"_kj);
+        break;
+      default:
+        KJ_FAIL_ASSERT("unexpected WAL message", message[4]);
+    }
+  }
+  kj::Promise<void> sendFrames(
+      server::DurableLogShipper&, kj::Array<kj::byte>, uint64_t, kj::Timer&) override {
+    KJ_FAIL_ASSERT("the shutdown fixture does not write frames");
+  }
+
+ private:
+  uint64_t request = 0;
+};
+
+class TeardownLoopback final: public Worker::Actor::Loopback, public kj::Refcounted {
+ public:
+  kj::Own<WorkerInterface> getWorker(IoChannelFactory::SubrequestMetadata) override {
+    KJ_FAIL_ASSERT("the shutdown fixture does not deliver events");
+  }
+  kj::Own<Loopback> addRef() override {
+    return kj::addRef(*this);
+  }
+};
+
+KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing the WAL Home") {
+  ThreadedServer server{1, "", "", -1, {}, {}, &initializeV8()};
+  server::DurableStorage storage;
+  // The fixture owns the resources so it can record early handle release safely.
+  TeardownWalChannel channel;
+  auto& events = channel.events;
+  Slot slot;
+  {
+    ThreadState state;
+    state.durableSlot = std::shared_ptr<Slot>(&slot, [](Slot*) {});
+    std::weak_ptr<Slot> copy = state.durableSlot;
+    state.wal = kj::attachRef(channel, kj::defer([&events, copy] {
+      KJ_EXPECT(copy.expired());
+      events.add("release Home"_kj);
+    }));
+
+    constexpr auto source = "export default { fetch() { return new Response('ok'); } };"_kj;
+    JsonDoc descriptor(kj::str(R"({"workerId":"test/teardown","versionId":"v1",
+        "mainModule":"index.js","compatibilityDate":"2026-11-01","contentHash":")",
+        digest(source.asBytes()).c_str(), "\"}"));
+    slot.worker = server.compile(slot, descriptor.get(), source);
+    auto makeCache = [&](const ActorCache::SharedLru&, OutputGate& gate, ActorCache::Hooks&,
+                         SqliteObserver& observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
+      auto storageId = digest("teardown"_kj.asBytes());
+      auto uniqueKey = kj::str("coworkerd-do-root-v1-", storageId.c_str());
+      auto database = storage.open(uniqueKey, storageId.c_str(), observer);
+      auto shipper = storage.ship(uniqueKey,
+          {.objectName = kj::str("test/teardown/1"), .storageId = kj::str(storageId.c_str())},
+          *database, state.io.provider->getTimer(), *state.wal, {}, 0);
+      return kj::heap<ActorSqlite>(kj::mv(database), gate,
+          [shipper = kj::mv(shipper)](SpanParent) mutable { return shipper->onCommit(); });
+    };
+    // This observer only touches the recorder, so even a broken order can be reported safely.
+    auto observer = kj::refcounted<ActorObserver>().attach(kj::defer([&events, copy] {
+      KJ_EXPECT(!copy.expired());
+      events.add("release actor observer"_kj);
+    }));
+    auto actor = kj::refcounted<Worker::Actor>(*KJ_ASSERT_NONNULL(slot.worker), kj::none,
+        kj::str("teardown"), false, kj::mv(makeCache), kj::none, Frankenvalue(),
+        Worker::Actor::MakeStorageFunc(), kj::refcounted<TeardownLoopback>(), state.timer,
+        kj::mv(observer), kj::none, kj::none);
+    auto& root = state.durableRoots.emplace(1, ThreadState::DurableRoot{.actor = kj::mv(actor)})
+                     .first->second;
+    auto releaseOnCancel = kj::defer([&events, actor = kj::addRef(*root.actor)]() mutable {
+      actor = nullptr;
+      events.add("cancel task"_kj);
+    });
+    state.tasks.add(kj::Promise<void>(kj::NEVER_DONE).attach(kj::mv(releaseOnCancel)));
+    KJ_REQUIRE(!state.tasks.isEmpty());
+    KJ_EXPECT(events.asPtr() == kj::arr("register shipper"_kj, "OPEN"_kj).asPtr());
+  }
+  auto expected = kj::arr("register shipper"_kj, "OPEN"_kj, "cancel task"_kj,
+      "unregister shipper"_kj, "CLOSED"_kj, "release actor observer"_kj, "release Home"_kj);
+  KJ_EXPECT(events.asPtr() == expected.asPtr());
 }
 
 KJ_TEST("a reclaim requested during maintenance never waits for that pass") {
