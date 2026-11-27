@@ -4892,8 +4892,6 @@ class DurableSocketHttp final: public kj::HttpService {
     KJ_REQUIRE(worker.get() != nullptr, "one call per socket event");
     KJ_REQUIRE(body.tryGetLength() == event.bytes, "invalid durable socket body length");
     auto entry = kj::mv(worker);
-    auto& manager = kj::downcast<LegacyHibernationManagerImpl>(
-        KJ_REQUIRE_NONNULL(event.actor->getHibernationManager()));
     kj::Maybe<api::HibernatableSocketParams> params;
     using Kind = DurableSocketEvent::Kind;
     if (event.kind == Kind::BINARY) {
@@ -4911,6 +4909,8 @@ class DurableSocketHttp final: public kj::HttpService {
         params.emplace(event.closeCode, kj::mv(text), event.wasClean, kj::String());
       }
     }
+    auto& manager = kj::downcast<LegacyHibernationManagerImpl>(
+        KJ_REQUIRE_NONNULL(event.actor->getHibernationManager()));
     co_await manager.dispatchNodeSocket(*entry, kj::mv(event.socketId), event.position,
         event.lastAutoResponse, kj::mv(KJ_ASSERT_NONNULL(params)));
     co_await event.actor->getOutputGate().wait(nullptr);
