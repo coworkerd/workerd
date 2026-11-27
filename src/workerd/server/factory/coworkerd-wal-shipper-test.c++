@@ -166,6 +166,93 @@ void configureWal(SqliteDatabase& db, uint32_t& lastCommit) {
   }, &lastCommit);
 }
 
+KJ_TEST("a SQL WAL transaction at the record limit commits and an extra frame rolls back") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  const auto walPath = kj::Path({"test.db-wal"});
+  // Enough bytes for four complete frames and the next frame's header.
+  SqliteDatabase::WalTransactionLimit limit(4 * FRAME_SIZE + FRAME_HEADER_SIZE);
+  SqliteDatabase::Vfs vfs(*dir, {.walTransactionLimit = &limit});
+  SqliteDatabase db(vfs, kj::Path({"test.db"}), CREATE_OR_MODIFY);
+  db.run("PRAGMA page_size = 4096; CREATE TABLE ledger (id INTEGER PRIMARY KEY, value BLOB)");
+  db.run("CREATE TABLE fixture_ids (id INTEGER PRIMARY KEY); BEGIN");
+  for (int id = 10; id <= 100; ++id) db.run("INSERT INTO fixture_ids VALUES (?)", id);
+  db.run("COMMIT");
+  db.run("PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF; PRAGMA wal_autocheckpoint = 0");
+  limit.setPageSize(PAGE_SIZE);
+  db.run("INSERT INTO ledger VALUES (1, x'01')");
+  const auto before = readDurableWalPosition(*dir, walPath).frames;
+
+  limit.begin();
+  db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (2, zeroblob(8184)); RELEASE ledger");
+  KJ_EXPECT(!limit.wasRefused());
+  limit.end(db);
+  KJ_EXPECT(readDurableWalPosition(*dir, walPath).frames == before + 4);
+  const auto committed = dir->openFile(walPath)->readAllBytes();
+
+  limit.begin();
+  db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (3, zeroblob(12276))");
+  KJ_EXPECT_THROW_MESSAGE("database or disk is full", db.run("RELEASE ledger"));
+  KJ_EXPECT(limit.wasRefused() && !db.observedCriticalError());
+  KJ_EXPECT(dir->openFile(walPath)->stat().size <= committed.size() + 4 * FRAME_SIZE);
+  db.rollbackWalTransaction();
+  limit.end(db);
+  KJ_EXPECT(dir->openFile(walPath)->readAllBytes() == committed.asPtr());
+
+  db.run("PRAGMA cache_size = 5; PRAGMA cache_spill = 5");
+  limit.begin();
+  db.run("SAVEPOINT ledger");
+  // This statement spills during sqlite3_step(), without attempting a commit.
+  KJ_EXPECT_THROW_MESSAGE("database or disk is full",
+      db.run("INSERT INTO ledger SELECT id, zeroblob(3000) FROM fixture_ids"));
+  KJ_EXPECT(limit.wasRefused() && !db.observedCriticalError());
+  db.rollbackWalTransaction();
+  limit.end(db);
+  KJ_EXPECT(dir->openFile(walPath)->readAllBytes() == committed.asPtr());
+  KJ_EXPECT(db.run("SELECT count(*) FROM ledger WHERE id IN (1, 2)").getInt(0) == 2);
+  KJ_EXPECT(db.run("SELECT count(*) FROM ledger WHERE id >= 3").getInt(0) == 0);
+
+  limit.begin();
+  db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (3, x'03'); RELEASE ledger");
+  KJ_EXPECT(!limit.wasRefused());
+  limit.end(db);
+  KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 3);
+}
+
+KJ_TEST("the SQL WAL shipper splits a group of commits that exceeds the record limit") {
+  auto io = kj::setupAsyncIo();
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  const auto dbPath = kj::Path({"test.db"});
+  const auto walPath = kj::Path({"test.db-wal"});
+  SqliteDatabase::WalTransactionLimit limit(FRAME_SIZE);
+  SqliteDatabase::Vfs vfs(*dir, {.walTransactionLimit = &limit});
+  SqliteDatabase db(vfs, dbPath.clone(), CREATE_OR_MODIFY);
+  db.run("PRAGMA page_size = 4096; CREATE TABLE entries (value INTEGER); INSERT INTO entries VALUES (0)");
+  db.run("PRAGMA journal_mode = WAL");
+  RecordingChannel channel;
+  DurableLogShipper shipper(*dir, walPath.clone(), dbPath.clone(),
+      {.objectName = kj::str(OBJECT_NAME), .storageId = kj::str(STORAGE_ID)}, db,
+      io.provider->getTimer(), channel);
+
+  // Leave both commits for a single shipper callback. Each changes the same
+  // leaf page and fits on its own.
+  for (int value: {1, 2}) {
+    limit.begin();
+    db.run("SAVEPOINT ledger");
+    db.run("UPDATE entries SET value = ?", value);
+    db.run("RELEASE ledger");
+    KJ_EXPECT(!limit.wasRefused());
+    limit.end(db);
+  }
+  const auto wal = dir->openFile(walPath)->readAllBytes();
+  KJ_ASSERT(wal.size() == WAL_HEADER_SIZE + 2 * FRAME_SIZE);
+  const auto header = wal.first(WAL_HEADER_SIZE);
+  const auto frames = wal.slice(WAL_HEADER_SIZE);
+  shipper.onCommit().wait(io.waitScope);
+  KJ_ASSERT(channel.frames.size() == 2);
+  expectFrames(channel.frames[0], header, 1, frames.first(FRAME_SIZE), 1, true);
+  expectFrames(channel.frames[1], header, 2, frames.slice(FRAME_SIZE), 2, false);
+}
+
 KJ_TEST("cold WAL scan and shipper agree on the last complete SQLite commit") {
   auto io = kj::setupAsyncIo();
   auto dir = kj::newInMemoryDirectory(kj::nullClock());

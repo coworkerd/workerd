@@ -31,9 +31,16 @@ kj::Path databasePath(
 DurableStorage::DurableStorage()
     : DurableStorage(kj::newInMemoryDirectory(kj::systemPreciseCalendarClock())) {}
 
-DurableStorage::DurableStorage(kj::Own<const kj::Directory> directory)
+DurableStorage::DurableStorage(kj::Own<const kj::Directory> directory,
+    uint64_t sqlDatabaseSpillBytes,
+    uint64_t sqlProcessSpillBytes)
     : directory(kj::mv(directory)),
-      vfs(*this->directory) {}
+      vfs(*this->directory),
+      sqlDatabaseSpillBytes(sqlDatabaseSpillBytes),
+      sqlSpillBudget(sqlProcessSpillBytes == 0 ? 4 * sqlDatabaseSpillBytes : sqlProcessSpillBytes) {
+  KJ_REQUIRE(sqlDatabaseSpillBytes > 0 && sqlDatabaseSpillBytes <= (1ull << 40));
+  KJ_REQUIRE(sqlProcessSpillBytes <= (4ull << 40));
+}
 
 void DurableStorage::ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr storageId) const {
   KJ_REQUIRE(uniqueKey.startsWith(ROOT_PREFIX) && isDigest(uniqueKey.slice(ROOT_PREFIX.size())) &&
@@ -43,10 +50,26 @@ void DurableStorage::ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr stor
       kj::Path({kj::str(uniqueKey)}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
 }
 
-kj::Own<SqliteDatabase> DurableStorage::open(
-    kj::StringPtr uniqueKey, kj::StringPtr storageId, SqliteObserver& observer, uint facet) const {
+kj::Own<SqliteDatabase> DurableStorage::open(kj::StringPtr uniqueKey,
+    kj::StringPtr storageId,
+    SqliteObserver& observer,
+    uint facet,
+    uint64_t sqlWalFrameLimitBytes,
+    size_t sqliteMemoryLimitBytes,
+    std::shared_ptr<SqliteProcessMemoryBudget> sqliteProcessBudget) const {
   ensureNamespace(uniqueKey, storageId);
   const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
+  if (sqlWalFrameLimitBytes != 0) {
+    auto limit = kj::heap<SqliteDatabase::WalTransactionLimit>(
+        sqlWalFrameLimitBytes, sqlSpillBudget, sqlDatabaseSpillBytes);
+    auto guardedVfs =
+        kj::heap<SqliteDatabase::Vfs>(*directory, SqliteDatabase::VfsOptions{
+          .walTransactionLimit = limit.get()});
+    auto database = kj::heap<SqliteDatabase>(*guardedVfs, databasePath(uniqueKey, storageId, facet),
+        mode, sqliteMemoryLimitBytes, kj::maxValue, observer, kj::none,
+        std::move(sqliteProcessBudget));
+    return database.attach(kj::mv(guardedVfs).attach(kj::mv(limit)));
+  }
   return kj::heap<SqliteDatabase>(
       vfs, databasePath(uniqueKey, storageId, facet), mode, kj::maxValue, kj::maxValue, observer);
 }

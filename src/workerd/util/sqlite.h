@@ -13,10 +13,13 @@
 #include <kj/one-of.h>
 #include <kj/string.h>
 
-#include <utility>
+#include <atomic>
+#include <functional>
 #include <memory>
+#include <utility>
 
 struct sqlite3;
+struct sqlite3_file;
 struct sqlite3_vfs;
 struct sqlite3_stmt;
 
@@ -35,16 +38,20 @@ using SqliteQueryId = uint64_t;
 // Owned by an event, shared by all of its tenant SQL calls. Internal SQL never acquires it.
 class SqlExecutionBudget {
  public:
-  enum class Cause { NONE, CPU, WALL };
+  enum class Cause { NONE, CPU, WALL, DISCONNECTED };
   static bool isEnabled();
   SqlExecutionBudget();
   SqlExecutionBudget(uint64_t eventCpuLimitNs, uint64_t threadCpuDeadlineNs);
+  SqlExecutionBudget(uint64_t wallLimitNs, std::function<Cause()> checkDeadline);
+  bool hasDeadline() const { return bool(deadlineCheck); }
+  bool checkDeadline() noexcept;
   Cause getCause() const { return cause; }
   kj::String describe() const;
 
  private:
   uint64_t cpuLimitNs, wallLimitNs;
   kj::Maybe<uint64_t> threadCpuDeadline;
+  std::function<Cause()> deadlineCheck;
   uint64_t cpuUsedNs = 0, wallUsedNs = 0;
   Cause cause = Cause::NONE;
   friend class SqliteDatabase;
@@ -95,6 +102,7 @@ class SqliteDatabase {
  public:
   // Allow 34 bytes of padding for V8 serialization overhead beyond the 8 MiB row limit.
   static constexpr int MAX_ROW_LENGTH = 8 * 1024 * 1024 + 34;
+  static constexpr size_t PLATFORM_SQL_HEAP_LIMIT_BYTES = 32 * 1024 * 1024;
 
   class Vfs;
   class Query;
@@ -102,6 +110,7 @@ class SqliteDatabase {
   class Lock;
   class LockManager;
   struct VfsOptions;
+  class WalTransactionLimit;
   class Regulator;
 
   // StaticRegulator is a wrapper type that asserts (using consteval) that the Regulator is
@@ -146,7 +155,8 @@ class SqliteDatabase {
       size_t sqliteMaxMemoryBytes = kj::maxValue,
       size_t sqliteMaxMemoryPerProcessBytes = kj::maxValue,
       SqliteObserver& sqliteObserver = SqliteObserver::DEFAULT,
-      kj::Maybe<const ActorAccountLimits&> actorAccountLimits = kj::none);
+      kj::Maybe<const ActorAccountLimits&> actorAccountLimits = kj::none,
+      std::shared_ptr<SqliteProcessMemoryBudget> processMemoryBudget = {});
 
   // Returns the current value of the per-actor SQLite memory byte counter for metrics reporting.
   size_t getSqliteMemoryBytes() const {
@@ -269,6 +279,16 @@ class SqliteDatabase {
   //
   // Note that the write callback is NOT called before (or at any point during) a reset(). Use the
   // `ResetListener` mechanism or `afterReset()` instead for that case.
+  // The actor's implicit transaction can commit after the JavaScript turn.
+  // A platform query may install its final check before that point.
+  void setCommitCheck(kj::Function<void()> check) { commitCheck = kj::mv(check); }
+  void clearCommitCheck() { commitCheck = kj::none; }
+  void checkCommit() {
+    auto check = kj::mv(commitCheck);
+    clearCommitCheck();
+    KJ_IF_SOME(run, check) { run(); }
+  }
+
   void onWrite(kj::Function<void(bool allowUnconfirmed)> callback) {
     onWriteCallback = kj::mv(callback);
   }
@@ -295,6 +315,14 @@ class SqliteDatabase {
 
   // Returns true if a transaction was automatically rolled due to a critical error.
   bool observedCriticalError();
+  WalTransactionLimit* getWalTransactionLimit() const;
+
+  // Durable WAL consumers use this to keep the transaction guard's observation
+  // of completed commits installed alongside their own callback.
+  using WalHook = int (*)(void*, sqlite3*, const char*, int);
+  void setWalHook(WalHook callback, void* context);
+  void rollbackWalTransaction();
+  void releaseCachedMemory();
 
   // Invoke the onWrite() callback.
   //
@@ -438,6 +466,7 @@ class SqliteDatabase {
 
   // The amount of memory in bytes used by this database for use by sqlite3_mem_methods.
   size_t sqliteMemoryBytes = 0;
+  std::shared_ptr<SqliteProcessMemoryBudget> processMemoryBudget;
 
   // The maximum amount of memory in bytes that can be used by this database for use by
   // sqlite3_mem_methods (from WorkerLimits::sqliteMaxMemoryMb). This is set to kj::maxValue to
@@ -464,6 +493,7 @@ class SqliteDatabase {
   ExecutionScope* activeExecutionScope = nullptr;
   uint64_t executionRandomState = 0;
   bool sampleSqlExecution();
+  kj::Maybe<kj::Function<void()>> commitCheck;
   static int progressCallback(void* database) noexcept;
   void handleExecutionLimit(kj::Maybe<int> errorCode, StaticRegulator regulator);
 
@@ -503,6 +533,9 @@ class SqliteDatabase {
   bool inTransaction = false;
 
   void init(kj::Maybe<kj::WriteMode> maybeMode);
+  void releaseProcessMemoryAfterClose() noexcept;
+  WalHook walHook = nullptr;
+  void* walHookContext = nullptr;
 
   // Describes various kinds of interesting state changes which a statement might apply, which we
   // need to track to implement the SqliteDatabse interface. In particular, we must track
@@ -522,6 +555,7 @@ class SqliteDatabase {
   // Called immediately after a statement executes, to update our understanding of the current
   // state.
   void applyChange(const StateChange& change);
+  void clearRolledBackTransaction();
 
   void handleCriticalError(kj::Maybe<int> errorCode,
       kj::StringPtr errorMessage,
@@ -913,7 +947,121 @@ class SqliteDatabase::Query final: private ResetListener {
 
   void beforeSqliteClose(CloseReason reason) override;
 
+  void checkColumnMemoryLimit(sqlite3_stmt* statement);
+
   void nextRow(bool first);
+};
+
+// Shared by the database connections of one durable process.
+class SqliteSpillBudget {
+ public:
+  explicit SqliteSpillBudget(uint64_t capacity): capacity(capacity) {}
+
+  bool tryCharge(uint64_t bytes) noexcept;
+  void release(uint64_t bytes) noexcept;
+  uint64_t getCapacity() const {
+    return capacity;
+  }
+  uint64_t getUsed() const {
+    return used.load(std::memory_order_relaxed);
+  }
+
+ private:
+  const uint64_t capacity;
+  std::atomic<uint64_t> used{0};
+};
+
+// A home-thread-only charge for both the current WAL transaction and SQLite's
+// live temporary files. Each owner supplies its old and new extent.
+class SqliteSpillTracker {
+ public:
+  SqliteSpillTracker(SqliteSpillBudget& process, uint64_t capacity)
+      : process(process),
+        capacity(capacity) {}
+  KJ_DISALLOW_COPY_AND_MOVE(SqliteSpillTracker);
+  ~SqliteSpillTracker() noexcept {
+    process.release(used);
+  }
+
+  bool resize(uint64_t before, uint64_t after) noexcept;
+
+ private:
+  SqliteSpillBudget& process;
+  const uint64_t capacity;
+  uint64_t used = 0;
+};
+
+// One SQL connection, used only on its home thread. SQLite rewrites spilled
+// pages in place, so measure the WAL frame span from its first write.
+class SqliteDatabase::WalTransactionLimit {
+ public:
+  explicit WalTransactionLimit(uint64_t frameBytes): frameBytes(frameBytes) {}
+  WalTransactionLimit(uint64_t frameBytes, SqliteSpillBudget& process, uint64_t databaseSpillBytes)
+      : frameBytes(frameBytes) {
+    spill.emplace(process, databaseSpillBytes);
+  }
+  uint64_t capacity() const { return frameBytes; }
+  bool isActive() const { return active; }
+  bool isRefusingWrites() const {
+    return active && refusal != Refusal::NONE;
+  }
+  bool wasRefused() const {
+    return active && refusal == Refusal::WAL_LIMIT;
+  }
+  bool wasMemoryRefused() const {
+    return active && refusal == Refusal::MEMORY_LIMIT;
+  }
+  bool wasProcessMemoryRefused() const {
+    return active && refusal == Refusal::PROCESS_MEMORY_LIMIT;
+  }
+  bool wasSpillRefused() const {
+    return active && refusal == Refusal::SPILL_LIMIT;
+  }
+  bool tracksSpill() const {
+    return spill != kj::none;
+  }
+  bool resizeSpill(uint64_t before, uint64_t after) noexcept;
+  void noteMemoryRefusal(SqliteMemoryScope::LimitRefusal cause) {
+    noteRefusal(cause == SqliteMemoryScope::LimitRefusal::PROCESS
+            ? Refusal::PROCESS_MEMORY_LIMIT
+            : Refusal::MEMORY_LIMIT);
+  }
+  void noteInterruption() {
+    noteRefusal(Refusal::INTERRUPTED);
+  }
+  void noteStatementRollback() {
+    noteRefusal(Refusal::STATEMENT_ROLLBACK);
+  }
+  void setPageSize(uint32_t pageSize);
+  void noteCommit() {
+    if (active) committed = true;
+  }
+  void begin();
+  void end(SqliteDatabase& db, bool rolledBack = false);
+  void abandon(SqliteDatabase& db) noexcept;
+  int checkWrite(sqlite3_file* file, int64_t offset, int length) noexcept;
+
+ private:
+  const uint64_t frameBytes;
+  kj::Maybe<SqliteSpillTracker> spill;
+  uint64_t frameSize = 0;
+  uint64_t wholeFrameBytes = 0;
+  uint64_t walSpillBytes = 0;
+  uint64_t walHeaderBytes = 0;
+  kj::Maybe<uint64_t> firstFrameByte;
+  kj::Maybe<int64_t> originalSize;
+  bool active = false;
+  bool committed = false;
+  enum class Refusal {
+    NONE, WAL_LIMIT, SPILL_LIMIT, MEMORY_LIMIT, PROCESS_MEMORY_LIMIT, INTERRUPTED, STATEMENT_ROLLBACK
+  };
+  Refusal refusal = Refusal::NONE;
+
+  void releaseWalSpill() noexcept;
+
+  void noteRefusal(Refusal cause) {
+    if (refusal == Refusal::NONE) refusal = cause;
+  }
 };
 
 // Options affecting SqliteDatabase::Vfs onstructor.
@@ -942,6 +1090,7 @@ struct SqliteDatabase::VfsOptions {
   // need not survive the machine, such as those of tests, where a sync can stall for seconds on a
   // busy disk.
   bool sync = true;
+  WalTransactionLimit* walTransactionLimit = nullptr;
 };
 
 // Implements a SQLite VFS based on a KJ directory.

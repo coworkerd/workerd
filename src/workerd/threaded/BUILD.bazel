@@ -5,6 +5,7 @@ load("//:build/wd_cc_library.bzl", "wd_cc_library")
 
 THREADED_DEPS = [
     ":fatal-attribution",
+    ":isolate-busy",
     ":protocol_capnp",
     "//src/workerd/api:memory-cache",
     "//src/workerd/io",
@@ -25,6 +26,7 @@ THREADED_DEPS = [
     "//src/workerd/server/factory:coworkerd-wal",
     "//src/workerd/util:autogate",
     "//src/workerd/util:entropy",
+    "//src/workerd/util:sqlite-metering",
     "@capnp-cpp//src/capnp:capnp-rpc",
     "@capnp-cpp//src/capnp/compat:http-over-capnp",
     "@capnp-cpp//src/capnp/compat:json",
@@ -32,6 +34,18 @@ THREADED_DEPS = [
     "@capnp-cpp//src/kj/compat:kj-http",
     "@ssl",
 ]
+
+wd_cc_library(
+    name = "isolate-busy",
+    hdrs = ["isolate-busy.h"],
+    deps = ["@capnp-cpp//src/kj"],
+)
+
+kj_test(
+    size = "small",
+    src = "isolate-busy-test.c++",
+    deps = [":isolate-busy"],
+)
 
 wd_cc_library(
     name = "fatal-attribution",

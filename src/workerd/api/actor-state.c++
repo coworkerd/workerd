@@ -19,6 +19,7 @@
 #include <workerd/io/features.h>
 #include <workerd/io/legacy-hibernation-manager.h>
 #include <workerd/io/stored-value.h>
+#include <workerd/jsg/coworkerd-rpc-code.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/ser.h>
 #include <workerd/jsg/util.h>
@@ -744,6 +745,80 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
   KJ_IF_SOME(sqlite, cache->getSqliteDatabase()) {
     auto& context = IoContext::current();
 
+    if (auto* limit = sqlite.getWalTransactionLimit()) {
+      // Platform SQL needs the SQLite commit to happen here so both a spill
+      // refusal and a refusal during the final commit can reach this caller.
+      // The actor still owns WAL confirmation and locks its output gate.
+      limit->begin();
+      KJ_DEFER(limit->abandon(sqlite));
+      auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
+      kj::Own<ActorCacheInterface::Transaction> txn;
+      bool commitStarted = false;
+      StoredExternalHandler::SyncNestedTransaction syncExternalTxn(
+          context.getActorOrThrow().getOrCreateStoredExternalHandler());
+      return js.tryCatch([&]() {
+        auto started = cache->startTransaction();
+        txn =
+            kj::mv(KJ_REQUIRE_NONNULL(started.tryGet<kj::Own<ActorCacheInterface::Transaction>>()));
+        auto result = callback(js);
+        JSG_REQUIRE(!sqlite.observedCriticalError(), Error,
+            "Cannot commit transaction due to an earlier SQL critical error");
+        if (budget && budget->hasDeadline() && budget->checkDeadline()) {
+          static constexpr SqlStorageRegulator regulator;
+          kj::throwRecoverableException(regulator.sqlExecutionLimitException(*budget));
+        }
+        JSG_REQUIRE(!limit->isRefusingWrites(), Error, "Cannot commit a refused SQL transaction");
+        commitStarted = true;
+        KJ_REQUIRE(txn->commit() == kj::none, "synchronous SQL commit unexpectedly deferred");
+        limit->end(sqlite);
+        syncExternalTxn.commit();
+        return kj::mv(result);
+      }, [&](jsg::Value exception) -> jsg::JsRef<jsg::JsValue> {
+        txn = nullptr;  // Roll back before translating the error.
+        if (!sqlite.observedCriticalError()) {
+          const bool recordRefused = limit->wasRefused();
+          const bool spillRefused = limit->wasSpillRefused();
+          const bool memoryRefused = limit->wasMemoryRefused();
+          const bool processMemoryRefused = limit->wasProcessMemoryRefused();
+          // Once commit starts, an unrelated exception can come from work
+          // after the SQLite commit. Trim then only for a recorded refusal
+          // or SQL interruption.
+          const bool interrupted = budget && budget->hasDeadline() &&
+              budget->getCause() != SqlExecutionBudget::Cause::NONE;
+          if (!commitStarted || limit->isRefusingWrites() || interrupted) {
+            limit->end(sqlite, /*rolledBack=*/true);
+          }
+          if (recordRefused) {
+            kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+                KJ_EXCEPTION(
+                    FAILED, "jsg.Error: the transaction exceeds one recoverable WAL record"),
+                "SQL_TRANSACTION_TOO_LARGE"));
+          }
+          if (spillRefused) {
+            kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+                KJ_EXCEPTION(FAILED,
+                    "jsg.Error: uncommitted WAL and temporary files exceeded a SQLite spill budget"),
+                "SQL_SPILL_LIMIT_EXCEEDED"));
+          }
+          if (memoryRefused || processMemoryRefused) {
+            sqlite.releaseCachedMemory();
+          }
+          if (processMemoryRefused) {
+            kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+                KJ_EXCEPTION(OVERLOADED, "jsg.Error: the durable process SQLite memory budget is full"),
+                "OVERLOADED"));
+          }
+          if (memoryRefused) {
+            kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+                KJ_EXCEPTION(
+                    FAILED, "jsg.Error: the statement exceeds the database SQLite memory limit"),
+                "SQL_MEMORY_LIMIT_EXCEEDED"));
+          }
+        }
+        js.throwException(kj::mv(exception));
+      });
+    }
+
     // SAVEPOINT is a readonly statement, but we need to trigger an outer TRANSACTION
     sqlite.notifyWrite();
 
@@ -768,7 +843,20 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
       JSG_REQUIRE(!sqlite.observedCriticalError(), Error,
           "Cannot commit transaction due to an earlier SQL critical error");
 
-      sqlite.run("RELEASE _cf_sync_savepoint");
+      auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
+      if (budget && budget->hasDeadline()) {
+        auto check = [budget = std::move(budget)] {
+          static constexpr SqlStorageRegulator regulator;
+          if (budget->checkDeadline()) {
+            kj::throwRecoverableException(regulator.sqlExecutionLimitException(*budget));
+          }
+        };
+        check();
+        sqlite.run("RELEASE _cf_sync_savepoint");
+        sqlite.setCommitCheck(kj::mv(check));
+      } else {
+        sqlite.run("RELEASE _cf_sync_savepoint");
+      }
       syncExternalTxn.commit();
       return kj::mv(result);
     }, [&](jsg::Value exception) -> jsg::JsRef<jsg::JsValue> {

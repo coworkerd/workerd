@@ -541,7 +541,7 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
 
 DurableLogShipper::~DurableLogShipper() noexcept(false) {
   KJ_DEFER(channel.unregisterShipper(*this));
-  sqlite3_wal_hook(*db, nullptr, nullptr);
+  db->setWalHook(nullptr, nullptr);
   if (!channel.enabled()) return;
   Writer w;
   w.u8(MSG_CLOSED);
@@ -569,16 +569,18 @@ void DurableLogShipper::configure(SqliteDatabase& database) {
   sqlite3* handle = database;
   // No checkpoint but the ones below: not after a commit, and not when the last connection closes -- the WAL must
   // keep every frame that has not been handed on.
-  sqlite3_wal_autocheckpoint(handle, 0);
   int previous = -1;
   sqlite3_db_config(handle, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, &previous);
   // The owner does not wait for its own disk: this machine's files are a cache, and the write is durable once the
   // node's peers hold its frames (docs/s3-truth-and-durable-objects.md, section 5.3).
   database.run(SqliteDatabase::QueryOptions{.regulator = SqliteDatabase::TRUSTED},
       "PRAGMA synchronous=OFF;"_kj);
+  if (auto* limit = database.getWalTransactionLimit()) {
+    limit->setPageSize(database.run("PRAGMA page_size").getInt(0));
+  }
   // Only to count: the hook's frame count is SQLite's own mxFrame, which says whether the WAL holds a frame this
   // shipper has not read (a rolled back overflow frame stays in the file, so its size does not say).
-  sqlite3_wal_hook(handle, &DurableLogShipper::walHook, this);
+  database.setWalHook(&DurableLogShipper::walHook, this);
 }
 
 void DurableLogShipper::afterReset(SqliteDatabase& database) {
@@ -662,11 +664,17 @@ void DurableLogShipper::readNewFrames() {
   uint64_t lastCommitEnd = 0;
   uint32_t lastCommitCk1 = cksum1, lastCommitCk2 = cksum2;
   uint32_t commitsHere = 0;
+  const auto* transactionLimit = db->getWalTransactionLimit();
   for (uint64_t i = 0; i < available; i++) {
     const kj::byte* f = buffer.begin() + i * frameSize;
     if (!readWalFrame(f, magic, pageSize, salt1, salt2, s1, s2)) break;
     if (getBe32(f + 4) != 0) {
-      lastCommitEnd = (i + 1) * frameSize;
+      const auto end = (i + 1) * frameSize;
+      // Group complete commits only while the combined frame bytes fit the
+      // node's record. A large individual SQL transaction still travels whole.
+      if (transactionLimit != nullptr && commitsHere != 0 &&
+          pendingFrames.size() + end > transactionLimit->capacity()) break;
+      lastCommitEnd = end;
       lastCommitCk1 = s1;
       lastCommitCk2 = s2;
       ++commitsHere;
@@ -841,7 +849,11 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
   if (hookFrames != readFrames) return;
   int64_t start = monoNs();
   int logFrames = -1, checkpointed = -1;
-  int rc = sqlite3_wal_checkpoint_v2(handle, "main", SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &checkpointed);
+  int rc;
+  {
+    auto memoryScope = db->enterMemoryScope();
+    rc = sqlite3_wal_checkpoint_v2(handle, "main", SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &checkpointed);
+  }
   int64_t took = monoNs() - start;
   if (rc != SQLITE_OK) {
     logRow(kj::str("{\"event\":\"checkpoint-failed\",\"object\":", jsonString(key), ",\"rc\":", rc,

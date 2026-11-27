@@ -72,6 +72,7 @@ ActorSqlite::ImplicitTxn::ImplicitTxn(ActorSqlite& parent): parent(parent) {
 ActorSqlite::ImplicitTxn::~ImplicitTxn() noexcept(false) {
   KJ_IF_SOME(c, parent.currentTxn.tryGet<ImplicitTxn*>()) {
     if (c == this) {
+      parent.db->clearCommitCheck();
       parent.currentTxn.init<NoTxn>();
     }
   }
@@ -87,6 +88,7 @@ ActorSqlite::ImplicitTxn::~ImplicitTxn() noexcept(false) {
 void ActorSqlite::ImplicitTxn::commit() {
   // Ignore redundant commit()s.
   if (!committed) {
+    parent.db->checkCommit();
     parent.commitTxn.run();
     committed = true;
   }
@@ -135,13 +137,11 @@ ActorSqlite::ExplicitTxn::ExplicitTxn(ActorSqlite& actorSqlite): actorSqlite(act
       KJ_REQUIRE(!exp->hasChild,
           "critical section should have blocked creation of more than one child at a time");
       parent = kj::addRef(*exp);
-      exp->hasChild = true;
       depth = exp->depth + 1;
       alarmDirty = exp->alarmDirty;
       someWriteConfirmed = exp->someWriteConfirmed;
     }
   }
-  actorSqlite.currentTxn = this;
 
   // To support nested transactions, we assign each savepoint a name based on its nesting depth.
   // Unfortunately this means we cannot prepare the statement, unless we prepare a series of
@@ -149,6 +149,11 @@ ActorSqlite::ExplicitTxn::ExplicitTxn(ActorSqlite& actorSqlite): actorSqlite(act
   // depth 0 specifically, but I'm not going to try it for now.)
   actorSqlite.db->run(
       {.regulator = SqliteDatabase::TRUSTED}, kj::str("SAVEPOINT _cf_savepoint_", depth));
+  // Publish the new transaction only after SQLite accepts the savepoint.
+  KJ_IF_SOME(p, parent) {
+    p->hasChild = true;
+  }
+  actorSqlite.currentTxn = this;
 }
 ActorSqlite::ExplicitTxn::~ExplicitTxn() noexcept(false) {
   KJ_DEFER([&]() noexcept {
@@ -282,6 +287,13 @@ kj::Promise<void> ActorSqlite::ExplicitTxn::rollback() {
 void ActorSqlite::ExplicitTxn::rollbackImpl() noexcept(false) {
   // Cancel any blocking async tasks that were scheduled as part of the transaction.
   actorSqlite.blockTasks.clear();
+
+  if (parent == kj::none && actorSqlite.db->getWalTransactionLimit() != nullptr) {
+    actorSqlite.db->rollbackWalTransaction();
+    alarmDirty = false;
+    someWriteConfirmed = false;
+    return;
+  }
 
   actorSqlite.db->run(
       {.regulator = SqliteDatabase::TRUSTED}, kj::str("ROLLBACK TO _cf_savepoint_", depth));

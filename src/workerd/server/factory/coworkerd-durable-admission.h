@@ -68,6 +68,7 @@ class DurableAdmission {
     Status status;
     std::optional<Ticket> ticket = std::nullopt;
     bool needsHome = false;
+    bool newTreeCapacityRefused = false;
   };
 
   enum class Cancellation { GONE, RELEASED, SIGNAL_HOME };
@@ -85,16 +86,22 @@ class DurableAdmission {
 
   DurableAdmission(Limits limits, uint64_t generation);
 
-  Result queue(const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now);
+  Result queue(const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now,
+      bool database = false);
+  void preferDatabaseTree(Time until) { databaseTreePreferredUntil = until; }
+  void limitDatabaseTreePreference(Time until);
+  void claimDatabaseTree() { databaseTreePreferredUntil = {}; }
   bool publishHome(uint64_t tree, uint64_t home);
   std::optional<uint64_t> homeFor(uint64_t tree) const;
   // Check the full descriptor and route the first live waiting event to an already published home.
   // Starting an event returns waiting credit while retaining its execution reservation.
   std::optional<Ticket> next(uint64_t tree) const;
+  bool hasActiveEvent(uint64_t tree) const;
   Delivery begin(Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now);
   Cancellation cancel(Ticket ticket);
   // Refuse a waiting call before acknowledging it, returning its event reservation.
-  bool refuseWaiting(Ticket ticket);
+  bool refuseWaiting(Ticket ticket, bool countOverload = true);
+  void recordOverload() { ++counters.overloads; }
   bool complete(Ticket ticket, uint64_t home);
   bool markSocket(Ticket ticket, uint64_t home);
   std::vector<Ticket> expire(Time now);
@@ -102,6 +109,7 @@ class DurableAdmission {
   // Reset closes admission immediately, releases waiting calls, and retains active credits
   // until their home completes them. The home still owns every actor handle until releaseTree().
   bool beginReset(uint64_t tree, uint64_t home);
+  bool isIdleTree(uint64_t tree, uint64_t home) const;
   // Idle close requires an empty mailbox and no active calls. It is also the drain check for
   // a reset already in progress. Keep the tree reservation until the home releases its handles.
   bool stopIdleTree(uint64_t tree, uint64_t home);
@@ -149,6 +157,7 @@ class DurableAdmission {
   const Limits limits;
   const uint64_t generation;
   State counters;
+  Time databaseTreePreferredUntil{};
   uint64_t nextTree = 1, nextEvent = 1;
   std::map<Key, uint64_t> objects;
   std::map<uint64_t, Tree> trees;
@@ -166,6 +175,7 @@ class DurableIdleLifecycle {
   void eventFinished(Time now);
   Pending pendingStarted(Time now);
   void pendingFinished(Pending pending, Time now);
+  bool hasPending() const { return !pending.empty(); }
   Decision check(Time now, bool hasOrdinarySocket, bool pressured);
 
  private:

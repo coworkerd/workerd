@@ -4,6 +4,8 @@
 #include "threaded-server.c++"
 #undef main
 
+#include <workerd/server/factory/coworkerd-wal-wire.h>
+
 #include <spawn.h>
 #include <sys/wait.h>
 
@@ -38,6 +40,654 @@ void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
   v8::Locker locker(isolate);
   v8::Isolate::Scope entered(isolate);
   limits.customizeIsolate(isolate);
+}
+
+KJ_TEST("platform durable plans pin the class and copy to the tenant") {
+  JsonDoc input(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
+  JsonDoc otherTenant(kj::str(R"({"workerId":"beta/:platform","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
+  JsonDoc databaseWorker(kj::str(R"({"workerId":"alpha/__databases","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
+  JsonDoc bound(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
+      "variables":[{"name":"TENANT_SECRET","value":"fixture"}]})"));
+  JsonDoc alpha(kj::str(R"({"tenant":"alpha","definitionName":"coworkerd:platform-test"})"));
+  JsonDoc beta(kj::str(R"({"tenant":"beta","definitionName":"coworkerd:platform-test"})"));
+  JsonDoc selection(kj::str(R"({"className":"Store"})"));
+  JsonDoc otherClass(kj::str(R"({"className":"Other"})"));
+  DurableRoute route{};
+  route.open.className = "Store";
+  route.open.definition = platformCopyKey(input.get(), alpha.get());
+  KJ_EXPECT(platformDurablePlan(input.get(), alpha.get(), selection.get(), route));
+  KJ_EXPECT(!platformDurablePlan(databaseWorker.get(), alpha.get(), selection.get(), route));
+  KJ_EXPECT(platformCopyKey(otherTenant.get(), beta.get()) != route.open.definition);
+  KJ_EXPECT(!platformDurablePlan(otherTenant.get(), beta.get(), selection.get(), route));
+  KJ_EXPECT(!platformDurablePlan(input.get(), beta.get(), selection.get(), route));
+  KJ_EXPECT(!platformDurablePlan(input.get(), alpha.get(), otherClass.get(), route));
+  KJ_EXPECT(!platformDurablePlan(bound.get(), alpha.get(), selection.get(), route));
+  route.open.definition = "wrong pin";
+  KJ_EXPECT(!platformDurablePlan(input.get(), alpha.get(), selection.get(), route));
+}
+
+KJ_TEST("platform databases use the database Worker and a copy pinned to the specific object") {
+  JsonDoc input(kj::str(R"({"workerId":"alpha/__databases","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
+      "durableObject":{"database":"first"}})"));
+  JsonDoc platformWorker(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
+      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
+      "durableObject":{"database":"first"}})"));
+  JsonDoc plan(kj::str(R"({"kind":"platformDurable","definitionName":"coworkerd:platform","tenant":"alpha"})"));
+  JsonDoc otherTenant(kj::str(R"({"kind":"platformDurable","definitionName":"coworkerd:platform","tenant":"beta"})"));
+  JsonDoc fixture(kj::str(R"({"kind":"platformDurable","definitionName":"coworkerd:platform-test","tenant":"alpha"})"));
+  JsonDoc selection(kj::str(R"({"className":"SqlDatabase"})"));
+  DurableRoute route{};
+  route.key = {"namespace-one", "object-one"};
+  route.open.className = "SqlDatabase";
+  route.open.definition = platformCopyKey(input.get(), plan.get());
+  KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
+  route.open.definition = platformCopyKey(input.get(), plan.get(), &route.key);
+  KJ_EXPECT(platformDurablePlan(input.get(), plan.get(), selection.get(), route));
+  KJ_EXPECT(!platformDurablePlan(platformWorker.get(), plan.get(), selection.get(), route));
+  route.open.definition = platformCopyKey(input.get(), otherTenant.get(), &route.key);
+  KJ_EXPECT(!platformDurablePlan(input.get(), otherTenant.get(), selection.get(), route));
+  route.open.definition = platformCopyKey(input.get(), fixture.get(), &route.key);
+  KJ_EXPECT(!platformDurablePlan(input.get(), fixture.get(), selection.get(), route));
+  route.open.definition = platformCopyKey(input.get(), plan.get(), &route.key);
+  route.key.namespaceId = "namespace-two";
+  KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
+  route.key = {"namespace-one", "object-two"};
+  KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
+}
+
+KJ_TEST("an exclusive database copy keeps its isolate while the home has a reservation") {
+  const auto database = PLATFORM_DATABASE_COPY_PREFIX + std::string(64, 'a');
+  const auto tenant = std::string(64, 'a') + ":" + std::string(64, 'b');
+  KJ_EXPECT(!shouldReleaseDurableCopy(1, false, database, false));
+  KJ_EXPECT(!shouldReleaseDurableCopy(0, true, database, false));
+  KJ_EXPECT(shouldReleaseDurableCopy(0, false, database, false));
+  KJ_EXPECT(!shouldReleaseDurableCopy(0, false, tenant, false));
+  KJ_EXPECT(shouldReleaseDurableCopy(0, false, tenant, true));
+}
+
+KJ_TEST("above the admission ceiling a database replaces only a sufficient charge within the hard budget") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  const auto budget = std::make_shared<ResourceBudget>(128 * MiB, 10, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto idleDatabase = std::make_shared<ResourceReservation>(budget, 64, true);
+  ResourceReservation ordinary(budget, 64);
+  ResourceReservation otherTenant(budget, 64);
+  ResourceReservation incoming(budget, 64, true);
+  KJ_REQUIRE(idleDatabase->registerPreparation());
+  KJ_REQUIRE(ordinary.registerPreparation());
+  const auto aboveAdmission = budget->admissionMaximum + 1;
+  KJ_REQUIRE(ordinary.allocateExternal(aboveAdmission - budget->memoryReserved.load()));
+  KJ_EXPECT(!incoming.registerPreparation());
+  KJ_EXPECT(!budget->replacementCeiling(
+      ResourceBudget::PREPARATION_MEMORY - 1, ResourceBudget::PREPARATION_HEAP));
+  const auto ceiling = idleDatabase->replacementCeiling();
+  KJ_REQUIRE(ceiling == aboveAdmission);
+  DatabasePreparationReplacement replacement{*ceiling};
+  idleDatabase.reset();
+  KJ_EXPECT(!otherTenant.registerPreparation(&replacement));
+  KJ_EXPECT(!incoming.registerPreparation());
+  KJ_REQUIRE(incoming.registerPreparation(&replacement));
+  KJ_EXPECT(budget->memoryReserved.load() == aboveAdmission);
+  KJ_EXPECT(budget->residents.load() == 2);
+
+  // A measured increase can take total reserved memory above the hard ceiling.
+  KJ_EXPECT(!budget->change(0, budget->memoryMaximum + 1 - aboveAdmission, 0, 0, false, true));
+  KJ_EXPECT(!incoming.replacementCeiling());
+  KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum + 1);
+}
+
+KJ_TEST("database retirement waits for the final reservation holder only until its deadline") {
+  using Outcome = DatabaseRetirement::Outcome;
+  constexpr auto MiB = ResourceBudget::MiB;
+  const auto budget = std::make_shared<ResourceBudget>(128 * MiB, 1, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto idleDatabase = std::make_shared<ResourceReservation>(budget, 64, true);
+  KJ_REQUIRE(idleDatabase->registerPreparation());
+  KJ_EXPECT(idleDatabase->replacementCeiling().has_value());
+  const auto now = server::DurableAdmission::Clock::now();
+  const auto deadline = now + std::chrono::seconds(1);
+  const DatabaseRetirement victim{1, 1, 0, idleDatabase->returned, deadline, false};
+  KJ_EXPECT(victim.outcome(now, true, false) == Outcome::REFUSED);
+  KJ_EXPECT(victim.outcome(now, true, true) == Outcome::PENDING);
+  auto lastHolder = idleDatabase;
+  idleDatabase.reset();
+  KJ_EXPECT(victim.outcome(now, false, false) == Outcome::PENDING);
+  KJ_EXPECT(victim.outcome(deadline, false, false) == Outcome::EXPIRED);
+  KJ_EXPECT(budget->residents.load() == 1);
+  lastHolder.reset();
+  KJ_EXPECT(victim.outcome(now, false, false) == Outcome::RELEASED);
+  KJ_EXPECT(victim.outcome(deadline, false, false) == Outcome::RELEASED);
+  KJ_EXPECT(budget->residents.load() == 0);
+  KJ_EXPECT(budget->memoryReserved.load() == budget->baselineMemory);
+}
+
+KJ_TEST("a database preparation retires only one copy when competing work claims its budget") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  const auto budget = std::make_shared<ResourceBudget>(128 * MiB, 2, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto first = std::make_shared<ResourceReservation>(budget, 64, true);
+  auto second = std::make_shared<ResourceReservation>(budget, 64, true);
+  KJ_REQUIRE(first->registerPreparation());
+  KJ_REQUIRE(second->registerPreparation());
+  ResourceReservation competitor(budget, 64);
+  ResourceReservation incoming(budget, 64, true);
+  unsigned retirements = 0;
+  auto retire = [&]() -> kj::Promise<std::shared_ptr<DatabasePreparationReplacement>> {
+    if (++retirements == 1) {
+      first.reset();
+      KJ_REQUIRE(competitor.registerPreparation());
+    } else {
+      second.reset();
+    }
+    return std::make_shared<DatabasePreparationReplacement>(budget->admissionMaximum);
+  };
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  KJ_EXPECT(!registerDurablePreparation(incoming, true, retire).wait(waitScope));
+  KJ_EXPECT(retirements == 1);
+  KJ_EXPECT(budget->residents.load() == 2);
+  KJ_EXPECT(!incoming.registered);
+}
+
+KJ_TEST("one returned copy admits at most one replacement above the admission ceiling") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  const auto budget = std::make_shared<ResourceBudget>(128 * MiB, 10, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto victim = std::make_shared<ResourceReservation>(budget, 64, true);
+  ResourceReservation live(budget, 64);
+  ResourceReservation first(budget, 64, true);
+  ResourceReservation second(budget, 64, true);
+  KJ_REQUIRE(victim->registerPreparation());
+  KJ_REQUIRE(live.registerPreparation());
+  KJ_REQUIRE(live.allocateExternal(budget->admissionMaximum - budget->memoryReserved.load() +
+      ResourceBudget::PREPARATION_MEMORY));
+  KJ_REQUIRE(victim->allocateExternal(ResourceBudget::PREPARATION_MEMORY));
+  const auto ceiling = victim->replacementCeiling();
+  KJ_REQUIRE(ceiling.has_value());
+  DatabasePreparationReplacement replacement{*ceiling};
+  victim.reset();
+  KJ_REQUIRE(first.registerPreparation(&replacement));
+  KJ_EXPECT(!second.registerPreparation(&replacement));
+  KJ_EXPECT(budget->memoryReserved.load() == budget->admissionMaximum +
+      ResourceBudget::PREPARATION_MEMORY);
+}
+
+KJ_TEST("a returned preparation credit is available to the waiting database first") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  const auto budget = std::make_shared<ResourceBudget>(128 * MiB, 10, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto victim = std::make_shared<ResourceReservation>(budget, 64, true);
+  ResourceReservation live(budget, 64);
+  ResourceReservation competitor(budget, 64);
+  ResourceReservation incoming(budget, 64, true);
+  KJ_REQUIRE(victim->registerPreparation());
+  KJ_REQUIRE(live.registerPreparation());
+  KJ_REQUIRE(live.allocateExternal(budget->admissionMaximum - budget->memoryReserved.load()));
+  budget->preferDatabasePreparation(server::DurableAdmission::Time::max());
+  victim.reset();
+  KJ_EXPECT(!competitor.registerPreparation());
+  KJ_EXPECT(incoming.registerPreparation());
+  KJ_EXPECT(budget->memoryReserved.load() == budget->admissionMaximum);
+  live.freeExternal(ResourceBudget::PREPARATION_MEMORY);
+  budget->preferDatabasePreparation(server::DurableAdmission::Clock::now());
+  KJ_EXPECT(competitor.registerPreparation());
+  KJ_EXPECT(budget->databasePreparationPreferredUntil == server::DurableAdmission::Time{});
+}
+
+KJ_TEST("a database replacement counts heap headroom lent after the victim was selected") {
+  constexpr auto preparation = ResourceBudget::PREPARATION_MEMORY;
+  const auto budget = std::make_shared<ResourceBudget>(128 * ResourceBudget::MiB, 2, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto victim = std::make_shared<ResourceReservation>(budget, 64, true);
+  ResourceReservation live(budget, 64);
+  ResourceReservation incoming(budget, 64, true);
+  KJ_REQUIRE(victim->registerPreparation());
+  KJ_REQUIRE(live.registerPreparation());
+  const auto beforeRelease = budget->memoryMaximum - 1;
+  KJ_REQUIRE(live.allocateExternal(beforeRelease - budget->memoryReserved.load()));
+  const auto ceiling = victim->replacementCeiling();
+  KJ_REQUIRE(ceiling == beforeRelease);
+
+  // Simulate two bytes lent to a heap before admission retries.
+  budget->lent = 2;
+  KJ_EXPECT(!victim->replacementCeiling());
+  victim.reset();
+  DatabasePreparationReplacement replacement{*ceiling};
+  KJ_EXPECT(!incoming.registerPreparation(&replacement));
+  KJ_EXPECT(!replacement.used);
+  KJ_EXPECT(budget->memoryReserved.load() == beforeRelease - preparation);
+  budget->lent = 1;
+  KJ_REQUIRE(incoming.registerPreparation(&replacement));
+  KJ_EXPECT(budget->memoryReserved.load() == beforeRelease);
+  KJ_EXPECT(budget->memoryReserved.load() + budget->lent == budget->memoryMaximum);
+}
+
+KJ_TEST("lent heap leaves the ordinary admission ceiling available to a database replacement") {
+  const auto budget = std::make_shared<ResourceBudget>(128 * ResourceBudget::MiB, 2, 4,
+      ResourceBudget::ReclaimMode::NONE);
+  auto victim = std::make_shared<ResourceReservation>(budget, 64, true);
+  ResourceReservation live(budget, 64);
+  KJ_REQUIRE(victim->registerPreparation());
+  KJ_REQUIRE(live.registerPreparation());
+  KJ_REQUIRE(live.allocateExternal(budget->admissionMaximum - budget->memoryReserved.load()));
+
+  // Simulate the emergency headroom from an isolate's first near-heap-limit raise.
+  budget->lent = MAX_SINGLE_HEAP_OBJECT;
+  KJ_EXPECT(victim->replacementCeiling() == budget->admissionMaximum);
+  victim.reset();
+  {
+    ResourceReservation ordinary(budget, 64, true);
+    KJ_REQUIRE(ordinary.registerPreparation());
+    KJ_EXPECT(budget->memoryReserved.load() == budget->admissionMaximum);
+  }
+  DatabasePreparationReplacement replacement{budget->admissionMaximum};
+  ResourceReservation incoming(budget, 64, true);
+  KJ_EXPECT(incoming.registerPreparation(&replacement));
+  KJ_EXPECT(budget->memoryReserved.load() == budget->admissionMaximum);
+}
+
+// Exercise the server's routing and accounting without starting homes or creating actors.
+struct DatabaseAdmissionFixture {
+  using Admission = server::DurableAdmission;
+  static constexpr auto PREPARATION = ResourceBudget::PREPARATION_MEMORY;
+  // Advance the routing clock explicitly while the budget's real clock remains before the
+  // preference deadline. No test waits for a real deadline or allocates the charged bytes.
+  const Admission::Time now = Admission::Clock::now() + std::chrono::hours(1);
+  const Admission::Time lease = now + std::chrono::seconds(5);
+  static constexpr auto RETIREMENT_WAIT = std::chrono::seconds(1);
+  ThreadedServer server{3, "", "", -1, {}, {}, &initializeV8()};
+  const std::shared_ptr<ResourceBudget> budget = std::make_shared<ResourceBudget>(
+      128 * ResourceBudget::MiB, 2, 3, ResourceBudget::ReclaimMode::NONE);
+  const DurableRoute victim = route("victim", true);
+  const DurableRoute incoming = route("incoming", true);
+  const DurableRoute neighbor = route("neighbor", false);
+  const DurableRoute competitor = route("competitor", false);
+  std::shared_ptr<ResourceReservation> held = std::make_shared<ResourceReservation>(budget, 64, true);
+  uint64_t victimTree = 0;
+
+  DatabaseAdmissionFixture() {
+    server.resources = budget;
+    server.durableAdmission.emplace(Admission::Limits{
+      .capacity = {.threads = 3, .descriptors = 20, .memory = 256},
+      .tree = {.threads = 1, .descriptors = 3, .memory = 16},
+      .event = {.descriptors = 1, .memory = 4},
+      .residentTarget = 2,
+      .mailboxDepth = 3,
+      .mailboxBytes = 64,
+    }, 1);
+    for (auto id: {1u, 2u, 3u}) {
+      auto thread = std::make_unique<ThreadedServer::Thread>(false, false);
+      thread->homeId = id;
+      thread->home.emplace();
+      server.threads.push_back(std::move(thread));
+    }
+    server.ready.store(true);
+    KJ_REQUIRE(held->registerPreparation());
+    victimTree = makeResident(victim);
+    KJ_REQUIRE(server.durableAdmission->homeFor(victimTree) == 1u);
+    home().databaseCanRetire = true;
+    home().databaseLastUse = 1;
+    home().databaseReservation = held;
+  }
+
+  ~DatabaseAdmissionFixture() {
+    for (auto& thread: server.threads) close(thread->wake);
+  }
+
+  static DurableRoute route(const char* object, bool database) {
+    return {{database ? "database" : "tenant", object},
+      {1, 1, 1, 1, database ? PLATFORM_DATABASE_COPY_PREFIX + std::string(object) : object,
+        database ? "SqlDatabase" : "Counter"},
+      {}, {}, {}};
+  }
+
+  ThreadedServer::Thread::DurableHome& home() {
+    return *server.threads.front()->home;
+  }
+
+  Admission::Result queue(const DurableRoute& route, Admission::Time at) {
+    return server.queueDurable(route, 0, lease, at);
+  }
+
+  uint64_t makeResident(const DurableRoute& route) {
+    auto ticket = queue(route, now).ticket;
+    KJ_REQUIRE(ticket.has_value());
+    auto& table = *server.durableAdmission;
+    const auto homeId = table.homeFor(ticket->tree);
+    KJ_REQUIRE(homeId.has_value());
+    KJ_REQUIRE(table.begin(*ticket, *homeId, route.key, route.open, now) ==
+        Admission::Delivery::ACCEPTED);
+    KJ_REQUIRE(table.complete(*ticket, *homeId));
+    auto& home = *server.threads[*homeId - 1]->home;
+    home.resident.insert(ticket->tree);
+    home.warmDefinition = route.open.definition;
+    return ticket->tree;
+  }
+
+  void closeVictim(const DatabaseRetirement& selected) {
+    std::lock_guard lock(server.durableRoutingMutex);
+    KJ_REQUIRE(server.stopDurableIdleTree(victimTree, 1, false, &selected, now));
+    KJ_REQUIRE(server.releaseDurableTree(victimTree, 1, true));
+    // Mirror the home dropping its empty copy while the test keeps the final charge alive.
+    home().warmDefinition.clear();
+    home().definition.clear();
+    home().databaseReservation.reset();
+  }
+};
+
+KJ_TEST("accept expiry releases every waiter and limits replacement to the actual pre-release total") {
+  DatabaseAdmissionFixture test;
+  auto& server = test.server;
+  auto& table = *server.durableAdmission;
+  ResourceReservation live(test.budget, 64);
+  KJ_REQUIRE(live.registerPreparation());
+  const auto selectedTotal = test.budget->admissionMaximum + DatabaseAdmissionFixture::PREPARATION;
+  KJ_REQUIRE(live.allocateExternal(selectedTotal - test.budget->memoryReserved.load()));
+
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  auto first = server.reclaimIdleDatabase(test.now);
+  auto second = server.reclaimIdleDatabase(test.now);
+  KJ_REQUIRE(server.databaseVictim.has_value());
+  auto selected = *server.databaseVictim;
+  KJ_REQUIRE(selected.preparationCeiling == selectedTotal);
+  KJ_EXPECT(test.budget->databasePreparationPreferredUntil == selected.deadline + DATABASE_ADMISSION_GRACE);
+  test.closeVictim(selected);
+  KJ_EXPECT(server.expireDurableAdmissions(selected.deadline - std::chrono::milliseconds(1)).empty());
+  KJ_EXPECT(!first.poll(waitScope));
+
+  // The home has not observed completion. A competing reservation shrank before the final
+  // holder died, so the replacement must use the smaller total recorded at release.
+  live.freeExternal(1);
+  test.held.reset();
+  KJ_EXPECT(server.expireDurableAdmissions(selected.deadline).empty());
+  KJ_EXPECT(!server.databaseVictim);
+  KJ_EXPECT(table.state().overloads == 0);
+  KJ_REQUIRE(first.poll(waitScope));
+  KJ_REQUIRE(second.poll(waitScope));
+  auto replacement = first.wait(waitScope);
+  KJ_REQUIRE(replacement != nullptr);
+  KJ_EXPECT(second.wait(waitScope) == replacement);
+  KJ_EXPECT(replacement->ceiling == selectedTotal - 1);
+  ResourceReservation incoming(test.budget, 64, true);
+  KJ_REQUIRE(live.allocateExternal(1));
+  KJ_EXPECT(!incoming.registerPreparation(&*replacement));
+  live.freeExternal(1);
+  KJ_EXPECT(incoming.registerPreparation(&*replacement));
+  KJ_EXPECT(test.budget->memoryReserved.load() == selectedTotal - 1);
+}
+
+KJ_TEST("accept expiry refuses every budget waiter while the charge is still held") {
+  DatabaseAdmissionFixture test;
+  auto& server = test.server;
+  auto& table = *server.durableAdmission;
+  auto neighbor = server.queueDurable(
+      test.neighbor, 0, test.now + DatabaseAdmissionFixture::RETIREMENT_WAIT, test.now).ticket;
+  KJ_REQUIRE(neighbor.has_value());
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  auto first = server.reclaimIdleDatabase(test.now);
+  auto second = server.reclaimIdleDatabase(test.now);
+  KJ_REQUIRE(server.databaseVictim.has_value());
+  const auto deadline = server.databaseVictim->deadline;
+  KJ_EXPECT(deadline == test.now + DatabaseAdmissionFixture::RETIREMENT_WAIT);
+  KJ_EXPECT_LOG(WARNING, "idle database admission retirement timed out");
+  const auto expired = server.expireDurableAdmissions(deadline);
+  KJ_REQUIRE(expired.size() == 1);
+  KJ_EXPECT(expired.front() == *neighbor);
+  KJ_REQUIRE(first.poll(waitScope));
+  KJ_REQUIRE(second.poll(waitScope));
+  KJ_EXPECT(!first.wait(waitScope));
+  KJ_EXPECT(!second.wait(waitScope));
+  KJ_EXPECT(!server.databaseVictim);
+  KJ_EXPECT(!test.home().databaseCanRetire);
+  KJ_EXPECT(table.state().overloads == 1);
+  KJ_EXPECT(table.state().expired == 1);
+  KJ_EXPECT(test.budget->databasePreparationPreferredUntil == deadline);
+}
+
+KJ_TEST("the server rechecks the deadline and activity before stopping the selected tree") {
+  using Admission = DatabaseAdmissionFixture::Admission;
+  DatabaseAdmissionFixture test;
+  auto& server = test.server;
+  auto& table = *server.durableAdmission;
+  test.makeResident(test.neighbor);
+  KJ_REQUIRE(test.queue(test.incoming, test.now).status == Admission::Status::RETIRING);
+  KJ_REQUIRE(server.databaseVictim.has_value());
+  const auto selected = *server.databaseVictim;
+  auto waiting = test.queue(test.victim, test.now).ticket;
+  KJ_REQUIRE(waiting.has_value());
+  std::lock_guard lock(server.durableRoutingMutex);
+  auto stop = [&](Admission::Time at) {
+    return server.stopDurableIdleTree(test.victimTree, 1, false, &selected, at);
+  };
+  KJ_EXPECT(!stop(test.now));
+  KJ_REQUIRE(table.cancel(*waiting) == Admission::Cancellation::RELEASED);
+  KJ_EXPECT(!stop(selected.deadline));
+  KJ_EXPECT(table.isIdleTree(test.victimTree, 1));
+  ++test.home().databaseLastUse;
+  const auto beforeDeadline = selected.deadline - std::chrono::milliseconds(1);
+  KJ_EXPECT(!stop(beforeDeadline));
+  test.home().databaseLastUse = selected.lastUse;
+  KJ_EXPECT(stop(beforeDeadline));
+}
+
+KJ_TEST("queueDurable holds the returned tree and preparation credits until a database claims them") {
+  using Admission = DatabaseAdmissionFixture::Admission;
+  using Status = Admission::Status;
+  DatabaseAdmissionFixture test;
+  auto& server = test.server;
+  auto& table = *server.durableAdmission;
+  test.makeResident(test.neighbor);
+  ResourceReservation live(test.budget, 64);
+  KJ_REQUIRE(live.registerPreparation());
+  KJ_REQUIRE(test.queue(test.incoming, test.now).status == Status::RETIRING);
+  KJ_REQUIRE(server.databaseVictim.has_value());
+  const auto selected = *server.databaseVictim;
+  KJ_EXPECT(test.budget->databasePreparationPreferredUntil == selected.deadline + DATABASE_ADMISSION_GRACE);
+  test.closeVictim(selected);
+  KJ_REQUIRE(server.databaseVictim->treePreferred);
+  test.held.reset();
+  const auto returnedAt = test.now + std::chrono::milliseconds(200);
+  {
+    std::lock_guard lock(server.durableRoutingMutex);
+    server.finishDatabaseRetirement(selected.outcome(returnedAt, false, false), returnedAt);
+  }
+  KJ_EXPECT(test.budget->databasePreparationPreferredUntil == returnedAt + DATABASE_ADMISSION_GRACE);
+  KJ_EXPECT(test.home().databasePreferredUntil == returnedAt + DATABASE_ADMISSION_GRACE);
+  KJ_EXPECT(test.queue(test.neighbor, returnedAt).status == Status::QUEUED);
+  // There is a spare home, but the only free tree credit is reserved for the database.
+  KJ_EXPECT(test.queue(test.competitor, returnedAt).status == Status::OVERLOADED);
+  ResourceReservation ordinary(test.budget, 64);
+  KJ_EXPECT(!ordinary.registerPreparation());
+  const auto claimed = test.queue(test.incoming, returnedAt);
+  KJ_REQUIRE(claimed.ticket.has_value());
+  KJ_EXPECT(table.homeFor(claimed.ticket->tree) == 1u);
+  auto database = std::make_shared<ResourceReservation>(test.budget, 64, true);
+  KJ_EXPECT(database->registerPreparation());
+  KJ_EXPECT(test.budget->databasePreparationPreferredUntil == Admission::Time{});
+
+  // If queueDurable consumed the tree preference, the ordinary caller can use the tree after
+  // this database closes, even though the preference's time has not elapsed.
+  {
+    std::lock_guard lock(server.durableRoutingMutex);
+    KJ_REQUIRE(table.cancel(*claimed.ticket) == Admission::Cancellation::RELEASED);
+    KJ_REQUIRE(server.stopDurableIdleTree(claimed.ticket->tree, 1, false, nullptr));
+    KJ_REQUIRE(server.releaseDurableTree(claimed.ticket->tree, 1, false));
+  }
+  database.reset();
+  KJ_EXPECT(test.queue(test.competitor, returnedAt).status == Status::QUEUED);
+  KJ_EXPECT(ordinary.registerPreparation());
+}
+
+KJ_TEST("SQLite allocations share the copy reservation with V8 and return only their net change") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  const auto budget =
+      std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
+  ResourceReservation copy(budget, 64, true);
+  KJ_REQUIRE(copy.registerPreparation());
+  const auto baseline = budget->memoryReserved.load();
+  size_t bytes = 0;
+  SqliteMemoryScope scope(bytes, 4 * MiB, &copy);
+  auto* block = sqliteMemMalloc(4096);
+  KJ_REQUIRE(block != nullptr);
+  KJ_DEFER(sqliteMemFree(block));
+  const auto original = bytes;
+  KJ_EXPECT(original >= 4096);
+  KJ_EXPECT(budget->memoryReserved.load() == baseline + MiB);
+
+  // Saturate the process with the copy's independently accounted ArrayBuffers.
+  const auto buffers = budget->memoryMaximum - budget->memoryReserved.load();
+  KJ_REQUIRE(copy.allocateExternal(buffers));
+  KJ_EXPECT(sqliteMemRealloc(block, MiB + 4096) == nullptr);
+  KJ_EXPECT(SqliteMemoryScope::getLimitRefusal() == SqliteMemoryScope::LimitRefusal::PROCESS);
+  KJ_EXPECT(bytes == original);
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == MiB);
+  KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum);
+  copy.freeExternal(buffers);
+  SqliteMemoryScope::clearLimitRefusal();
+  KJ_EXPECT(sqliteMemRealloc(block, 4 * MiB + 4096) == nullptr);
+  KJ_EXPECT(SqliteMemoryScope::getLimitRefusal() == SqliteMemoryScope::LimitRefusal::DATABASE);
+  KJ_EXPECT(bytes == original);
+
+  auto* grown = sqliteMemRealloc(block, MiB + 4096);
+  KJ_REQUIRE(grown != nullptr);
+  block = grown;
+  const auto growth = bytes;
+  KJ_EXPECT(growth >= MiB + 4096);
+  KJ_EXPECT(budget->memoryReserved.load() == baseline + 2 * MiB);
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == 2 * MiB);
+
+  auto* shrunk = sqliteMemRealloc(block, 1024);
+  KJ_REQUIRE(shrunk != nullptr);
+  block = shrunk;
+  KJ_EXPECT(bytes >= 1024 && bytes < original);
+  KJ_EXPECT(budget->memoryReserved.load() == baseline + MiB);
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == MiB);
+  sqliteMemFree(block);
+  block = nullptr;
+  KJ_EXPECT(bytes == 0);
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
+  KJ_EXPECT(budget->memoryReserved.load() == baseline);
+}
+
+KJ_TEST("SQLite heap held by multiple databases meets the process ceiling and returns on close") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  constexpr int queryBytes = int(MiB) + 192 * 1024;
+  const auto budget =
+      std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
+  auto firstCopy = std::make_shared<ResourceReservation>(budget, 64, true);
+  auto secondCopy = std::make_shared<ResourceReservation>(budget, 64, true);
+  ResourceReservation competitor(budget, 64);
+  KJ_REQUIRE(firstCopy->registerPreparation());
+  KJ_REQUIRE(secondCopy->registerPreparation());
+  KJ_REQUIRE(competitor.registerPreparation());
+
+  installSqliteCustomAllocator();
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::WalTransactionLimit firstLimit(MiB), secondLimit(MiB);
+  SqliteDatabase::Vfs firstVfs(*dir, {.walTransactionLimit = &firstLimit});
+  SqliteDatabase::Vfs secondVfs(*dir, {.walTransactionLimit = &secondLimit});
+  const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
+  auto openFirst = [&] {
+    return kj::heap<SqliteDatabase>(firstVfs, kj::Path({"one.db"}), mode, 4 * MiB, kj::maxValue,
+        SqliteObserver::DEFAULT, kj::none, firstCopy);
+  };
+  const auto beforeOpen = budget->memoryReserved.load();
+  auto first = openFirst();
+  auto second = kj::heap<SqliteDatabase>(secondVfs, kj::Path({"two.db"}), mode, 4 * MiB,
+      kj::maxValue, SqliteObserver::DEFAULT, kj::none, secondCopy);
+  auto verify = [&] {
+    const auto firstCharge = SqliteProcessMemoryBudget::chargeFor(first->getSqliteMemoryBytes());
+    const auto secondCharge = SqliteProcessMemoryBudget::chargeFor(second->getSqliteMemoryBytes());
+    KJ_EXPECT(firstCopy->sqliteMemoryCharge() == firstCharge);
+    KJ_EXPECT(secondCopy->sqliteMemoryCharge() == secondCharge);
+    KJ_EXPECT(budget->sqliteMemoryReserved.load() == firstCharge + secondCharge);
+    return firstCharge + secondCharge;
+  };
+  auto idleBytes = verify();
+  KJ_REQUIRE(idleBytes == 2 * MiB);
+  KJ_EXPECT(budget->memoryReserved.load() == beforeOpen + idleBytes);
+  const auto buffers = budget->memoryMaximum - budget->memoryReserved.load() - MiB;
+  KJ_REQUIRE(competitor.allocateExternal(buffers));
+
+  firstLimit.setPageSize(4096);
+  secondLimit.setPageSize(4096);
+  {
+    auto held = first->run("SELECT randomblob(?)", queryBytes);
+    KJ_REQUIRE(held.getBlob(0).size() == queryBytes);
+    const auto holdingBytes = verify();
+    KJ_EXPECT(holdingBytes == 3 * MiB);
+    KJ_EXPECT(budget->memoryReserved.load() == beforeOpen + holdingBytes + buffers);
+    {
+      // Trusted work outside the transaction still acquires and returns the step.
+      auto maintenance = second->run("SELECT randomblob(?)", queryBytes);
+      KJ_REQUIRE(maintenance.getBlob(0).size() == queryBytes);
+      KJ_EXPECT(verify() == holdingBytes + MiB);
+      KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum + MiB);
+    }
+    KJ_EXPECT(verify() == holdingBytes);
+    secondLimit.begin();
+    second->run("SAVEPOINT pending");
+    KJ_EXPECT_THROW_MESSAGE("out of memory", second->run("SELECT randomblob(?)", queryBytes));
+    KJ_EXPECT(secondLimit.wasProcessMemoryRefused() && !secondLimit.wasMemoryRefused());
+    second->rollbackWalTransaction();
+    secondLimit.end(*second, /*rolledBack=*/true);
+    KJ_EXPECT(!second->observedCriticalError());
+    KJ_EXPECT(held.getBlob(0).size() == queryBytes);
+    KJ_EXPECT(budget->withinMaximum());
+  }
+  KJ_EXPECT(verify() == idleBytes);
+  secondLimit.begin();
+  {
+    auto admitted = second->run("SELECT randomblob(?)", queryBytes);
+    KJ_EXPECT(admitted.getBlob(0).size() == queryBytes);
+  }
+  secondLimit.end(*second);
+
+  // The copy can outlive its connection. Its SQLite bytes must be available
+  // before the copy returns its own reservation to the process.
+  first->close();
+  KJ_EXPECT(firstCopy->sqliteMemoryCharge() == 0);
+  KJ_EXPECT(verify() == MiB);
+  const auto openHeadroom = budget->memoryMaximum - budget->memoryReserved.load();
+  KJ_REQUIRE(competitor.allocateExternal(openHeadroom));
+  first = openFirst();
+  KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum + MiB);
+  first->reset();
+  KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum + MiB);
+  KJ_EXPECT(first->run("SELECT 1").getInt(0) == 1);
+  KJ_EXPECT(verify() == 2 * MiB);
+  competitor.freeExternal(openHeadroom);
+  first = nullptr;
+  second = nullptr;
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
+  KJ_EXPECT(budget->memoryReserved.load() == beforeOpen + buffers);
+  competitor.freeExternal(buffers);
+  KJ_EXPECT(budget->memoryReserved.load() == beforeOpen);
+}
+
+KJ_TEST("a copy logs SQLite charge drift and returns its recorded memory once") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  auto budget = std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
+  const auto baseline = budget->memoryReserved.load();
+  {
+    KJ_EXPECT_LOG(ERROR, "SQLite heap charge remained when releasing a copy reservation");
+    ResourceReservation copy(budget, 64, true);
+    KJ_REQUIRE(copy.registerPreparation());
+    KJ_REQUIRE(copy.resizeSqliteMemory(0, MiB, true));
+    KJ_EXPECT_LOG(ERROR, "SQLite heap change exceeded the copy's recorded charge");
+    KJ_REQUIRE(copy.resizeSqliteMemory(2 * MiB, 0, true));
+    KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
+    KJ_REQUIRE(copy.resizeSqliteMemory(0, MiB, true));
+  }
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
+  KJ_EXPECT(budget->memoryReserved.load() == baseline);
 }
 
 KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
@@ -1225,7 +1875,7 @@ KJ_TEST("the raised heap ceiling counts from the heap in use and later stays wit
   const auto third = memory.raise(second);
   KJ_EXPECT(third == second, third, second);
   KJ_EXPECT(memory.ceilingRaised.load() == 2);
-  KJ_EXPECT(budget->lent.load() == left, budget->lent.load(), left);
+  KJ_EXPECT(budget->lent == left);
   // A second isolate of the same process, terminated at its ceiling too: its
   // first raise is one maximum object as always, but what the first isolate
   // was lent is not left for its later one, until that call's execution ends.
@@ -1247,10 +1897,10 @@ KJ_TEST("the raised heap ceiling counts from the heap in use and later stays wit
     KJ_EXPECT(otherFirst == otherUsed + MAX_SINGLE_HEAP_OBJECT, otherFirst, otherUsed);
     KJ_EXPECT(otherMemory.raise(otherFirst) == otherFirst, "the first isolate's lent headroom is not left");
     memory.returnLent();
-    KJ_EXPECT(budget->lent.load() == MAX_SINGLE_HEAP_OBJECT);
+    KJ_EXPECT(budget->lent == MAX_SINGLE_HEAP_OBJECT);
     KJ_EXPECT(otherMemory.raise(otherFirst) > otherFirst, "returned headroom is left again");
     otherMemory.returnLent();
-    KJ_EXPECT(budget->lent.load() == 0);
+    KJ_EXPECT(budget->lent == 0);
   }
   isolate->CancelTerminateExecution();
 }
@@ -1276,7 +1926,7 @@ KJ_TEST("with a sandbox per isolate, a raised ceiling stays within the isolate's
   KJ_EXPECT(first == OWN_CAGE_HEAP, first);
   KJ_EXPECT(memory.raise(first) == first, "the isolate's own cage has nothing left");
   memory.returnLent();
-  KJ_EXPECT(budget->lent.load() == 0);
+  KJ_EXPECT(budget->lent == 0);
 }
 
 // Each long operation below ended the process before v138 (exit 74 at the
@@ -1675,6 +2325,134 @@ KJ_TEST("a call thread cancels background work that outlives the drain limit") {
   if (returned) backstop.wait(waitScope);
   KJ_EXPECT(canceled && tasks.isEmpty());
   KJ_EXPECT(BACKGROUND_BACKSTOP > WAIT_UNTIL_LIMIT);
+}
+
+class TeardownWalChannel final: public server::DurableWalChannel {
+ public:
+  kj::Vector<kj::StringPtr> events;
+
+  bool enabled() const override {
+    return true;
+  }
+  uint64_t nextRequest() override {
+    return ++request;
+  }
+
+  uint64_t registerShipper(server::DurableLogShipper&) override {
+    return nextRequest();
+  }
+  void unregisterShipper(server::DurableLogShipper& shipper) override {
+    auto openId = shipper.getOpenId();
+    KJ_REQUIRE(openId == 1 || openId == 2);
+    events.add(openId == 1 ? "unregister root"_kj : "unregister facet"_kj);
+  }
+  void send(uint64_t openId, kj::Array<kj::byte> message) override {
+    KJ_REQUIRE(message.size() >= 13);
+    KJ_REQUIRE(openId == 1 || openId == 2);
+    KJ_EXPECT(server::wal::getLe64(message.begin() + 5) == openId);
+    switch (message[4]) {
+      case server::wal::MSG_OPEN:
+        events.add(openId == 1 ? "root OPEN"_kj : "facet OPEN"_kj);
+        break;
+      case server::wal::MSG_CLOSED:
+        events.add(openId == 1 ? "root CLOSED"_kj : "facet CLOSED"_kj);
+        break;
+      case server::wal::MSG_ALARM:
+        KJ_EXPECT(openId == 1);
+        break;
+      default:
+        KJ_FAIL_ASSERT("unexpected WAL message", message[4]);
+    }
+  }
+  kj::Promise<void> sendFrames(
+      server::DurableLogShipper&, kj::Array<kj::byte>, uint64_t, kj::Timer&) override {
+    KJ_FAIL_ASSERT("the shutdown fixture does not write frames");
+  }
+
+ private:
+  uint64_t request = 0;
+};
+
+KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing the WAL Home") {
+  ThreadedServer server{
+    1, "", "teardown:1", -1, kj::newInMemoryDirectory(kj::nullClock()), {}, &initializeV8()};
+  // The fixture owns the resources so it can record early handle release safely.
+  TeardownWalChannel channel;
+  auto& events = channel.events;
+  Slot slot;
+  {
+    ThreadState state;
+    state.durableSlot = std::shared_ptr<Slot>(&slot, [](Slot*) {});
+    std::weak_ptr<Slot> copy = state.durableSlot;
+    state.wal = kj::attachRef(channel, kj::defer([&events, copy] {
+      KJ_EXPECT(copy.expired());
+      events.add("release Home"_kj);
+    }));
+
+    constexpr auto source = R"(
+      import { DurableObject } from 'cloudflare:workers';
+      export class Store extends DurableObject {}
+      export default { fetch() { return new Response('ok'); } };
+    )"_kj;
+    JsonDoc descriptor(kj::str(R"({"workerId":"test/teardown","versionId":"v1",
+        "mainModule":"index.js","compatibilityDate":"2026-11-01","contentHash":")",
+        digest(source.asBytes()).c_str(), "\"}"));
+    slot.worker = server.compile(slot, descriptor.get(), source);
+    auto storageId = digest("teardown"_kj.asBytes());
+    auto tree = std::make_shared<DurableTreeContext>(DurableTreeContext{
+      .state = state,
+      .server = server,
+      .slot = state.durableSlot,
+      .tree = 1,
+      .uniqueKey = kj::str("coworkerd-do-root-v1-", storageId.c_str()),
+      .storageId = kj::str(storageId.c_str()),
+      .objectName = kj::str("test/teardown/1"),
+      .idle = std::make_shared<server::DurableIdleLifecycle>(
+          server::DurableIdleLifecycle::Time{}, std::chrono::seconds(70)),
+    });
+    auto& worker = *KJ_ASSERT_NONNULL(slot.worker);
+    auto root =
+        makeDurableActor(tree, worker, kj::str("teardown"), "Store"_kj, Frankenvalue(), 0, 0);
+    auto facet = makeDurableActor(
+        tree, worker, kj::str("facet"), "Store"_kj, Frankenvalue(), 1, 1, nullptr, 0, "facet"_kj);
+    KJ_REQUIRE(state.durableActorTrees.size() == 2);
+    KJ_EXPECT(state.durableActorTrees.contains(root.value.get()));
+    KJ_EXPECT(state.durableActorTrees.contains(facet.value.get()));
+
+    // Model the drain queued when a root's I/O context cancels a facet session. The drain
+    // retains a real facet actor and its storage until the second round of cancellation.
+    auto queueDrain = kj::defer([&state, &events, facet = kj::mv(facet.value)]() mutable {
+      KJ_EXPECT(state.durableActorTrees.size() == 1);
+      KJ_EXPECT(state.durableActorTrees.contains(facet.get()));
+      events.add("queue facet drain"_kj);
+      auto cancelDrain = kj::defer([&state, &events, facet = kj::mv(facet)]() mutable {
+        KJ_EXPECT(state.durableRoots.empty());
+        events.add("cancel facet drain"_kj);
+        facet = nullptr;
+        KJ_EXPECT(state.durableActorTrees.empty());
+        events.add("actor index empty"_kj);
+      });
+      state.tasks.add(kj::Promise<void>(kj::NEVER_DONE).attach(kj::mv(cancelDrain)));
+    });
+    auto releaseOnCancel = kj::defer([&events, actor = kj::addRef(*root.value)]() mutable {
+      actor = nullptr;
+      events.add("cancel root task"_kj);
+    });
+    state.durableRoots.emplace(tree->tree,
+        ThreadState::DurableRoot{
+          .actor = kj::mv(root.value).attachToThisReference(kj::mv(queueDrain)),
+          .tree = tree,
+          .hooks = root.hooks,
+          .idle = tree->idle,
+        });
+    state.tasks.add(kj::Promise<void>(kj::NEVER_DONE).attach(kj::mv(releaseOnCancel)));
+    KJ_REQUIRE(!state.tasks.isEmpty());
+    KJ_EXPECT(events.asPtr() == kj::arr("root OPEN"_kj, "facet OPEN"_kj).asPtr());
+  }
+  auto expected = kj::arr("root OPEN"_kj, "facet OPEN"_kj, "cancel root task"_kj,
+      "unregister root"_kj, "root CLOSED"_kj, "queue facet drain"_kj, "cancel facet drain"_kj,
+      "unregister facet"_kj, "facet CLOSED"_kj, "actor index empty"_kj, "release Home"_kj);
+  KJ_EXPECT(events.asPtr() == expected.asPtr());
 }
 
 KJ_TEST("a reclaim requested during maintenance never waits for that pass") {

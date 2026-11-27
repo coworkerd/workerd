@@ -24,6 +24,8 @@ class RootBootstrapChannel final: public IoChannelFactory::SubrequestChannel {
     KJ_IF_SOME(cf, metadata.cfBlobJson) {
       request.setCfBlobJson(cf);
     }
+    // Dispatch from the platform wrapper into the selected root with the same node budget.
+    request.setBudgetLifetime(IoContext::current().getIoChannelFactory().getCoworkerdBudgetLifetime());
     return kj::heap<RpcWorkerInterface>(httpFactory, byteFactory,
         getUnsupportedFrankenvalueHandler(), request.send().getDispatcher());
   }
