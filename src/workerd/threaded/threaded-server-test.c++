@@ -109,7 +109,7 @@ KJ_TEST("a stateless isolate starts idle after loading and counts its next HTTP 
   // The first lock taken while serving the request lasts 200 ms on the controlled clock.
   clock.time = 2875 * kj::MILLISECONDS;
   clock.advanceAfterRead = 200 * kj::MILLISECONDS;
-  Invocation invocation(server, state, kj::mv(descriptor), Frankenvalue(), {});
+  Invocation invocation(server, state, kj::mv(descriptor), Frankenvalue(), {}, kj::none);
   auto client = kj::newHttpClient(invocation);
   auto response =
       client->request(kj::HttpMethod::GET, "http://test/busy", kj::HttpHeaders(*state.headers))
