@@ -30,10 +30,14 @@ constexpr size_t QUEUED_RECORD_BYTES = 72u << 20;
 // Reserve room for open/close and give-up commands when the data queue is full.
 constexpr size_t QUEUED_CONTROL_BYTES = 1u << 20;
 constexpr size_t HOME_OPEN_LIMIT = 4096;
+constexpr size_t MAX_BREAK_REASON_BYTES = 256;
 constexpr uint8_t ACK_TIMEOUT = 255;
 constexpr uint8_t ACK_DISCONNECTED = 254;
 constexpr auto STORAGE_UNAVAILABLE =
     "jsg.Error: Durable Object storage is unavailable: the node's replicator is not reachable "
+    "(STORAGE_UNAVAILABLE)"_kj;
+constexpr auto HOME_CAPACITY_REFUSAL =
+    "jsg.Error: Durable Object storage is unavailable: its Home has no notification capacity "
     "(STORAGE_UNAVAILABLE)"_kj;
 constexpr auto CLOSE_UNCONFIRMED =
     "the previous SQLite connection did not confirm close in this generation"_kj;
@@ -120,6 +124,11 @@ class Inbox {
     return true;
   }
 
+  bool atCapacity() {
+    std::lock_guard lock(mutex);
+    return closed || opens.size() == openLimit;
+  }
+
   void unregister(uint64_t openId) {
     std::lock_guard lock(mutex);
     auto entry = opens.find(openId);
@@ -186,7 +195,7 @@ class Inbox {
  private:
   using Notices = std::list<Notification>;
   // Each live registration reserves one slot per routed message kind. Only
-  // BREAK owns variable-length data, bounded by its wire length field.
+  // BREAK owns variable-length data, bounded by MAX_BREAK_REASON_BYTES.
   using Slots = std::array<kj::Maybe<Notices::iterator>, MSG_CLOSE_FOR_CODE_UPDATE + 1>;
   const size_t openLimit;
   std::mutex mutex;
@@ -386,8 +395,8 @@ class Session {
         KJ_REQUIRE(payload.size() >= 2, "invalid threaded WAL break");
         const size_t length = size_t(payload[0]) | (size_t(payload[1]) << 8);
         KJ_REQUIRE(payload.size() == length + 2, "invalid threaded WAL break length");
-        notice.reason = kj::str(kj::arrayPtr(
-            reinterpret_cast<const char*>(payload.begin() + 2), length));
+        notice.reason = kj::str(kj::arrayPtr(reinterpret_cast<const char*>(payload.begin() + 2),
+            kj::min(length, MAX_BREAK_REASON_BYTES)));
         break;
       }
       case MSG_CHECKPOINT_ASKED:
@@ -412,32 +421,44 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
  public:
   Home(std::shared_ptr<Shared> shared,
       kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose,
-      const kj::MonotonicClock& clock)
+      const kj::MonotonicClock& clock,
+      kj::Maybe<std::atomic<bool>&> walFull = kj::none,
+      std::shared_ptr<Inbox> inbox = std::make_shared<Inbox>())
       : shared(kj::mv(shared)),
         clock(clock),
-        inbox(std::make_shared<Inbox>()),
+        inbox(kj::mv(inbox)),
+        walFull(walFull),
         requestClose(kj::mv(requestClose)),
         tasks(*this) {
+    publishCapacity();
     tasks.add(read());
   }
 
   ~Home() noexcept(false) override {
     inbox->close();
+    publishCapacity();
   }
 
   bool enabled() const override { return true; }
   uint64_t nextRequest() override { return ++shared->nextId; }
 
   uint64_t registerShipper(DurableLogShipper& shipper) override {
-    KJ_REQUIRE(shared->negotiated(), STORAGE_UNAVAILABLE);
+    if (!shared->negotiated()) {
+      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
+    }
     const auto openId = nextRequest();
     auto result = kj::newPromiseAndFulfiller<void>();
     shippers.emplace(openId, Registration{&shipper, kj::mv(result.fulfiller), result.promise.fork()});
     if (!inbox->tryRegister(openId)) {
       shippers.erase(openId);
-      kj::throwRecoverableException(KJ_EXCEPTION(
-          OVERLOADED, "threaded WAL home notification capacity exhausted", STORAGE_UNAVAILABLE));
+      if (!shared->negotiated()) {
+        kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
+      }
+      auto error = KJ_EXCEPTION(OVERLOADED, kj::str(HOME_CAPACITY_REFUSAL));
+      error.setDetail(ThreadedWalLog::HOME_CAPACITY_DETAIL, kj::heapArray<kj::byte>(0));
+      kj::throwRecoverableException(kj::mv(error));
     }
+    publishCapacity();
     return openId;
   }
 
@@ -445,11 +466,14 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
     const auto openId = shipper.getOpenId();
     inbox->unregister(openId);
     shippers.erase(openId);
+    publishCapacity();
   }
 
   kj::Promise<void> waitForOpen(uint64_t openId, kj::Timer& timer) override {
     const auto found = shippers.find(openId);
-    KJ_REQUIRE(shared->negotiated() && found != shippers.end(), STORAGE_UNAVAILABLE);
+    if (!shared->negotiated() || found == shippers.end()) {
+      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
+    }
     auto timeout = timer.afterDelay(shared->confirmationTimeout).then([] {
       kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
     });
@@ -492,9 +516,16 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
   std::shared_ptr<Shared> shared;
   const kj::MonotonicClock& clock;
   std::shared_ptr<Inbox> inbox;
+  kj::Maybe<std::atomic<bool>&> walFull;
   std::map<uint64_t, Registration> shippers;
   kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose;
   kj::TaskSet tasks;
+
+  void publishCapacity() {
+    KJ_IF_SOME(full, walFull) {
+      full.store(inbox->atCapacity(), std::memory_order_relaxed);
+    }
+  }
 
   void taskFailed(kj::Exception&&) override { shared->stop(); }
 
@@ -675,8 +706,9 @@ uint64_t ThreadedWalLog::unconfirmedCloseIdentities() const {
 }
 
 kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
-    kj::Function<void(uint64_t, CloseReason)> requestClose) {
-  return kj::heap<Home>(impl->shared, kj::mv(requestClose), kj::systemPreciseMonotonicClock());
+    kj::Function<void(uint64_t, CloseReason)> requestClose, kj::Maybe<std::atomic<bool>&> walFull) {
+  return kj::heap<Home>(
+      impl->shared, kj::mv(requestClose), kj::systemPreciseMonotonicClock(), walFull);
 }
 
 kj::Promise<ThreadedWalLog::PreparedOpen> ThreadedWalLog::prepareOpen(

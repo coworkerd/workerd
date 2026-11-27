@@ -595,7 +595,8 @@ KJ_TEST("a full threaded WAL home inbox leaves another home ready and drains in 
   test.link.opened(heldId, ACK_QUOTA);
   tellSeal(1, 12);
   test.link.checkpoint(heldId);
-  tellBreak("held storage broke"_kj);
+  const std::string heldReason(1024, 'x');
+  tellBreak(heldReason.c_str());
   test.link.requestClose(heldId, MSG_CLOSE_ASKED);
   tellSeal(2, 20);
   test.link.requestClose(heldId, MSG_CLOSE_FOR_CODE_UPDATE);
@@ -635,7 +636,8 @@ KJ_TEST("a full threaded WAL home inbox leaves another home ready and drains in 
   };
   KJ_EXPECT(take(MSG_OPENED).status == ACK_QUOTA);
   take(MSG_CHECKPOINT_ASKED);
-  KJ_EXPECT(take(MSG_BREAK).reason == "held storage broke"_kj);
+  const auto broken = take(MSG_BREAK);
+  KJ_EXPECT(broken.reason == kj::StringPtr(heldReason.c_str()).first(MAX_BREAK_REASON_BYTES));
   take(MSG_CLOSE_ASKED);
   auto seal = take(MSG_SEALED);
   KJ_EXPECT(seal.salt1 == 2 && seal.upToFrame == 20);
@@ -652,6 +654,48 @@ KJ_TEST("a full threaded WAL home inbox leaves another home ready and drains in 
   paused->push({.type = MSG_OPENED, .openId = freshId});
   auto fresh = test.link.wait(paused->next());
   KJ_EXPECT(KJ_ASSERT_NONNULL(fresh).openId == freshId);
+}
+
+KJ_TEST("threaded WAL Home publishes its registration limit and closes its inbox") {
+  HomeSession test;
+  std::atomic<bool> full{false};
+  auto inbox = std::make_shared<Inbox>(1);
+  auto home = kj::heap<Home>(test.shared, [](uint64_t, CloseReason) {}, test.clock, full, inbox);
+  KJ_EXPECT(!full.load());
+  uint64_t openId;
+  {
+    TestRoot root(test, *home, "namespace/capacity/epoch"_kj);
+    openId = root.id();
+    acceptOpen(test, *home, root);
+    KJ_EXPECT(full.load());
+    auto refusal = kj::runCatchingExceptions(
+        [&] { TestRoot rejected(test, *home, "namespace/refused/epoch"_kj); });
+    const auto& error = KJ_ASSERT_NONNULL(refusal);
+    KJ_EXPECT(error.getType() == kj::Exception::Type::OVERLOADED);
+    KJ_EXPECT(error.getDescription() == HOME_CAPACITY_REFUSAL);
+    KJ_EXPECT(error.getDetail(ThreadedWalLog::HOME_CAPACITY_DETAIL) != kj::none);
+  }
+  test.link.receive(MSG_CLOSED, openId);
+  KJ_EXPECT(!full.load());
+  home = nullptr;
+  KJ_EXPECT(full.load());
+  KJ_EXPECT(test.link.wait(inbox->next()) == kj::none);
+  KJ_EXPECT(test.shared->negotiated());
+}
+
+KJ_TEST("threaded WAL Home returns capacity across more opens than its slot limit") {
+  HomeSession test;
+  auto home = test.attachHome();
+  for (auto i KJ_UNUSED: kj::zeroTo(HOME_OPEN_LIMIT + 1)) {
+    uint64_t openId;
+    {
+      TestRoot root(test, *home, "namespace/retired/epoch"_kj);
+      openId = root.id();
+      acceptOpen(test, *home, root);
+    }
+    test.link.receive(MSG_CLOSED, openId);
+  }
+  KJ_EXPECT(test.shared->negotiated());
 }
 
 KJ_TEST("threaded WAL home gives up a pending write at its deadline after caller cancellation") {
