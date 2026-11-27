@@ -1990,9 +1990,17 @@ struct ThreadState {
   };
   std::map<Worker::Actor *, uint64_t> durableActorTrees;
   std::map<uint64_t, DurableRoot> durableRoots;
-  // Cancel sessions and background work before destroying the state they can access during
-  // cancellation, including the actor indexes and storage that their actor references use.
   kj::TaskSet tasks{errors};
+
+  ~ThreadState() noexcept(false) {
+    // Cancel sessions while the roots and indexes are live. Dropping the roots can enqueue
+    // drains from their facet sessions, so cancel those before destroying the task set.
+    KJ_DEFER({
+      durableRoots.clear();
+      tasks.clear();
+    });
+    tasks.clear();
+  }
 };
 
 Frankenvalue readNativeProps(ThreadState &state, rpc::Frankenvalue::Reader value);
