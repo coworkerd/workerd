@@ -87,7 +87,7 @@ class DurableAdmission {
   DurableAdmission(Limits limits, uint64_t generation);
 
   Result queue(const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now,
-      bool database = false);
+      bool database = false, bool deferNewTreeOverload = false);
   void preferDatabaseTree(Time until) { databaseTreePreferredUntil = until; }
   void limitDatabaseTreePreference(Time until);
   void claimDatabaseTree() { databaseTreePreferredUntil = {}; }
@@ -176,6 +176,7 @@ class DurableIdleLifecycle {
   Pending pendingStarted(Time now);
   void pendingFinished(Pending pending, Time now);
   bool hasPending() const { return !pending.empty(); }
+  Time lastUse() const { return lastEvent < lastUnblocked ? lastUnblocked : lastEvent; }
   Decision check(Time now, bool hasOrdinarySocket, bool pressured);
 
  private:

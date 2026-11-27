@@ -54,7 +54,7 @@ void DurableAdmission::limitDatabaseTreePreference(Time until) {
 
 DurableAdmission::Result DurableAdmission::queue(
     const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now,
-    bool database) {
+    bool database, bool deferNewTreeOverload) {
   if (open.generation != generation) return {Status::STALE};
   if (deadline <= now) {
     ++counters.expired;
@@ -68,7 +68,7 @@ DurableAdmission::Result DurableAdmission::queue(
   }
 
   auto refuse = [&](bool newTreeCapacityRefused = false) -> Result {
-    if (!database || !newTreeCapacityRefused) recordOverload();
+    if (!(newTreeCapacityRefused && (database || deferNewTreeOverload))) recordOverload();
     return {.status = Status::OVERLOADED, .newTreeCapacityRefused = newTreeCapacityRefused};
   };
   if (bytes > limits.mailboxBytes ||
@@ -92,7 +92,7 @@ DurableAdmission::Result DurableAdmission::queue(
     auto includingPreferredTree = reserved;
     if ((limits.residentTarget != 0 && counters.trees + 1 >= limits.residentTarget) ||
         !reserve(includingPreferredTree, limits.capacity, limits.tree)) {
-      return refuse(true);
+      return refuse();
     }
   }
 
@@ -388,7 +388,7 @@ DurableIdleLifecycle::Decision DurableIdleLifecycle::check(
     Time now, bool hasOrdinarySocket, bool pressured) {
   if (ordinarySocket && !hasOrdinarySocket) lastUnblocked = now;
   ordinarySocket = hasOrdinarySocket;
-  const auto idle = now - std::max(lastEvent, lastUnblocked);
+  const auto idle = now - lastUse();
   if (!pending.empty() && now - *pending.rbegin() < std::chrono::minutes(15)) {
     return Decision::WAIT;
   }
