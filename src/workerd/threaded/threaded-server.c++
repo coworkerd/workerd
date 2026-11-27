@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "fatal-attribution.h"
+#include "isolate-busy.h"
 #include "protocol.h"
 
 #include <workerd/api/actor-state.h>
@@ -1508,6 +1509,20 @@ struct Reporter final: Worker::ValidationErrorReporter {
   void addWorkflowClass(kj::StringPtr, kj::Array<kj::String>) override {}
 };
 
+class BusyIsolateObserver final: public JsgIsolateObserver {
+ public:
+  explicit BusyIsolateObserver(const kj::MonotonicClock &clock): window(clock) {}
+
+  void onLockAcquired() noexcept override {
+    window.acquired();
+  }
+  void onLockReleasing() noexcept override {
+    window.releasing();
+  }
+
+  threaded::IsolateBusyWindow window;
+};
+
 struct Slot {
   capnp::MallocMessageBuilder configArena, flagsArena;
   api::MemoryCacheProvider cache;
@@ -1515,6 +1530,7 @@ struct Slot {
   std::atomic<bool> complete{false};
   std::atomic<bool> retryableLoad{false};
   std::shared_ptr<ResourceReservation> reservation;
+  kj::Maybe<kj::Own<BusyIsolateObserver>> busy;
   std::string workerId, versionId, planRevision, isolateLabel;
   uint64_t instance = 0;
   std::atomic<uint64_t> lastUseNs{nowNs()};
@@ -2948,7 +2964,18 @@ struct ThreadedServer {
           ",\"active\":" + std::to_string(contexts) +
           ",\"loading\":" + (complete ? "false" : "true") +
           ",\"backgroundActive\":" + (contexts && js == 0 ? "true" : "false") +
-          ",\"nativeMemory\":" + slot->reservation->metrics() + "}";
+          ",\"nativeMemory\":" + slot->reservation->metrics();
+      if (complete) {
+        KJ_IF_SOME(busy, slot->busy) {
+          const auto sample = busy->window.sample();
+          json += ",\"isolateBusy\":{\"windowMs\":" +
+              std::to_string(threaded::IsolateBusyWindow::WINDOW_NS / 1000000) +
+              ",\"throughMonotonicMs\":" + std::to_string(sample.throughNs / 1000000) +
+              ",\"busyNs\":" + std::to_string(sample.busyNs) +
+              ",\"permille\":" + std::to_string(sample.permille()) + "}";
+        }
+      }
+      json += "}";
     }
     json += "],\"createdIsolates\":" + std::to_string(compilations.load()) +
         ",\"resourceBudget\":{\"memoryBytes\":" + std::to_string(resources->memoryReserved.load()) +
@@ -4199,9 +4226,15 @@ struct ThreadedServer {
     isolateCreationAttempts.fetch_add(1);
     const api::pyodide::PythonConfig python{
       .packageDiskCacheRoot = kj::none, .createSnapshot = false, .createBaselineSnapshot = false};
+    kj::Own<JsgIsolateObserver> jsgObserver;
+    KJ_IF_SOME(busy, slot.busy) {
+      jsgObserver = kj::atomicAddRef(*busy);
+    } else {
+      jsgObserver = kj::atomicRefcounted<JsgIsolateObserver>();
+    }
     auto api = kj::heap<server::WorkerdApi>(v8, flags.asReader(),
         capnp::List<server::config::Extension>::Reader(), limits->getCreateParams(), group,
-        kj::atomicRefcounted<JsgIsolateObserver>(), slot.cache, python);
+        kj::mv(jsgObserver), slot.cache, python);
     auto name = kj::str(text(descriptor, "workerId"), "@", text(descriptor, "versionId"));
     // Declared before the isolate so that a load that fails tears its Worker down in this scope.
     kj::Maybe<FatalInvocation> fatal;
@@ -4513,6 +4546,8 @@ struct ThreadedServer {
             else {
               slot = std::make_shared<Slot>();
               slot->reservation = std::move(reservation);
+              slot->busy =
+                  kj::atomicRefcounted<BusyIsolateObserver>(kj::systemPreciseMonotonicClock());
               slot->instance = ++nextInstance;
               slot->workerId = str(descriptor, "workerId");
               slot->versionId = str(descriptor, "versionId");
