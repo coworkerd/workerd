@@ -622,7 +622,7 @@ struct ResourceReservation final: SqliteProcessMemoryBudget {
     if (newCharge >= oldCharge) {
       sqliteBytes += newCharge - oldCharge;
     } else {
-      sqliteBytes -= kj::min<uint64_t>(sqliteBytes, oldCharge - newCharge);
+      sqliteBytes -= kj::min(sqliteBytes, oldCharge - newCharge);
     }
     // Observe trusted allocations even at the process ceiling.
     if (resize(false, observe, int64_t(sqliteBytes) - int64_t(previous)) || observe) return true;
