@@ -2714,6 +2714,7 @@ struct ThreadedServer {
   };
   const std::unique_ptr<Engine> engine;
   jsg::V8System& v8;
+  const kj::MonotonicClock& isolateBusyClock;
   const std::string sourceAddress, identity;
   const std::unique_ptr<server::DurableStorage> durableStorage;
   kj::Own<server::ThreadedWalLog> durableLog;
@@ -2810,9 +2811,11 @@ struct ThreadedServer {
       int parent,
       kj::Own<const kj::Directory> durableDirectory = {},
       kj::Own<server::ThreadedWalLog> durableLog = {},
-      jsg::V8System* existingV8 = nullptr)
+      jsg::V8System* existingV8 = nullptr,
+      const kj::MonotonicClock& isolateBusyClock = kj::systemPreciseMonotonicClock())
       : engine(existingV8 == nullptr ? std::make_unique<Engine>() : nullptr),
         v8(existingV8 == nullptr ? engine->v8 : *existingV8),
+        isolateBusyClock(isolateBusyClock),
         sourceAddress(std::move(sourceAddress)),
         identity(std::move(identity)),
         durableStorage(durableDirectory
@@ -4549,8 +4552,7 @@ struct ThreadedServer {
             else {
               slot = std::make_shared<Slot>();
               slot->reservation = std::move(reservation);
-              slot->busy =
-                  kj::atomicRefcounted<BusyIsolateObserver>(kj::systemPreciseMonotonicClock());
+              slot->busy = kj::atomicRefcounted<BusyIsolateObserver>(isolateBusyClock);
               slot->instance = ++nextInstance;
               slot->workerId = str(descriptor, "workerId");
               slot->versionId = str(descriptor, "versionId");
@@ -4617,6 +4619,9 @@ struct ThreadedServer {
           trace("source-end");
           fetched = true;
           slot->worker = compile(*slot, descriptor, source);
+          // All startup locks have been released. Clear their time before the slot is
+          // published to request threads and the lifecycle sampler.
+          KJ_ASSERT_NONNULL(slot->busy)->window.reset();
           trace("compiled");
         } catch (kj::Exception &error) {
           auto stage = kj::heapArray<kj::byte>(1);
