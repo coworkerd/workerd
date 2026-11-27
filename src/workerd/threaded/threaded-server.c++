@@ -7155,7 +7155,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
       KJ_REQUIRE(slot != nullptr, "database storage opened without its isolate reservation");
       sqliteProcessBudget = slot->reservation;
     }
-    KJ_ASSERT(tree->server.durableLog == nullptr || prepared != kj::none,
+    KJ_ASSERT(tree->server.durableLog.get() == nullptr || prepared != kj::none,
         "persistent SQLite open without WAL preparation");
     server::DurableWalPosition position;
     KJ_IF_SOME(open, prepared) position = open.positionForOpen();
