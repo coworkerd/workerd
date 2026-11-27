@@ -39,7 +39,7 @@ class DurableStorage {
       DurableWalChannel& channel,
       DurableWalPosition position,
       uint64_t localOpenStartedNs,
-      kj::Maybe<kj::Function<void()>> confirmClose = kj::none) const;
+      kj::Maybe<kj::Function<void(SqliteDatabase::CloseOutcome)>> confirmClose = kj::none) const;
   struct WalImage {
     const kj::Directory& directory;
     kj::Path path;

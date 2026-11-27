@@ -332,6 +332,8 @@ KJ_TEST("threaded WAL waits before scanning for a retained root and facet") {
 KJ_TEST("a BUSY SQLite close cannot release threaded WAL preparation") {
   StorageSession test;
   auto old = test.open(*test.oldHome, test.link.wait(test.prepare(1, 0)), 0);
+  auto reopening = test.prepare(2, 0).eagerlyEvaluate(nullptr);
+  KJ_REQUIRE(!reopening.poll(test.link.io.waitScope));
   sqlite3_stmt* statement = nullptr;
   // This fixture bypasses the wrapper's SQL preparation only to keep one
   // untracked dependent handle. No SQL runs after the statement is prepared.
@@ -343,15 +345,173 @@ KJ_TEST("a BUSY SQLite close cannot release threaded WAL preparation") {
     old.close();
   }
 
-  auto reopening = test.prepare(2, 0).eagerlyEvaluate(nullptr);
+  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+      "did not confirm close in this generation", test.link.wait(kj::mv(reopening)));
+  KJ_EXPECT(test.log.unconfirmedCloseIdentities() == 1);
+  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+      "did not confirm close in this generation", test.link.wait(test.prepare(2, 0)));
   auto neighbor = test.open(*test.nextHome,
       test.link.wait(test.prepare(3, 0, StorageSession::OTHER)), 0, StorageSession::OTHER);
-  KJ_REQUIRE(!reopening.poll(test.link.io.waitScope),
-      "a destroyed SQLite wrapper without close proof cannot authorize a scan");
   const auto finalized = sqlite3_finalize(std::exchange(statement, nullptr));
   KJ_REQUIRE(finalized == SQLITE_OK);
-  test.link.wait(test.prepare(3, 1, StorageSession::OTHER));
-  KJ_EXPECT(!reopening.poll(test.link.io.waitScope), "lazy close produced no synchronous proof");
+  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+      "did not confirm close in this generation", test.link.wait(test.prepare(4, 0)));
+}
+
+KJ_TEST("a reset failure after SQLite closed still confirms final close") {
+  StorageSession test;
+  auto old = test.open(*test.oldHome, test.link.wait(test.prepare(1, 0)), 0);
+  auto reopen = test.prepare(2, 0).eagerlyEvaluate(nullptr);
+  auto id = old.shipper->getOpenId();
+  auto image = test.storage.walImage(StorageSession::NAMESPACE, StorageSession::ID, 0);
+  // Force the unlink in reset() to fail after the old SQLite handle closes.
+  image.directory.remove(
+      kj::Path({kj::str(StorageSession::NAMESPACE), kj::str(StorageSession::ID, ".sqlite")}));
+  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("path to remove doesn't exist", old.database->reset());
+  KJ_EXPECT(!reopen.poll(test.link.io.waitScope));
+  old.close();
+  test.link.receive(MSG_CLOSED, id);
+  auto next = test.open(*test.nextHome, test.link.wait(kj::mv(reopen)), 0);
+  KJ_EXPECT(test.log.unconfirmedCloseIdentities() == 0);
+}
+
+KJ_TEST("dropping a reserved WAL preparation allows the same identity to reopen") {
+  StorageSession test;
+  {
+    auto abandoned = test.link.wait(test.prepare(1, 0));
+    abandoned.positionForOpen();
+  }
+  auto reopened = test.open(*test.nextHome, test.link.wait(test.prepare(2, 0)), 0);
+}
+
+KJ_TEST("stopping threaded WAL wakes preparations waiting for close") {
+  // The peer disconnect is reported on the WAL owner thread.
+  class ExpectedDisconnect final: public kj::ExceptionCallback {
+   public:
+    explicit ExpectedDisconnect(std::atomic<bool>& seen): seen(seen) {}
+
+    void logMessage(kj::LogSeverity severity, const char* file, int line, int depth,
+        kj::String&& message) override {
+      if (severity == kj::LogSeverity::ERROR && message.contains("threaded WAL channel closed"_kj)) {
+        seen = true;
+        return;
+      }
+      ExceptionCallback::logMessage(severity, file, line, depth, kj::mv(message));
+    }
+
+    kj::Function<void(kj::Function<void()>)> getThreadInitializer() override {
+      return [next = ExceptionCallback::getThreadInitializer(), &seen = seen](
+                 kj::Function<void()> run) mutable {
+        next([&] {
+          ExpectedDisconnect expected(seen);
+          run();
+        });
+      };
+    }
+
+   private:
+    std::atomic<bool>& seen;
+  };
+  std::atomic<bool> sawDisconnect = false;
+  {
+    ExpectedDisconnect expected(sawDisconnect);
+    StorageSession test;
+    auto old = test.open(*test.oldHome, test.link.wait(test.prepare(1, 0)), 0);
+    auto reopening = test.prepare(2, 0).eagerlyEvaluate(nullptr);
+    KJ_EXPECT(!reopening.poll(test.link.io.waitScope));
+    test.link.node = nullptr;
+    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+        "replicator is not reachable", test.link.wait(kj::mv(reopening)));
+  }
+  KJ_EXPECT(sawDisconnect.load());
+}
+
+class BeforeClosedChannel final: public DurableWalChannel {
+ public:
+  explicit BeforeClosedChannel(DurableWalChannel& inner): inner(inner) {}
+  kj::Maybe<kj::Function<void()>> beforeClosed;
+
+  bool enabled() const override {
+    return inner.enabled();
+  }
+  uint64_t nextRequest() override {
+    return inner.nextRequest();
+  }
+  uint64_t registerShipper(DurableLogShipper& shipper) override {
+    return inner.registerShipper(shipper);
+  }
+  void unregisterShipper(DurableLogShipper& shipper) override {
+    inner.unregisterShipper(shipper);
+  }
+  kj::Promise<void> waitForOpen(uint64_t id, kj::Timer& timer) override {
+    return inner.waitForOpen(id, timer);
+  }
+  void send(uint64_t id, kj::Array<kj::byte> message) override {
+    if (message[4] == MSG_CLOSED) {
+      KJ_IF_SOME(check, beforeClosed) check();
+    }
+    inner.send(id, kj::mv(message));
+  }
+  kj::Promise<void> sendFrames(DurableLogShipper& shipper,
+      kj::Array<kj::byte> message,
+      uint64_t request,
+      kj::Timer& timer) override {
+    return inner.sendFrames(shipper, kj::mv(message), request, timer);
+  }
+
+ private:
+  DurableWalChannel& inner;
+};
+
+KJ_TEST("threaded WAL queues CLOSED before waking a replacement on another home") {
+  StorageSession test;
+  BeforeClosedChannel closing(*test.oldHome);
+  auto old = test.open(closing, test.link.wait(test.prepare(1, 0)), 0);
+  const auto id = old.shipper->getOpenId();
+
+  struct Waiter {
+    const kj::Executor& executor;
+    kj::Timer& timer;
+    kj::Own<kj::PromiseFulfiller<void>> quit;
+    bool prepared = false;
+    kj::Promise<ThreadedWalLog::PreparedOpen> opening = nullptr;
+  };
+  auto started = kj::newPromiseAndCrossThreadFulfiller<Waiter*>();
+  kj::Thread home([&test, ready = kj::mv(started.fulfiller)]() mutable {
+    auto io = kj::setupAsyncIo();
+    auto stop = kj::newPromiseAndFulfiller<void>();
+    Waiter waiter{kj::getCurrentThreadExecutor(), io.provider->getTimer(), kj::mv(stop.fulfiller)};
+    waiter.opening = test.prepare(2, 0)
+                         .then([&waiter](auto prepared) {
+      waiter.prepared = true;
+      return prepared;
+    }).eagerlyEvaluate(nullptr);
+    KJ_EXPECT(!waiter.opening.poll(io.waitScope));
+    ready->fulfill(&waiter);
+    stop.promise.wait(io.waitScope);
+  });
+  auto& waiter = *test.link.wait(kj::mv(started.promise));
+  KJ_DEFER({
+    closing.beforeClosed = kj::none;
+    waiter.executor.executeSync([&] { waiter.quit->fulfill(); });
+  });
+  closing.beforeClosed = [&] {
+    // Run the other home's queued work while CLOSED is held before enqueue.
+    // An independent scan drains the scanner queue after any early wakeup.
+    const auto prepared = waiter.executor.executeSync([&]() -> kj::Promise<bool> {
+      co_await kj::evalLast([] {});
+      auto barrier = co_await waiter.timer.timeoutAfter(
+          kj::SECONDS, test.prepare(3, 0, StorageSession::OTHER));
+      co_await kj::evalLast([] {});
+      co_return waiter.prepared;
+    });
+    KJ_EXPECT(!prepared, "CLOSED must be queued before the replacement is prepared");
+  };
+  old.close();
+  auto prepared = waiter.executor.executeSync(
+      [&] { return waiter.timer.timeoutAfter(kj::SECONDS, kj::mv(waiter.opening)); });
+  test.link.receive(MSG_CLOSED, id);
+  auto reopened = test.open(*test.nextHome, prepared, 0);
 }
 
 struct TestRoot {

@@ -33,6 +33,8 @@ constexpr uint8_t ACK_DISCONNECTED = 254;
 constexpr auto STORAGE_UNAVAILABLE =
     "jsg.Error: Durable Object storage is unavailable: the node's replicator is not reachable "
     "(STORAGE_UNAVAILABLE)"_kj;
+constexpr auto CLOSE_UNCONFIRMED =
+    "the previous SQLite connection did not confirm close in this generation"_kj;
 
 // The producer transfers owned data and wakes the consumer without entering its
 // loop. A queue has one consumer. Its mutex is released before any I/O or await.
@@ -138,6 +140,14 @@ struct Shared {
     return !stopped.load(std::memory_order_acquire) && ready.load(std::memory_order_acquire);
   }
 
+  void checkReservedOpen(const std::string& key) {
+    std::lock_guard lock(openMutex);
+    KJ_REQUIRE(negotiated(), STORAGE_UNAVAILABLE);
+    auto storage = openStorage.find(key);
+    KJ_ASSERT(storage != openStorage.end());
+    requireConfirmedClose(storage->second);
+  }
+
   bool reserveOpen(const std::string& key,
       uint64_t tree,
       uint facet,
@@ -145,6 +155,7 @@ struct Shared {
     std::lock_guard lock(openMutex);
     KJ_REQUIRE(negotiated(), STORAGE_UNAVAILABLE);
     auto& storage = openStorage.try_emplace(key, tree).first->second;
+    requireConfirmedClose(storage);
     if (storage.tree == tree && storage.facets.insert(facet).second) return true;
     // Coalesced root requests and the facet startup each have one shared
     // preparation. Drop canceled waiters as later requests replace them.
@@ -153,13 +164,20 @@ struct Shared {
     return false;
   }
 
-  void releaseOpen(const std::string& key, uint64_t tree, uint facet) {
+  void finishOpen(
+      const std::string& key, uint64_t tree, uint facet, SqliteDatabase::CloseOutcome outcome) {
     std::lock_guard lock(openMutex);
     auto storage = openStorage.find(key);
     KJ_ASSERT(storage != openStorage.end() && storage->second.tree == tree);
     KJ_ASSERT(storage->second.facets.erase(facet) == 1);
+    if (outcome == SqliteDatabase::CloseOutcome::UNCONFIRMED &&
+        !std::exchange(storage->second.closeUnconfirmed, true)) {
+      unconfirmedCloseIdentities.fetch_add(1, std::memory_order_relaxed);
+    }
     wakePreparations(storage->second);
-    if (storage->second.facets.empty()) openStorage.erase(storage);
+    if (storage->second.facets.empty() && !storage->second.closeUnconfirmed) {
+      openStorage.erase(storage);
+    }
   }
 
   const kj::Duration confirmationTimeout;
@@ -168,15 +186,25 @@ struct Shared {
   std::atomic<uint64_t> nextId{0};
   std::atomic<bool> ready{false};
   std::atomic<bool> stopped{false};
+  std::atomic<uint64_t> unconfirmedCloseIdentities{0};
 
  private:
   struct OpenStorage {
     uint64_t tree;
+    bool closeUnconfirmed = false;
     std::set<uint> facets;
     std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
   };
   std::mutex openMutex;
   std::map<std::string, OpenStorage> openStorage;
+
+  static void requireConfirmedClose(const OpenStorage& storage) {
+    if (storage.closeUnconfirmed) {
+      auto error = KJ_EXCEPTION(OVERLOADED, CLOSE_UNCONFIRMED);
+      error.setDetail(ThreadedWalLog::CLOSE_UNCONFIRMED_DETAIL, kj::heapArray<kj::byte>(0));
+      kj::throwRecoverableException(kj::mv(error));
+    }
+  }
 
   static void wakePreparations(OpenStorage& storage) {
     for (auto& waiter: storage.waiters) waiter->fulfill();
@@ -461,28 +489,31 @@ struct ThreadedWalLog::OpenReservation {
         facet(facet) {}
 
   ~OpenReservation() {
-    // Once SQLite has opened, destroying the callback is insufficient proof.
-    // A BUSY connection leaves its reservation in place for this generation.
-    if (state == State::RESERVED) shared->releaseOpen(key, tree, facet);
+    // Dropping a preparation that never reached SQLite needs no close proof.
+    if (state == State::RESERVED) {
+      shared->finishOpen(key, tree, facet, SqliteDatabase::CloseOutcome::CONFIRMED);
+    }
   }
 
-  void closed() {
+  void closed(SqliteDatabase::CloseOutcome outcome) {
     KJ_ASSERT(state == State::OPENED);
     state = State::WAITING;
-    shared->releaseOpen(key, tree, facet);
+    shared->finishOpen(key, tree, facet, outcome);
   }
 };
 
 DurableWalPosition ThreadedWalLog::PreparedOpen::positionForOpen() const {
   KJ_REQUIRE(reservation->state == OpenReservation::State::RESERVED,
       "jsg.Error: Durable Object storage preparation was already used (STORAGE_UNAVAILABLE)");
+  reservation->shared->checkReservedOpen(reservation->key);
   return position;
 }
 
-kj::Function<void()> ThreadedWalLog::PreparedOpen::trackClose() const {
+kj::Function<void(SqliteDatabase::CloseOutcome)> ThreadedWalLog::PreparedOpen::trackClose() const {
   KJ_ASSERT(reservation->state == OpenReservation::State::RESERVED);
   reservation->state = OpenReservation::State::OPENED;
-  return [reservation = reservation] { reservation->closed(); };
+  return [reservation = reservation](
+             SqliteDatabase::CloseOutcome outcome) { reservation->closed(outcome); };
 }
 
 struct ThreadedWalLog::Impl {
@@ -539,6 +570,10 @@ ThreadedWalLog::~ThreadedWalLog() noexcept(false) = default;
 bool ThreadedWalLog::ready() const { return impl->shared->negotiated(); }
 
 kj::Duration ThreadedWalLog::confirmationTimeout() const { return impl->shared->confirmationTimeout; }
+
+uint64_t ThreadedWalLog::unconfirmedCloseIdentities() const {
+  return impl->shared->unconfirmedCloseIdentities.load(std::memory_order_relaxed);
+}
 
 kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
     kj::Function<void(uint64_t, CloseReason)> requestClose) {

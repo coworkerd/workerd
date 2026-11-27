@@ -81,14 +81,15 @@ kj::Own<DurableLogShipper> DurableStorage::ship(kj::StringPtr uniqueKey,
     DurableWalChannel& channel,
     DurableWalPosition position,
     uint64_t localOpenStartedNs,
-    kj::Maybe<kj::Function<void()>> confirmClose) const {
+    kj::Maybe<kj::Function<void(SqliteDatabase::CloseOutcome)>> confirmClose) const {
   auto report = kj::heap<DurableLogShipper::DeferredClose>();
   auto& pending = *report;
   // Install the callback before setup can fail. When there is an OPEN on
   // the wire, enqueue its CLOSED before a waiter can enqueue the next OPEN.
-  database.afterClose([report = kj::mv(report), confirm = kj::mv(confirmClose)]() mutable {
-    report->send();
-    KJ_IF_SOME(closed, confirm) closed();
+  database.afterClose([report = kj::mv(report), confirm = kj::mv(confirmClose)](
+                          SqliteDatabase::CloseOutcome outcome) mutable {
+    if (outcome == SqliteDatabase::CloseOutcome::CONFIRMED) report->send();
+    KJ_IF_SOME(closed, confirm) closed(outcome);
   });
   auto wal = databasePath(uniqueKey, name.storageId, name.facetId, "-wal"_kj);
   auto image = databasePath(uniqueKey, name.storageId, name.facetId);

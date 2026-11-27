@@ -3808,13 +3808,16 @@ struct ThreadedServer {
         ",\"resettingHomes\":" + std::to_string(resettingHomes) +
         ",\"maxHomeMemoryBytes\":" + std::to_string(maxHomeMemory) +
         ",\"sqlSpillBytes\":" + std::to_string(durableStorage->getSqlSpillBudget().getUsed()) +
-        ",\"sqlSpillMaximum\":" + std::to_string(durableStorage->getSqlSpillBudget().getCapacity()) +
+        ",\"sqlSpillMaximum\":" +
+        std::to_string(durableStorage->getSqlSpillBudget().getCapacity()) +
         ",\"workerThreads\":" + std::to_string(liveThreads.load()) +
         ",\"waiting\":" + std::to_string(state.waiting) +
         ",\"running\":" + std::to_string(state.active) +
         ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
         ",\"homeSessions\":" + std::to_string(durableHomeSessions.load()) +
         ",\"pendingCommits\":" + std::to_string(durablePendingCommits.load()) +
+        ",\"unconfirmedCloseIdentities\":" +
+        std::to_string(durableLog ? durableLog->unconfirmedCloseIdentities() : 0) +
         ",\"groupCreationRefusals\":" + std::to_string(sandboxRefusals.load()) +
         ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
         ",\"pressureRetirements\":" + std::to_string(durablePressureRetirements.load()) +
@@ -6722,6 +6725,23 @@ class DurableAlarmReporter final: public ActorSqlite::Hooks {
   uint facet;
 };
 
+kj::Exception tagWalOpenError(kj::Exception error) {
+  if (error.getDetail(server::ThreadedWalLog::CLOSE_UNCONFIRMED_DETAIL) != kj::none) {
+    return jsg::tagCoworkerdRpcError(kj::mv(error), "DO_UNAVAILABLE");
+  }
+  return error;
+}
+
+kj::Promise<server::ThreadedWalLog::PreparedOpen> prepareDurableWal(server::ThreadedWalLog &log,
+    server::DurableStorage::WalImage image,
+    uint64_t tree,
+    uint facet) {
+  return log.prepareOpen(image.directory, kj::mv(image.path), kj::mv(image.storageKey), tree, facet)
+      .catch_([](kj::Exception &&error) -> kj::Promise<server::ThreadedWalLog::PreparedOpen> {
+    return tagWalOpenError(kj::mv(error));
+  });
+}
+
 DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &tree,
     Worker &worker,
     Worker::Actor::Id id,
@@ -7111,8 +7131,7 @@ kj::Promise<void> LocalFacet::initialize(kj::String descriptor) {
   kj::Maybe<server::ThreadedWalLog::PreparedOpen> prepared;
   if (tree->state.wal) {
     auto wal = tree->storage().walImage(tree->uniqueKey, tree->storageId, facet);
-    prepared = co_await tree->server.durableLog->prepareOpen(
-        wal.directory, kj::mv(wal.path), kj::mv(wal.storageKey), tree->tree, facet);
+    prepared = co_await prepareDurableWal(*tree->server.durableLog, kj::mv(wal), tree->tree, facet);
     KJ_REQUIRE(!stopped, "durable facet closed during WAL preparation");
   }
   actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(id), className,
@@ -7193,11 +7212,17 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     KJ_ASSERT(tree->server.durableLog.get() == nullptr || prepared != kj::none,
         "persistent SQLite open without WAL preparation");
     server::DurableWalPosition position;
-    KJ_IF_SOME(open, prepared) position = open.positionForOpen();
+    KJ_IF_SOME(open, prepared) {
+      try {
+        position = open.positionForOpen();
+      } catch (const kj::Exception &error) {
+        kj::throwRecoverableException(tagWalOpenError(error.clone()));
+      }
+    }
     auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet,
         sqlWalFrameLimitBytes, memoryLimit, std::move(sqliteProcessBudget));
     if (tree->state.wal) {
-      kj::Maybe<kj::Function<void()>> confirmClose;
+      kj::Maybe<kj::Function<void(SqliteDatabase::CloseOutcome)>> confirmClose;
       KJ_IF_SOME(open, prepared) confirmClose = open.trackClose();
       auto shipper = tree->storage().ship(tree->uniqueKey,
           {.objectName = kj::str(tree->objectName),
@@ -7256,8 +7281,8 @@ std::shared_ptr<ThreadState::WalPreparation> prepareRootWal(
   auto preparation = slot.lock();
   if (!preparation) {
     auto wal = server.durableStorage->walImage(route.uniqueKey.c_str(), route.storageId.c_str(), 0);
-    preparation = std::make_shared<ThreadState::WalPreparation>(server.durableLog->prepareOpen(
-        wal.directory, kj::mv(wal.path), kj::mv(wal.storageKey), tree, 0));
+    preparation = std::make_shared<ThreadState::WalPreparation>(
+        prepareDurableWal(*server.durableLog, kj::mv(wal), tree, 0));
     slot = preparation;
   }
   return preparation;

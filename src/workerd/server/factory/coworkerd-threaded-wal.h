@@ -18,6 +18,8 @@ class ThreadedWalLog {
 
   bool ready() const;
   kj::Duration confirmationTimeout() const;
+  uint64_t unconfirmedCloseIdentities() const;
+  static constexpr kj::Exception::DetailTypeId CLOSE_UNCONFIRMED_DETAIL = 0x997a5d73b0e11893ull;
   enum class CloseReason { DRAIN, CODE_UPDATED };
   kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t, CloseReason)> requestClose);
 
@@ -28,7 +30,7 @@ class ThreadedWalLog {
 
     // Bind a successful SQLite open to this reservation. Only a confirmed
     // SQLite close can then release it for a later preparation.
-    kj::Function<void()> trackClose() const;
+    kj::Function<void(SqliteDatabase::CloseOutcome)> trackClose() const;
 
    private:
     friend class ThreadedWalLog;
