@@ -83,8 +83,11 @@ class SqlStorage final: public jsg::Object {
     visitor.visit(storage);
   }
 
-  jsg::Ref<Cursor> execImpl(jsg::Lock& js, SqliteDatabase& db, jsg::JsString query,
-      jsg::Arguments<BindingValue> bindings, TraceContext traceContext);
+  jsg::Ref<Cursor> execImpl(jsg::Lock& js,
+      SqliteDatabase& db,
+      jsg::JsString query,
+      jsg::Arguments<BindingValue> bindings,
+      TraceContext traceContext);
 
   static constexpr SqlStorageRegulator regulator;
 

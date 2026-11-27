@@ -47,13 +47,15 @@ jsg::Ref<SqlStorage::Cursor> SqlStorage::exec(
   querySql = querySql.internalize(js);
 
   auto& db = getDb(js);
-  return db.executeObjectSql([&] {
-    return execImpl(js, db, querySql, kj::mv(bindings), kj::mv(traceContext));
-  });
+  return db.executeObjectSql(
+      [&] { return execImpl(js, db, querySql, kj::mv(bindings), kj::mv(traceContext)); });
 }
 
-jsg::Ref<SqlStorage::Cursor> SqlStorage::execImpl(jsg::Lock& js, SqliteDatabase& db,
-    jsg::JsString querySql, jsg::Arguments<BindingValue> bindings, TraceContext traceContext) {
+jsg::Ref<SqlStorage::Cursor> SqlStorage::execImpl(jsg::Lock& js,
+    SqliteDatabase& db,
+    jsg::JsString querySql,
+    jsg::Arguments<BindingValue> bindings,
+    TraceContext traceContext) {
   auto& context = IoContext::current();
   auto& statementCache = *this->statementCache;
 

@@ -23,6 +23,17 @@ class SqliteProcessMemoryBudget {
   virtual bool resizeSqliteMemory(size_t oldCharge, size_t newCharge, bool observe) noexcept = 0;
 };
 
+// Ordinary actors share a process in much larger numbers. Keep one step of
+// hysteresis while busy and return it when the connection goes idle.
+struct ObjectSqlHeapReservation {
+  static constexpr size_t STEP_BYTES = 64 * 1024;
+  static constexpr size_t chargeFor(size_t bytes) {
+    return (bytes / STEP_BYTES + (bytes % STEP_BYTES != 0)) * STEP_BYTES;
+  }
+
+  size_t bytes = 0;
+};
+
 // This module implements per-database SQLite memory metering.
 //
 // SQLite uses a single process-wide memory allocator, but we want to account allocations against
@@ -51,7 +62,8 @@ class SqliteMemoryScope {
   explicit SqliteMemoryScope(size_t& memoryBytes,
       size_t maxMemoryBytes,
       SqliteProcessMemoryBudget* processBudget = nullptr,
-      bool observeProcess = false);
+      bool observeProcess = false,
+      ObjectSqlHeapReservation* objectReservation = nullptr);
 
   ~SqliteMemoryScope() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(SqliteMemoryScope);
@@ -70,6 +82,7 @@ class SqliteMemoryScope {
   LimitRefusal limitRefusal = LimitRefusal::NONE;
   SqliteProcessMemoryBudget* const processBudget;
   const bool observeProcess;
+  ObjectSqlHeapReservation* const objectReservation;
   bool resize(size_t previous, size_t replacement) noexcept;
 
   // Thread-local pointer to the active scope. Set to this on construction (if not already set),

@@ -384,6 +384,10 @@ void DurableIdleLifecycle::pendingFinished(Pending operation, Time now) {
   if (pending.empty()) lastUnblocked = now;
 }
 
+bool DurableIdleLifecycle::idleFor(Time now, std::chrono::seconds interval) const {
+  return pending.empty() && now - std::max(lastEvent, lastUnblocked) >= interval;
+}
+
 DurableIdleLifecycle::Decision DurableIdleLifecycle::check(
     Time now, bool hasOrdinarySocket, bool pressured) {
   if (ordinarySocket && !hasOrdinarySocket) lastUnblocked = now;

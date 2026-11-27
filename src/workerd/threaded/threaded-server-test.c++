@@ -791,7 +791,7 @@ struct ObjectSqlHeapTest {
 
   template <typename... Params>
   void run(kj::StringPtr sql, Params... params) {
-    db->executeObjectSql([&] { db->run(sql, params...); });
+    db->executeObjectSql([&] { db->run({.regulator = SqliteDatabase::TRUSTED}, sql, params...); });
   }
 
   int rows() {
@@ -803,18 +803,19 @@ struct ObjectSqlHeapTest {
   }
 };
 
-KJ_TEST("ordinary object SQLite heap refusal rolls back and leaves the implicit commit gate usable") {
+KJ_TEST(
+    "ordinary object SQLite heap refusal rolls back and leaves the implicit commit gate usable") {
   ObjectSqlHeapTest t(ObjectSqlHeapTest::MiB);
   {
-    t.db->notifyWrite();
     SqliteDatabase::ObjectSqlTransaction txn(*t.db);
+    t.db->notifyWrite();
     t.db->run("SAVEPOINT object_sync");
     t.run("INSERT INTO entries VALUES (2, NULL)");
     KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
         t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob));
     KJ_EXPECT(txn.wasRefused());
-    KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
-        t.run("INSERT INTO entries VALUES (4, NULL)"));
+    KJ_EXPECT_THROW_MESSAGE(
+        "SQL_MEMORY_LIMIT_EXCEEDED", t.run("INSERT INTO entries VALUES (4, NULL)"));
   }
   KJ_EXPECT(t.rows() == 1);
   KJ_EXPECT(!t.db->observedCriticalError());
@@ -826,6 +827,21 @@ KJ_TEST("ordinary object SQLite heap refusal rolls back and leaves the implicit 
   KJ_EXPECT(t.rows() == 2);
 }
 
+KJ_TEST("ordinary object SQLite refusal fails the output gate for earlier writes") {
+  ObjectSqlHeapTest t(ObjectSqlHeapTest::MiB);
+  t.run("INSERT INTO entries VALUES (2, NULL)");
+  {
+    SqliteDatabase::ObjectSqlTransaction txn(*t.db);
+    t.db->run("SAVEPOINT object_sync");
+    KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
+        t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob));
+  }
+  KJ_EXPECT(t.db->observedCriticalError());
+  KJ_EXPECT(t.rows() == 1);
+  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED", t.flush());
+  KJ_EXPECT(t.commits == 1);
+}
+
 KJ_TEST("ordinary object SQLite process refusal rolls back and retries on the same connection") {
   constexpr auto MiB = ObjectSqlHeapTest::MiB;
   ObjectSqlHeapTest t(4 * MiB);
@@ -833,15 +849,20 @@ KJ_TEST("ordinary object SQLite process refusal rolls back and retries on the sa
   KJ_REQUIRE(other.registerPreparation());
   const auto available = t.budget->memoryMaximum - t.budget->memoryReserved.load();
   KJ_REQUIRE(other.allocateExternal(available));
-  t.run("INSERT INTO entries VALUES (2, NULL)");
-  auto refusal = kj::runCatchingExceptions([&] {
-    t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob);
-  });
-  auto& error = KJ_REQUIRE_NONNULL(refusal);
-  KJ_EXPECT(error.getType() == kj::Exception::Type::OVERLOADED);
-  KJ_EXPECT(KJ_REQUIRE_NONNULL(error.getDetail(jsg::COWORKERD_CODE_DETAIL_ID)).asChars() ==
-      kj::StringPtr("OVERLOADED").asArray());
-  KJ_EXPECT(error.getDetail(jsg::COWORKERD_SQL_RETRY_DETAIL_ID) != kj::none);
+  {
+    SqliteDatabase::ObjectSqlTransaction txn(*t.db);
+    t.db->notifyWrite();
+    t.db->run("SAVEPOINT object_sync");
+    t.run("INSERT INTO entries VALUES (2, NULL)");
+    auto refusal = kj::runCatchingExceptions([&] {
+      t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob);
+    });
+    auto& error = KJ_REQUIRE_NONNULL(refusal);
+    KJ_EXPECT(error.getType() == kj::Exception::Type::OVERLOADED);
+    KJ_EXPECT(KJ_REQUIRE_NONNULL(error.getDetail(jsg::COWORKERD_CODE_DETAIL_ID)).asChars() ==
+        kj::StringPtr("OVERLOADED").asArray());
+    KJ_EXPECT(error.getDetail(jsg::COWORKERD_SQL_RETRY_DETAIL_ID) != kj::none);
+  }
   KJ_EXPECT(!t.db->observedCriticalError());
   KJ_EXPECT(t.rows() == 1);
   t.flush();
@@ -852,11 +873,15 @@ KJ_TEST("ordinary object SQLite process refusal rolls back and retries on the sa
   KJ_EXPECT(t.commits == 2);
   KJ_EXPECT(t.rows() == 2);
 
+  const auto warmCharge = t.copy->sqliteMemoryCharge();
+  t.db->trimIdleObjectSqlHeap();
+  KJ_EXPECT(t.copy->sqliteMemoryCharge() < warmCharge);
   auto statement = t.db->prepare("SELECT payload FROM entries WHERE id = 3");
   auto held = t.db->executeObjectSql([&] { return statement.run(); });
-  const auto charge = SqliteProcessMemoryBudget::chargeFor(t.db->getSqliteMemoryBytes());
-  KJ_EXPECT(charge >= 2 * MiB);
-  KJ_EXPECT(t.copy->sqliteMemoryCharge() == charge);
+  const auto charge = t.copy->sqliteMemoryCharge();
+  const auto roundUp = ObjectSqlHeapReservation::chargeFor(t.db->getSqliteMemoryBytes());
+  KJ_EXPECT(charge >= roundUp && charge <= roundUp + ObjectSqlHeapReservation::STEP_BYTES);
+  KJ_EXPECT(charge > MiB);
   KJ_EXPECT(t.budget->sqliteMemoryReserved.load() == charge);
   t.db->close();
   KJ_EXPECT(t.copy->sqliteMemoryCharge() == 0);

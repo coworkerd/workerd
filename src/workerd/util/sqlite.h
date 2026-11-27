@@ -324,6 +324,7 @@ class SqliteDatabase {
   void setWalHook(WalHook callback, void* context);
   void rollbackWalTransaction();
   void releaseCachedMemory();
+  void trimIdleObjectSqlHeap();
 
   // User SQL may reserve more heap. If the allocator refuses, finish unwinding
   // SQLite's call scopes before rolling back on the same connection.
@@ -357,8 +358,10 @@ class SqliteDatabase {
     SqliteDatabase* db;
   };
 
+  kj::Maybe<kj::Exception> getObjectSqlTransactionRefusal() const;
   void requireObjectSqlTransaction();
-  void onObjectSqlRollback(kj::Function<void()> callback) {
+  // Returning true means the storage owner marked the actor broken.
+  void onObjectSqlRollback(kj::Function<bool(bool, const kj::Exception&)> callback) {
     objectSqlRollback = kj::mv(callback);
   }
 
@@ -506,6 +509,7 @@ class SqliteDatabase {
   // The amount of memory in bytes used by this database for use by sqlite3_mem_methods.
   size_t sqliteMemoryBytes = 0;
   std::shared_ptr<SqliteProcessMemoryBudget> processMemoryBudget;
+  ObjectSqlHeapReservation objectSqlHeapReservation;
 
   // The maximum amount of memory in bytes that can be used by this database for use by
   // sqlite3_mem_methods (from WorkerLimits::sqliteMaxMemoryMb). This is set to kj::maxValue to
@@ -549,9 +553,11 @@ class SqliteDatabase {
 
   bool criticalErrorOccurred = false;
   SqliteMemoryScope::LimitRefusal* objectSqlRefusal = nullptr;
-  SqliteMemoryScope::LimitRefusal objectSqlTransactionRefusal = SqliteMemoryScope::LimitRefusal::NONE;
+  SqliteMemoryScope::LimitRefusal objectSqlTransactionRefusal =
+      SqliteMemoryScope::LimitRefusal::NONE;
   unsigned objectSqlTransactionDepth = 0;
-  kj::Maybe<kj::Function<void()>> objectSqlRollback;
+  bool objectSqlTransactionWasOpen = false;
+  kj::Maybe<kj::Function<bool(bool, const kj::Exception&)>> objectSqlRollback;
   bool hasObjectSqlBudget() const;
   [[noreturn]] void settleObjectSqlRefusal(SqliteMemoryScope::LimitRefusal refusal);
 

@@ -921,9 +921,10 @@ SqliteDatabase::operator sqlite3*() {
 SqliteMemoryScope SqliteDatabase::enterMemoryScope() {
   auto* limit = getWalTransactionLimit();
   const bool observeProcess = limit == nullptr ? objectSqlRefusal == nullptr : !limit->isActive();
-  const auto maximum = hasObjectSqlBudget() && observeProcess
-      ? size_t(kj::maxValue) : sqliteMaxMemoryBytes;
-  return SqliteMemoryScope(sqliteMemoryBytes, maximum, processMemoryBudget.get(), observeProcess);
+  const auto maximum =
+      hasObjectSqlBudget() && observeProcess ? size_t(kj::maxValue) : sqliteMaxMemoryBytes;
+  return SqliteMemoryScope(sqliteMemoryBytes, maximum, processMemoryBudget.get(), observeProcess,
+      hasObjectSqlBudget() ? &objectSqlHeapReservation : nullptr);
 }
 
 bool SqliteDatabase::hasObjectSqlBudget() const {
@@ -932,33 +933,42 @@ bool SqliteDatabase::hasObjectSqlBudget() const {
 
 static kj::Exception objectSqlMemoryException(SqliteMemoryScope::LimitRefusal refusal) {
   if (refusal == SqliteMemoryScope::LimitRefusal::PROCESS) {
-    auto error = jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED,
-        "jsg.Error: OVERLOADED: the durable process SQLite memory budget is full"), "OVERLOADED");
+    auto error = jsg::tagCoworkerdRpcError(
+        KJ_EXCEPTION(
+            OVERLOADED, "jsg.Error: OVERLOADED: the durable process SQLite memory budget is full"),
+        "OVERLOADED");
     error.setDetail(jsg::COWORKERD_SQL_RETRY_DETAIL_ID, kj::heapArray<kj::byte>(0));
     return error;
   }
-  return jsg::tagCoworkerdRpcError(KJ_EXCEPTION(FAILED,
-      "jsg.Error: SQL_MEMORY_LIMIT_EXCEEDED: the statement exceeds the object SQLite memory limit"),
+  return jsg::tagCoworkerdRpcError(
+      KJ_EXCEPTION(FAILED,
+          "jsg.Error: SQL_MEMORY_LIMIT_EXCEEDED: the statement exceeds the object SQLite memory limit"),
       "SQL_MEMORY_LIMIT_EXCEEDED");
 }
 
 void SqliteDatabase::settleObjectSqlRefusal(SqliteMemoryScope::LimitRefusal refusal) {
   if (objectSqlTransactionDepth != 0) objectSqlTransactionRefusal = refusal;
+  auto exception = objectSqlMemoryException(refusal);
   try {
     if (inTransaction || !savepoints.empty()) {
       rollbackWalTransaction();
       clearCommitCheck();
-      KJ_IF_SOME(callback, objectSqlRollback) callback();
+      // A rolled-back implicit turn could contain writes outside a callback,
+      // including writes by other events whose responses are waiting on it.
+      const bool needsFailedOutput = objectSqlTransactionDepth == 0 || objectSqlTransactionWasOpen;
+      KJ_IF_SOME(callback, objectSqlRollback) {
+        criticalErrorOccurred = callback(needsFailedOutput, exception);
+      }
     }
     releaseCachedMemory();
   } catch (const kj::Exception& error) {
     criticalErrorOccurred = true;
     KJ_IF_SOME(callback, onCriticalErrorCallback) {
-      callback(error.getDescription(), error);
+      callback(error.getDescription(), error.clone());
     }
     throw;
   }
-  kj::throwRecoverableException(objectSqlMemoryException(refusal));
+  kj::throwRecoverableException(kj::mv(exception));
   KJ_UNREACHABLE;
 }
 
@@ -966,7 +976,9 @@ SqliteDatabase::ObjectSqlTransaction::ObjectSqlTransaction(SqliteDatabase& db)
     : db(db.hasObjectSqlBudget() ? &db : nullptr) {
   if (this->db == nullptr) return;
   db.requireObjectSqlTransaction();
-  ++db.objectSqlTransactionDepth;
+  if (db.objectSqlTransactionDepth++ == 0) {
+    db.objectSqlTransactionWasOpen = db.inTransaction || !db.savepoints.empty();
+  }
 }
 
 SqliteDatabase::ObjectSqlTransaction::~ObjectSqlTransaction() {
@@ -979,18 +991,28 @@ bool SqliteDatabase::ObjectSqlTransaction::wasRefused() const {
   return db != nullptr && db->objectSqlTransactionRefusal != SqliteMemoryScope::LimitRefusal::NONE;
 }
 
+kj::Maybe<kj::Exception> SqliteDatabase::getObjectSqlTransactionRefusal() const {
+  if (objectSqlTransactionRefusal == SqliteMemoryScope::LimitRefusal::NONE) return kj::none;
+  return objectSqlMemoryException(objectSqlTransactionRefusal);
+}
+
 void SqliteDatabase::requireObjectSqlTransaction() {
-  if (objectSqlTransactionRefusal != SqliteMemoryScope::LimitRefusal::NONE) {
-    kj::throwRecoverableException(objectSqlMemoryException(objectSqlTransactionRefusal));
+  KJ_IF_SOME(refusal, getObjectSqlTransactionRefusal()) {
+    kj::throwRecoverableException(kj::mv(refusal));
   }
 }
 
 void SqliteDatabase::releaseProcessMemoryAfterClose() noexcept {
-  if (processMemoryBudget == nullptr || sqliteMemoryBytes == 0) return;
-  KJ_LOG(ERROR, "SQLite heap charge remained after closing the database", sqliteMemoryBytes);
-  processMemoryBudget->resizeSqliteMemory(
-      SqliteProcessMemoryBudget::chargeFor(sqliteMemoryBytes), 0, /*observe=*/true);
+  if (processMemoryBudget == nullptr) return;
+  const auto charge = hasObjectSqlBudget()
+      ? objectSqlHeapReservation.bytes
+      : SqliteProcessMemoryBudget::chargeFor(sqliteMemoryBytes);
+  if (charge == 0 && sqliteMemoryBytes == 0) return;
+  KJ_LOG(
+      ERROR, "SQLite heap charge remained after closing the database", sqliteMemoryBytes, charge);
+  processMemoryBudget->resizeSqliteMemory(charge, 0, /*observe=*/true);
   sqliteMemoryBytes = 0;
+  objectSqlHeapReservation.bytes = 0;
 }
 
 bool SqliteDatabase::observedCriticalError() {
@@ -1026,7 +1048,7 @@ void SqliteDatabase::rollbackWalTransaction() {
   // allocations while allowing the trusted rollback to finish. The platform
   // transaction calls this after leaving the failed SQLite call's memory scope.
   SqliteMemoryScope memoryScope(sqliteMemoryBytes, kj::maxValue, processMemoryBudget.get(),
-      /*observeProcess=*/true);
+      /*observeProcess=*/true, hasObjectSqlBudget() ? &objectSqlHeapReservation : nullptr);
   if (!sqlite3_get_autocommit(*this)) {
     run("ROLLBACK TRANSACTION");
   } else {
@@ -1038,6 +1060,17 @@ void SqliteDatabase::rollbackWalTransaction() {
 void SqliteDatabase::releaseCachedMemory() {
   auto memoryScope = enterMemoryScope();
   sqlite3_db_release_memory(*this);
+  if (hasObjectSqlBudget()) {
+    const auto charge = ObjectSqlHeapReservation::chargeFor(sqliteMemoryBytes);
+    if (charge != objectSqlHeapReservation.bytes) {
+      processMemoryBudget->resizeSqliteMemory(objectSqlHeapReservation.bytes, charge, true);
+      objectSqlHeapReservation.bytes = charge;
+    }
+  }
+}
+
+void SqliteDatabase::trimIdleObjectSqlHeap() {
+  if (hasObjectSqlBudget() && maybeDb != kj::none) releaseCachedMemory();
 }
 
 bool SqliteSpillBudget::tryCharge(uint64_t bytes) noexcept {
@@ -1622,7 +1655,8 @@ void SqliteDatabase::close() noexcept {
 
   SqliteMemoryScope memoryScope(sqliteMemoryBytes,
       processMemoryBudget == nullptr ? sqliteMaxMemoryBytes : size_t(kj::maxValue),
-      processMemoryBudget.get(), /*observeProcess=*/true);
+      processMemoryBudget.get(), /*observeProcess=*/true,
+      hasObjectSqlBudget() ? &objectSqlHeapReservation : nullptr);
 
   KJ_IF_SOME(db, maybeDb) {
     for (auto& listener: resetListeners) {
@@ -2412,7 +2446,10 @@ SqliteDatabase::Query::ValuePtr SqliteDatabase::Query::getValue(uint column) {
 kj::StringPtr SqliteDatabase::Query::getColumnName(uint column) {
   auto memoryScope = db.enterMemoryScope();
   sqlite3_stmt* statement = getStatement();
-  return sqlite3_column_name(statement, column);
+  SqliteMemoryScope::clearLimitRefusal();
+  const char* name = sqlite3_column_name(statement, column);
+  if (name == nullptr) checkColumnMemoryLimit(statement);
+  return name;
 }
 
 void SqliteDatabase::Query::checkColumnMemoryLimit(sqlite3_stmt* statement) {
@@ -2421,7 +2458,8 @@ void SqliteDatabase::Query::checkColumnMemoryLimit(sqlite3_stmt* statement) {
     *db.objectSqlRefusal = SqliteMemoryScope::getLimitRefusal();
     sqlite3_reset(statement);
     done = true;
-    kj::throwRecoverableException(KJ_EXCEPTION(FAILED, "SQLite failed", sqlite3_errstr(SQLITE_NOMEM)));
+    kj::throwRecoverableException(
+        KJ_EXCEPTION(FAILED, "SQLite failed", sqlite3_errstr(SQLITE_NOMEM)));
   }
   if (auto* limit = db.getWalTransactionLimit(); limit != nullptr && limit->isActive()) {
     // A column accessor can allocate, for example when it expands a zero BLOB.

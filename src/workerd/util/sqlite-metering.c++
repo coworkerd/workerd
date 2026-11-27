@@ -82,6 +82,11 @@ void* sqliteMemRealloc(void* ptr, int newSize) {
   }
 
   const auto oldActual = usableSize(ptr);
+  // Modest shrinks can keep the same buffer. It remains charged at its real
+  // usable size. Substantial shrinks still return the released capacity.
+  if (scope->objectReservation != nullptr && requested <= oldActual && requested > oldActual / 2) {
+    return ptr;
+  }
   const auto reserved = kj::max(oldActual, requested);
   if (!scope->resize(oldActual, reserved)) return nullptr;
   const bool canRefuse =
@@ -160,13 +165,23 @@ bool SqliteMemoryScope::resize(size_t previous, size_t replacement) noexcept {
   }
   const auto next = retained + replacement;
   if (processBudget != nullptr) {
-    const auto oldCharge = SqliteProcessMemoryBudget::chargeFor(memoryBytes);
-    const auto newCharge = SqliteProcessMemoryBudget::chargeFor(next);
+    auto oldCharge = SqliteProcessMemoryBudget::chargeFor(memoryBytes);
+    auto newCharge = SqliteProcessMemoryBudget::chargeFor(next);
+    if (objectReservation != nullptr) {
+      oldCharge = objectReservation->bytes;
+      // While busy, retain one step across small drops below a boundary.
+      const auto target = ObjectSqlHeapReservation::chargeFor(next);
+      newCharge = target != 0 && target < oldCharge &&
+              oldCharge - target <= ObjectSqlHeapReservation::STEP_BYTES
+          ? oldCharge
+          : target;
+    }
     if (oldCharge != newCharge &&
         !processBudget->resizeSqliteMemory(oldCharge, newCharge, observeProcess)) {
       limitRefusal = LimitRefusal::PROCESS;
       return false;
     }
+    if (objectReservation != nullptr) objectReservation->bytes = newCharge;
   }
   memoryBytes = next;
   return true;
@@ -183,11 +198,13 @@ SqliteMemoryScope::LimitRefusal SqliteMemoryScope::getLimitRefusal() noexcept {
 SqliteMemoryScope::SqliteMemoryScope(size_t& memoryBytes,
     size_t maxMemoryBytes,
     SqliteProcessMemoryBudget* processBudget,
-    bool observeProcess)
+    bool observeProcess,
+    ObjectSqlHeapReservation* objectReservation)
     : memoryBytes(memoryBytes),
       maxMemoryBytes(maxMemoryBytes),
       processBudget(processBudget),
-      observeProcess(observeProcess) {
+      observeProcess(observeProcess),
+      objectReservation(objectReservation) {
   if (threadLocalScope == nullptr) {
     threadLocalScope = this;
   }

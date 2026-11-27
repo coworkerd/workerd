@@ -55,12 +55,22 @@ ActorSqlite::ActorSqlite(kj::Own<SqliteDatabase> dbParam,
       debugAlarmSync(debugAlarmSyncParam) {
   db->onWrite(KJ_BIND_METHOD(*this, onWrite));
   db->onCriticalError(KJ_BIND_METHOD(*this, onCriticalError));
-  db->onObjectSqlRollback([this] {
-    blockTasks.clear();
+  db->onObjectSqlRollback([this](bool needsFailedOutput, const kj::Exception& exception) {
+    bool alarmTouched = false;
     KJ_IF_SOME(implicit, currentTxn.tryGet<ImplicitTxn*>()) {
+      alarmTouched = implicit->touchedAlarm();
       implicit->storageRolledBack();
       currentTxn.init<NoTxn>();
+    } else KJ_IF_SOME(explicitTxn, currentTxn.tryGet<ExplicitTxn*>()) {
+      alarmTouched = explicitTxn->getAlarmDirty();
     }
+    if (needsFailedOutput || alarmTouched) {
+      // Existing writes and alarm bookkeeping require the actor's normal
+      // storage failure path. All responses waiting on this turn must fail.
+      onCriticalError(exception.getDescription(), exception.clone());
+    }
+    blockTasks.clear();
+    return broken != kj::none;
   });
   lastConfirmedAlarmDbState = metadata.getAlarm();
 
@@ -133,7 +143,8 @@ kj::Promise<void> ActorSqlite::ImplicitTxn::waitForCompletion() {
 }
 
 ActorSqlite::ExplicitTxn::ExplicitTxn(ActorSqlite& actorSqlite)
-    : actorSqlite(actorSqlite), objectSqlTxn(*actorSqlite.db) {
+    : actorSqlite(actorSqlite),
+      objectSqlTxn(*actorSqlite.db) {
   KJ_SWITCH_ONEOF(actorSqlite.currentTxn) {
     KJ_CASE_ONEOF(_, NoTxn) {}
     KJ_CASE_ONEOF(implicit, ImplicitTxn*) {
@@ -873,6 +884,9 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::setAlarm(
   KJ_IF_SOME(exp, currentTxn.tryGet<ExplicitTxn*>()) {
     exp->setAlarmDirty();
   } else {
+    KJ_IF_SOME(implicit, currentTxn.tryGet<ImplicitTxn*>()) {
+      implicit->touchAlarm();
+    }
     haveDeferredDelete = false;
   }
 

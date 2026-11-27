@@ -176,6 +176,7 @@ class DurableIdleLifecycle {
   Pending pendingStarted(Time now);
   void pendingFinished(Pending pending, Time now);
   bool hasPending() const { return !pending.empty(); }
+  bool idleFor(Time now, std::chrono::seconds interval) const;
   Decision check(Time now, bool hasOrdinarySocket, bool pressured);
 
  private:

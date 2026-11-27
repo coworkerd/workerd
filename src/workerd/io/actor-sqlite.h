@@ -178,8 +178,18 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
 
     void commit();
     void rollback();
-    void storageRolledBack() { rolledBackForSqlMemory = true; }
-    bool wasRolledBackForSqlMemory() const { return rolledBackForSqlMemory; }
+    void storageRolledBack() {
+      rolledBackForSqlMemory = true;
+    }
+    bool wasRolledBackForSqlMemory() const {
+      return rolledBackForSqlMemory;
+    }
+    void touchAlarm() {
+      alarmTouched = true;
+    }
+    bool touchedAlarm() const {
+      return alarmTouched;
+    }
 
     void setSomeWriteConfirmed(bool someWriteConfirmed);
     bool isSomeWriteConfirmed() const;
@@ -189,6 +199,7 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
    private:
     ActorSqlite& parent;
     bool rolledBackForSqlMemory = false;
+    bool alarmTouched = false;
 
     bool committed = false;
 
