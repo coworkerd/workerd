@@ -450,8 +450,13 @@ KJ_TEST("ordinary admission refuses before dispatch while full of busy trees and
   ObjectAdmissionFixture test;
   auto& server = test.server;
   auto& table = *server.durableAdmission;
-  auto first = test.start(test.route("first"));
-  auto second = test.start(test.route("second"));
+  const auto firstRoute = test.route("first");
+  const auto secondRoute = test.route("second");
+  test.finish(test.start(firstRoute), test.now);
+  test.finish(test.start(secondRoute), test.now);
+  // Both earlier idle publications are stale once these events start.
+  auto first = test.start(firstRoute);
+  auto second = test.start(secondRoute);
   auto incoming = test.route("incoming");
   const auto refused = test.queue(incoming);
   KJ_EXPECT(refused.status == ObjectAdmissionFixture::Status::OVERLOADED);
