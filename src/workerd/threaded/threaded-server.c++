@@ -2002,8 +2002,9 @@ struct ThreadState {
   };
   std::optional<DurableLoad> durableLoad;
   struct WalPreparation {
-    explicit WalPreparation(kj::Promise<server::DurableWalPosition> task): ready(task.fork()) {}
-    kj::ForkedPromise<server::DurableWalPosition> ready;
+    explicit WalPreparation(kj::Promise<server::ThreadedWalLog::PreparedOpen> task)
+        : ready(task.fork()) {}
+    kj::ForkedPromise<server::ThreadedWalLog::PreparedOpen> ready;
   };
   struct SocketAdoption {
     explicit SocketAdoption(kj::Promise<void> promise): ready(promise.fork()) {}
@@ -3810,13 +3811,16 @@ struct ThreadedServer {
         ",\"resettingHomes\":" + std::to_string(resettingHomes) +
         ",\"maxHomeMemoryBytes\":" + std::to_string(maxHomeMemory) +
         ",\"sqlSpillBytes\":" + std::to_string(durableStorage->getSqlSpillBudget().getUsed()) +
-        ",\"sqlSpillMaximum\":" + std::to_string(durableStorage->getSqlSpillBudget().getCapacity()) +
+        ",\"sqlSpillMaximum\":" +
+        std::to_string(durableStorage->getSqlSpillBudget().getCapacity()) +
         ",\"workerThreads\":" + std::to_string(liveThreads.load()) +
         ",\"waiting\":" + std::to_string(state.waiting) +
         ",\"running\":" + std::to_string(state.active) +
         ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
         ",\"homeSessions\":" + std::to_string(durableHomeSessions.load()) +
         ",\"pendingCommits\":" + std::to_string(durablePendingCommits.load()) +
+        ",\"unconfirmedCloseIdentities\":" +
+        std::to_string(durableLog ? durableLog->unconfirmedCloseIdentities() : 0) +
         ",\"groupCreationRefusals\":" + std::to_string(sandboxRefusals.load()) +
         ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
         ",\"pressureRetirements\":" + std::to_string(durablePressureRetirements.load()) +
@@ -6726,6 +6730,23 @@ class DurableAlarmReporter final: public ActorSqlite::Hooks {
   uint facet;
 };
 
+kj::Exception tagWalOpenError(kj::Exception error) {
+  if (error.getDetail(server::ThreadedWalLog::CLOSE_UNCONFIRMED_DETAIL) != kj::none) {
+    return jsg::tagCoworkerdRpcError(kj::mv(error), "DO_UNAVAILABLE");
+  }
+  return error;
+}
+
+kj::Promise<server::ThreadedWalLog::PreparedOpen> prepareDurableWal(server::ThreadedWalLog &log,
+    server::DurableStorage::WalImage image,
+    uint64_t tree,
+    uint facet) {
+  return log.prepareOpen(image.directory, kj::mv(image.path), kj::mv(image.storageKey), tree, facet)
+      .catch_([](kj::Exception &&error) -> kj::Promise<server::ThreadedWalLog::PreparedOpen> {
+    return tagWalOpenError(kj::mv(error));
+  });
+}
+
 DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &tree,
     Worker &worker,
     Worker::Actor::Id id,
@@ -6736,7 +6757,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     std::shared_ptr<DurableFacetReservation> reservation = nullptr,
     uint parentFacet = 0,
     kj::StringPtr facetName = ""_kj,
-    server::DurableWalPosition position = {},
+    kj::Maybe<server::ThreadedWalLog::PreparedOpen> prepared = kj::none,
     bool platformDatabase = false,
     uint64_t sqlWalFrameLimitBytes = 0);
 
@@ -7112,14 +7133,14 @@ kj::Promise<void> LocalFacet::initialize(kj::String descriptor) {
       }
     }
   }
-  server::DurableWalPosition position;
+  kj::Maybe<server::ThreadedWalLog::PreparedOpen> prepared;
   if (tree->state.wal) {
     auto wal = tree->storage().walImage(tree->uniqueKey, tree->storageId, facet);
-    position = co_await tree->server.durableLog->prepareOpen(wal.directory, kj::mv(wal.path));
+    prepared = co_await prepareDurableWal(*tree->server.durableLog, kj::mv(wal), tree->tree, facet);
     KJ_REQUIRE(!stopped, "durable facet closed during WAL preparation");
   }
   actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(id), className,
-      kj::mv(props), facet, depth, reservation, parentFacet, name, position);
+      kj::mv(props), facet, depth, reservation, parentFacet, name, kj::mv(prepared));
   if (tree->state.wal) co_await tree->state.wal->waitForOpen(
       tree->shippers.at(facet)->getOpenId(), tree->state.io.provider->getTimer());
   KJ_REQUIRE(!stopped, "durable facet closed during startup");
@@ -7169,7 +7190,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     std::shared_ptr<DurableFacetReservation> reservation,
     uint parentFacet,
     kj::StringPtr facetName,
-    server::DurableWalPosition position,
+    kj::Maybe<server::ThreadedWalLog::PreparedOpen> prepared,
     bool platformDatabase,
     uint64_t sqlWalFrameLimitBytes) {
   auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth);
@@ -7177,9 +7198,9 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
   auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
   auto *borrowedObserver = observer.get();
   if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
-  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName), position, borrowedHooks,
-                       sqlWalFrameLimitBytes](const ActorCache::SharedLru &, OutputGate &gate,
-                       ActorCache::Hooks &,
+  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName),
+                       prepared = kj::mv(prepared), borrowedHooks, sqlWalFrameLimitBytes](
+                       const ActorCache::SharedLru &, OutputGate &gate, ActorCache::Hooks &,
                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
     const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
     const auto memoryLimit = sqlWalFrameLimitBytes != 0
@@ -7193,13 +7214,29 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
       KJ_REQUIRE(slot != nullptr, "database storage opened without its isolate reservation");
       sqliteProcessBudget = slot->reservation;
     }
+    KJ_ASSERT(tree->server.durableLog.get() == nullptr || prepared != kj::none,
+        "persistent SQLite open without WAL preparation");
+    server::DurableWalPosition position;
+    KJ_IF_SOME(open, prepared) {
+      try {
+        position = open.positionForOpen();
+      } catch (const kj::Exception &error) {
+        kj::throwRecoverableException(tagWalOpenError(error.clone()));
+      }
+    }
     auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet,
         sqlWalFrameLimitBytes, memoryLimit, std::move(sqliteProcessBudget));
     if (tree->state.wal) {
+      kj::Maybe<kj::Function<void(SqliteDatabase::CloseOutcome)>> confirmClose;
+      KJ_IF_SOME(open, prepared) confirmClose = open.trackClose();
       auto shipper = tree->storage().ship(tree->uniqueKey,
-          {.objectName = kj::str(tree->objectName), .storageId = kj::str(tree->storageId),
-            .facetId = facet, .parentFacetId = parentFacet, .facetName = kj::str(name)},
-          *database, tree->state.io.provider->getTimer(), *tree->state.wal, position, localOpenStartedNs);
+          {.objectName = kj::str(tree->objectName),
+            .storageId = kj::str(tree->storageId),
+            .facetId = facet,
+            .parentFacetId = parentFacet,
+            .facetName = kj::str(name)},
+          *database, tree->state.io.provider->getTimer(), *tree->state.wal, position,
+          localOpenStartedNs, kj::mv(confirmClose));
       auto* current = shipper.get();
       KJ_REQUIRE(tree->shippers.emplace(facet, current).second, "durable facet is already open");
       shipper = kj::mv(shipper).attach(kj::defer([tree, facet] { tree->shippers.erase(facet); }));
@@ -7243,18 +7280,17 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
   return {kj::mv(actor), borrowedHooks};
 }
 
-kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
-    ThreadState& state, const DurableRoute& route, uint64_t tree) {
+std::shared_ptr<ThreadState::WalPreparation> prepareRootWal(
+    ThreadedServer &server, ThreadState &state, const DurableRoute &route, uint64_t tree) {
   auto& slot = state.preparingWal[tree];
   auto preparation = slot.lock();
   if (!preparation) {
     auto wal = server.durableStorage->walImage(route.uniqueKey.c_str(), route.storageId.c_str(), 0);
     preparation = std::make_shared<ThreadState::WalPreparation>(
-        server.durableLog->prepareOpen(wal.directory, kj::mv(wal.path)));
+        prepareDurableWal(*server.durableLog, kj::mv(wal), tree, 0));
     slot = preparation;
   }
-  KJ_DEFER(if (preparation.use_count() == 1) state.preparingWal.erase(tree));
-  co_return co_await preparation->ready.addBranch();
+  return preparation;
 }
 
 kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
@@ -7324,9 +7360,14 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
   KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
       "durable class missing from pinned Worker");
   auto found = state.durableRoots.find(ticket.tree);
-  server::DurableWalPosition position;
+  // Keep sharing the preparation until a home publishes the root. There can
+  // be new arrivals between the scanner's completion and opening SQLite.
+  std::shared_ptr<ThreadState::WalPreparation> walPreparation;
+  KJ_DEFER(if (walPreparation.use_count() == 1) state.preparingWal.erase(ticket.tree));
+  kj::Maybe<server::ThreadedWalLog::PreparedOpen> prepared;
   if (found == state.durableRoots.end() && state.wal) {
-    position = co_await prepareRootWal(server, state, route, ticket.tree);
+    walPreparation = prepareRootWal(server, state, route, ticket.tree);
+    prepared = co_await walPreparation->ready.addBranch();
     found = state.durableRoots.find(ticket.tree);
   }
   if (found == state.durableRoots.end()) {
@@ -7349,7 +7390,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
     });
     auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
         Worker::Actor::Id(kj::mv(actorId)), route.open.className.c_str(), Frankenvalue(), 0, 0,
-        nullptr, 0, ""_kj, position, platformDatabase, sqlWalFrameLimitBytes);
+        nullptr, 0, ""_kj, kj::mv(prepared), platformDatabase, sqlWalFrameLimitBytes);
     found = state.durableRoots
                 .emplace(ticket.tree,
                     ThreadState::DurableRoot{
