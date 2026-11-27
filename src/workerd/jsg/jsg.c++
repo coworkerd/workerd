@@ -208,9 +208,11 @@ Lock::Lock(v8::Isolate* v8Isolate)
 #endif
   }
   v8Isolate->SetData(SET_DATA_LOCK, this);
+  if (previousData == nullptr) IsolateBase::from(v8Isolate).getObserver().onLockAcquired();
 }
 Lock::~Lock() noexcept(false) {
   v8Isolate->SetData(SET_DATA_LOCK, previousData);
+  if (previousData == nullptr) IsolateBase::from(v8Isolate).getObserver().onLockReleasing();
 }
 
 #ifdef WORKERD_ASAN
