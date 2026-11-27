@@ -7,9 +7,11 @@
 #include <kj/thread.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -27,7 +29,7 @@ using namespace wal;
 constexpr size_t QUEUED_RECORD_BYTES = 72u << 20;
 // Reserve room for open/close and give-up commands when the data queue is full.
 constexpr size_t QUEUED_CONTROL_BYTES = 1u << 20;
-constexpr size_t QUEUED_NOTIFICATIONS = 4096;
+constexpr size_t HOME_OPEN_LIMIT = 4096;
 constexpr uint8_t ACK_TIMEOUT = 255;
 constexpr uint8_t ACK_DISCONNECTED = 254;
 constexpr auto STORAGE_UNAVAILABLE =
@@ -107,7 +109,92 @@ struct Notification {
   kj::String reason;
 };
 
-using Inbox = Mailbox<Notification>;
+class Inbox {
+ public:
+  explicit Inbox(size_t openLimit = HOME_OPEN_LIMIT): openLimit(openLimit) {}
+
+  bool tryRegister(uint64_t openId) {
+    std::lock_guard lock(mutex);
+    if (closed || opens.size() == openLimit) return false;
+    KJ_ASSERT(opens.try_emplace(openId).second);
+    return true;
+  }
+
+  void unregister(uint64_t openId) {
+    std::lock_guard lock(mutex);
+    auto entry = opens.find(openId);
+    if (entry == opens.end()) return;
+    for (auto& slot: entry->second) {
+      KJ_IF_SOME(notice, slot) {
+        notices.erase(notice);
+      }
+    }
+    opens.erase(entry);
+  }
+
+  void push(Notification notice) {
+    std::lock_guard lock(mutex);
+    auto entry = opens.find(notice.openId);
+    if (entry == opens.end()) return;
+    auto& slot = entry->second[notice.type];
+    KJ_IF_SOME(queued, slot) {
+      // There is one open result and one request for each close reason. The
+      // shipper keeps the first break reason and latches a checkpoint request.
+      if (notice.type != MSG_SEALED) return;
+      if (queued->salt1 == notice.salt1 && queued->salt2 == notice.salt2 &&
+          queued->upToFrame >= notice.upToFrame) {
+        return;
+      }
+      // A seal is advisory. Keep its newest position and let earlier controls
+      // run first. The shipper checks the salts against its live WAL on delivery.
+      *queued = kj::mv(notice);
+      notices.splice(notices.end(), notices, queued);
+      return;
+    }
+    const bool wasEmpty = notices.empty();
+    slot = notices.insert(notices.end(), kj::mv(notice));
+    // Use the bounded mailbox as a wake latch. It may hold an earlier wake
+    // when unregistering a shipper clears the last notification.
+    if (wasEmpty) wake.push(true, 1, 1);
+  }
+
+  kj::Promise<kj::Maybe<Notification>> next() {
+    for (;;) {
+      {
+        std::lock_guard lock(mutex);
+        if (closed) co_return kj::none;
+        if (!notices.empty()) {
+          auto& notice = notices.front();
+          opens.at(notice.openId)[notice.type] = kj::none;
+          auto result = kj::mv(notice);
+          notices.pop_front();
+          co_return kj::mv(result);
+        }
+      }
+      if (co_await wake.next() == kj::none) co_return kj::none;
+    }
+  }
+
+  void close() {
+    std::lock_guard lock(mutex);
+    closed = true;
+    opens.clear();
+    notices.clear();
+    wake.close();
+  }
+
+ private:
+  using Notices = std::list<Notification>;
+  // Each live registration reserves one slot per routed message kind. Only
+  // BREAK owns variable-length data, bounded by its wire length field.
+  using Slots = std::array<kj::Maybe<Notices::iterator>, MSG_CLOSE_FOR_CODE_UPDATE + 1>;
+  const size_t openLimit;
+  std::mutex mutex;
+  bool closed = false;
+  Notices notices;
+  std::map<uint64_t, Slots> opens;
+  Mailbox<bool> wake;
+};
 
 struct Command {
   kj::Array<kj::byte> bytes;
@@ -256,6 +343,8 @@ class Session {
       if (type == MSG_OPEN) routes.emplace(command.openId, kj::mv(command.inbox));
       if (command.ack.get() != nullptr) pending.emplace(command.request, kj::mv(command.ack));
       co_await wire.write(kj::mv(command.bytes));
+      // Only the SQLite close path posts CLOSED. Unregistering a shipper just
+      // releases its Home inbox slots. The command FIFO keeps CLOSED before OPEN.
       if (type == MSG_CLOSED) routes.erase(command.openId);
     }
   }
@@ -315,8 +404,7 @@ class Session {
       default:
         KJ_FAIL_REQUIRE("unknown threaded WAL reply", type);
     }
-    KJ_REQUIRE(entry->second->push(kj::mv(notice), 1, QUEUED_NOTIFICATIONS),
-        "threaded WAL home cannot receive notification");
+    entry->second->push(kj::mv(notice));
   }
 };
 
@@ -333,6 +421,10 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
     tasks.add(read());
   }
 
+  ~Home() noexcept(false) override {
+    inbox->close();
+  }
+
   bool enabled() const override { return true; }
   uint64_t nextRequest() override { return ++shared->nextId; }
 
@@ -341,11 +433,18 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
     const auto openId = nextRequest();
     auto result = kj::newPromiseAndFulfiller<void>();
     shippers.emplace(openId, Registration{&shipper, kj::mv(result.fulfiller), result.promise.fork()});
+    if (!inbox->tryRegister(openId)) {
+      shippers.erase(openId);
+      kj::throwRecoverableException(KJ_EXCEPTION(
+          OVERLOADED, "threaded WAL home notification capacity exhausted", STORAGE_UNAVAILABLE));
+    }
     return openId;
   }
 
   void unregisterShipper(DurableLogShipper& shipper) override {
-    shippers.erase(shipper.getOpenId());
+    const auto openId = shipper.getOpenId();
+    inbox->unregister(openId);
+    shippers.erase(openId);
   }
 
   kj::Promise<void> waitForOpen(uint64_t openId, kj::Timer& timer) override {
