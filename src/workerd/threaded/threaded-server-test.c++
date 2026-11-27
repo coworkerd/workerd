@@ -653,9 +653,15 @@ KJ_TEST("SQLite heap held by multiple databases meets the process ceiling and re
   first->close();
   KJ_EXPECT(firstCopy->sqliteMemoryCharge() == 0);
   KJ_EXPECT(verify() == MiB);
+  const auto openHeadroom = budget->memoryMaximum - budget->memoryReserved.load();
+  KJ_REQUIRE(competitor.allocateExternal(openHeadroom));
   first = openFirst();
+  KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum + MiB);
+  first->reset();
+  KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum + MiB);
   KJ_EXPECT(first->run("SELECT 1").getInt(0) == 1);
   KJ_EXPECT(verify() == 2 * MiB);
+  competitor.freeExternal(openHeadroom);
   first = nullptr;
   second = nullptr;
   KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
