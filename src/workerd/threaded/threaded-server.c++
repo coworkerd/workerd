@@ -7773,7 +7773,13 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
     }
     kj::throwRecoverableException(kj::mv(error));
   }
-  co_await settleBackground(state.io.provider->getTimer(), state.tasks);
+  // Return the HTTP result at body completion, so a chunked writer can send
+  // EOF and ingress can start the shared drain. The incoming request retains
+  // its budget capability while background work runs. The connection keeps
+  // pumping the call thread and its teardown still has a bounded backstop.
+  if (invocation->measurement.requestLeaseEnded == kj::none) {
+    co_await settleBackground(state.io.provider->getTimer(), state.tasks);
+  }
 }
 
 void acceptLoop(ThreadedServer &server, int listener, int parent) {
