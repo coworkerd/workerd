@@ -840,6 +840,7 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
   // sqlite3_close_v2 is safe to call on nullptr, so we should simply call this always, thus
   // cleaning up a partial db even when SQLITE_CALL_NODB throws.
   KJ_ON_SCOPE_FAILURE({
+    maybeDb = kj::none;
     sqlite3_close_v2(db);
     releaseProcessMemoryAfterClose();
   });
@@ -887,40 +888,33 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
 }
 
 SqliteDatabase::~SqliteDatabase() noexcept(false) {
-  sqlite3* db = &KJ_UNWRAP_OR(maybeDb, return);
-
-  if (getWalTransactionLimit() != nullptr || processMemoryBudget != nullptr) {
-    // Finalize tracked statements and close the handle while the VFS, its limit,
-    // and the SQLite heap reservation are still live.
-    close();
-    KJ_IF_SOME(closed, afterCloseCallback) closed();
-    return;
+  // A failed reset can leave no handle after synchronously closing the old
+  // one. Still report that close after the shipper has been dropped.
+  auto outcome = CloseOutcome::CONFIRMED;
+  int err = SQLITE_OK;
+  KJ_IF_SOME(db, maybeDb) {
+    if (getWalTransactionLimit() != nullptr || processMemoryBudget != nullptr) {
+      // Finalize tracked statements while the VFS and its budgets are live.
+      close();
+    } else {
+      auto memoryScope = enterMemoryScope();
+      sqlite3_progress_handler(&db, 0, nullptr, nullptr);
+      err = sqlite3_close(&db);
+      if (err != SQLITE_OK) outcome = CloseOutcome::UNCONFIRMED;
+      if (err == SQLITE_BUSY) {
+        KJ_LOG(ERROR, "sqlite database destroyed while dependent objects still exist");
+        err = sqlite3_close_v2(&db);
+      }
+    }
   }
-
-  auto memoryScope = enterMemoryScope();
-
-  sqlite3_progress_handler(db, 0, nullptr, nullptr);
-  auto err = sqlite3_close(db);
-  if (err == SQLITE_OK) {
-    KJ_IF_SOME(closed, afterCloseCallback) closed();
-    return;
-  }
-  if (err == SQLITE_BUSY) {
-    KJ_LOG(ERROR, "sqlite database destroyed while dependent objects still exist");
-    // SQLite actually provides a lazy-close API which we might as well use here instead of leaking
-    // memory.
-    err = sqlite3_close_v2(db);
-  }
-
+  KJ_IF_SOME(callback, afterCloseCallback) callback(outcome);
   KJ_DTOR_REQUIRE(err == SQLITE_OK, sqlite3_errstr(err));
 }
 
 SqliteDatabase::operator sqlite3*() {
-  KJ_IF_SOME(db, maybeDb) {
-    return &db;
-  }
   KJ_REQUIRE(!closed, "database has been closed");
-  KJ_FAIL_ASSERT("previous reset() failed");
+  KJ_ASSERT(!resetFailed, "previous reset() failed");
+  return &KJ_ASSERT_NONNULL(maybeDb, "previous reset() failed");
 }
 
 SqliteMemoryScope SqliteDatabase::enterMemoryScope() {
@@ -948,13 +942,18 @@ SqliteDatabase::WalTransactionLimit* SqliteDatabase::getWalTransactionLimit() co
 }
 
 void SqliteDatabase::setWalHook(WalHook callback, void* context) {
+  // The shipper clears its hook even if reset() has already cleared the handle.
+  auto* db = callback == nullptr
+      ? maybeDb.map([](sqlite3& handle) { return &handle; }).orDefault(nullptr)
+      : static_cast<sqlite3*>(*this);
+  if (db == nullptr) return;
   if (getWalTransactionLimit() == nullptr) {
-    sqlite3_wal_hook(*this, callback, context);
+    sqlite3_wal_hook(db, callback, context);
     return;
   }
   walHook = callback;
   walHookContext = context;
-  sqlite3_wal_hook(*this, [](void* arg, sqlite3* db, const char* schema, int frames) {
+  sqlite3_wal_hook(db, [](void* arg, sqlite3* db, const char* schema, int frames) {
     auto& self = *static_cast<SqliteDatabase*>(arg);
     self.getWalTransactionLimit()->noteCommit();
     if (self.walHook != nullptr) return self.walHook(self.walHookContext, db, schema, frames);
@@ -1535,7 +1534,8 @@ void SqliteDatabase::reset() {
     vfs.directory.remove(path);
   }
 
-  KJ_ON_SCOPE_FAILURE(maybeDb = kj::none);
+  KJ_ON_SCOPE_FAILURE(resetFailed = true);
+  resetFailed = false;
   init(kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
 
   KJ_IF_SOME(resetCb, afterResetCallback) {

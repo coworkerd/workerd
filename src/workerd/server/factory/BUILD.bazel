@@ -131,7 +131,11 @@ wd_cc_library(
 kj_test(
     src = "coworkerd-threaded-wal-test.c++",
     target_compatible_with = ["@platforms//os:linux"],
-    deps = [":coworkerd-threaded-wal-source"],
+    deps = [
+        ":coworkerd-durable-test-storage",
+        ":coworkerd-threaded-wal-source",
+        "@sqlite3",
+    ],
 )
 
 wd_cc_library(

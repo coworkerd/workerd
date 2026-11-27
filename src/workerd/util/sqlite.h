@@ -424,9 +424,10 @@ class SqliteDatabase {
     afterResetCallback = kj::mv(callback);
   }
 
-  // On destruction, only a synchronous SQLite close proves that no deferred
-  // handle can still touch the files.
-  void afterClose(kj::Function<void()> callback) {
+  enum class CloseOutcome { CONFIRMED, UNCONFIRMED };
+  // Report the final close on destruction. A lazy close leaves dependent
+  // handles that may still touch the files.
+  void afterClose(kj::Function<void(CloseOutcome)> callback) {
     afterCloseCallback = kj::mv(callback);
   }
 
@@ -485,6 +486,8 @@ class SqliteDatabase {
 
   // Set by close(). Distinguishes the closed state from a failed reset() in error messages.
   bool closed = false;
+  // A failed afterReset callback can leave a replacement handle to close.
+  bool resetFailed = false;
 
   // Set while a query is compiling.
   kj::Maybe<StaticRegulator> currentRegulator;
@@ -511,7 +514,7 @@ class SqliteDatabase {
   kj::Maybe<kj::Function<void(kj::StringPtr errorMessage, kj::Maybe<kj::Exception> maybeException)>>
       onCriticalErrorCallback;
   kj::Maybe<kj::Function<void(SqliteDatabase&)>> afterResetCallback;
-  kj::Maybe<kj::Function<void()>> afterCloseCallback;
+  kj::Maybe<kj::Function<void(CloseOutcome)>> afterCloseCallback;
   kj::Maybe<kj::String> errorContext;
 
   kj::List<ResetListener, &ResetListener::link> resetListeners;
