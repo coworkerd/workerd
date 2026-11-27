@@ -55,7 +55,8 @@ kj::Own<SqliteDatabase> DurableStorage::open(kj::StringPtr uniqueKey,
     SqliteObserver& observer,
     uint facet,
     uint64_t sqlWalFrameLimitBytes,
-    size_t sqliteMemoryLimitBytes) const {
+    size_t sqliteMemoryLimitBytes,
+    std::shared_ptr<SqliteProcessMemoryBudget> sqliteProcessBudget) const {
   ensureNamespace(uniqueKey, storageId);
   const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
   if (sqlWalFrameLimitBytes != 0) {
@@ -65,7 +66,8 @@ kj::Own<SqliteDatabase> DurableStorage::open(kj::StringPtr uniqueKey,
         kj::heap<SqliteDatabase::Vfs>(*directory, SqliteDatabase::VfsOptions{
           .walTransactionLimit = limit.get()});
     auto database = kj::heap<SqliteDatabase>(*guardedVfs, databasePath(uniqueKey, storageId, facet),
-        mode, sqliteMemoryLimitBytes, kj::maxValue, observer);
+        mode, sqliteMemoryLimitBytes, kj::maxValue, observer, kj::none,
+        std::move(sqliteProcessBudget));
     return database.attach(kj::mv(guardedVfs).attach(kj::mv(limit)));
   }
   return kj::heap<SqliteDatabase>(
