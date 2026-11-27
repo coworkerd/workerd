@@ -1,16 +1,21 @@
 #include "coworkerd-threaded-wal.h"
-#include "coworkerd-wal-wire.h"
 
-#include <kj/thread.h>
+#include "coworkerd-wal-wire.h"
 
 #include <unistd.h>
 
+#include <kj/thread.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <string>
+#include <vector>
 
 namespace workerd::server {
 namespace {
@@ -28,6 +33,8 @@ constexpr uint8_t ACK_DISCONNECTED = 254;
 constexpr auto STORAGE_UNAVAILABLE =
     "jsg.Error: Durable Object storage is unavailable: the node's replicator is not reachable "
     "(STORAGE_UNAVAILABLE)"_kj;
+constexpr auto CLOSE_UNCONFIRMED =
+    "the previous SQLite connection did not confirm close in this generation"_kj;
 
 // The producer transfers owned data and wakes the consumer without entering its
 // loop. A queue has one consumer. Its mutex is released before any I/O or await.
@@ -111,12 +118,6 @@ struct Command {
   std::shared_ptr<Inbox> inbox;
 };
 
-struct OpenPreparation {
-  const kj::Directory& directory;
-  kj::Path path;
-  kj::Own<kj::CrossThreadPromiseFulfiller<DurableWalPosition>> result;
-};
-
 struct Shared {
   explicit Shared(kj::Duration confirmationTimeout): confirmationTimeout(confirmationTimeout) {}
 
@@ -125,6 +126,8 @@ struct Shared {
     ready.store(false, std::memory_order_release);
     commands.close();
     stopSignal.close();
+    std::lock_guard lock(openMutex);
+    for (auto& [key, storage]: openStorage) wakePreparations(storage);
   }
 
   bool post(Command command, bool control) {
@@ -137,12 +140,76 @@ struct Shared {
     return !stopped.load(std::memory_order_acquire) && ready.load(std::memory_order_acquire);
   }
 
+  void checkReservedOpen(const std::string& key) {
+    std::lock_guard lock(openMutex);
+    KJ_REQUIRE(negotiated(), STORAGE_UNAVAILABLE);
+    auto storage = openStorage.find(key);
+    KJ_ASSERT(storage != openStorage.end());
+    requireConfirmedClose(storage->second);
+  }
+
+  bool reserveOpen(const std::string& key,
+      uint64_t tree,
+      uint facet,
+      kj::Own<kj::CrossThreadPromiseFulfiller<void>> changed) {
+    std::lock_guard lock(openMutex);
+    KJ_REQUIRE(negotiated(), STORAGE_UNAVAILABLE);
+    auto& storage = openStorage.try_emplace(key, tree).first->second;
+    requireConfirmedClose(storage);
+    if (storage.tree == tree && storage.facets.insert(facet).second) return true;
+    // Coalesced root requests and the facet startup each have one shared
+    // preparation. Drop canceled waiters as later requests replace them.
+    std::erase_if(storage.waiters, [](auto& waiter) { return !waiter->isWaiting(); });
+    storage.waiters.push_back(kj::mv(changed));
+    return false;
+  }
+
+  void finishOpen(
+      const std::string& key, uint64_t tree, uint facet, SqliteDatabase::CloseOutcome outcome) {
+    std::lock_guard lock(openMutex);
+    auto storage = openStorage.find(key);
+    KJ_ASSERT(storage != openStorage.end() && storage->second.tree == tree);
+    KJ_ASSERT(storage->second.facets.erase(facet) == 1);
+    if (outcome == SqliteDatabase::CloseOutcome::UNCONFIRMED &&
+        !std::exchange(storage->second.closeUnconfirmed, true)) {
+      unconfirmedCloseIdentities.fetch_add(1, std::memory_order_relaxed);
+    }
+    wakePreparations(storage->second);
+    if (storage->second.facets.empty() && !storage->second.closeUnconfirmed) {
+      openStorage.erase(storage);
+    }
+  }
+
   const kj::Duration confirmationTimeout;
   Mailbox<Command> commands;
   Mailbox<bool> stopSignal;
   std::atomic<uint64_t> nextId{0};
   std::atomic<bool> ready{false};
   std::atomic<bool> stopped{false};
+  std::atomic<uint64_t> unconfirmedCloseIdentities{0};
+
+ private:
+  struct OpenStorage {
+    uint64_t tree;
+    bool closeUnconfirmed = false;
+    std::set<uint> facets;
+    std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
+  };
+  std::mutex openMutex;
+  std::map<std::string, OpenStorage> openStorage;
+
+  static void requireConfirmedClose(const OpenStorage& storage) {
+    if (storage.closeUnconfirmed) {
+      auto error = KJ_EXCEPTION(OVERLOADED, CLOSE_UNCONFIRMED);
+      error.setDetail(ThreadedWalLog::CLOSE_UNCONFIRMED_DETAIL, kj::heapArray<kj::byte>(0));
+      kj::throwRecoverableException(kj::mv(error));
+    }
+  }
+
+  static void wakePreparations(OpenStorage& storage) {
+    for (auto& waiter: storage.waiters) waiter->fulfill();
+    storage.waiters.clear();
+  }
 };
 
 class Session {
@@ -407,7 +474,57 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
 
 }  // namespace
 
+struct ThreadedWalLog::OpenReservation {
+  std::shared_ptr<Shared> shared;
+  std::string key;
+  uint64_t tree;
+  uint facet;
+  enum class State { WAITING, RESERVED, OPENED };
+  State state = State::WAITING;
+
+  OpenReservation(std::shared_ptr<Shared> shared, kj::StringPtr key, uint64_t tree, uint facet)
+      : shared(std::move(shared)),
+        key(key.cStr(), key.size()),
+        tree(tree),
+        facet(facet) {}
+
+  ~OpenReservation() {
+    // Dropping a preparation that never reached SQLite needs no close proof.
+    if (state == State::RESERVED) {
+      shared->finishOpen(key, tree, facet, SqliteDatabase::CloseOutcome::CONFIRMED);
+    }
+  }
+
+  void closed(SqliteDatabase::CloseOutcome outcome) {
+    KJ_ASSERT(state == State::OPENED);
+    state = State::WAITING;
+    shared->finishOpen(key, tree, facet, outcome);
+  }
+};
+
+DurableWalPosition ThreadedWalLog::PreparedOpen::positionForOpen() const {
+  KJ_REQUIRE(reservation->state == OpenReservation::State::RESERVED,
+      "jsg.Error: Durable Object storage preparation was already used (STORAGE_UNAVAILABLE)");
+  reservation->shared->checkReservedOpen(reservation->key);
+  return position;
+}
+
+kj::Function<void(SqliteDatabase::CloseOutcome)> ThreadedWalLog::PreparedOpen::trackClose() const {
+  KJ_ASSERT(reservation->state == OpenReservation::State::RESERVED);
+  reservation->state = OpenReservation::State::OPENED;
+  return [reservation = reservation](
+             SqliteDatabase::CloseOutcome outcome) { reservation->closed(outcome); };
+}
+
 struct ThreadedWalLog::Impl {
+  struct OpenPreparation {
+    const kj::Directory& directory;
+    kj::Path path;
+    kj::Own<kj::CrossThreadPromiseFulfiller<DurableWalPosition>> result;
+    // A canceled caller may leave its scan running until this item is dropped.
+    std::shared_ptr<OpenReservation> reservation;
+  };
+
   Impl(int fd, uint64_t generation, kj::Duration confirmationTimeout)
       : shared(std::make_shared<Shared>(confirmationTimeout)),
         owner([state = shared, descriptor = kj::AutoCloseFd(fd), generation]() mutable {
@@ -454,17 +571,37 @@ bool ThreadedWalLog::ready() const { return impl->shared->negotiated(); }
 
 kj::Duration ThreadedWalLog::confirmationTimeout() const { return impl->shared->confirmationTimeout; }
 
+uint64_t ThreadedWalLog::unconfirmedCloseIdentities() const {
+  return impl->shared->unconfirmedCloseIdentities.load(std::memory_order_relaxed);
+}
+
 kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
     kj::Function<void(uint64_t, CloseReason)> requestClose) {
   return kj::heap<Home>(impl->shared, kj::mv(requestClose), kj::systemPreciseMonotonicClock());
 }
 
-kj::Promise<DurableWalPosition> ThreadedWalLog::prepareOpen(
-    const kj::Directory& directory, kj::Path path) {
+kj::Promise<ThreadedWalLog::PreparedOpen> ThreadedWalLog::prepareOpen(
+    const kj::Directory& directory,
+    kj::Path path,
+    kj::String storageKey,
+    uint64_t tree,
+    uint facet) {
+  auto reservation = std::make_shared<OpenReservation>(impl->shared, storageKey, tree, facet);
+  for (;;) {
+    auto changed = kj::newPromiseAndCrossThreadFulfiller<void>();
+    if (impl->shared->reserveOpen(reservation->key, tree, facet, kj::mv(changed.fulfiller))) {
+      reservation->state = OpenReservation::State::RESERVED;
+      break;
+    }
+    co_await changed.promise;
+  }
   auto paf = kj::newPromiseAndCrossThreadFulfiller<DurableWalPosition>();
-  KJ_REQUIRE(ready() && impl->opens.push({directory, kj::mv(path), kj::mv(paf.fulfiller)}, 1, 1024),
+  KJ_REQUIRE(ready() &&
+          impl->opens.push({directory, kj::mv(path), kj::mv(paf.fulfiller), reservation}, 1, 1024),
       STORAGE_UNAVAILABLE);
-  return kj::mv(paf.promise);
+  auto position = co_await paf.promise;
+  KJ_REQUIRE(ready(), STORAGE_UNAVAILABLE);
+  co_return PreparedOpen(position, std::move(reservation));
 }
 
 }  // namespace workerd::server
