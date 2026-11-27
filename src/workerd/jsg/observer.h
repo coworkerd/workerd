@@ -188,6 +188,10 @@ struct IsolateObserver: public CompilationObserver,
                         public ResolveObserver {
   virtual ~IsolateObserver() noexcept(false) {}
 
+  // These callbacks bracket an outer JSG lock, on the thread holding the V8 locker.
+  virtual void onLockAcquired() noexcept {}
+  virtual void onLockReleasing() noexcept {}
+
   // Called when eval(), new Function(), or similar dynamic code generation
   // is performed. Note that the source here may not be a string: V8 also reports
   // each object argument to new Function() before converting it to a string.
