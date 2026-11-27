@@ -350,7 +350,7 @@ struct ResourceBudget {
   std::atomic<uint32_t> residentMaximum;
   std::mutex mutex;
   server::DurableAdmission::Time databasePreparationPreferredUntil{};
-  std::atomic<uint64_t> memoryReserved{0}, addressReserved{0};
+  std::atomic<uint64_t> memoryReserved{0}, addressReserved{0}, sqliteMemoryReserved{0};
   // Heap headroom near-heap-limit raises granted above what their isolates
   // used, until each call's termination takes effect (MemoryBudget::raise()):
   // two isolates raised at once never both count on the same remainder.
@@ -482,7 +482,8 @@ struct ResourceBudget {
       uint64_t newAddress,
       bool admission = false,
       bool observe = false,
-      uint64_t* memoryBeforeRelease = nullptr) {
+      uint64_t *memoryBeforeRelease = nullptr,
+      int64_t sqliteDelta = 0) {
     std::lock_guard lock(mutex);
     const auto reserved = memoryReserved.load();
     if (memoryBeforeRelease != nullptr) *memoryBeforeRelease = reserved;
@@ -494,13 +495,14 @@ struct ResourceBudget {
     if (!accepted && !observe) return false;
     memoryReserved.store(memory + newMemory);
     addressReserved.store(address + newAddress);
+    if (sqliteDelta != 0) sqliteMemoryReserved.fetch_add(sqliteDelta);
     if (memory + newMemory > admissionMaximum || address + newAddress > addressMaximum)
       requestReclaimLocked();
     return accepted;
   }
 };
 
-struct ResourceReservation {
+struct ResourceReservation final: SqliteProcessMemoryBudget {
   static constexpr uint64_t MiB = ResourceBudget::MiB;
   // The capacity acquisition records heap and RSS deltas to validate this seed
   // and fixed native overhead separately from each isolate's own heap ceiling.
@@ -511,10 +513,13 @@ struct ResourceReservation {
       : budget(std::move(budget)),
         maximumHeap(uint64_t(memoryMiB == 0 ? 128 : memoryMiB) * MiB),
         returned(platformDatabase ? std::make_shared<DatabaseReservationReturn>() : nullptr) {}
-  ~ResourceReservation() {
+  ~ResourceReservation() noexcept override {
     if (!registered) return;
+    if (sqliteBytes != 0) {
+      KJ_LOG(ERROR, "SQLite heap charge remained when releasing a copy reservation", sqliteBytes);
+    }
     (void)budget->change(memoryCharge, 0, addressCharge, 0, false, false,
-        returned ? &returned->memoryBeforeRelease : nullptr);
+        returned ? &returned->memoryBeforeRelease : nullptr, -int64_t(sqliteBytes));
     budget->residents.fetch_sub(1);
     if (returned) returned->releasedMemory.store(memoryCharge);
   }
@@ -522,8 +527,8 @@ struct ResourceReservation {
   const uint64_t maximumHeap;
   const std::shared_ptr<DatabaseReservationReturn> returned;
   std::mutex mutex;
-  uint64_t heap = PREPARATION_HEAP, heapPhysical = 0, otherExternal = 0, ownedExternal = 0, source = 0,
-           logs = 0;
+  uint64_t heap = PREPARATION_HEAP, heapPhysical = 0, otherExternal = 0, ownedExternal = 0,
+           source = 0, logs = 0, sqliteBytes = 0;
   uint64_t memoryCharge = 0, addressCharge = 0;
   uint32_t preparing = 0;
   bool registered = false;
@@ -531,10 +536,12 @@ struct ResourceReservation {
     std::lock_guard lock(mutex);
     return registered ? budget->replacementCeiling(memoryCharge, addressCharge) : std::nullopt;
   }
-  bool resize(bool admission = false, bool observe = false) {
-    auto memory = NATIVE_OVERHEAD + source + heap + otherExternal + ownedExternal + logs;
+  bool resize(bool admission = false, bool observe = false, int64_t sqliteDelta = 0) {
+    auto memory =
+        NATIVE_OVERHEAD + source + heap + otherExternal + ownedExternal + logs + sqliteBytes;
     auto address = kj::max(2 * MiB, heap);
-    bool fits = budget->change(memoryCharge, memory, addressCharge, address, admission, observe);
+    bool fits = budget->change(
+        memoryCharge, memory, addressCharge, address, admission, observe, nullptr, sqliteDelta);
     if (fits || observe) {
       memoryCharge = memory;
       addressCharge = address;
@@ -601,6 +608,30 @@ struct ResourceReservation {
     KJ_ASSERT(size <= ownedExternal);
     ownedExternal -= size;
     (void)resize(false, true);
+  }
+  bool resizeSqliteMemory(size_t oldCharge, size_t newCharge, bool observe) noexcept override {
+    std::lock_guard lock(mutex);
+    if (!registered) {
+      KJ_LOG(ERROR, "SQLite heap changed before its copy reservation was registered");
+      return observe || newCharge <= oldCharge;
+    }
+    if (oldCharge > sqliteBytes) {
+      KJ_LOG(ERROR, "SQLite heap change exceeded the copy's recorded charge", oldCharge, sqliteBytes);
+    }
+    const auto previous = sqliteBytes;
+    if (newCharge >= oldCharge) {
+      sqliteBytes += newCharge - oldCharge;
+    } else {
+      sqliteBytes -= kj::min(sqliteBytes, oldCharge - newCharge);
+    }
+    // Observe trusted allocations even at the process ceiling.
+    if (resize(false, observe, int64_t(sqliteBytes) - int64_t(previous)) || observe) return true;
+    sqliteBytes = previous;
+    return false;
+  }
+  size_t sqliteMemoryCharge() {
+    std::lock_guard lock(mutex);
+    return sqliteBytes;
   }
   bool retainLogs(uint64_t bytes) {
     std::lock_guard lock(mutex);
@@ -1799,7 +1830,8 @@ struct RequestLimits final: LimitEnforcer {
     return 0 * kj::SECONDS;
   }
   size_t getSqliteMemoryUsage() const override {
-    return 0;
+    // Report the copy's committed SQLite heap reservation.
+    return slot.reservation->sqliteMemoryCharge();
   }
   Slot &slot;
   Measurement &measurement;
@@ -3757,6 +3789,9 @@ struct ThreadedServer {
         ",\"isolateResets\":" + std::to_string(durableIsolateResets.load()) +
         ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
         ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
+        ",\"sqliteHeapReservedBytes\":" + std::to_string(resources->sqliteMemoryReserved.load()) +
+        ",\"copyMemoryReservedBytes\":" + std::to_string(resources->memoryReserved.load()) +
+        ",\"copyMemoryMaximum\":" + std::to_string(resources->memoryMaximum) +
         ",\"overloaded\":" + std::to_string(state.overloads) +
         ",\"expired\":" + std::to_string(state.expired) + "}}";
     if (publish) {
@@ -7075,8 +7110,14 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
               SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES,
               SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES)
         : kj::maxValue;
-    auto database = tree->storage().open(
-        tree->uniqueKey, tree->storageId, observer, facet, sqlWalFrameLimitBytes, memoryLimit);
+    std::shared_ptr<SqliteProcessMemoryBudget> sqliteProcessBudget;
+    if (sqlWalFrameLimitBytes != 0) {
+      auto slot = tree->slot.lock();
+      KJ_REQUIRE(slot != nullptr, "database storage opened without its isolate reservation");
+      sqliteProcessBudget = slot->reservation;
+    }
+    auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet,
+        sqlWalFrameLimitBytes, memoryLimit, std::move(sqliteProcessBudget));
     if (tree->state.wal) {
       auto shipper = tree->storage().ship(tree->uniqueKey,
           {.objectName = kj::str(tree->objectName), .storageId = kj::str(tree->storageId),

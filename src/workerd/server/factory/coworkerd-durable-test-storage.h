@@ -29,7 +29,8 @@ class DurableStorage {
       SqliteObserver& observer = SqliteObserver::DEFAULT,
       uint facet = 0,
       uint64_t sqlWalFrameLimitBytes = 0,
-      size_t sqliteMemoryLimitBytes = kj::maxValue) const;
+      size_t sqliteMemoryLimitBytes = kj::maxValue,
+      std::shared_ptr<SqliteProcessMemoryBudget> sqliteProcessBudget = {}) const;
 
   kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
       DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,

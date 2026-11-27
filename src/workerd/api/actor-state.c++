@@ -779,6 +779,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
           const bool recordRefused = limit->wasRefused();
           const bool spillRefused = limit->wasSpillRefused();
           const bool memoryRefused = limit->wasMemoryRefused();
+          const bool processMemoryRefused = limit->wasProcessMemoryRefused();
           // Once commit starts, an unrelated exception can come from work
           // after the SQLite commit. Trim then only for a recorded refusal
           // or SQL interruption.
@@ -799,8 +800,15 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
                     "jsg.Error: uncommitted WAL and temporary files exceeded a SQLite spill budget"),
                 "SQL_SPILL_LIMIT_EXCEEDED"));
           }
-          if (memoryRefused) {
+          if (memoryRefused || processMemoryRefused) {
             sqlite.releaseCachedMemory();
+          }
+          if (processMemoryRefused) {
+            kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+                KJ_EXCEPTION(OVERLOADED, "jsg.Error: the durable process SQLite memory budget is full"),
+                "OVERLOADED"));
+          }
+          if (memoryRefused) {
             kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
                 KJ_EXCEPTION(
                     FAILED, "jsg.Error: the statement exceeds the database SQLite memory limit"),
