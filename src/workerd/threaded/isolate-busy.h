@@ -4,7 +4,6 @@
 
 #pragma once
 
-#include <kj/debug.h>
 #include <kj/mutex.h>
 #include <kj/time.h>
 
@@ -38,9 +37,10 @@ class IsolateBusyWindow final {
 
   void releasing() {
     auto locked = state.lockExclusive();
+    const auto heldSince = KJ_UNWRAP_OR(locked->heldSince, return);
     const auto end = nowNs();
     const auto oldest = firstBucket(end / BUCKET_NS) * BUCKET_NS;
-    auto start = kj::max(KJ_ASSERT_NONNULL(locked->heldSince), oldest);
+    auto start = kj::max(heldSince, oldest);
     while (start < end) {
       const auto index = start / BUCKET_NS;
       const auto through = kj::min(end, (index + 1) * BUCKET_NS);

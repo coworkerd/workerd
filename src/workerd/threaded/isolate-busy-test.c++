@@ -57,6 +57,23 @@ KJ_TEST("isolate busy time includes a live hold and rolls off bucket by bucket")
   KJ_EXPECT(window.sample().permille() == 0);
 }
 
+KJ_TEST("a release without a matching isolate hold leaves the reading unchanged") {
+  TestClock clock;
+  IsolateBusyWindow window(clock);
+
+  clock.time = 100 * kj::MILLISECONDS;
+  window.releasing();
+  KJ_EXPECT(window.sample().busyNs == 0);
+
+  clock.time = 150 * kj::MILLISECONDS;
+  window.acquired();
+  clock.time = 200 * kj::MILLISECONDS;
+  window.releasing();
+  clock.time = 300 * kj::MILLISECONDS;
+  window.releasing();
+  KJ_EXPECT(window.sample().busyNs == 50000000);
+}
+
 KJ_TEST("the published permille crosses an inclusive fractional threshold at the exact boundary") {
   TestClock clock;
   const auto readingAfter = [&](kj::Duration held) {
