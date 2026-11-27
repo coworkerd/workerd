@@ -28,6 +28,11 @@ class IsolateBusyWindow final {
 
   explicit IsolateBusyWindow(const kj::MonotonicClock& clock): clock(clock) {}
 
+  void reset() {
+    auto locked = state.lockExclusive();
+    *locked = State{};
+  }
+
   // Serialize each clock read with the state it describes. The snapshot thread never
   // takes the V8 locker. Only the outer V8 lock owner calls acquired() and releasing().
   void acquired() {

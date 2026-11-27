@@ -42,6 +42,88 @@ void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
   limits.customizeIsolate(isolate);
 }
 
+KJ_TEST("a stateless isolate starts idle after loading and counts its next HTTP request") {
+  struct BusyClock final: kj::MonotonicClock {
+    kj::TimePoint now() const override {
+      const auto reading = kj::origin<kj::TimePoint>() + time;
+      time += advanceAfterRead;
+      advanceAfterRead = 0 * kj::MILLISECONDS;
+      return reading;
+    }
+
+    mutable kj::Duration time = 0 * kj::MILLISECONDS;
+    mutable kj::Duration advanceAfterRead = 2850 * kj::MILLISECONDS;
+  } clock;
+
+  constexpr auto source = "export default { fetch() { return new Response('served'); } };"_kj;
+  const auto hash = digest(source.asBytes());
+  auto descriptor = kj::str(R"({
+    "workerId":"test/busy","versionId":"v1","format":"v1","definitionHash":"definition",
+    "invocationId":"request","processId":"process","processGeneration":1,"lease":null,
+    "mainModule":"index.js","compatibilityDate":"2026-11-01","contentHash":")",
+      hash.c_str(), R"(","rootPlan":{"kind":"tenant","namespaces":[]},
+    "rootSelection":{"kind":"plain","dispatchChecked":true}
+  })");
+  JsonDoc input(descriptor);
+  auto sourceReply = kj::str(R"({"workerId":"test/busy","versionId":"v1","contentHash":")",
+      hash.c_str(), R"(","source":")", source, R"("})");
+  ThreadState state;
+  struct SourceService final: kj::HttpService {
+    SourceService(const kj::HttpHeaderTable& headers, kj::StringPtr reply)
+        : headers(headers),
+          reply(reply) {}
+
+    kj::Promise<void> request(kj::HttpMethod method,
+        kj::StringPtr url,
+        const kj::HttpHeaders&,
+        kj::AsyncInputStream&,
+        Response& response) override {
+      KJ_EXPECT(method == kj::HttpMethod::GET && url.contains("/v1/source?"));
+      auto output = response.send(200, "OK", kj::HttpHeaders(headers), reply.size());
+      co_await output->write(reply.asBytes());
+    }
+
+    const kj::HttpHeaderTable& headers;
+    kj::StringPtr reply;
+  } sourceService(*state.headers, sourceReply);
+
+  auto& waitScope = state.io.waitScope;
+  auto listener =
+      state.io.provider->getNetwork().parseAddress("127.0.0.1", 0).wait(waitScope)->listen();
+  kj::HttpServer sourceServer(state.io.provider->getTimer(), *state.headers, sourceService);
+  auto listening = sourceServer.listenHttp(*listener).eagerlyEvaluate(nullptr);
+  ThreadedServer server{
+    4, kj::str("127.0.0.1:", listener->getPort()).cStr(), "", -1, {}, {}, &initializeV8(), clock};
+
+  bool coldLoaded = false;
+  auto slot = server.getWorker(input.get(), state, coldLoaded).wait(waitScope);
+  KJ_REQUIRE(coldLoaded && slot->complete && slot->worker != kj::none);
+  KJ_EXPECT(clock.time == 2850 * kj::MILLISECONDS);
+  KJ_EXPECT(slot->contexts.load() == 0);
+  auto& window = KJ_ASSERT_NONNULL(slot->busy)->window;
+  const auto ready = window.sample();
+  KJ_EXPECT(ready.throughNs == 2800000000);
+  KJ_EXPECT(ready.busyNs == 0);
+  KJ_EXPECT(ready.permille() == 0);
+
+  // The first lock taken while serving the request lasts 200 ms on the controlled clock.
+  clock.time = 2875 * kj::MILLISECONDS;
+  clock.advanceAfterRead = 200 * kj::MILLISECONDS;
+  Invocation invocation(server, state, kj::mv(descriptor), Frankenvalue(), {});
+  auto client = kj::newHttpClient(invocation);
+  auto response =
+      client->request(kj::HttpMethod::GET, "http://test/busy", kj::HttpHeaders(*state.headers))
+          .response.wait(waitScope);
+  KJ_EXPECT(response.statusCode == 200);
+  KJ_EXPECT(response.body->readAllText().wait(waitScope) == "served");
+  KJ_EXPECT(server.compilations.load() == 1);
+  KJ_EXPECT(clock.time == 3075 * kj::MILLISECONDS);
+  clock.time = 3100 * kj::MILLISECONDS;
+  const auto served = window.sample();
+  KJ_EXPECT(served.busyNs == 200000000);
+  KJ_EXPECT(served.permille() == 66);
+}
+
 KJ_TEST("platform durable plans pin the class and copy to the tenant") {
   JsonDoc input(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
