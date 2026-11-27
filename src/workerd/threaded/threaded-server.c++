@@ -1969,13 +1969,12 @@ struct ThreadState {
   ThreadContext context{io.provider->getTimer(), entropy, ids, http, bytes};
   Timer timer{io.provider->getTimer()};
   Errors errors;
-  kj::TaskSet tasks{errors};
-  int decisionSpare = open("/dev/null", O_RDONLY | O_CLOEXEC);
-  ~ThreadState() {
-    if (decisionSpare >= 0) close(decisionSpare);
-  }
+  kj::AutoCloseFd decisionSpare{open("/dev/null", O_RDONLY | O_CLOEXEC)};
   bool rejectOnly = false;
   uint64_t durableHome = 0;
+  // Shippers and SQLite's deferred close callbacks borrow this channel. Keep it alive
+  // until the home has canceled its tasks and destroyed its actors and isolate copy.
+  kj::Own<server::DurableWalChannel> wal;
   std::shared_ptr<Slot> durableSlot;
   // The cold load in flight on this home. Its waiters all want its definition, and it
   // ends with the last of them, so a canceled load is never left for a later tree.
@@ -1986,7 +1985,6 @@ struct ThreadState {
     bool settled = false;
   };
   std::optional<DurableLoad> durableLoad;
-  kj::Own<server::DurableWalChannel> wal;
   struct WalPreparation {
     explicit WalPreparation(kj::Promise<server::DurableWalPosition> task): ready(task.fork()) {}
     kj::ForkedPromise<server::DurableWalPosition> ready;
@@ -2024,6 +2022,17 @@ struct ThreadState {
   };
   std::map<Worker::Actor *, uint64_t> durableActorTrees;
   std::map<uint64_t, DurableRoot> durableRoots;
+  kj::TaskSet tasks{errors};
+
+  ~ThreadState() noexcept(false) {
+    // Cancel sessions while the roots and indexes are live. Dropping the roots can enqueue
+    // drains from their facet sessions, so cancel those before destroying the task set.
+    KJ_DEFER({
+      durableRoots.clear();
+      tasks.clear();
+    });
+    tasks.clear();
+  }
 };
 
 Frankenvalue readNativeProps(ThreadState &state, rpc::Frankenvalue::Reader value);
@@ -3022,11 +3031,8 @@ struct ThreadedServer {
       threaded::LoadStage loadStage) {
     // One descriptor per event loop is held aside for this private proof path.
     // Releasing it permits the receipt exchange even during process EMFILE.
-    if (state.decisionSpare >= 0) {
-      close(state.decisionSpare);
-      state.decisionSpare = -1;
-    }
-    KJ_DEFER(state.decisionSpare = open("/dev/null", O_RDONLY | O_CLOEXEC));
+    state.decisionSpare = nullptr;
+    KJ_DEFER(state.decisionSpare = kj::AutoCloseFd(open("/dev/null", O_RDONLY | O_CLOEXEC)));
     auto receipt = field(input, "dispatchReceipt");
     KJ_REQUIRE(receipt.isString() && receipt.getString().size() == 32,
         "missing private dispatch decision receipt");
