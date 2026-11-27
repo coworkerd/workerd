@@ -19,8 +19,8 @@ class SqliteProcessMemoryBudget {
   }
 
   virtual ~SqliteProcessMemoryBudget() noexcept = default;
-  // Only called when the rounded charge changes. Decreases cannot be refused.
-  virtual bool resizeSqliteMemory(size_t oldCharge, size_t newCharge, bool cleanup) noexcept = 0;
+  // Called at a rounded charge boundary. Decreases and observed changes cannot be refused.
+  virtual bool resizeSqliteMemory(size_t oldCharge, size_t newCharge, bool observe) noexcept = 0;
 };
 
 // This module implements per-database SQLite memory metering.
@@ -51,7 +51,7 @@ class SqliteMemoryScope {
   explicit SqliteMemoryScope(size_t& memoryBytes,
       size_t maxMemoryBytes,
       SqliteProcessMemoryBudget* processBudget = nullptr,
-      bool cleanup = false);
+      bool observeProcess = false);
 
   ~SqliteMemoryScope() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(SqliteMemoryScope);
@@ -59,15 +59,17 @@ class SqliteMemoryScope {
   // The wrapper clears this at the start of a SQLite call. SQLITE_NOMEM can
   // also come from SQLite's own limits or a system allocation failure.
   static void clearLimitRefusal() noexcept;
-  static bool wasLimitRefused() noexcept;
+  enum class LimitRefusal { NONE, DATABASE, PROCESS };
+  static LimitRefusal getLimitRefusal() noexcept;
+  static bool wasLimitRefused() noexcept { return getLimitRefusal() != LimitRefusal::NONE; }
 
  private:
   // These are accessed by the allocator functions via threadLocalScope.
   size_t& memoryBytes;
   const size_t maxMemoryBytes;
-  bool limitRefused = false;
+  LimitRefusal limitRefusal = LimitRefusal::NONE;
   SqliteProcessMemoryBudget* const processBudget;
-  const bool cleanup;
+  const bool observeProcess;
   bool resize(size_t previous, size_t replacement) noexcept;
 
   // Thread-local pointer to the active scope. Set to this on construction (if not already set),

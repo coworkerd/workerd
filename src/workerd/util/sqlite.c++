@@ -839,7 +839,10 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
   // expected that sqlite3_close_v2 sets up a database in need of close, or sets nullptr.
   // sqlite3_close_v2 is safe to call on nullptr, so we should simply call this always, thus
   // cleaning up a partial db even when SQLITE_CALL_NODB throws.
-  KJ_ON_SCOPE_FAILURE(sqlite3_close_v2(db));
+  KJ_ON_SCOPE_FAILURE({
+    sqlite3_close_v2(db);
+    releaseProcessMemoryAfterClose();
+  });
 
   KJ_IF_SOME(mode, maybeMode) {
     int flags = SQLITE_OPEN_READWRITE;
@@ -921,7 +924,19 @@ SqliteDatabase::operator sqlite3*() {
 }
 
 SqliteMemoryScope SqliteDatabase::enterMemoryScope() {
-  return SqliteMemoryScope(sqliteMemoryBytes, sqliteMaxMemoryBytes, processMemoryBudget.get());
+  // Opening, recovery and maintenance have no platform transaction to settle a refusal.
+  auto* limit = getWalTransactionLimit();
+  const bool observeProcess = limit == nullptr || !limit->isActive();
+  return SqliteMemoryScope(
+      sqliteMemoryBytes, sqliteMaxMemoryBytes, processMemoryBudget.get(), observeProcess);
+}
+
+void SqliteDatabase::releaseProcessMemoryAfterClose() noexcept {
+  if (processMemoryBudget == nullptr || sqliteMemoryBytes == 0) return;
+  KJ_LOG(ERROR, "SQLite heap charge remained after closing the database", sqliteMemoryBytes);
+  processMemoryBudget->resizeSqliteMemory(
+      SqliteProcessMemoryBudget::chargeFor(sqliteMemoryBytes), 0, /*observe=*/true);
+  sqliteMemoryBytes = 0;
 }
 
 bool SqliteDatabase::observedCriticalError() {
@@ -952,7 +967,7 @@ void SqliteDatabase::rollbackWalTransaction() {
   // allocations while allowing the trusted rollback to finish. The platform
   // transaction calls this after leaving the failed SQLite call's memory scope.
   SqliteMemoryScope memoryScope(sqliteMemoryBytes, kj::maxValue, processMemoryBudget.get(),
-      /*cleanup=*/true);
+      /*observeProcess=*/true);
   if (!sqlite3_get_autocommit(*this)) {
     run("ROLLBACK TRANSACTION");
   } else {
@@ -1131,7 +1146,7 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
       if (code == SQLITE_FULL && limit->isRefusingWrites()) return;
       if (code == SQLITE_NOMEM && SqliteMemoryScope::wasLimitRefused()) {
         // The active platform transaction owns rollback and error translation.
-        limit->noteMemoryRefusal();
+        limit->noteMemoryRefusal(SqliteMemoryScope::getLimitRefusal());
         return;
       }
     }
@@ -1516,6 +1531,7 @@ void SqliteDatabase::reset() {
         sqlite3_errstr(err));
 
     maybeDb = kj::none;
+    releaseProcessMemoryAfterClose();
     vfs.directory.remove(path);
   }
 
@@ -1541,7 +1557,7 @@ void SqliteDatabase::close() noexcept {
 
   SqliteMemoryScope memoryScope(sqliteMemoryBytes,
       processMemoryBudget == nullptr ? sqliteMaxMemoryBytes : size_t(kj::maxValue),
-      processMemoryBudget.get(), /*cleanup=*/true);
+      processMemoryBudget.get(), /*observeProcess=*/true);
 
   KJ_IF_SOME(db, maybeDb) {
     for (auto& listener: resetListeners) {
@@ -1565,6 +1581,7 @@ void SqliteDatabase::close() noexcept {
   inTransaction = false;
   savepoints.clear();
   rollbackCallbacks.clear();
+  releaseProcessMemoryAfterClose();
   closed = true;
 }
 
@@ -2332,7 +2349,7 @@ void SqliteDatabase::Query::checkColumnMemoryLimit(sqlite3_stmt* statement) {
   if (auto* limit = db.getWalTransactionLimit(); limit != nullptr && limit->isActive()) {
     // A column accessor can allocate, for example when it expands a zero BLOB.
     // Finalize this execution now rather than returning a bogus empty value.
-    limit->noteMemoryRefusal();
+    limit->noteMemoryRefusal(SqliteMemoryScope::getLimitRefusal());
     sqlite3_reset(statement);
     kj::throwRecoverableException(
         KJ_EXCEPTION(FAILED, "SQLite failed", sqlite3_errstr(SQLITE_NOMEM)));

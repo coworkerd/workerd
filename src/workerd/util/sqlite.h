@@ -533,6 +533,7 @@ class SqliteDatabase {
   bool inTransaction = false;
 
   void init(kj::Maybe<kj::WriteMode> maybeMode);
+  void releaseProcessMemoryAfterClose() noexcept;
   WalHook walHook = nullptr;
   void* walHookContext = nullptr;
 
@@ -1010,6 +1011,9 @@ class SqliteDatabase::WalTransactionLimit {
   bool wasMemoryRefused() const {
     return active && refusal == Refusal::MEMORY_LIMIT;
   }
+  bool wasProcessMemoryRefused() const {
+    return active && refusal == Refusal::PROCESS_MEMORY_LIMIT;
+  }
   bool wasSpillRefused() const {
     return active && refusal == Refusal::SPILL_LIMIT;
   }
@@ -1017,8 +1021,10 @@ class SqliteDatabase::WalTransactionLimit {
     return spill != kj::none;
   }
   bool resizeSpill(uint64_t before, uint64_t after) noexcept;
-  void noteMemoryRefusal() {
-    noteRefusal(Refusal::MEMORY_LIMIT);
+  void noteMemoryRefusal(SqliteMemoryScope::LimitRefusal cause) {
+    noteRefusal(cause == SqliteMemoryScope::LimitRefusal::PROCESS
+            ? Refusal::PROCESS_MEMORY_LIMIT
+            : Refusal::MEMORY_LIMIT);
   }
   void noteInterruption() {
     noteRefusal(Refusal::INTERRUPTED);
@@ -1046,7 +1052,9 @@ class SqliteDatabase::WalTransactionLimit {
   kj::Maybe<int64_t> originalSize;
   bool active = false;
   bool committed = false;
-  enum class Refusal { NONE, WAL_LIMIT, SPILL_LIMIT, MEMORY_LIMIT, INTERRUPTED, STATEMENT_ROLLBACK };
+  enum class Refusal {
+    NONE, WAL_LIMIT, SPILL_LIMIT, MEMORY_LIMIT, PROCESS_MEMORY_LIMIT, INTERRUPTED, STATEMENT_ROLLBACK
+  };
   Refusal refusal = Refusal::NONE;
 
   void releaseWalSpill() noexcept;

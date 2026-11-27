@@ -514,10 +514,12 @@ struct ResourceReservation final: SqliteProcessMemoryBudget {
         maximumHeap(uint64_t(memoryMiB == 0 ? 128 : memoryMiB) * MiB),
         returned(platformDatabase ? std::make_shared<DatabaseReservationReturn>() : nullptr) {}
   ~ResourceReservation() noexcept override {
-    KJ_ASSERT(sqliteBytes == 0, "SQLite heap outlived its connection");
     if (!registered) return;
+    if (sqliteBytes != 0) {
+      KJ_LOG(ERROR, "SQLite heap charge remained when releasing a copy reservation", sqliteBytes);
+    }
     (void)budget->change(memoryCharge, 0, addressCharge, 0, false, false,
-        returned ? &returned->memoryBeforeRelease : nullptr);
+        returned ? &returned->memoryBeforeRelease : nullptr, -int64_t(sqliteBytes));
     budget->residents.fetch_sub(1);
     if (returned) returned->releasedMemory.store(memoryCharge);
   }
@@ -607,14 +609,23 @@ struct ResourceReservation final: SqliteProcessMemoryBudget {
     ownedExternal -= size;
     (void)resize(false, true);
   }
-  bool resizeSqliteMemory(size_t oldCharge, size_t newCharge, bool cleanup) noexcept override {
+  bool resizeSqliteMemory(size_t oldCharge, size_t newCharge, bool observe) noexcept override {
     std::lock_guard lock(mutex);
-    KJ_ASSERT(registered && oldCharge <= sqliteBytes);
+    if (!registered) {
+      KJ_LOG(ERROR, "SQLite heap changed before its copy reservation was registered");
+      return observe || newCharge <= oldCharge;
+    }
+    if (oldCharge > sqliteBytes) {
+      KJ_LOG(ERROR, "SQLite heap change exceeded the copy's recorded charge", oldCharge, sqliteBytes);
+    }
     const auto previous = sqliteBytes;
-    sqliteBytes = sqliteBytes - oldCharge + newCharge;
-    // Keep trusted rollback and close able to finish at the process ceiling,
-    // and report their temporary allocations until SQLite frees them.
-    if (resize(false, cleanup, int64_t(newCharge) - int64_t(oldCharge)) || cleanup) return true;
+    if (newCharge >= oldCharge) {
+      sqliteBytes += newCharge - oldCharge;
+    } else {
+      sqliteBytes -= kj::min<uint64_t>(sqliteBytes, oldCharge - newCharge);
+    }
+    // Observe trusted allocations even at the process ceiling.
+    if (resize(false, observe, int64_t(sqliteBytes) - int64_t(previous)) || observe) return true;
     sqliteBytes = previous;
     return false;
   }

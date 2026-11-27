@@ -85,7 +85,8 @@ void* sqliteMemRealloc(void* ptr, int newSize) {
   const auto reserved = kj::max(oldActual, requested);
   if (!scope->resize(oldActual, reserved)) return nullptr;
   const bool canRefuse =
-      scope->maxMemoryBytes != kj::maxValue || (scope->processBudget != nullptr && !scope->cleanup);
+      scope->maxMemoryBytes != kj::maxValue ||
+      (scope->processBudget != nullptr && !scope->observeProcess);
   auto* newPtr = canRefuse ? malloc(requested) : realloc(ptr, requested);
   if (newPtr == nullptr) {
     scope->resize(reserved, oldActual);
@@ -154,7 +155,7 @@ bool SqliteMemoryScope::resize(size_t previous, size_t replacement) noexcept {
   const auto retained = memoryBytes - previous;
   if (replacement > size_t(kj::maxValue) - retained ||
       (replacement > previous && retained + replacement > maxMemoryBytes)) {
-    limitRefused = true;
+    limitRefusal = LimitRefusal::DATABASE;
     return false;
   }
   const auto next = retained + replacement;
@@ -162,8 +163,8 @@ bool SqliteMemoryScope::resize(size_t previous, size_t replacement) noexcept {
     const auto oldCharge = SqliteProcessMemoryBudget::chargeFor(memoryBytes);
     const auto newCharge = SqliteProcessMemoryBudget::chargeFor(next);
     if (oldCharge != newCharge &&
-        !processBudget->resizeSqliteMemory(oldCharge, newCharge, cleanup)) {
-      limitRefused = true;
+        !processBudget->resizeSqliteMemory(oldCharge, newCharge, observeProcess)) {
+      limitRefusal = LimitRefusal::PROCESS;
       return false;
     }
   }
@@ -172,21 +173,21 @@ bool SqliteMemoryScope::resize(size_t previous, size_t replacement) noexcept {
 }
 
 void SqliteMemoryScope::clearLimitRefusal() noexcept {
-  if (threadLocalScope != nullptr) threadLocalScope->limitRefused = false;
+  if (threadLocalScope != nullptr) threadLocalScope->limitRefusal = LimitRefusal::NONE;
 }
 
-bool SqliteMemoryScope::wasLimitRefused() noexcept {
-  return threadLocalScope != nullptr && threadLocalScope->limitRefused;
+SqliteMemoryScope::LimitRefusal SqliteMemoryScope::getLimitRefusal() noexcept {
+  return threadLocalScope == nullptr ? LimitRefusal::NONE : threadLocalScope->limitRefusal;
 }
 
 SqliteMemoryScope::SqliteMemoryScope(size_t& memoryBytes,
     size_t maxMemoryBytes,
     SqliteProcessMemoryBudget* processBudget,
-    bool cleanup)
+    bool observeProcess)
     : memoryBytes(memoryBytes),
       maxMemoryBytes(maxMemoryBytes),
       processBudget(processBudget),
-      cleanup(cleanup) {
+      observeProcess(observeProcess) {
   if (threadLocalScope == nullptr) {
     threadLocalScope = this;
   }

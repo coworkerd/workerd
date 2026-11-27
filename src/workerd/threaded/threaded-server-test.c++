@@ -543,11 +543,15 @@ KJ_TEST("SQLite allocations share the copy reservation with V8 and return only t
   const auto buffers = budget->memoryMaximum - budget->memoryReserved.load();
   KJ_REQUIRE(copy.allocateExternal(buffers));
   KJ_EXPECT(sqliteMemRealloc(block, MiB + 4096) == nullptr);
-  KJ_EXPECT(SqliteMemoryScope::wasLimitRefused());
+  KJ_EXPECT(SqliteMemoryScope::getLimitRefusal() == SqliteMemoryScope::LimitRefusal::PROCESS);
   KJ_EXPECT(bytes == original);
   KJ_EXPECT(budget->sqliteMemoryReserved.load() == MiB);
   KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum);
   copy.freeExternal(buffers);
+  SqliteMemoryScope::clearLimitRefusal();
+  KJ_EXPECT(sqliteMemRealloc(block, 4 * MiB + 4096) == nullptr);
+  KJ_EXPECT(SqliteMemoryScope::getLimitRefusal() == SqliteMemoryScope::LimitRefusal::DATABASE);
+  KJ_EXPECT(bytes == original);
 
   auto* grown = sqliteMemRealloc(block, MiB + 4096);
   KJ_REQUIRE(grown != nullptr);
@@ -618,10 +622,18 @@ KJ_TEST("SQLite heap held by multiple databases meets the process ceiling and re
     const auto holdingBytes = verify();
     KJ_EXPECT(holdingBytes == 3 * MiB);
     KJ_EXPECT(budget->memoryReserved.load() == beforeOpen + holdingBytes + buffers);
+    {
+      // Trusted work outside the transaction still acquires and returns the step.
+      auto maintenance = second->run("SELECT randomblob(?)", queryBytes);
+      KJ_REQUIRE(maintenance.getBlob(0).size() == queryBytes);
+      KJ_EXPECT(verify() == holdingBytes + MiB);
+      KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum + MiB);
+    }
+    KJ_EXPECT(verify() == holdingBytes);
     secondLimit.begin();
     second->run("SAVEPOINT pending");
     KJ_EXPECT_THROW_MESSAGE("out of memory", second->run("SELECT randomblob(?)", queryBytes));
-    KJ_EXPECT(secondLimit.wasMemoryRefused());
+    KJ_EXPECT(secondLimit.wasProcessMemoryRefused() && !secondLimit.wasMemoryRefused());
     second->rollbackWalTransaction();
     secondLimit.end(*second, /*rolledBack=*/true);
     KJ_EXPECT(!second->observedCriticalError());
@@ -629,10 +641,12 @@ KJ_TEST("SQLite heap held by multiple databases meets the process ceiling and re
     KJ_EXPECT(budget->withinMaximum());
   }
   KJ_EXPECT(verify() == idleBytes);
+  secondLimit.begin();
   {
     auto admitted = second->run("SELECT randomblob(?)", queryBytes);
     KJ_EXPECT(admitted.getBlob(0).size() == queryBytes);
   }
+  secondLimit.end(*second);
 
   // The copy can outlive its connection. Its SQLite bytes must be available
   // before the copy returns its own reservation to the process.
@@ -648,6 +662,24 @@ KJ_TEST("SQLite heap held by multiple databases meets the process ceiling and re
   KJ_EXPECT(budget->memoryReserved.load() == beforeOpen + buffers);
   competitor.freeExternal(buffers);
   KJ_EXPECT(budget->memoryReserved.load() == beforeOpen);
+}
+
+KJ_TEST("a copy logs SQLite charge drift and returns its recorded memory once") {
+  constexpr auto MiB = ResourceBudget::MiB;
+  auto budget = std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
+  const auto baseline = budget->memoryReserved.load();
+  {
+    ResourceReservation copy(budget, 64, true);
+    KJ_REQUIRE(copy.registerPreparation());
+    KJ_REQUIRE(copy.resizeSqliteMemory(0, MiB, true));
+    KJ_EXPECT_LOG(ERROR, "SQLite heap change exceeded the copy's recorded charge");
+    KJ_REQUIRE(copy.resizeSqliteMemory(2 * MiB, 0, true));
+    KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
+    KJ_REQUIRE(copy.resizeSqliteMemory(0, MiB, true));
+    KJ_EXPECT_LOG(ERROR, "SQLite heap charge remained when releasing a copy reservation");
+  }
+  KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
+  KJ_EXPECT(budget->memoryReserved.load() == baseline);
 }
 
 KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
