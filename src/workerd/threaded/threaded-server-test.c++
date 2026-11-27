@@ -675,6 +675,7 @@ KJ_TEST("a copy logs SQLite charge drift and returns its recorded memory once") 
   auto budget = std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
   const auto baseline = budget->memoryReserved.load();
   {
+    KJ_EXPECT_LOG(ERROR, "SQLite heap charge remained when releasing a copy reservation");
     ResourceReservation copy(budget, 64, true);
     KJ_REQUIRE(copy.registerPreparation());
     KJ_REQUIRE(copy.resizeSqliteMemory(0, MiB, true));
@@ -682,7 +683,6 @@ KJ_TEST("a copy logs SQLite charge drift and returns its recorded memory once") 
     KJ_REQUIRE(copy.resizeSqliteMemory(2 * MiB, 0, true));
     KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
     KJ_REQUIRE(copy.resizeSqliteMemory(0, MiB, true));
-    KJ_EXPECT_LOG(ERROR, "SQLite heap charge remained when releasing a copy reservation");
   }
   KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
   KJ_EXPECT(budget->memoryReserved.load() == baseline);
