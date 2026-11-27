@@ -47,6 +47,14 @@ jsg::Ref<SqlStorage::Cursor> SqlStorage::exec(
   querySql = querySql.internalize(js);
 
   auto& db = getDb(js);
+  return db.executeObjectSql([&] {
+    return execImpl(js, db, querySql, kj::mv(bindings), kj::mv(traceContext));
+  });
+}
+
+jsg::Ref<SqlStorage::Cursor> SqlStorage::execImpl(jsg::Lock& js, SqliteDatabase& db,
+    jsg::JsString querySql, jsg::Arguments<BindingValue> bindings, TraceContext traceContext) {
+  auto& context = IoContext::current();
   auto& statementCache = *this->statementCache;
 
   kj::Rc<CachedStatement>& slot = statementCache.map.findOrCreate(querySql, [&]() {
@@ -107,7 +115,8 @@ jsg::Ref<SqlStorage::Cursor> SqlStorage::exec(
 SqlStorage::IngestResult SqlStorage::ingest(jsg::Lock& js, kj::String querySql) {
   auto& context = IoContext::current();
   TraceContext traceContext = context.makeUserTraceSpan("durable_object_storage_ingest"_kjc);
-  auto result = getDb(js).ingestSql(regulator, querySql);
+  auto& db = getDb(js);
+  auto result = db.executeObjectSql([&] { return db.ingestSql(regulator, querySql); });
 
   traceContext.setTag(
       "cloudflare.durable_object.response.rows_read"_kjc, static_cast<int64_t>(result.rowsRead));
@@ -397,11 +406,14 @@ kj::Maybe<v8::LocalVector<v8::Value>> SqlStorage::Cursor::iteratorImpl(
   });
 
   auto& query = state.query;
+  auto row = query.executeObjectSql([&] { return readRow(js, query); });
+  if (query.isDone()) obj->endQuery(state);
+  return row;
+}
 
-  if (query.isDone()) {
-    obj->endQuery(state);
-    return kj::none;
-  }
+kj::Maybe<v8::LocalVector<v8::Value>> SqlStorage::Cursor::readRow(
+    jsg::Lock& js, SqliteDatabase::Query& query) {
+  if (query.isDone()) return kj::none;
 
   auto n = query.columnCount();
   v8::LocalVector<v8::Value> results(js.v8Isolate);
@@ -444,10 +456,6 @@ kj::Maybe<v8::LocalVector<v8::Value>> SqlStorage::Cursor::iteratorImpl(
   // results still available from the cursor. There's not much we can do about that case since
   // there's no way to know if the app might come back and try to use the cursor again later.
   query.nextRow();
-  if (query.isDone()) {
-    obj->endQuery(state);
-  }
-
   return kj::mv(results);
 }
 

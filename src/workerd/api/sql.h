@@ -83,6 +83,9 @@ class SqlStorage final: public jsg::Object {
     visitor.visit(storage);
   }
 
+  jsg::Ref<Cursor> execImpl(jsg::Lock& js, SqliteDatabase& db, jsg::JsString query,
+      jsg::Arguments<BindingValue> bindings, TraceContext traceContext);
+
   static constexpr SqlStorageRegulator regulator;
 
   SqliteDatabase& getDb(jsg::Lock& js) {
@@ -312,6 +315,7 @@ class SqlStorage::Cursor final: public jsg::Object {
   static kj::Maybe<jsg::JsObject> rowIteratorNext(jsg::Lock& js, jsg::Ref<Cursor>& obj);
   static kj::Maybe<jsg::JsArray> rawIteratorNext(jsg::Lock& js, jsg::Ref<Cursor>& obj);
   static kj::Maybe<v8::LocalVector<v8::Value>> iteratorImpl(jsg::Lock& js, jsg::Ref<Cursor>& obj);
+  static kj::Maybe<v8::LocalVector<v8::Value>> readRow(jsg::Lock& js, SqliteDatabase::Query& query);
 
   friend class Statement;
 

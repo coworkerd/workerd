@@ -7,6 +7,7 @@
 #include <workerd/util/account-limits.h>
 #include <workerd/util/sqlite-metering.h>
 
+#include <kj/debug.h>
 #include <kj/filesystem.h>
 #include <kj/function.h>
 #include <kj/list.h>
@@ -324,6 +325,43 @@ class SqliteDatabase {
   void rollbackWalTransaction();
   void releaseCachedMemory();
 
+  // User SQL may reserve more heap. If the allocator refuses, finish unwinding
+  // SQLite's call scopes before rolling back on the same connection.
+  template <typename Func>
+  decltype(auto) executeObjectSql(Func&& func) {
+    if (!hasObjectSqlBudget()) return func();
+    requireObjectSqlTransaction();
+    KJ_ASSERT(objectSqlRefusal == nullptr);
+    auto refusal = SqliteMemoryScope::LimitRefusal::NONE;
+    objectSqlRefusal = &refusal;
+    KJ_DEFER(objectSqlRefusal = nullptr);
+    try {
+      return func();
+    } catch (...) {
+      objectSqlRefusal = nullptr;
+      if (refusal != SqliteMemoryScope::LimitRefusal::NONE) settleObjectSqlRefusal(refusal);
+      throw;
+    }
+  }
+
+  // A refusal invalidates every savepoint in the open SQLite transaction.
+  // Keep the refusal visible until all the corresponding JS scopes exit.
+  class ObjectSqlTransaction {
+   public:
+    explicit ObjectSqlTransaction(SqliteDatabase& db);
+    ~ObjectSqlTransaction();
+    KJ_DISALLOW_COPY_AND_MOVE(ObjectSqlTransaction);
+    bool wasRefused() const;
+
+   private:
+    SqliteDatabase* db;
+  };
+
+  void requireObjectSqlTransaction();
+  void onObjectSqlRollback(kj::Function<void()> callback) {
+    objectSqlRollback = kj::mv(callback);
+  }
+
   // Invoke the onWrite() callback.
   //
   // This is useful when the caller is about to execute a statement which SQLite considers
@@ -510,6 +548,13 @@ class SqliteDatabase {
   kj::Maybe<sqlite3_stmt&> currentStatement;
 
   bool criticalErrorOccurred = false;
+  SqliteMemoryScope::LimitRefusal* objectSqlRefusal = nullptr;
+  SqliteMemoryScope::LimitRefusal objectSqlTransactionRefusal = SqliteMemoryScope::LimitRefusal::NONE;
+  unsigned objectSqlTransactionDepth = 0;
+  kj::Maybe<kj::Function<void()>> objectSqlRollback;
+  bool hasObjectSqlBudget() const;
+  [[noreturn]] void settleObjectSqlRefusal(SqliteMemoryScope::LimitRefusal refusal);
+
   kj::Maybe<kj::Function<void(bool allowUnconfirmed)>> onWriteCallback;
   kj::Maybe<kj::Function<void(kj::StringPtr errorMessage, kj::Maybe<kj::Exception> maybeException)>>
       onCriticalErrorCallback;
@@ -712,6 +757,12 @@ class SqliteDatabase::Query final: private ResetListener {
   // TODO(someday): We should find a way to fix changeCount() to return the count from the query
   // that the method is being run on, otherwise this is quite a gotcha.
   uint changeCount();
+
+  // Execute a segment of user SQL on this cursor.
+  template <typename Func>
+  decltype(auto) executeObjectSql(Func&& func) {
+    return db.executeObjectSql(kj::fwd<Func>(func));
+  }
 
   // Advance to the next row.
   void nextRow() {

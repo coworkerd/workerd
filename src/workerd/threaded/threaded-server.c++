@@ -7199,19 +7199,23 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
   auto *borrowedObserver = observer.get();
   if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
   auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName),
-                       prepared = kj::mv(prepared), borrowedHooks, sqlWalFrameLimitBytes](
+                       prepared = kj::mv(prepared), borrowedHooks, platformDatabase,
+                       sqlWalFrameLimitBytes](
                        const ActorCache::SharedLru &, OutputGate &gate, ActorCache::Hooks &,
                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
     const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
-    const auto memoryLimit = sqlWalFrameLimitBytes != 0
-        ? boundedDurableSetting("COWORKERD_DO_TEST_SQL_MEMORY_BYTES",
+    const bool budgeted = !platformDatabase || sqlWalFrameLimitBytes != 0;
+    const auto memoryLimit = budgeted
+        ? boundedDurableSetting(
+              platformDatabase ? "COWORKERD_DO_TEST_SQL_MEMORY_BYTES"
+                               : "COWORKERD_DO_TEST_OBJECT_SQL_MEMORY_BYTES",
               SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES,
               SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES)
         : kj::maxValue;
     std::shared_ptr<SqliteProcessMemoryBudget> sqliteProcessBudget;
-    if (sqlWalFrameLimitBytes != 0) {
+    if (budgeted) {
       auto slot = tree->slot.lock();
-      KJ_REQUIRE(slot != nullptr, "database storage opened without its isolate reservation");
+      KJ_REQUIRE(slot != nullptr, "durable storage opened without its isolate reservation");
       sqliteProcessBudget = slot->reservation;
     }
     KJ_ASSERT(tree->server.durableLog.get() == nullptr || prepared != kj::none,

@@ -830,6 +830,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
     // database, which is destroyed and recreated when the actor is reset. Preparing them would
     // require managing their lifetime elsewhere, e.g. attached to the IoContext the way
     // SqlStorage::execMemoized() caches its statements.
+    SqliteDatabase::ObjectSqlTransaction objectSqlTxn(sqlite);
     sqlite.run("SAVEPOINT _cf_sync_savepoint");
 
     StoredExternalHandler::SyncNestedTransaction syncExternalTxn(
@@ -838,6 +839,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
     return js.tryCatch([&]() {
       auto result = callback(js);
 
+      sqlite.requireObjectSqlTransaction();
       // If a critical error forced an automatic rollback, we throw an exception to convey failure
       // to the caller of transactionSync(), even if the callback did not throw.
       JSG_REQUIRE(!sqlite.observedCriticalError(), Error,
@@ -862,7 +864,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
     }, [&](jsg::Value exception) -> jsg::JsRef<jsg::JsValue> {
       // If a critical error forced an automatic rollback, we skip the rollback and release
       // attempt, because savepoints should already be released.
-      if (!sqlite.observedCriticalError()) {
+      if (!objectSqlTxn.wasRefused() && !sqlite.observedCriticalError()) {
         sqlite.run("ROLLBACK TO _cf_sync_savepoint");
         sqlite.run("RELEASE _cf_sync_savepoint");
       }
@@ -1102,9 +1104,10 @@ void DurableObjectTransaction::rollback() {
 kj::Promise<void> DurableObjectTransaction::maybeCommit() {
   // cacheTxn is null if rollback() was called, in which case we don't want to commit anything.
   KJ_IF_SOME(t, cacheTxn) {
-    auto maybePromise = t->commit();
+    // Release the transaction even if its commit throws synchronously.
+    auto transaction = kj::mv(t);
     cacheTxn = kj::none;
-    KJ_IF_SOME(promise, maybePromise) {
+    KJ_IF_SOME(promise, transaction->commit()) {
       return kj::mv(promise);
     }
   }
