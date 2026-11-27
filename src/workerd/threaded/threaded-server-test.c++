@@ -4,6 +4,8 @@
 #include "threaded-server.c++"
 #undef main
 
+#include <workerd/server/factory/coworkerd-wal-wire.h>
+
 #include <spawn.h>
 #include <sys/wait.h>
 
@@ -2302,6 +2304,134 @@ KJ_TEST("a call thread cancels background work that outlives the drain limit") {
   if (returned) backstop.wait(waitScope);
   KJ_EXPECT(canceled && tasks.isEmpty());
   KJ_EXPECT(BACKGROUND_BACKSTOP > WAIT_UNTIL_LIMIT);
+}
+
+class TeardownWalChannel final: public server::DurableWalChannel {
+ public:
+  kj::Vector<kj::StringPtr> events;
+
+  bool enabled() const override {
+    return true;
+  }
+  uint64_t nextRequest() override {
+    return ++request;
+  }
+
+  uint64_t registerShipper(server::DurableLogShipper&) override {
+    return nextRequest();
+  }
+  void unregisterShipper(server::DurableLogShipper& shipper) override {
+    auto openId = shipper.getOpenId();
+    KJ_REQUIRE(openId == 1 || openId == 2);
+    events.add(openId == 1 ? "unregister root"_kj : "unregister facet"_kj);
+  }
+  void send(uint64_t openId, kj::Array<kj::byte> message) override {
+    KJ_REQUIRE(message.size() >= 13);
+    KJ_REQUIRE(openId == 1 || openId == 2);
+    KJ_EXPECT(server::wal::getLe64(message.begin() + 5) == openId);
+    switch (message[4]) {
+      case server::wal::MSG_OPEN:
+        events.add(openId == 1 ? "root OPEN"_kj : "facet OPEN"_kj);
+        break;
+      case server::wal::MSG_CLOSED:
+        events.add(openId == 1 ? "root CLOSED"_kj : "facet CLOSED"_kj);
+        break;
+      case server::wal::MSG_ALARM:
+        KJ_EXPECT(openId == 1);
+        break;
+      default:
+        KJ_FAIL_ASSERT("unexpected WAL message", message[4]);
+    }
+  }
+  kj::Promise<void> sendFrames(
+      server::DurableLogShipper&, kj::Array<kj::byte>, uint64_t, kj::Timer&) override {
+    KJ_FAIL_ASSERT("the shutdown fixture does not write frames");
+  }
+
+ private:
+  uint64_t request = 0;
+};
+
+KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing the WAL Home") {
+  ThreadedServer server{
+    1, "", "teardown:1", -1, kj::newInMemoryDirectory(kj::nullClock()), {}, &initializeV8()};
+  // The fixture owns the resources so it can record early handle release safely.
+  TeardownWalChannel channel;
+  auto& events = channel.events;
+  Slot slot;
+  {
+    ThreadState state;
+    state.durableSlot = std::shared_ptr<Slot>(&slot, [](Slot*) {});
+    std::weak_ptr<Slot> copy = state.durableSlot;
+    state.wal = kj::attachRef(channel, kj::defer([&events, copy] {
+      KJ_EXPECT(copy.expired());
+      events.add("release Home"_kj);
+    }));
+
+    constexpr auto source = R"(
+      import { DurableObject } from 'cloudflare:workers';
+      export class Store extends DurableObject {}
+      export default { fetch() { return new Response('ok'); } };
+    )"_kj;
+    JsonDoc descriptor(kj::str(R"({"workerId":"test/teardown","versionId":"v1",
+        "mainModule":"index.js","compatibilityDate":"2026-11-01","contentHash":")",
+        digest(source.asBytes()).c_str(), "\"}"));
+    slot.worker = server.compile(slot, descriptor.get(), source);
+    auto storageId = digest("teardown"_kj.asBytes());
+    auto tree = std::make_shared<DurableTreeContext>(DurableTreeContext{
+      .state = state,
+      .server = server,
+      .slot = state.durableSlot,
+      .tree = 1,
+      .uniqueKey = kj::str("coworkerd-do-root-v1-", storageId.c_str()),
+      .storageId = kj::str(storageId.c_str()),
+      .objectName = kj::str("test/teardown/1"),
+      .idle = std::make_shared<server::DurableIdleLifecycle>(
+          server::DurableIdleLifecycle::Time{}, std::chrono::seconds(70)),
+    });
+    auto& worker = *KJ_ASSERT_NONNULL(slot.worker);
+    auto root =
+        makeDurableActor(tree, worker, kj::str("teardown"), "Store"_kj, Frankenvalue(), 0, 0);
+    auto facet = makeDurableActor(
+        tree, worker, kj::str("facet"), "Store"_kj, Frankenvalue(), 1, 1, nullptr, 0, "facet"_kj);
+    KJ_REQUIRE(state.durableActorTrees.size() == 2);
+    KJ_EXPECT(state.durableActorTrees.contains(root.value.get()));
+    KJ_EXPECT(state.durableActorTrees.contains(facet.value.get()));
+
+    // Model the drain queued when a root's I/O context cancels a facet session. The drain
+    // retains a real facet actor and its storage until the second round of cancellation.
+    auto queueDrain = kj::defer([&state, &events, facet = kj::mv(facet.value)]() mutable {
+      KJ_EXPECT(state.durableActorTrees.size() == 1);
+      KJ_EXPECT(state.durableActorTrees.contains(facet.get()));
+      events.add("queue facet drain"_kj);
+      auto cancelDrain = kj::defer([&state, &events, facet = kj::mv(facet)]() mutable {
+        KJ_EXPECT(state.durableRoots.empty());
+        events.add("cancel facet drain"_kj);
+        facet = nullptr;
+        KJ_EXPECT(state.durableActorTrees.empty());
+        events.add("actor index empty"_kj);
+      });
+      state.tasks.add(kj::Promise<void>(kj::NEVER_DONE).attach(kj::mv(cancelDrain)));
+    });
+    auto releaseOnCancel = kj::defer([&events, actor = kj::addRef(*root.value)]() mutable {
+      actor = nullptr;
+      events.add("cancel root task"_kj);
+    });
+    state.durableRoots.emplace(tree->tree,
+        ThreadState::DurableRoot{
+          .actor = kj::mv(root.value).attachToThisReference(kj::mv(queueDrain)),
+          .tree = tree,
+          .hooks = root.hooks,
+          .idle = tree->idle,
+        });
+    state.tasks.add(kj::Promise<void>(kj::NEVER_DONE).attach(kj::mv(releaseOnCancel)));
+    KJ_REQUIRE(!state.tasks.isEmpty());
+    KJ_EXPECT(events.asPtr() == kj::arr("root OPEN"_kj, "facet OPEN"_kj).asPtr());
+  }
+  auto expected = kj::arr("root OPEN"_kj, "facet OPEN"_kj, "cancel root task"_kj,
+      "unregister root"_kj, "root CLOSED"_kj, "queue facet drain"_kj, "cancel facet drain"_kj,
+      "unregister facet"_kj, "facet CLOSED"_kj, "actor index empty"_kj, "release Home"_kj);
+  KJ_EXPECT(events.asPtr() == expected.asPtr());
 }
 
 KJ_TEST("a reclaim requested during maintenance never waits for that pass") {
