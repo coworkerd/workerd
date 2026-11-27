@@ -1,9 +1,11 @@
+#include "coworkerd-durable-test-storage.h"
 #include "coworkerd-threaded-wal.c++"
 
-#include <kj/test.h>
-
 #include <fcntl.h>
+#include <sqlite3.h>
 #include <sys/socket.h>
+
+#include <kj/test.h>
 
 namespace workerd::server {
 namespace {
@@ -14,7 +16,7 @@ struct WirePair {
   kj::Own<kj::AsyncIoStream> node;
   kj::Own<WalWire> child;
 
-  explicit WirePair(bool limitSendBuffer = false) {
+  explicit WirePair(bool limitSendBuffer = false, kj::Maybe<kj::AutoCloseFd&> external = kj::none) {
     int fds[2];
     KJ_SYSCALL(socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
     if (limitSendBuffer) {
@@ -22,7 +24,11 @@ struct WirePair {
       KJ_SYSCALL(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sendBuffer, sizeof(sendBuffer)));
     }
     KJ_SYSCALL(fcntl(fds[0], F_SETFD, FD_CLOEXEC));
-    child = kj::heap<WalWire>(*io.lowLevelProvider, fds[0]);
+    KJ_IF_SOME(fd, external) {
+      fd = kj::AutoCloseFd(fds[0]);
+    } else {
+      child = kj::heap<WalWire>(*io.lowLevelProvider, fds[0]);
+    }
     node = io.lowLevelProvider->wrapSocketFd(fds[1], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
   }
 
@@ -226,6 +232,127 @@ struct HomeSession {
     link.io.waitScope.poll();
   }
 };
+
+struct StorageSession {
+  static constexpr uint64_t GENERATION = 7;
+  static constexpr auto NAMESPACE =
+      "coworkerd-do-root-v1-1111111111111111111111111111111111111111111111111111111111111111"_kj;
+  static constexpr auto ID = "2222222222222222222222222222222222222222222222222222222222222222"_kj;
+  static constexpr auto OTHER =
+      "3333333333333333333333333333333333333333333333333333333333333333"_kj;
+
+  kj::AutoCloseFd fd;
+  WirePair link{false, fd};
+  DurableStorage storage;
+  ThreadedWalLog log{fd.release(), GENERATION, CONFIRMATION_TIMEOUT};
+  kj::Own<DurableWalChannel> oldHome = log.attachHome([](uint64_t, CloseReason) {});
+  kj::Own<DurableWalChannel> nextHome = log.attachHome([](uint64_t, CloseReason) {});
+
+  StorageSession() {
+    link.ready(GENERATION);
+    link.wait(waitForReady());
+  }
+
+  kj::Promise<void> waitForReady() {
+    while (!log.ready()) co_await link.io.provider->getTimer().afterDelay(kj::MILLISECONDS);
+  }
+
+  kj::Promise<ThreadedWalLog::PreparedOpen> prepare(
+      uint64_t tree, uint facet, kj::StringPtr id = ID) {
+    auto image = storage.walImage(NAMESPACE, id, facet);
+    return log.prepareOpen(
+        image.directory, kj::mv(image.path), kj::mv(image.storageKey), tree, facet);
+  }
+
+  struct Connection {
+    kj::Own<SqliteDatabase> database;
+    kj::Own<DurableLogShipper> shipper;
+
+    void close() {
+      shipper = nullptr;
+      database = nullptr;
+    }
+  };
+
+  Connection open(DurableWalChannel& home,
+      const ThreadedWalLog::PreparedOpen& prepared,
+      uint facet,
+      kj::StringPtr id = ID) {
+    const auto position = prepared.positionForOpen();
+    auto database = storage.open(NAMESPACE, id, SqliteObserver::DEFAULT, facet);
+    auto shipper = storage.ship(NAMESPACE,
+        {.objectName = kj::str(id), .storageId = kj::str(id), .facetId = facet}, *database,
+        link.io.provider->getTimer(), home, position, 0, prepared.trackClose());
+    const auto openId = shipper->getOpenId();
+    link.receive(MSG_OPEN, openId);
+    auto opening = home.waitForOpen(openId, link.io.provider->getTimer());
+    link.opened(openId);
+    link.wait(kj::mv(opening));
+    return {kj::mv(database), kj::mv(shipper)};
+  }
+};
+
+KJ_TEST("threaded WAL waits before scanning for a retained root and facet") {
+  StorageSession test;
+  auto oldPreparation = test.link.wait(test.prepare(1, 0));
+  auto root = test.open(*test.oldHome, oldPreparation, 0);
+  auto facet = test.open(*test.oldHome, test.link.wait(test.prepare(1, 1)), 1);
+  auto reopening = test.prepare(2, 0).eagerlyEvaluate(nullptr);
+  {
+    // A canceled preparation never opens SQLite or owns the next tree.
+    auto canceled = test.prepare(3, 0);
+    KJ_REQUIRE(!canceled.poll(test.link.io.waitScope));
+  }
+
+  // The unrelated scan passes through the same scanner while the new tree is
+  // waiting. It also lets us check that no earlier scan completed on that queue.
+  auto neighbor = test.link.wait(test.prepare(4, 0, StorageSession::OTHER));
+  KJ_REQUIRE(!reopening.poll(test.link.io.waitScope));
+  const auto rootId = root.shipper->getOpenId();
+  root.close();
+  test.link.receive(MSG_CLOSED, rootId);
+  auto neighborFacet = test.link.wait(test.prepare(4, 1, StorageSession::OTHER));
+  KJ_REQUIRE(
+      !reopening.poll(test.link.io.waitScope), "the previous facet still holds this storage");
+
+  const auto facetId = facet.shipper->getOpenId();
+  facet.shipper = nullptr;
+  auto unrelated = test.open(*test.nextHome, neighbor, 0, StorageSession::OTHER);
+  auto unrelatedFacet = test.open(*test.nextHome, neighborFacet, 1, StorageSession::OTHER);
+  KJ_REQUIRE(
+      !reopening.poll(test.link.io.waitScope), "deregistration does not prove SQLite closed");
+  facet.database = nullptr;
+  auto prepared = test.link.wait(kj::mv(reopening));
+  test.link.receive(MSG_CLOSED, facetId);
+  KJ_EXPECT_THROW_MESSAGE("storage preparation was already used", oldPreparation.positionForOpen());
+  auto reopened = test.open(*test.nextHome, prepared, 0);
+  KJ_EXPECT(reopened.shipper->getOpenId() != rootId);
+}
+
+KJ_TEST("a BUSY SQLite close cannot release threaded WAL preparation") {
+  StorageSession test;
+  auto old = test.open(*test.oldHome, test.link.wait(test.prepare(1, 0)), 0);
+  sqlite3_stmt* statement = nullptr;
+  // This fixture bypasses the wrapper's SQL preparation only to keep one
+  // untracked dependent handle. No SQL runs after the statement is prepared.
+  KJ_REQUIRE(sqlite3_set_authorizer(*old.database, nullptr, nullptr) == SQLITE_OK);
+  KJ_REQUIRE(sqlite3_prepare_v2(*old.database, "SELECT 1", -1, &statement, nullptr) == SQLITE_OK);
+  KJ_DEFER(if (statement != nullptr) KJ_EXPECT(sqlite3_finalize(statement) == SQLITE_OK));
+  {
+    KJ_EXPECT_LOG(ERROR, "sqlite database destroyed while dependent objects still exist");
+    old.close();
+  }
+
+  auto reopening = test.prepare(2, 0).eagerlyEvaluate(nullptr);
+  auto neighbor = test.open(*test.nextHome,
+      test.link.wait(test.prepare(3, 0, StorageSession::OTHER)), 0, StorageSession::OTHER);
+  KJ_REQUIRE(!reopening.poll(test.link.io.waitScope),
+      "a destroyed SQLite wrapper without close proof cannot authorize a scan");
+  const auto finalized = sqlite3_finalize(std::exchange(statement, nullptr));
+  KJ_REQUIRE(finalized == SQLITE_OK);
+  test.link.wait(test.prepare(3, 1, StorageSession::OTHER));
+  KJ_EXPECT(!reopening.poll(test.link.io.waitScope), "lazy close produced no synchronous proof");
+}
 
 struct TestRoot {
   kj::Own<kj::Directory> directory = kj::newInMemoryDirectory(kj::nullClock());

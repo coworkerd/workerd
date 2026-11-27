@@ -1,16 +1,21 @@
 #include "coworkerd-threaded-wal.h"
-#include "coworkerd-wal-wire.h"
 
-#include <kj/thread.h>
+#include "coworkerd-wal-wire.h"
 
 #include <unistd.h>
 
+#include <kj/thread.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <string>
+#include <vector>
 
 namespace workerd::server {
 namespace {
@@ -111,12 +116,6 @@ struct Command {
   std::shared_ptr<Inbox> inbox;
 };
 
-struct OpenPreparation {
-  const kj::Directory& directory;
-  kj::Path path;
-  kj::Own<kj::CrossThreadPromiseFulfiller<DurableWalPosition>> result;
-};
-
 struct Shared {
   explicit Shared(kj::Duration confirmationTimeout): confirmationTimeout(confirmationTimeout) {}
 
@@ -125,6 +124,8 @@ struct Shared {
     ready.store(false, std::memory_order_release);
     commands.close();
     stopSignal.close();
+    std::lock_guard lock(openMutex);
+    for (auto& [key, storage]: openStorage) wakePreparations(storage);
   }
 
   bool post(Command command, bool control) {
@@ -137,12 +138,50 @@ struct Shared {
     return !stopped.load(std::memory_order_acquire) && ready.load(std::memory_order_acquire);
   }
 
+  bool reserveOpen(const std::string& key,
+      uint64_t tree,
+      uint facet,
+      kj::Own<kj::CrossThreadPromiseFulfiller<void>> changed) {
+    std::lock_guard lock(openMutex);
+    KJ_REQUIRE(negotiated(), STORAGE_UNAVAILABLE);
+    auto& storage = openStorage.try_emplace(key, tree).first->second;
+    if (storage.tree == tree && storage.facets.insert(facet).second) return true;
+    // Coalesced root requests and the facet startup each have one shared
+    // preparation. Drop canceled waiters as later requests replace them.
+    std::erase_if(storage.waiters, [](auto& waiter) { return !waiter->isWaiting(); });
+    storage.waiters.push_back(kj::mv(changed));
+    return false;
+  }
+
+  void releaseOpen(const std::string& key, uint64_t tree, uint facet) {
+    std::lock_guard lock(openMutex);
+    auto storage = openStorage.find(key);
+    KJ_ASSERT(storage != openStorage.end() && storage->second.tree == tree);
+    KJ_ASSERT(storage->second.facets.erase(facet) == 1);
+    wakePreparations(storage->second);
+    if (storage->second.facets.empty()) openStorage.erase(storage);
+  }
+
   const kj::Duration confirmationTimeout;
   Mailbox<Command> commands;
   Mailbox<bool> stopSignal;
   std::atomic<uint64_t> nextId{0};
   std::atomic<bool> ready{false};
   std::atomic<bool> stopped{false};
+
+ private:
+  struct OpenStorage {
+    uint64_t tree;
+    std::set<uint> facets;
+    std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
+  };
+  std::mutex openMutex;
+  std::map<std::string, OpenStorage> openStorage;
+
+  static void wakePreparations(OpenStorage& storage) {
+    for (auto& waiter: storage.waiters) waiter->fulfill();
+    storage.waiters.clear();
+  }
 };
 
 class Session {
@@ -407,7 +446,54 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
 
 }  // namespace
 
+struct ThreadedWalLog::OpenReservation {
+  std::shared_ptr<Shared> shared;
+  std::string key;
+  uint64_t tree;
+  uint facet;
+  enum class State { WAITING, RESERVED, OPENED };
+  State state = State::WAITING;
+
+  OpenReservation(std::shared_ptr<Shared> shared, kj::StringPtr key, uint64_t tree, uint facet)
+      : shared(std::move(shared)),
+        key(key.cStr(), key.size()),
+        tree(tree),
+        facet(facet) {}
+
+  ~OpenReservation() {
+    // Once SQLite has opened, destroying the callback is insufficient proof.
+    // A BUSY connection leaves its reservation in place for this generation.
+    if (state == State::RESERVED) shared->releaseOpen(key, tree, facet);
+  }
+
+  void closed() {
+    KJ_ASSERT(state == State::OPENED);
+    state = State::WAITING;
+    shared->releaseOpen(key, tree, facet);
+  }
+};
+
+DurableWalPosition ThreadedWalLog::PreparedOpen::positionForOpen() const {
+  KJ_REQUIRE(reservation->state == OpenReservation::State::RESERVED,
+      "jsg.Error: Durable Object storage preparation was already used (STORAGE_UNAVAILABLE)");
+  return position;
+}
+
+kj::Function<void()> ThreadedWalLog::PreparedOpen::trackClose() const {
+  KJ_ASSERT(reservation->state == OpenReservation::State::RESERVED);
+  reservation->state = OpenReservation::State::OPENED;
+  return [reservation = reservation] { reservation->closed(); };
+}
+
 struct ThreadedWalLog::Impl {
+  struct OpenPreparation {
+    const kj::Directory& directory;
+    kj::Path path;
+    kj::Own<kj::CrossThreadPromiseFulfiller<DurableWalPosition>> result;
+    // A canceled caller may leave its scan running until this item is dropped.
+    std::shared_ptr<OpenReservation> reservation;
+  };
+
   Impl(int fd, uint64_t generation, kj::Duration confirmationTimeout)
       : shared(std::make_shared<Shared>(confirmationTimeout)),
         owner([state = shared, descriptor = kj::AutoCloseFd(fd), generation]() mutable {
@@ -459,12 +545,28 @@ kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
   return kj::heap<Home>(impl->shared, kj::mv(requestClose), kj::systemPreciseMonotonicClock());
 }
 
-kj::Promise<DurableWalPosition> ThreadedWalLog::prepareOpen(
-    const kj::Directory& directory, kj::Path path) {
+kj::Promise<ThreadedWalLog::PreparedOpen> ThreadedWalLog::prepareOpen(
+    const kj::Directory& directory,
+    kj::Path path,
+    kj::String storageKey,
+    uint64_t tree,
+    uint facet) {
+  auto reservation = std::make_shared<OpenReservation>(impl->shared, storageKey, tree, facet);
+  for (;;) {
+    auto changed = kj::newPromiseAndCrossThreadFulfiller<void>();
+    if (impl->shared->reserveOpen(reservation->key, tree, facet, kj::mv(changed.fulfiller))) {
+      reservation->state = OpenReservation::State::RESERVED;
+      break;
+    }
+    co_await changed.promise;
+  }
   auto paf = kj::newPromiseAndCrossThreadFulfiller<DurableWalPosition>();
-  KJ_REQUIRE(ready() && impl->opens.push({directory, kj::mv(path), kj::mv(paf.fulfiller)}, 1, 1024),
+  KJ_REQUIRE(ready() &&
+          impl->opens.push({directory, kj::mv(path), kj::mv(paf.fulfiller), reservation}, 1, 1024),
       STORAGE_UNAVAILABLE);
-  return kj::mv(paf.promise);
+  auto position = co_await paf.promise;
+  KJ_REQUIRE(ready(), STORAGE_UNAVAILABLE);
+  co_return PreparedOpen(position, std::move(reservation));
 }
 
 }  // namespace workerd::server

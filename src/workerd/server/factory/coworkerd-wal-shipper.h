@@ -117,10 +117,19 @@ class DurableLogShipper {
   ~DurableLogShipper() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(DurableLogShipper);
 
-  // ActorSqlite drops its commit callback (and the shipper it owns) before
-  // destroying its SQLite connection. The threaded channel reports closure only
-  // after that connection's destructor has run.
-  void reportAfterDatabaseClose();
+  // Owned by the SQLite afterClose callback. ActorSqlite drops the shipper
+  // first, so the report can be sent once SQLite confirms synchronous close.
+  class DeferredClose {
+   public:
+    void send();
+
+   private:
+    friend class DurableLogShipper;
+    DurableWalChannel* channel = nullptr;
+    uint64_t openId = 0;
+    kj::Array<kj::byte> message;
+  };
+  void reportAfterDatabaseClose(DeferredClose& report);
 
   // ActorSqlite's commit callback: the frames of everything committed since the last one go to the replicator and
   // the promise resolves when it confirms them. It is rejected -- which breaks the output gate, so the object is

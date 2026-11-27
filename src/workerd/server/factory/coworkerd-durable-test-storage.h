@@ -33,11 +33,17 @@ class DurableStorage {
       std::shared_ptr<SqliteProcessMemoryBudget> sqliteProcessBudget = {}) const;
 
   kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
-      DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
-      DurableWalChannel& channel, DurableWalPosition position, uint64_t localOpenStartedNs) const;
+      DurableObjectName name,
+      SqliteDatabase& database,
+      kj::Timer& timer,
+      DurableWalChannel& channel,
+      DurableWalPosition position,
+      uint64_t localOpenStartedNs,
+      kj::Maybe<kj::Function<void()>> confirmClose = kj::none) const;
   struct WalImage {
     const kj::Directory& directory;
     kj::Path path;
+    kj::String storageKey;
   };
   WalImage walImage(kj::StringPtr uniqueKey, kj::StringPtr storageId, uint facet) const;
 

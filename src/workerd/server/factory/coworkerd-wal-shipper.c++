@@ -554,14 +554,15 @@ DurableLogShipper::~DurableLogShipper() noexcept(false) {
   else channel.send(openId, w.finish(openId));
 }
 
-void DurableLogShipper::reportAfterDatabaseClose() {
+void DurableLogShipper::DeferredClose::send() {
+  if (message.size() != 0) channel->send(openId, kj::mv(message));
+}
+
+void DurableLogShipper::reportAfterDatabaseClose(DeferredClose& report) {
   KJ_REQUIRE(openId != 0 && deferredClose == nullptr);
-  auto message = kj::heap<kj::Array<kj::byte>>();
-  auto* slot = message.get();
-  db->afterClose([&channel = channel, id = openId, message = kj::mv(message)]() mutable {
-    if (message->size() != 0) channel.send(id, kj::mv(*message));
-  });
-  deferredClose = slot;
+  report.channel = &channel;
+  report.openId = openId;
+  deferredClose = &report.message;
 }
 
 void DurableLogShipper::configure(SqliteDatabase& database) {
