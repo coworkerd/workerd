@@ -2226,7 +2226,8 @@ KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing th
           [shipper = kj::mv(shipper)](SpanParent) mutable { return shipper->onCommit(); });
     };
     // This observer only touches the recorder, so even a broken order can be reported safely.
-    auto observer = kj::refcounted<ActorObserver>().attach(kj::defer([&events, copy] {
+    auto observer =
+        kj::refcounted<ActorObserver>().attachToThisReference(kj::defer([&events, copy] {
       KJ_EXPECT(!copy.expired());
       events.add("release actor observer"_kj);
     }));
