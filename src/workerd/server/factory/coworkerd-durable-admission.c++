@@ -81,7 +81,9 @@ DurableAdmission::Result DurableAdmission::queue(
   auto reserved = counters.reserved;
   if (!reserve(reserved, limits.capacity, limits.event) ||
       !reserve(reserved, limits.capacity, {.memory = bytes})) {
-    return refuse(newTree);
+    // An ordinary tree cannot make up missing event credit. Keep the database
+    // path's existing copy and event reservation recovery.
+    return refuse(database && newTree);
   }
   if (newTree &&
       ((limits.residentTarget != 0 && counters.trees >= limits.residentTarget) ||
