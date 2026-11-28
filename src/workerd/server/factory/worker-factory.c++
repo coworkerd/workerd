@@ -4,6 +4,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "worker-factory-impl.h"
+#include "coworkerd-alarm-limit.h"
 
 #include <workerd/api/analytics-engine.capnp.h>
 #include <workerd/api/trace.h>
@@ -389,7 +390,7 @@ class NullLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
     return kj::NEVER_DONE;
   }
   kj::Duration getAlarmLimit() override {
-    return 15 * kj::MINUTES;
+    return coworkerdAlarmLimit();
   }
   size_t getBufferingLimit() override {
     return kj::maxValue;
