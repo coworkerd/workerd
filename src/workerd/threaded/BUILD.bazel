@@ -31,7 +31,9 @@ THREADED_DEPS = [
     "@capnp-cpp//src/capnp/compat:json",
     "@capnp-cpp//src/kj:kj-async",
     "@capnp-cpp//src/kj/compat:kj-http",
+    "@com_google_absl//absl/time",
     "@ssl",
+    "@tcmalloc//tcmalloc:malloc_extension",
 ]
 
 wd_cc_library(
