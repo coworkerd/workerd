@@ -2065,10 +2065,10 @@ struct ThreadState {
   ThreadContext context{io.provider->getTimer(), entropy, ids, http, bytes};
   Timer timer{io.provider->getTimer()};
   Errors errors;
-  explicit ThreadState(kj::AutoCloseFd spare = kj::AutoCloseFd(open("/dev/null", O_RDONLY | O_CLOEXEC)))
-      : decisionSpare(kj::mv(spare)) {}
+  ThreadState() = default;
+  explicit ThreadState(kj::AutoCloseFd spare): decisionSpare(kj::mv(spare)) {}
 
-  kj::AutoCloseFd decisionSpare;
+  kj::AutoCloseFd decisionSpare{open("/dev/null", O_RDONLY | O_CLOEXEC)};
   uint64_t durableHome = 0;
   // Shippers and SQLite's deferred close callbacks borrow this channel. Keep it alive
   // until the home has canceled its tasks and destroyed its actors and isolate copy.
