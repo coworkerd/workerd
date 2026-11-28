@@ -70,8 +70,8 @@ kj::Own<SqliteDatabase> DurableStorage::open(kj::StringPtr uniqueKey,
         std::move(sqliteProcessBudget));
     return database.attach(kj::mv(guardedVfs).attach(kj::mv(limit)));
   }
-  return kj::heap<SqliteDatabase>(
-      vfs, databasePath(uniqueKey, storageId, facet), mode, kj::maxValue, kj::maxValue, observer);
+  return kj::heap<SqliteDatabase>(vfs, databasePath(uniqueKey, storageId, facet), mode,
+      sqliteMemoryLimitBytes, kj::maxValue, observer, kj::none, std::move(sqliteProcessBudget));
 }
 
 kj::Own<DurableLogShipper> DurableStorage::ship(kj::StringPtr uniqueKey,
