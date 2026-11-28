@@ -435,6 +435,75 @@ struct ObjectAdmissionFixture {
   }
 };
 
+KJ_TEST("home admission takes the home with the oldest most recent use") {
+  using Status = ObjectAdmissionFixture::Status;
+  ObjectAdmissionFixture test(0);
+  auto& server = test.server;
+  const auto age = std::chrono::seconds(1);
+  const auto oldRoot = test.start(test.route("old-root", "recent-home"));
+  const auto newest = test.start(test.route("newest", "recent-home"));
+  const auto first = test.start(test.route("first", "older-home"));
+  const auto second = test.start(test.route("second", "older-home"));
+  const auto busy = test.start(test.route("busy"));
+  test.finish(oldRoot, test.now - 3 * age);
+  test.finish(first, test.now - 2 * age);
+  test.finish(second, test.now - age);
+  test.finish(newest, test.now);
+
+  const auto incoming = test.route("new-worker");
+  KJ_EXPECT(test.queue(incoming).status == Status::RETIRING);
+  KJ_REQUIRE(server.homeVictim.has_value());
+  const auto picked = *server.homeVictim;
+  KJ_EXPECT(picked.home == 2u);
+  {
+    std::lock_guard lock(server.durableRoutingMutex);
+    KJ_REQUIRE(server.fenceHome(picked, test.now));
+    KJ_EXPECT(!server.durableAdmission->isIdleTree(first.tree, picked.home));
+    KJ_EXPECT(!server.durableAdmission->isIdleTree(second.tree, picked.home));
+    KJ_EXPECT(server.durableAdmission->isIdleTree(oldRoot.tree, 1u));
+    KJ_EXPECT(server.durableAdmission->hasActiveEvent(busy.tree));
+  }
+  KJ_EXPECT(test.queue(test.route("second", "older-home")).status == Status::RETIRING);
+}
+
+KJ_TEST("home admission refuses a new Worker if every home has a queued event") {
+  using Status = ObjectAdmissionFixture::Status;
+  ObjectAdmissionFixture test(0);
+  for (const auto* definition: {"first", "second", "third"}) {
+    auto first = test.route(definition, definition);
+    auto sibling = test.route((std::string(definition) + "-sibling").c_str(), definition);
+    test.finish(test.start(first), test.now);
+    test.finish(test.start(sibling), test.now);
+    // Leave the stale idle reading in place while an accepted event waits.
+    KJ_REQUIRE(test.queue(sibling).status == Status::QUEUED);
+  }
+  const auto refused = test.queue(test.route("incoming"));
+  KJ_EXPECT(refused.status == Status::OVERLOADED);
+  KJ_EXPECT(!refused.ticket);
+  KJ_EXPECT(!test.server.homeVictim);
+  KJ_EXPECT(test.server.durableAdmission->state().overloads == 1);
+}
+
+KJ_TEST("an event on any selected home tree cancels the whole home retirement") {
+  using Status = ObjectAdmissionFixture::Status;
+  ObjectAdmissionFixture test(0);
+  const auto first = test.route("first", "idle");
+  const auto second = test.route("second", "idle");
+  test.finish(test.start(first), test.now);
+  test.finish(test.start(second), test.now);
+  test.start(test.route("busy-1"));
+  test.start(test.route("busy-2"));
+  KJ_REQUIRE(test.queue(test.route("incoming")).status == Status::RETIRING);
+  KJ_REQUIRE(test.server.homeVictim.has_value());
+  const auto picked = *test.server.homeVictim;
+  // The call starts and finishes between selection and fencing.
+  const auto late = test.start(second);
+  test.finish(late, test.now);
+  std::lock_guard lock(test.server.durableRoutingMutex);
+  KJ_EXPECT(test.server.durableAdmission->isIdleTree(late.tree, picked.home));
+  KJ_EXPECT(!test.server.fenceHome(picked, test.now));
+}
+
 KJ_TEST("ordinary admission selects the least recently used eligible tree across homes") {
   ObjectAdmissionFixture test(3);
   auto recent = test.start(test.route("recent"));
