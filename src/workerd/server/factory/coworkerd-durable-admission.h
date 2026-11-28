@@ -87,7 +87,7 @@ class DurableAdmission {
   DurableAdmission(Limits limits, uint64_t generation);
 
   Result queue(const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now,
-      bool database = false);
+      bool database = false, bool deferNewTreeOverload = false);
   void preferDatabaseTree(Time until) { databaseTreePreferredUntil = until; }
   void limitDatabaseTreePreference(Time until);
   void claimDatabaseTree() { databaseTreePreferredUntil = {}; }

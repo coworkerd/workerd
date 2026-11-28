@@ -27,6 +27,7 @@ class DurableHomeLoad {
   void end(Time now);
   Duration busyFor(Time now) const;
   Duration window() const;
+  bool hasRunningTurn() const { return running.has_value(); }
 
  private:
   static constexpr int64_t BUCKETS = 16;
