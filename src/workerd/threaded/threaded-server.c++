@@ -1582,6 +1582,8 @@ struct Slot {
   std::atomic<uint> active{0}, maxActive{0}, creates{0};
   std::function<void(bool)> homeTurn;
   std::function<void(Worker::Actor &)> resetDurableRoot;
+  // Set only by the durable home after it publishes its first actor.
+  bool hasHostedDurableRoot = false;
 };
 
 struct Entry {
@@ -2344,11 +2346,11 @@ bool productPlatformPlan(Json::Reader plan) {
 constexpr char PLATFORM_DATABASE_COPY_PREFIX[] = "platform-object-v1:";
 
 bool shouldReleaseDurableCopy(uint32_t reservedTrees, bool hasResidentRoots,
-    const std::string &definition, bool resettingOrExpired) {
+    const std::string &definition, bool hasHostedRoot, bool resettingOrExpired) {
   // The catalog mints tenant fingerprints with a hexadecimal definition hash first.
   // The platform copy key below is recomputed when the database route is validated.
   return reservedTrees == 0 && !hasResidentRoots &&
-      (resettingOrExpired || definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX));
+      (!hasHostedRoot || resettingOrExpired || definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX));
 }
 
 std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
@@ -4210,7 +4212,7 @@ struct ThreadedServer {
       // tree retires so a new database can open on an unused home.
       releaseCopy = state.admissionWalClosing.empty() &&
           shouldReleaseDurableCopy(home.reservedTrees, !state.durableRoots.empty(),
-              state.durableSlot->planRevision,
+              state.durableSlot->planRevision, state.durableSlot->hasHostedDurableRoot,
               home.pressure.resetting() || (home.reclaiming && !closingForAdmission) ||
                   (idleMs && nowNs() - lastUse >= idleMs * 1000000));
       // Reserved trees include starts still queued or preparing. The home owns the event loop,
@@ -8101,6 +8103,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
                     })
                 .first;
     server.publishDurableRoot(state.durableHome, ticket.tree);
+    slot->hasHostedDurableRoot = true;
     found->second.broken = found->second.actor->onBroken()
                                .then([]() {}, [tree](kj::Exception &&error) {
       const auto at = tree->state.durableRoots.find(tree->tree);

@@ -183,14 +183,16 @@ KJ_TEST("platform databases use the database Worker and a copy pinned to the spe
   KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
 }
 
-KJ_TEST("an exclusive database copy keeps its isolate while the home has a reservation") {
+KJ_TEST("unplaced copies return their home while used tenant copies can stay warm") {
   const auto database = PLATFORM_DATABASE_COPY_PREFIX + std::string(64, 'a');
   const auto tenant = std::string(64, 'a') + ":" + std::string(64, 'b');
-  KJ_EXPECT(!shouldReleaseDurableCopy(1, false, database, false));
-  KJ_EXPECT(!shouldReleaseDurableCopy(0, true, database, false));
-  KJ_EXPECT(shouldReleaseDurableCopy(0, false, database, false));
-  KJ_EXPECT(!shouldReleaseDurableCopy(0, false, tenant, false));
-  KJ_EXPECT(shouldReleaseDurableCopy(0, false, tenant, true));
+  KJ_EXPECT(!shouldReleaseDurableCopy(1, false, database, false, false));
+  KJ_EXPECT(!shouldReleaseDurableCopy(0, true, database, true, false));
+  KJ_EXPECT(shouldReleaseDurableCopy(0, false, database, true, false));
+  KJ_EXPECT(!shouldReleaseDurableCopy(1, false, tenant, false, false));
+  KJ_EXPECT(shouldReleaseDurableCopy(0, false, tenant, false, false));
+  KJ_EXPECT(!shouldReleaseDurableCopy(0, false, tenant, true, false));
+  KJ_EXPECT(shouldReleaseDurableCopy(0, false, tenant, true, true));
 }
 
 KJ_TEST("above the admission ceiling a database replaces only a sufficient charge within the hard budget") {
