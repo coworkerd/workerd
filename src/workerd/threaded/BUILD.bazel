@@ -113,8 +113,8 @@ wd_cc_library(
 )
 
 kj_test(
-    # About 20 s on cwkd-p40 (seven children that each make near-GiB allocations): over the 15 s
-    # that .bazelrc gives a medium test.
+    # Seven child processes make near-GiB allocations. The test took about 20 s,
+    # exceeding the 15 s that .bazelrc gives a medium test.
     size = "large",
     src = "threaded-server-test.c++",
     malloc = "//src/workerd/server:malloc",

@@ -1054,7 +1054,7 @@ KJ_TEST("tenant admission releases counts on errors and cancellation") {
 }
 
 // A console line past 4,096 bytes reaches the node cut, with its size, so that
-// the node marks it truncated and counts it (b50 log-quota-isolation).
+// the node marks it truncated and counts it.
 KJ_TEST("a console line past 4,096 bytes carries its size to the node") {
   auto longLine = consoleLogRow("log", kj::str(kj::repeat('x', 5000)));
   KJ_EXPECT(longLine.endsWith(",\"messageBytes\":5000}"), longLine.slice(longLine.size() - 40));
@@ -1066,7 +1066,7 @@ KJ_TEST("a console line past 4,096 bytes carries its size to the node") {
 // The maintenance pass formats every resident into its lifecycle row outside
 // the registry lock; holding them meanwhile must not make an idle Worker look
 // in use, or a load past the resident limit is refused instead of evicting
-// one (r50's fill cells: about four loads in ten refused).
+// one. In the original saturation run, about four loads in ten were refused.
 KJ_TEST("the maintenance pass's snapshot leaves an idle resident evictable") {
   std::map<std::string, std::shared_ptr<Slot>> registry;
   auto idle = std::make_shared<Slot>();
@@ -1115,7 +1115,7 @@ KJ_TEST("subrequest quotas, recursive bindings, release wakeup and cancellation"
   abandoned = nullptr;
   KJ_EXPECT(small.waiters.empty());
 
-  // Without a per-tenant limit no per-tenant count is kept (v138 section 1).
+  // Without a per-tenant limit no per-tenant count is kept.
   SubrequestBudget unlimited(512, 0);
   auto calls = std::make_shared<uint32_t>(0);
   SubrequestPermit egress(unlimited, calls, "a", true);
@@ -1320,7 +1320,7 @@ KJ_TEST("a Worker's ArrayBuffers lie in its own isolate group's sandbox") {
   KJ_EXPECT(limits.group.SandboxContains(store->Data()));
   KJ_EXPECT(!other.SandboxContains(store->Data()) || !v8::IsolateGroup::CanCreateNewGroups());
   // V8 refuses a buffer above the group's pool before reserving anything; the Worker's own limit
-  // (32 MiB here) is not V8's maximum (r50 §6.5 B2: the next test).
+  // (32 MiB here) is enforced separately, as the next test shows.
   if (v8::IsolateGroup::CanCreateNewGroups()) {
     KJ_EXPECT(limits.memory->MaxAllocationSize() == server::SANDBOX_POOL_BYTES);
   } else {
@@ -1330,7 +1330,7 @@ KJ_TEST("a Worker's ArrayBuffers lie in its own isolate group's sandbox") {
 
 KJ_TEST("one ArrayBuffer above the memory limit ends the execution as MEMORY_LIMIT_EXCEEDED") {
   // With or without the V8 sandbox: the buffer reaches the budget, which marks MEMORY and ends
-  // the execution, never a RangeError the Worker could catch (r50 §6.5 B2).
+  // the execution, never a RangeError the Worker could catch.
   allocationComponent(
       "try { globalThis.retained = new ArrayBuffer(64 * 1024 * 1024); } catch (e) { globalThis.caught = e; }");
 }
@@ -1338,7 +1338,7 @@ KJ_TEST("one ArrayBuffer above the memory limit ends the execution as MEMORY_LIM
 KJ_TEST("a refused isolate group is retried, not kept as the Worker's failure") {
   // compile() throws capacityError() when tryNewIsolateGroup() refuses (no room in the address
   // space for another V8 sandbox). Kept in the slot, every request for that Worker answered 503
-  // in this process until the slot idled out (r50 §6.5 B1).
+  // in this process until the slot idled out.
   kj::Maybe<kj::Exception> refused = capacityError();
   KJ_EXPECT(loadFailureRetryable(refused, true, false));
   KJ_EXPECT(isCapacityError(KJ_ASSERT_NONNULL(refused)));
@@ -1356,7 +1356,7 @@ KJ_TEST("a refused isolate group is retried, not kept as the Worker's failure") 
 }
 
 KJ_TEST("a refused isolate group lowers the process's resident limit to its residents") {
-  // r50 §6.5 B3: the next Worker then evicts an idle one instead of being refused again.
+  // The next Worker can then evict an idle one instead of being refused again.
   auto budget = std::make_shared<ResourceBudget>(1ull << 30, 1840, 1);
   std::vector<std::shared_ptr<ResourceReservation>> residents;
   for (int i = 0; i < 4; i++) {
@@ -1412,8 +1412,8 @@ constexpr kj::StringPtr LIVE126_86K_THEN_STRING =
 // A 500 MB one-byte string first: V8 takes the first object of the young
 // large-object space without checking its capacity or collecting, so the
 // tenant check (after a collection) does not see it; then one maximum string.
-// Before the near-heap-limit callback this ended the process (exit 74,
-// raw/s27-x500).
+// Before the near-heap-limit callback, the second allocation caused a fatal
+// OOM (exit 74).
 constexpr kj::StringPtr YOUNG500_THEN_STRING =
     "const a = ' '.repeat(5e8); a.indexOf('z'); globalThis.kept = a;"
     "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
@@ -1421,10 +1421,10 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
     "globalThis.kept = []; for (let i = 0; i < 1013; ++i) kept.push(new Array(16300).fill(1.5));"
     "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
 
-// Long operations that check no interrupt while they allocate: after the
-// near-heap-limit callback has raised the ceiling and requested the
-// termination, they keep allocating until they meet the raised ceiling (v137
-// §6.28-§6.29, v138 §4).
+// These long operations allocate without checking for interrupts. The
+// near-heap-limit callback raises the ceiling and requests termination.
+// Until the operation reaches an interrupt check, it can keep allocating
+// up to the raised ceiling.
 // JSON.parse of 120 million empty objects (about 3.4 GB) from a 360 MB text.
 constexpr kj::StringPtr JSON_OBJECTS =
     "globalThis.retained = JSON.parse('[' + '{},'.repeat(1.2e8) + '{}]'); retained.length"_kj;
@@ -1432,9 +1432,9 @@ constexpr kj::StringPtr JSON_OBJECTS =
 // while parsing, then a backing store V8 cannot allocate.
 constexpr kj::StringPtr JSON_NUMBERS =
     "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**27) + '1]'); retained.length"_kj;
-// Straight-line code: no loop and no JavaScript call, so no interrupt check,
-// six flattened 500 MB strings one after another (the shape of the §6.29
-// verifier).
+// Straight-line code flattens six 500 MB strings in succession.
+// There is no loop or JavaScript call to provide an interrupt check
+// between allocations.
 constexpr kj::StringPtr STRAIGHT_LINE =
     "const a = ' '.repeat(5e8); a.indexOf('z'); const b = a + '1'; b.indexOf('z');"
     "const c = b + '2'; c.indexOf('z'); const d = c + '3'; d.indexOf('z');"
@@ -1447,7 +1447,7 @@ constexpr kj::StringPtr CLONE_STRINGS =
     "globalThis.retained = clone([0, 1, 2, 3].map(i => String.fromCharCode(256 + i).repeat(2**29 - 24)));"
     "retained.length"_kj;
 // replaceAll with a string replacement: a new ConsString per match and no
-// JavaScript call, 250 million matches (§8.2 of the v138 task).
+// JavaScript call, 250 million matches.
 constexpr kj::StringPtr REPLACE_ALL =
     "const s = 'a'.repeat(2.5e8); s.indexOf('z'); globalThis.retained = s.replaceAll('a', 'b'); retained.length"_kj;
 // String.prototype.split into 120 million three-character strings (about
@@ -1474,14 +1474,14 @@ constexpr kj::StringPtr JSON_PROPERTIES =
 // without the limit the repeated key collapses into one property and the parse completes.
 constexpr kj::StringPtr JSON_PROPERTIES_REVIVER =
     "globalThis.retained = JSON.parse('{' + '\"a\":1,'.repeat(2**24) + '\"a\":1}', (k, v) => v); 1"_kj;
-// The verifier's sweep of V8 builtins (v138 §8.4), the shapes that ended the
-// process on cwkd-p40: a sort of an array-like object or a string sized its
-// work array by the length; a global replace with a function collected every
+// These V8 builtins previously caused fatal allocation failures. Sorting an
+// array-like object or a string sized the work array by input length. A
+// global replace with a function collected every
 // match before the first call; a global atom match allocated one array for
 // every match it counted.
 constexpr kj::StringPtr SORT_STRING =
     "Array.prototype.sort.call('x'.repeat(2**28)); 1"_kj;
-// The work array of such a sort grows as it collects (v138 §8.5): past 89,989,624 elements its next
+// The work array grows as the sort collects elements. Past 89,989,624 elements its next
 // growth went beyond the largest FixedArray and ended the process for a tenant whose memory limit
 // lets it get there; it stops at the largest now, and one element more throws a RangeError.
 constexpr kj::StringPtr SORT_STRING_90M = "Array.prototype.sort.call('x'.repeat(9e7)); 1"_kj;
@@ -1495,7 +1495,7 @@ constexpr kj::StringPtr MATCH_ATOM =
     "globalThis.retained = 'x'.repeat(2**27 + 1).match(/x/g); retained.length"_kj;
 // Loops that allocate nothing while they run: their interrupt checks are what
 // lets a short CPU limit end the call (each takes about a second unchecked).
-// The numbers' fast path: long decimals, about 2 s of parsing on cwkd-p40 after about 0.15 s of flattening the text.
+// On the numbers' fast path, long decimals took about 2 s to parse after about 0.15 s to flatten the text.
 // Its CPU limit (500 ms, below) expires inside the number loop, so only that loop's check can end the call in time;
 // with the 50 ms of the others the limit expired while the text was flattened and the first value's check ended it.
 constexpr kj::StringPtr CPU_JSON_NUMBERS =
@@ -2006,10 +2006,10 @@ KJ_TEST("the raised heap ceiling counts from the heap in use and later stays wit
   isolate->CancelTerminateExecution();
 }
 
-// With a V8 sandbox per isolate group each isolate's heap has a pointer cage of its own: a raise
-// reaches at most that cage less what V8 keeps in it, however much the process budget has left
-// (v138 §8.1's interface with r50's S3a). A build with one shared cage bounds it by that cage's
-// remainder over all isolates instead (the test above), and skips this one.
+// With a V8 sandbox per isolate group, each isolate's heap has its own pointer cage.
+// The cage space V8 leaves available bounds a raise even if the process budget has room.
+// With a shared cage, the space left by all isolates in that cage bounds the raise.
+// That build runs the test above and skips this case.
 KJ_TEST("with a sandbox per isolate, a raised ceiling stays within the isolate's own cage") {
   initializeV8();
   if (!v8::IsolateGroup::CanCreateNewGroups()) return;
@@ -2030,7 +2030,7 @@ KJ_TEST("with a sandbox per isolate, a raised ceiling stays within the isolate's
   KJ_EXPECT(budget->lent == 0);
 }
 
-// Each long operation below ended the process before v138 (exit 74 at the
+// Each long operation below previously ended the process (exit 74 at the
 // raised ceiling, or V8's fatal invalid size): the child must survive, its
 // call end with the memory limit (or, where noted, a RangeError), and the
 // neighbor keep answering and allocating.
@@ -2093,8 +2093,8 @@ KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker
 // Four isolates each finish an object of about 1 GiB at the same moment while a neighbor keeps
 // answering. With a pointer cage (and a V8 sandbox) per isolate (--config=coworkerd-sandbox), each
 // heap has its own 4 GiB, so the process survives. With one shared 4 GiB cage this ended the
-// process with V8's fatal OOM (exit 74; the known failure until S3, v137 §6.24), which a build
-// without per-isolate cages still reproduces: that branch keeps the old expectation.
+// process with V8's fatal OOM (exit 74). A build without per-isolate cages still reproduces
+// the failure, so that branch keeps the original expectation.
 KJ_TEST("four simultaneous near-GiB heap objects preserve the process and a neighboring Worker") {
   auto child = runAllocationChild("4:string");
   if (v8::IsolateGroup::CanCreateNewGroups()) {
@@ -2345,7 +2345,7 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
 
 // A streamed body keeps the call's response open: the 30 seconds of waitUntil
 // work start when it ends (or the client goes away), not when the handler
-// returned (Cloudflare's Context page; v138 section 4).
+// returned (see Cloudflare's Context documentation).
 KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handler returns") {
   initializeV8();
   kj::EventLoop loop;

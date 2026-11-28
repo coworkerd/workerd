@@ -241,9 +241,9 @@ class SteadySupervisor final {
   }
 };
 
-// Everything this process does once it serves: the dumpable bit the launcher cleared before it executed us
-// (the kernel sets it again for a readable, same-owner binary -- which is why v44's state endpoint reported
-// `nonDumpable` false and why this is done from here), and the steady-state filter.
+// Clear the dumpable bit and install the steady-state filter when serving starts.
+// The kernel can set the bit again when the launcher executes a readable, same-owner
+// binary, so clearing it in the launcher does not guarantee `nonDumpable` here.
 void narrow() {
   const char* modeText = std::getenv("COWORKERD_SECCOMP_STEADY_MODE");
   const char* path = std::getenv("COWORKERD_SECCOMP_STEADY_FILE");
@@ -297,7 +297,7 @@ void narrow() {
       installed = true;
     }
   }
-  // Test only: a call this process no longer has (v49's acceptance 3.1). The startup table holds the calls only
+  // Test only: exercise a syscall that the steady-state filter blocks. The startup table holds the calls only
   // the startup needs -- execve above all, since the launcher has to execve this program -- and the steady table
   // does not; with the narrow filter in force, making one of them must end the process. Honoured in `enforce`
   // alone: in `observe` the call would be let through, and an execve of this process is not something to let

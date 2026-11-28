@@ -138,8 +138,8 @@ KJ_TEST("a memory-limited isolate allocates its ArrayBuffers in its own sandbox"
   KJ_EXPECT(group.SandboxContains(store->Data()));
   KJ_EXPECT(!other.SandboxContains(store->Data()));
   KJ_EXPECT(limit->bufferBytes.load() >= size_t(1) << 20);
-  // V8's maximum is the group's pool, not the 64 MiB limit, which allocate() enforces itself
-  // (r50 §6.5 B2).
+  // V8's maximum is the group's pool. The allocator enforces the 64 MiB
+  // Worker limit separately.
   KJ_EXPECT(limit->MaxAllocationSize() == SANDBOX_POOL_BYTES);
 }
 
