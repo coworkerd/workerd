@@ -955,10 +955,13 @@ KJ_TEST("an ordinary ceiling has no idle cost, and live calls share the Worker b
   auto root = budget.reserveOrdinaryCall(high->limit, 128 * descriptors, Lane::ROOT);
   KJ_REQUIRE(root.has_value() && root->resource == Resource::MEMORY);
   KJ_EXPECT(root->budget == idle.memoryCeiling - bytes && root->current == root->budget);
+  KJ_EXPECT(!budget.reclaimRequested.load());
   KJ_REQUIRE(!budget.reserveOrdinaryCall(high->limit, 128 * descriptors, Lane::NESTED));
   auto nested = budget.reserveOrdinaryCall(high->limit, 128 * descriptors, Lane::NESTED);
   KJ_REQUIRE(nested.has_value() && nested->resource == Resource::MEMORY);
   KJ_EXPECT(nested->budget == idle.memoryCeiling && nested->current == nested->budget);
+  KJ_EXPECT(budget.reclaimRequested.load());
+  KJ_EXPECT(budget.targetMemory == idle.memoryCeiling - bytes);
   {
     ResourceReservation worker(high->resources, 128);
     KJ_REQUIRE(worker.registerPreparation(), "a call at the limit can still prepare its Worker");

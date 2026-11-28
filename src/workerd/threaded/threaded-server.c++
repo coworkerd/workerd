@@ -376,15 +376,18 @@ struct ResourceBudget {
   int reclaimWake = -1;  // assigned before the server starts any threads
   uint64_t reclaimEpoch = 0, targetMemory = UINT64_MAX, targetAddress = UINT64_MAX;
   bool noIdleAtLastReclaim = false;
-  void requestReclaimLocked(uint64_t additionalMemory = 0) {
-    targetMemory = kj::min(targetMemory,
-        kj::min(admissionMaximum, memoryMaximum - kj::min(memoryMaximum, additionalMemory)));
+  void requestReclaimToLocked(uint64_t memoryLimit) {
+    targetMemory = kj::min(targetMemory, memoryLimit);
     targetAddress = kj::min(targetAddress, addressMaximum);
     reclaimRequested.store(true);
     if (reclaimWake >= 0) {
       uint64_t one = 1;
       (void)!write(reclaimWake, &one, sizeof(one));
     }
+  }
+  void requestReclaimLocked(uint64_t additionalMemory = 0) {
+    requestReclaimToLocked(
+        kj::min(admissionMaximum, memoryMaximum - kj::min(memoryMaximum, additionalMemory)));
   }
   // Set while this thread runs a maintenance pass, the only place a reclaim
   // completes. An eviction there can enter GC callbacks and the allocator.
@@ -440,13 +443,21 @@ struct ResourceBudget {
     using Resource = threaded::OrdinaryResource;
     std::lock_guard lock(mutex);
     const auto memory = memoryReserved.load();
-    auto memoryCeiling = ordinaryMemoryCeiling();
+    const auto fullMemoryCeiling = ordinaryMemoryCeiling();
+    auto memoryCeiling = fullMemoryCeiling;
     if (lane == threaded::OrdinaryLane::ROOT) {
       const auto other = memory - ordinaryCalls * ORDINARY_CALL_MEMORY;
       memoryCeiling = reserveNestedRoom(memoryCeiling, other, ORDINARY_CALL_MEMORY);
       descriptorBudget = reserveNestedRoom(descriptorBudget, 0, threaded::ORDINARY_FDS_PER_CALL);
     }
     if (ORDINARY_CALL_MEMORY > memoryCeiling - kj::min(memory, memoryCeiling)) {
+      const auto target = fullMemoryCeiling - kj::min(fullMemoryCeiling, ORDINARY_CALL_MEMORY);
+      // Idle Workers can hold the entire budget and no subsequent call can
+      // start a preparation to reclaim them. Let the maintenance loop free
+      // one call's charge if it can. A root hitting its own reserve needs no reclaim.
+      if (memory > target && reclaimMode == ReclaimMode::BACKGROUND) {
+        requestReclaimToLocked(target);
+      }
       return threaded::OrdinaryRefusal{Resource::MEMORY, memory, memoryCeiling};
     }
     const uint64_t descriptors = uint64_t(ordinaryCalls) * threaded::ORDINARY_FDS_PER_CALL;
