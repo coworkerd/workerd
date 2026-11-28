@@ -15,6 +15,7 @@ THREADED_DEPS = [
     "//src/workerd/jsg",
     "//src/workerd/server:v8-platform-impl",
     "//src/workerd/server:workerd-api",
+    "//src/workerd/server/factory:coworkerd-alarm-limit",
     "//src/workerd/server/factory:coworkerd-durable-admission",
     "//src/workerd/server/factory:coworkerd-durable-cpu",
     "//src/workerd/server/factory:coworkerd-durable-placement",

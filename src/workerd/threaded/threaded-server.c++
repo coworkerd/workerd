@@ -25,6 +25,7 @@
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/coworkerd-rpc-code.h>
 #include <workerd/jsg/setup.h>
+#include <workerd/server/factory/coworkerd-alarm-limit.h>
 #include <workerd/server/factory/coworkerd-durable-admission.h>
 #include <workerd/server/factory/coworkerd-durable-cpu.h>
 #include <workerd/server/factory/coworkerd-durable-placement.h>
@@ -1563,7 +1564,15 @@ struct Measurement {
   // An HTTP call's response end: its body sent to the end, or the client gone
   // (Invocation::request). Without it the drain limit runs from its call.
   kj::Maybe<kj::ForkedPromise<void>> responseEnded;
+  kj::Maybe<kj::ForkedPromise<void>> requestLeaseEnded;
 };
+
+void watchRequestLease(Measurement &measurement, kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease) {
+  KJ_IF_SOME(control, lease) {
+    auto ended = control.whenEndedRequest().send().ignoreResult().catch_([](kj::Exception &&) {});
+    measurement.requestLeaseEnded = ended.attach(kj::mv(control)).fork();
+  }
+}
 
 struct DurableEventCpu {
   DurableEventCpu(kj::String identity, uint32_t memoryMiB)
@@ -1775,29 +1784,31 @@ struct RequestLimits final: LimitEnforcer {
     unsupported("analytics");
   }
   kj::Promise<void> limitDrain() override {
-    // Called when the handler has returned. A lease expires the authority to
-    // make child calls, not this invocation's waitUntil work, which keeps its
-    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT after the
-    // response ended: as on Cloudflare, once the response is sent -- a
-    // streamed body to its end -- or the client disconnected, not when the
-    // handler returned the response (v138 section 4). KJ's timer does not
-    // advance while JavaScript runs, so the deadline is taken from the
-    // monotonic clock (or the timer, if that is ahead), not as a delay from the
-    // timer's cached time.
+    // This invocation keeps its CPU and heap limits while draining. A live
+    // request may end the drain sooner than the per-invocation ceiling. That
+    // ceiling starts once the response body finishes or the client disconnects
+    // (v138 section 4). KJ's timer does not advance while JavaScript runs, so
+    // take the deadline from the monotonic clock (or the timer if it is ahead).
     if (drainLimitDisabledForTest()) return kj::NEVER_DONE;
     auto deadline = [this]() {
       return timer.timer.atTime(kj::max(kj::systemPreciseMonotonicClock().now(), timer.timer.now()) + WAIT_UNTIL_LIMIT);
     };
+    kj::Promise<void> wait = nullptr;
     KJ_IF_SOME(ended, measurement.responseEnded) {
-      return ended.addBranch().then(kj::mv(deadline));
+      wait = ended.addBranch().then(kj::mv(deadline));
+    } else {
+      wait = deadline();
     }
-    return deadline();
+    KJ_IF_SOME(ended, measurement.requestLeaseEnded) {
+      return kj::mv(wait).exclusiveJoin(ended.addBranch());
+    }
+    return wait;
   }
   kj::Promise<void> limitScheduled() override {
     return kj::NEVER_DONE;
   }
   kj::Duration getAlarmLimit() override {
-    return 0 * kj::SECONDS;
+    return coworkerdAlarmLimit();
   }
   size_t getBufferingLimit() override {
     return 1 << 20;
@@ -1968,6 +1979,7 @@ server::DurableIdleLifecycle::Time durableIdleNow() {
 }
 
 struct DurableTreeContext;
+void trimIdleObjectSqlite(DurableTreeContext &tree);
 bool hasDurableWalRegistrations(const DurableTreeContext& tree);
 class DurableActorHooks;
 
@@ -2030,6 +2042,7 @@ struct ThreadState {
     bool idleClosing = false;
     bool cancelExpiredWork = false;
     bool admissionClosing = false;
+    std::optional<server::DurableIdleLifecycle::Time> sqliteTrimmedForIdleSince;
     std::shared_ptr<class DurableNodeSockets> nodeSockets;
     kj::Function<bool()> hasLocalSockets;
     kj::Function<kj::Promise<SocketParkResult>()> parkSockets;
@@ -2506,12 +2519,14 @@ struct InvocationState: kj::Refcounted {
 class Invocation final: public kj::HttpService {
  public:
   Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
-      BudgetLifetime budgetLifetime)
+      BudgetLifetime budgetLifetime,
+      kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease)
       : server(server),
         state(state),
         descriptor(kj::mv(descriptor)),
         props(kj::mv(props)),
-        budgetLifetime(kj::mv(budgetLifetime)) {}
+        budgetLifetime(kj::mv(budgetLifetime)),
+        lease(kj::mv(lease)) {}
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
       const kj::HttpHeaders &headers,
@@ -2524,23 +2539,26 @@ class Invocation final: public kj::HttpService {
   kj::String descriptor;
   Frankenvalue props;
   BudgetLifetime budgetLifetime;
+  kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease;
   bool used = false;
 };
 
 class Dispatcher final: public rpc::EventDispatcher::Server {
  public:
   Dispatcher(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
-      BudgetLifetime budgetLifetime)
+      BudgetLifetime budgetLifetime,
+      kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease = kj::none)
       : server(server),
         state(state),
         descriptor(kj::mv(descriptor)),
         props(kj::mv(props)),
-        budgetLifetime(kj::mv(budgetLifetime)) {}
+        budgetLifetime(kj::mv(budgetLifetime)),
+        lease(kj::mv(lease)) {}
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
     KJ_REQUIRE(!used, "NOT_SUPPORTED: one HTTP event per invocation");
     used = true;
     context.initResults().setHttp(state.http.kjToCapnp(
-        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props), kj::mv(budgetLifetime))));
+        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props), kj::mv(budgetLifetime), kj::mv(lease))));
     return kj::READY_NOW;
   }
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override;
@@ -2551,6 +2569,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
   kj::String descriptor;
   Frankenvalue props;
   BudgetLifetime budgetLifetime;
+  kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease;
   bool used = false;
 };
 
@@ -2573,9 +2592,11 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
     KJ_REQUIRE(!used, "one startEvent per connection");
     used = true;
     auto params = context.getParams();
+    kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease;
+    if (params.hasLease()) lease = params.getLease();
     context.getResults().setDispatcher(kj::heap<Dispatcher>(server, state,
         kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()),
-        std::make_shared<capnp::Capability::Client>(params.getBudgetLifetime())));
+        std::make_shared<capnp::Capability::Client>(params.getBudgetLifetime()), kj::mv(lease)));
     return kj::READY_NOW;
   }
 
@@ -2752,6 +2773,7 @@ struct ThreadedServer {
   std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<DatabaseReplacement>>> databaseCapacityWaiters;
   std::atomic<uint64_t> durableHomeSessions{0};
   std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
+  std::atomic<uint64_t> objectSqliteConnections{0};
   std::atomic<uint64_t> durableAdmissionRetirements{0}, durableAdmissionWalTimeouts{0};
   std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
   std::atomic<uint64_t> durableTreeResets{0};
@@ -3806,7 +3828,13 @@ struct ThreadedServer {
           decision = Decision::CANCEL_PENDING;
       }
       if (decision == Decision::WAIT) {
-        if (!database && canRetire) idleObjects.emplace(tree, root.idle->lastUse());
+        const auto idleSince = root.idle->idleSince();
+        if (root.sqliteTrimmedForIdleSince != idleSince &&
+            root.idle->idleFor(now, std::chrono::seconds(1))) {
+          trimIdleObjectSqlite(*root.tree);
+          root.sqliteTrimmedForIdleSince = idleSince;
+        }
+        if (!database && canRetire) idleObjects.emplace(tree, root.idle->idleSince());
         continue;
       }
       const bool cancelPending = decision == Decision::CANCEL_PENDING;
@@ -3825,7 +3853,7 @@ struct ThreadedServer {
         std::lock_guard lock(durableRoutingMutex);
         if (forObjectAdmission && !root.admissionClosing) {
           if (!stopObjectAdmissionVictim(*selectedObject, server::DurableAdmission::Clock::now())) {
-            idleObjects.emplace(tree, root.idle->lastUse());
+            idleObjects.emplace(tree, root.idle->idleSince());
             continue;
           }
         } else {
@@ -4028,6 +4056,7 @@ struct ThreadedServer {
         ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
         ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
         ",\"sqliteHeapReservedBytes\":" + std::to_string(resources->sqliteMemoryReserved.load()) +
+        ",\"objectSqliteConnections\":" + std::to_string(objectSqliteConnections.load()) +
         ",\"copyMemoryReservedBytes\":" + std::to_string(resources->memoryReserved.load()) +
         ",\"copyMemoryMaximum\":" + std::to_string(resources->memoryMaximum) +
         ",\"overloaded\":" + std::to_string(state.overloads) +
@@ -6544,6 +6573,7 @@ struct DurableTreeContext {
   kj::Own<server::FacetTreeIndex> index;
   std::shared_ptr<server::DurableIdleLifecycle> idle;
   std::map<uint, server::DurableLogShipper*> shippers;
+  std::map<uint, SqliteDatabase *> sqliteConnections;
   uint liveFacets = 0;
   std::shared_ptr<DurableNodeSockets> nodeSockets;
   std::map<uint, SocketManager> socketManagers;
@@ -6568,6 +6598,10 @@ struct DurableTreeContext {
     return *index;
   }
 };
+
+void trimIdleObjectSqlite(DurableTreeContext &tree) {
+  for (auto &[facet, connection]: tree.sqliteConnections) connection->trimIdleObjectSqlHeap();
+}
 
 bool hasDurableWalRegistrations(const DurableTreeContext& tree) {
   return !tree.shippers.empty();
@@ -7402,19 +7436,22 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
   auto *borrowedObserver = observer.get();
   if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
   auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName),
-                       prepared = kj::mv(prepared), borrowedHooks, sqlWalFrameLimitBytes](
-                       const ActorCache::SharedLru &, OutputGate &gate, ActorCache::Hooks &,
+                       prepared = kj::mv(prepared), borrowedHooks, platformDatabase,
+                       sqlWalFrameLimitBytes](const ActorCache::SharedLru &, OutputGate &gate,
+                       ActorCache::Hooks &,
                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
     const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
-    const auto memoryLimit = sqlWalFrameLimitBytes != 0
-        ? boundedDurableSetting("COWORKERD_DO_TEST_SQL_MEMORY_BYTES",
+    const bool budgeted = !platformDatabase || sqlWalFrameLimitBytes != 0;
+    const auto memoryLimit = budgeted
+        ? boundedDurableSetting(platformDatabase ? "COWORKERD_DO_TEST_SQL_MEMORY_BYTES"
+                                                 : "COWORKERD_DO_TEST_OBJECT_SQL_MEMORY_BYTES",
               SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES,
               SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES)
         : kj::maxValue;
     std::shared_ptr<SqliteProcessMemoryBudget> sqliteProcessBudget;
-    if (sqlWalFrameLimitBytes != 0) {
+    if (budgeted) {
       auto slot = tree->slot.lock();
-      KJ_REQUIRE(slot != nullptr, "database storage opened without its isolate reservation");
+      KJ_REQUIRE(slot != nullptr, "durable storage opened without its isolate reservation");
       sqliteProcessBudget = slot->reservation;
     }
     KJ_ASSERT(tree->server.durableLog.get() == nullptr || prepared != kj::none,
@@ -7429,6 +7466,15 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     }
     auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet,
         sqlWalFrameLimitBytes, memoryLimit, std::move(sqliteProcessBudget));
+    if (!platformDatabase) {
+      KJ_REQUIRE(tree->sqliteConnections.emplace(facet, database.get()).second,
+          "durable SQLite connection is already registered");
+      tree->server.objectSqliteConnections.fetch_add(1);
+      database = kj::mv(database).attach(kj::defer([tree, facet] {
+        tree->sqliteConnections.erase(facet);
+        tree->server.objectSqliteConnections.fetch_sub(1);
+      }));
+    }
     if (tree->state.wal) {
       kj::Maybe<kj::Function<void(SqliteDatabase::CloseOutcome)>> confirmClose;
       KJ_IF_SOME(open, prepared) confirmClose = open.trackClose();
@@ -7835,6 +7881,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
   }
   auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props),
       std::move(preparation), std::move(tenant));
+  watchRequestLease(prepared.invocation->measurement, kj::mv(lease));
   auto identity = invocationIdentity(*slot, input);
   startBoundRpcSession(context.getResults(),
       kj::mv(prepared.entry).attach(kj::mv(prepared.invocation)), std::move(slot),
@@ -7979,6 +8026,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
       httpEntryObserver(input, entrypoint.c_str(), headers, state.placementCallId));
   auto &invocation = prepared.invocation;
   auto &entry = prepared.entry;
+  watchRequestLease(invocation->measurement, kj::mv(lease));
   kj::Maybe<kj::Exception> failure;
   LimitedResponse checkedResponse(response, *invocation);
   // workerd's request() returns once the response body is sent; a client that
@@ -8001,7 +8049,13 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
     }
     kj::throwRecoverableException(kj::mv(error));
   }
-  co_await settleBackground(state.io.provider->getTimer(), state.tasks);
+  // Return the HTTP result at body completion, so a chunked writer can send
+  // EOF and ingress can start the shared drain. The incoming request retains
+  // its budget capability while background work runs. The connection keeps
+  // pumping the call thread and its teardown still has a bounded backstop.
+  if (invocation->measurement.requestLeaseEnded == kj::none) {
+    co_await settleBackground(state.io.provider->getTimer(), state.tasks);
+  }
 }
 
 void acceptLoop(ThreadedServer &server, int listener, int parent) {

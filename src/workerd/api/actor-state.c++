@@ -716,7 +716,20 @@ jsg::Promise<DurableObjectStorage::AsyncTxnResult> DurableObjectStorage::asyncTr
 
   return js.resolvedPromise(txn.addRef())
       .then(js, kj::mv(callback))
-      .then(js, [txn = txn.addRef()](jsg::Lock& js, jsg::JsRef<jsg::JsValue> value) mutable {
+      .then(js,
+          [txn = txn.addRef(), weakCache = cache.addWeak()](
+              jsg::Lock& js, jsg::JsRef<jsg::JsValue> value) mutable {
+    // A callback can catch a SQLite budget error after its transaction is
+    // already gone. Deliver that error after restoring the input gate, just
+    // like an exception that left the callback.
+    KJ_IF_SOME(cache, weakCache.tryGet()) {
+      KJ_IF_SOME(sqlite, cache.getSqliteDatabase()) {
+        KJ_IF_SOME(refusal, sqlite.getObjectSqlTransactionRefusal()) {
+          txn->maybeRollback();
+          return js.resolvedPromise(AsyncTxnResult{js.exceptionToJsValue(kj::mv(refusal)), true});
+        }
+      }
+    }
     // In correct usage, `context` should not have changed here, particularly because we're in
     // a critical section so it should have been impossible for any other context to receive
     // control. However, depending on all that is a bit precarious. jsg::Promise::then() itself
@@ -728,7 +741,8 @@ jsg::Promise<DurableObjectStorage::AsyncTxnResult> DurableObjectStorage::asyncTr
         js, txn->maybeCommit(), [value = kj::mv(value)](jsg::Lock&) mutable {
       return AsyncTxnResult{kj::mv(value), false};
     });
-  }, [txn = txn.addRef()](jsg::Lock& js, jsg::Value exception) mutable {
+  },
+          [txn = txn.addRef()](jsg::Lock& js, jsg::Value exception) mutable {
     // The transaction callback threw an exception. We don't actually want to reset the object,
     // we only want to roll back the transaction and propagate the exception. So, we carefully
     // pack the exception away into a value.
@@ -819,6 +833,8 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
       });
     }
 
+    SqliteDatabase::ObjectSqlTransaction objectSqlTxn(sqlite);
+
     // SAVEPOINT is a readonly statement, but we need to trigger an outer TRANSACTION
     sqlite.notifyWrite();
 
@@ -838,6 +854,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
     return js.tryCatch([&]() {
       auto result = callback(js);
 
+      sqlite.requireObjectSqlTransaction();
       // If a critical error forced an automatic rollback, we throw an exception to convey failure
       // to the caller of transactionSync(), even if the callback did not throw.
       JSG_REQUIRE(!sqlite.observedCriticalError(), Error,
@@ -862,7 +879,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
     }, [&](jsg::Value exception) -> jsg::JsRef<jsg::JsValue> {
       // If a critical error forced an automatic rollback, we skip the rollback and release
       // attempt, because savepoints should already be released.
-      if (!sqlite.observedCriticalError()) {
+      if (!objectSqlTxn.wasRefused() && !sqlite.observedCriticalError()) {
         sqlite.run("ROLLBACK TO _cf_sync_savepoint");
         sqlite.run("RELEASE _cf_sync_savepoint");
       }
