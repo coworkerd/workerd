@@ -403,7 +403,7 @@ struct DatabaseAdmissionFixture {
       .mailboxBytes = 64,
     }, 1);
     for (auto id: {1u, 2u, 3u}) {
-      auto thread = std::make_unique<ThreadedServer::Thread>(false, false);
+      auto thread = std::make_unique<ThreadedServer::Thread>();
       thread->homeId = id;
       thread->home.emplace();
       server.threads.push_back(std::move(thread));
@@ -928,42 +928,149 @@ KJ_TEST("a startup entry opens the fatal scope of its Worker and closes it") {
   });
 }
 
-KJ_TEST("descriptor queue: empty, full, FIFO, SPSC handoff and close") {
-  DescriptorQueue queue(2);
-  KJ_EXPECT(queue.pop() == -1 && queue.hasSpace());
-  int a = open("/dev/null", O_RDONLY | O_CLOEXEC);
-  int b = open("/dev/null", O_RDONLY | O_CLOEXEC);
-  KJ_ASSERT(a >= 0 && b >= 0);
-  KJ_EXPECT(queue.push(a) && queue.push(b));
-  KJ_EXPECT(!queue.hasSpace() && !queue.push(1000000));
-  KJ_EXPECT(queue.pop() == a);
-  ::close(a);
-  queue.close();
-  KJ_EXPECT(fcntl(b, F_GETFD) == -1 && errno == EBADF);
-  KJ_EXPECT(queue.pop() == -1 && !queue.hasSpace() && !queue.push(1000000));
+KJ_TEST("an ordinary ceiling has no idle cost, and live calls share the Worker budget") {
+  using Lane = threaded::OrdinaryLane;
+  using Resource = threaded::OrdinaryResource;
+  constexpr auto bytes = ResourceBudget::ORDINARY_CALL_MEMORY;
+  constexpr auto descriptors = threaded::ORDINARY_FDS_PER_CALL;
+  auto makeServer = [](uint ceiling) {
+    return std::make_unique<ThreadedServer>(ceiling, "", "", -1,
+        kj::Own<const kj::Directory>(), kj::Own<server::ThreadedWalLog>(),
+        &initializeV8(), kj::systemPreciseMonotonicClock(), 128 * descriptors);
+  };
+  auto low = makeServer(1);
+  auto high = makeServer(threaded::ORDINARY_MAX_IN_FLIGHT);
+  const auto idle = high->ordinaryAdmissionSample();
+  KJ_EXPECT(idle.calls == 0 && low->ordinaryAdmissionSample().calls == 0);
+  KJ_EXPECT(low->ordinaryAdmissionSample().memory == idle.memory);
+  KJ_EXPECT(low->ordinaryAdmissionSample().memoryCeiling == idle.memoryCeiling);
+  KJ_EXPECT(high->threads.empty() && low->threads.empty());
 
-  DescriptorQueue concurrent(8);
-  std::atomic<bool> done{false};
-  std::thread producer([&] {
-    for (unsigned i = 0; i < 2000; ++i) {
-      int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
-      while (!concurrent.push(fd)) std::this_thread::yield();
-    }
-    done.store(true, std::memory_order_release);
-  });
-  unsigned received = 0;
-  while (!done.load(std::memory_order_acquire) || received < 2000) {
-    int fd = concurrent.pop();
-    if (fd < 0) {
-      std::this_thread::yield();
-      continue;
-    }
-    KJ_EXPECT(fcntl(fd, F_GETFD) >= 0);
-    ::close(fd);
-    ++received;
+  auto& budget = *high->resources;
+  constexpr auto allowance = 8 * bytes;
+  const auto nonCallCharge = idle.memoryCeiling - idle.memory - allowance;
+  KJ_REQUIRE(budget.change(0, nonCallCharge, 0, 0));
+  for (uint i = 0; i < 7; ++i) {
+    KJ_REQUIRE(!budget.reserveOrdinaryCall(high->limit, 128 * descriptors, Lane::ROOT));
   }
-  producer.join();
-  KJ_EXPECT(received == 2000 && concurrent.pop() == -1);
+  auto root = budget.reserveOrdinaryCall(high->limit, 128 * descriptors, Lane::ROOT);
+  KJ_REQUIRE(root.has_value() && root->resource == Resource::MEMORY);
+  KJ_EXPECT(root->budget == idle.memoryCeiling - bytes && root->current == root->budget);
+  KJ_REQUIRE(!budget.reserveOrdinaryCall(high->limit, 128 * descriptors, Lane::NESTED));
+  auto nested = budget.reserveOrdinaryCall(high->limit, 128 * descriptors, Lane::NESTED);
+  KJ_REQUIRE(nested.has_value() && nested->resource == Resource::MEMORY);
+  KJ_EXPECT(nested->budget == idle.memoryCeiling && nested->current == nested->budget);
+  for (uint i = 0; i < 8; ++i) budget.releaseOrdinaryCall();
+  KJ_REQUIRE(budget.change(nonCallCharge, 0, 0, 0));
+  KJ_EXPECT(high->ordinaryAdmissionSample().memory == idle.memory);
+  KJ_EXPECT(high->ordinaryAdmissionSample().calls == 0);
+}
+
+KJ_TEST("ordinary descriptor credits reserve nested room and name the process ceiling separately") {
+  using Lane = threaded::OrdinaryLane;
+  using Resource = threaded::OrdinaryResource;
+  constexpr auto descriptors = threaded::ORDINARY_FDS_PER_CALL;
+  initializeV8();
+  ResourceBudget budget(96 * ResourceBudget::MiB, 4, 0);
+  for (uint i = 0; i < 7; ++i) {
+    KJ_REQUIRE(!budget.reserveOrdinaryCall(1000, 8 * descriptors, Lane::ROOT));
+  }
+  auto root = budget.reserveOrdinaryCall(1000, 8 * descriptors, Lane::ROOT);
+  KJ_REQUIRE(root.has_value() && root->resource == Resource::DESCRIPTORS);
+  KJ_EXPECT(root->current == 7 * descriptors && root->budget == root->current);
+  KJ_REQUIRE(!budget.reserveOrdinaryCall(1000, 8 * descriptors, Lane::NESTED));
+  auto nested = budget.reserveOrdinaryCall(1000, 8 * descriptors, Lane::NESTED);
+  KJ_REQUIRE(nested.has_value() && nested->resource == Resource::DESCRIPTORS);
+  KJ_EXPECT(nested->current == 8 * descriptors && nested->budget == nested->current);
+  auto ceiling = budget.reserveOrdinaryCall(8, 16 * descriptors, Lane::ROOT);
+  KJ_REQUIRE(ceiling.has_value() && ceiling->resource == Resource::CEILING);
+  KJ_EXPECT(ceiling->current == 8 && ceiling->budget == 8);
+  for (uint i = 0; i < 8; ++i) budget.releaseOrdinaryCall();
+  KJ_EXPECT(budget.ordinaryCalls == 0 && budget.memoryReserved.load() == budget.baselineMemory);
+  KJ_REQUIRE(!budget.reserveOrdinaryCall(1, descriptors, Lane::ROOT));
+  budget.releaseOrdinaryCall();
+}
+
+std::array<kj::AutoCloseFd, 2> ordinaryTestSocket() {
+  int pair[2];
+  KJ_SYSCALL(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair));
+  timeval timeout{3, 0};
+  KJ_SYSCALL(setsockopt(pair[0], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
+  KJ_SYSCALL(fcntl(pair[0], F_SETFL, fcntl(pair[0], F_GETFL) & ~O_NONBLOCK));
+  return {kj::AutoCloseFd(pair[0]), kj::AutoCloseFd(pair[1])};
+}
+
+void waitForOrdinaryCallRelease(ThreadedServer& server) {
+  auto until = nowNs() + 3'000'000'000;
+  while (server.ordinaryAdmissionSample().calls != 0 && nowNs() < until) usleep(1000);
+  KJ_ASSERT(server.ordinaryAdmissionSample().calls == 0);
+}
+
+KJ_TEST("ordinary admission only acknowledges a call with a live native loop and returns its charge") {
+  using Lane = threaded::OrdinaryLane;
+  ThreadedServer server{1, "", "", -1, {}, {}, &initializeV8(),
+    kj::systemPreciseMonotonicClock(), 128};
+  server.ready.store(true);
+  const auto idle = server.ordinaryAdmissionSample().memory;
+
+  for (const auto lane: {Lane::LEGACY, Lane::ROOT}) {
+    auto call = ordinaryTestSocket();
+    KJ_DEFER({
+      call[0] = nullptr;
+      waitForOrdinaryCallRelease(server);
+    });
+    server.acceptOrdinary(kj::mv(call[1]), lane);
+    char accepted;
+    KJ_REQUIRE(recv(call[0], &accepted, 1, 0) == 1 && accepted == 'A');
+    const auto busy = server.ordinaryAdmissionSample();
+    KJ_EXPECT(server.liveThreads.load() == 1 && busy.calls == 1);
+    KJ_EXPECT(busy.memory == idle + ResourceBudget::ORDINARY_CALL_MEMORY);
+
+    auto blocked = ordinaryTestSocket();
+    server.acceptOrdinary(kj::mv(blocked[1]), Lane::NESTED);
+    // Compare independent wire bytes, including the big-endian integer offsets.
+    std::array<char, 18> refusal;
+    constexpr std::array<char, 18> expected{'R', 'C', 0, 0, 0, 0, 0, 0, 0, 1,
+      0, 0, 0, 0, 0, 0, 0, 1};
+    KJ_REQUIRE(recv(blocked[0], refusal.data(), refusal.size(), MSG_WAITALL) == refusal.size());
+    KJ_EXPECT(refusal == expected);
+  }
+  KJ_EXPECT(server.liveThreads.load() == 0);
+  KJ_EXPECT(server.ordinaryAdmissionSample().memory == idle);
+  KJ_EXPECT(server.refusedOrdinaryCeiling.load() == 2);
+}
+
+KJ_TEST("ordinary native loop descriptor exhaustion is a refusal before acknowledgement") {
+  using Lane = threaded::OrdinaryLane;
+  ThreadedServer server{8, "", "", -1, {}, {}, &initializeV8(),
+    kj::systemPreciseMonotonicClock(), 256};
+  server.ready.store(true);
+  auto call = ordinaryTestSocket();
+  const auto idle = server.ordinaryAdmissionSample().memory;
+  rlimit previous;
+  KJ_SYSCALL(getrlimit(RLIMIT_NOFILE, &previous));
+  auto constrained = previous;
+  constrained.rlim_cur = std::min<rlim_t>(previous.rlim_cur, 128);
+  KJ_SYSCALL(setrlimit(RLIMIT_NOFILE, &constrained));
+  KJ_DEFER(KJ_SYSCALL(setrlimit(RLIMIT_NOFILE, &previous)));
+  std::vector<kj::AutoCloseFd> held;
+  for (;;) {
+    auto fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+      KJ_REQUIRE(errno == EMFILE);
+      break;
+    }
+    held.emplace_back(fd);
+  }
+  KJ_DEFER(waitForOrdinaryCallRelease(server));
+  server.acceptOrdinary(kj::mv(call[1]), Lane::ROOT);
+  std::array<char, 18> refusal;
+  constexpr std::array<char, 18> expected{'R', 'F'};
+  KJ_REQUIRE(recv(call[0], refusal.data(), refusal.size(), MSG_WAITALL) == refusal.size());
+  KJ_EXPECT(refusal == expected);
+  waitForOrdinaryCallRelease(server);
+  KJ_EXPECT(server.ordinaryAdmissionSample().memory == idle);
+  KJ_EXPECT(server.refusedOrdinaryDescriptors.load() == 1);
 }
 
 KJ_TEST("actual reservation arithmetic, both watermarks and RAII release") {

@@ -91,7 +91,9 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -122,28 +124,33 @@ kj::Own<const kj::Directory> newDurableTestDirectory(int listener) {
       filesystem->getCurrentPath().evalNative(path), kj::WriteMode::MODIFY);
 }
 
-bool prepareDescriptors(uint32_t threads) {
+// Durable homes still reserve their descriptors at startup. The ordinary pool
+// only needs the fixed headroom and enough descriptors to run its first call.
+std::optional<uint64_t> prepareDescriptors(uint32_t durableHomes) {
   rlimit current;
-  auto required = threaded::descriptorBudget(threads);
+  const auto required = durableHomes == 0
+      ? threaded::ORDINARY_FD_HEADROOM + threaded::ORDINARY_FDS_PER_CALL
+      : threaded::descriptorBudget(durableHomes);
   if (getrlimit(RLIMIT_NOFILE, &current) != 0 || current.rlim_max < required) {
     fprintf(stderr,
         "[threaded-start] "
         "{\"event\":\"startup-rejected\",\"resource\":\"descriptors\","
         "\"required\":%llu}\n",
         (unsigned long long)required);
-    return false;
+    return std::nullopt;
   }
-  if (current.rlim_cur < required) {
-    current.rlim_cur = required;
+  const auto desired = durableHomes == 0 ? current.rlim_max : rlim_t(required);
+  if (current.rlim_cur < desired) {
+    current.rlim_cur = desired;
     if (setrlimit(RLIMIT_NOFILE, &current) != 0) {
       fprintf(stderr,
           "[threaded-start] "
           "{\"event\":\"startup-rejected\",\"resource\":"
           "\"descriptor-soft-limit\"}\n");
-      return false;
+      return std::nullopt;
     }
   }
-  return true;
+  return current.rlim_cur;
 }
 
 struct Entropy final: kj::EntropySource {
@@ -319,6 +326,7 @@ struct ResourceBudget {
   static constexpr uint64_t NATIVE_OVERHEAD = 512ull << 10;
   static constexpr uint64_t PREPARATION_HEAP = 2 * MiB;
   static constexpr uint64_t PREPARATION_MEMORY = NATIVE_OVERHEAD + PREPARATION_HEAP;
+  static constexpr uint64_t ORDINARY_CALL_MEMORY = 256ull << 10;
   ResourceBudget(uint64_t maximum,
       uint32_t residents,
       uint32_t callThreads,
@@ -326,7 +334,10 @@ struct ResourceBudget {
       : reclaimMode(reclaimMode),
         memoryMaximum(maximum),
         admissionMaximum(maximum -
-            kj::min(maximum / 10, kj::max<uint64_t>(8 * MiB, uint64_t(callThreads) * MiB))),
+            (callThreads == 0
+                    ? maximum / 10
+                    : kj::min(maximum / 10,
+                          kj::max<uint64_t>(8 * MiB, uint64_t(callThreads) * MiB)))),
         addressMaximum(v8::IsolateGroup::CanCreateNewGroups()
                 ? UINT64_MAX
                 : (4ull << 30) - MAX_SINGLE_HEAP_OBJECT - (256ull << 20)),
@@ -357,6 +368,7 @@ struct ResourceBudget {
   // used, until each call's termination takes effect (MemoryBudget::raise()):
   // two isolates raised at once never both count on the same remainder.
   uint64_t lent = 0;  // Protected by mutex.
+  uint32_t ordinaryCalls = 0;  // Protected by mutex and charged in memoryReserved.
   std::atomic<uint32_t> residents{0};
   std::atomic<uint64_t> rejections{0}, evictions{0}, pressureTerminations{0};
   std::condition_variable reclaimed;
@@ -408,6 +420,52 @@ struct ResourceBudget {
     ++reclaimEpoch;
     if (!reclaimRequested.load()) targetMemory = targetAddress = UINT64_MAX;
     reclaimed.notify_all();
+  }
+
+  static uint64_t reserveNestedRoom(uint64_t budget, uint64_t other, uint64_t charge) {
+    const auto slots = (budget - kj::min(budget, other)) / charge;
+    if (slots <= 1) return budget;
+    return budget - kj::min((slots + 7) / 8, slots - 1) * charge;
+  }
+
+  uint64_t ordinaryMemoryCeiling() const {
+    // The caller must leave room for the existing cold Worker preparation.
+    // Heap growth already lent to a running isolate also takes real headroom.
+    const auto ceiling = kj::min(admissionMaximum, memoryMaximum - kj::min(lent, memoryMaximum));
+    return ceiling - kj::min(ceiling, PREPARATION_MEMORY);
+  }
+
+  std::optional<threaded::OrdinaryRefusal> reserveOrdinaryCall(
+      uint32_t ceiling, uint64_t descriptorBudget, threaded::OrdinaryLane lane) {
+    using Resource = threaded::OrdinaryResource;
+    std::lock_guard lock(mutex);
+    const auto memory = memoryReserved.load();
+    auto memoryCeiling = ordinaryMemoryCeiling();
+    if (lane == threaded::OrdinaryLane::ROOT) {
+      const auto other = memory - ordinaryCalls * ORDINARY_CALL_MEMORY;
+      memoryCeiling = reserveNestedRoom(memoryCeiling, other, ORDINARY_CALL_MEMORY);
+      descriptorBudget = reserveNestedRoom(descriptorBudget, 0, threaded::ORDINARY_FDS_PER_CALL);
+    }
+    if (ORDINARY_CALL_MEMORY > memoryCeiling - kj::min(memory, memoryCeiling)) {
+      return threaded::OrdinaryRefusal{Resource::MEMORY, memory, memoryCeiling};
+    }
+    const uint64_t descriptors = uint64_t(ordinaryCalls) * threaded::ORDINARY_FDS_PER_CALL;
+    if (threaded::ORDINARY_FDS_PER_CALL > descriptorBudget - kj::min(descriptors, descriptorBudget)) {
+      return threaded::OrdinaryRefusal{Resource::DESCRIPTORS, descriptors, descriptorBudget};
+    }
+    if (ordinaryCalls == ceiling) {
+      return threaded::OrdinaryRefusal{Resource::CEILING, ordinaryCalls, ceiling};
+    }
+    memoryReserved.store(memory + ORDINARY_CALL_MEMORY);
+    ++ordinaryCalls;
+    return std::nullopt;
+  }
+
+  void releaseOrdinaryCall() {
+    std::lock_guard lock(mutex);
+    KJ_ASSERT(ordinaryCalls > 0);
+    --ordinaryCalls;
+    memoryReserved.fetch_sub(ORDINARY_CALL_MEMORY);
   }
 
   bool fits(uint64_t memory, uint64_t newMemory, uint64_t address, uint64_t newAddress,
@@ -1996,8 +2054,10 @@ struct ThreadState {
   ThreadContext context{io.provider->getTimer(), entropy, ids, http, bytes};
   Timer timer{io.provider->getTimer()};
   Errors errors;
-  kj::AutoCloseFd decisionSpare{open("/dev/null", O_RDONLY | O_CLOEXEC)};
-  bool rejectOnly = false;
+  explicit ThreadState(kj::AutoCloseFd spare = kj::AutoCloseFd(open("/dev/null", O_RDONLY | O_CLOEXEC)))
+      : decisionSpare(kj::mv(spare)) {}
+
+  kj::AutoCloseFd decisionSpare;
   uint64_t durableHome = 0;
   // Shippers and SQLite's deferred close callbacks borrow this channel. Keep it alive
   // until the home has canceled its tasks and destroyed its actors and isolate copy.
@@ -2431,48 +2491,6 @@ class ObjectIdFactory final: public ActorIdFactory {
   }
 };
 
-// Raw descriptors and atomic queue positions are the accept loop's only shared
-// state.
-class DescriptorQueue {
- public:
-  explicit DescriptorQueue(size_t limit): entries(limit + 1) {}
-  ~DescriptorQueue() {
-    close();
-  }
-  // Called only after producer and consumer have stopped. Pending descriptors
-  // are owned by this queue until pop() transfers them to a call loop.
-  void close() {
-    closed.store(true, std::memory_order_release);
-    for (int fd; (fd = pop()) >= 0;) ::close(fd);
-  }
-  bool hasSpace() const {
-    return !closed.load(std::memory_order_acquire) &&
-        (tail.load(std::memory_order_relaxed) + 1) % entries.size() !=
-        head.load(std::memory_order_acquire);
-  }
-  bool push(int fd) {
-    if (closed.load(std::memory_order_acquire)) return false;
-    auto position = tail.load(std::memory_order_relaxed);
-    auto next = (position + 1) % entries.size();
-    if (next == head.load(std::memory_order_acquire)) return false;
-    entries[position] = fd;
-    tail.store(next, std::memory_order_release);
-    return true;
-  }
-  int pop() {
-    auto position = head.load(std::memory_order_relaxed);
-    if (position == tail.load(std::memory_order_acquire)) return -1;
-    auto fd = entries[position];
-    head.store((position + 1) % entries.size(), std::memory_order_release);
-    return fd;
-  }
-
- private:
-  std::vector<int> entries;
-  std::atomic<size_t> head{0}, tail{0};
-  std::atomic<bool> closed{false};
-};
-
 struct ThreadedServer;
 using BudgetLifetime = std::shared_ptr<void>;
 
@@ -2767,21 +2785,17 @@ struct ThreadedServer {
   std::mutex registryMutex;
   std::map<std::string, std::shared_ptr<Slot>> registry;
   std::vector<std::shared_ptr<Slot>> retiredSlots;
-  DescriptorQueue pending;
   const uint limit;
-  static constexpr uint CONTROL_THREADS = 8;
-  static constexpr int MAINTAIN = -3, STOP = -4, STOPPED = -5;
+  const uint64_t ordinaryDescriptorBudget;
+  std::atomic<uint64_t> refusedOrdinaryMemory{0}, refusedOrdinaryDescriptors{0},
+      refusedOrdinaryThreads{0}, refusedOrdinaryCeiling{0};
   std::shared_ptr<ResourceBudget> resources;
   LifecycleChannel lifecycle;
   std::shared_ptr<TenantBudget> tenantBudget;
   std::atomic<uint64_t> nextInstance{0};
   struct Thread {
-    const bool control;
-    const bool maintenanceOnly;
     int wake;
-    std::atomic<int> descriptor{-2};  // -2 initializes/runs; -1 is idle
-    std::atomic<bool> invocation{false};
-    std::atomic<uint64_t> idleSince{nowNs()};
+    std::atomic<bool> ready{false};
     std::thread thread;
     struct DurableHome {
       std::string definition;
@@ -2800,10 +2814,7 @@ struct ThreadedServer {
     };
     std::optional<DurableHome> home;
     uint64_t homeId = 0;
-    Thread(bool control, bool maintenanceOnly)
-        : control(control),
-          maintenanceOnly(maintenanceOnly),
-          wake(eventfd(0, EFD_CLOEXEC)) {
+    Thread(): wake(eventfd(0, EFD_CLOEXEC)) {
       KJ_REQUIRE(wake >= 0);
     }
   };
@@ -2832,7 +2843,8 @@ struct ThreadedServer {
       kj::Own<const kj::Directory> durableDirectory = {},
       kj::Own<server::ThreadedWalLog> durableLog = {},
       jsg::V8System* existingV8 = nullptr,
-      const kj::MonotonicClock& isolateBusyClock = kj::systemPreciseMonotonicClock())
+      const kj::MonotonicClock& isolateBusyClock = kj::systemPreciseMonotonicClock(),
+      uint64_t ordinaryDescriptorBudget = 0)
       : engine(existingV8 == nullptr ? std::make_unique<Engine>() : nullptr),
         v8(existingV8 == nullptr ? engine->v8 : *existingV8),
         isolateBusyClock(isolateBusyClock),
@@ -2859,22 +2871,23 @@ struct ThreadedServer {
         durableCommitDelayMs(
             this->durableStorage && !this->durableLog
                 ? configuredCount("COWORKERD_DO_TEST_COMMIT_DELAY_MS", 0) : 0),
-        pending(limit * 2),
         limit(limit),
+        ordinaryDescriptorBudget(ordinaryDescriptorBudget),
         resources(std::make_shared<ResourceBudget>(
             configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) -
                 (this->durableStorage
                         ? configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) / 8
                         : 0),
             configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
-            limit,
+            this->durableStorage ? limit : 0,
             this->durableStorage ? ResourceBudget::ReclaimMode::NONE
                                  : ResourceBudget::ReclaimMode::BACKGROUND)),
         tenantBudget(std::make_shared<TenantBudget>(
             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
         parent(parent),
         subrequestBudget(limit, tenantBudget->limit) {
-    KJ_REQUIRE(limit > 0 && limit <= 16384);
+    KJ_REQUIRE(limit > 0 &&
+        limit <= (this->durableStorage ? 16384u : threaded::ORDINARY_MAX_IN_FLIGHT));
     if (this->durableStorage) {
       KJ_REQUIRE(durableCommitDelayMs <= 1000, "invalid durable test commit delay");
       const auto refuseGroup = configuredCount("COWORKERD_DO_TEST_REFUSE_GROUP", 0);
@@ -3000,8 +3013,9 @@ struct ThreadedServer {
       }
       json += "}";
     }
+    const auto ordinary = ordinaryAdmissionSample();
     json += "],\"createdIsolates\":" + std::to_string(compilations.load()) +
-        ",\"resourceBudget\":{\"memoryBytes\":" + std::to_string(resources->memoryReserved.load()) +
+        ",\"resourceBudget\":{\"memoryBytes\":" + std::to_string(ordinary.memory) +
         ",\"memoryMaximum\":" + std::to_string(resources->memoryMaximum) +
         ",\"admissionMaximum\":" + std::to_string(resources->admissionMaximum) +
         ",\"pressureTerminations\":" + std::to_string(resources->pressureTerminations.load()) +
@@ -3014,7 +3028,8 @@ struct ThreadedServer {
         ",\"sandboxRefused\":" + std::to_string(sandboxRefusals.load()) +
         ",\"evicted\":" + std::to_string(resources->evictions.load()) +
         ",\"tenantRejected\":" + std::to_string(tenantBudget->rejected.load()) +
-        ",\"limitRowsDropped\":" + std::to_string(limitRowsDropped.load()) + "}}";
+        ",\"limitRowsDropped\":" + std::to_string(limitRowsDropped.load()) + "}" +
+        ",\"ordinaryAdmission\":" + ordinaryAdmissionJson(ordinary) + "}";
     lifecycle.publish(json, active, background, unknown);
   }
 
@@ -3188,12 +3203,6 @@ struct ThreadedServer {
       while (read(managerWake, &count, sizeof(count)) > 0) {}
     }
   }
-  bool enqueue(int fd) {
-    if (!pending.push(fd)) return false;
-    wake(managerWake);
-    return true;
-  }
-
   // Called with durableRoutingMutex held. The home still rechecks all the
   // prerequisites locally before it fences admission to the selected tree.
   bool requestDatabaseRetirement(server::DurableAdmission::Time now, bool needsPreparationBudget) {
@@ -3866,150 +3875,224 @@ struct ThreadedServer {
     }
   }
 
+  struct OrdinaryAdmissionSample {
+    uint32_t calls;
+    uint64_t memory, memoryCeiling, rootMemoryCeiling;
+  };
+
+  OrdinaryAdmissionSample ordinaryAdmissionSample() {
+    std::lock_guard lock(resources->mutex);
+    const auto calls = resources->ordinaryCalls;
+    const auto memory = resources->memoryReserved.load();
+    const auto ceiling = resources->ordinaryMemoryCeiling();
+    return {calls, memory, ceiling, ResourceBudget::reserveNestedRoom(ceiling,
+        memory - calls * ResourceBudget::ORDINARY_CALL_MEMORY, ResourceBudget::ORDINARY_CALL_MEMORY)};
+  }
+
+  std::string ordinaryAdmissionJson(OrdinaryAdmissionSample sample) const {
+    return "{\"inFlight\":" + std::to_string(sample.calls) +
+        ",\"ceiling\":" + std::to_string(limit) +
+        ",\"callMemoryBytes\":" + std::to_string(sample.calls * ResourceBudget::ORDINARY_CALL_MEMORY) +
+        ",\"memoryBytesPerCall\":" + std::to_string(ResourceBudget::ORDINARY_CALL_MEMORY) +
+        ",\"memoryBytes\":" + std::to_string(sample.memory) +
+        ",\"memoryBudgetBytes\":" + std::to_string(sample.memoryCeiling) +
+        ",\"rootMemoryBudgetBytes\":" + std::to_string(sample.rootMemoryCeiling) +
+        ",\"descriptorCredits\":" + std::to_string(sample.calls * threaded::ORDINARY_FDS_PER_CALL) +
+        ",\"descriptorBudget\":" + std::to_string(ordinaryDescriptorBudget) +
+        ",\"rootDescriptorBudget\":" + std::to_string(ResourceBudget::reserveNestedRoom(
+            ordinaryDescriptorBudget, 0, threaded::ORDINARY_FDS_PER_CALL)) +
+        ",\"descriptorsPerCall\":" + std::to_string(threaded::ORDINARY_FDS_PER_CALL) +
+        ",\"refusedMemory\":" + std::to_string(refusedOrdinaryMemory.load()) +
+        ",\"refusedDescriptors\":" + std::to_string(refusedOrdinaryDescriptors.load()) +
+        ",\"refusedThreads\":" + std::to_string(refusedOrdinaryThreads.load()) +
+        ",\"refusedCeiling\":" + std::to_string(refusedOrdinaryCeiling.load()) + "}";
+  }
+
+  static bool sendOrdinaryDecision(int fd, std::span<const char> reply) {
+    while (!reply.empty()) {
+      auto sent = send(fd, reply.data(), reply.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+      if (sent < 0 && errno == EINTR) continue;
+      if (sent <= 0) return false;
+      reply = reply.subspan(sent);
+    }
+    return true;
+  }
+
+  void refuseOrdinary(int fd, bool extended, threaded::OrdinaryRefusal refusal) {
+    using Resource = threaded::OrdinaryResource;
+    switch (refusal.resource) {
+      case Resource::MEMORY: refusedOrdinaryMemory.fetch_add(1); break;
+      case Resource::DESCRIPTORS: refusedOrdinaryDescriptors.fetch_add(1); break;
+      case Resource::THREADS: refusedOrdinaryThreads.fetch_add(1); break;
+      case Resource::CEILING: refusedOrdinaryCeiling.fetch_add(1); break;
+    }
+    const auto reply = refusal.encode();
+    sendOrdinaryDecision(fd, std::span(reply).first(extended ? reply.size() : 1));
+  }
+
+  void acceptOrdinary(kj::AutoCloseFd socket, threaded::OrdinaryLane lane) {
+    const bool extended = lane != threaded::OrdinaryLane::LEGACY;
+    if (durableStorage || !ready.load(std::memory_order_acquire)) {
+      constexpr char refused = 'R';
+      if (!extended) sendOrdinaryDecision(socket.get(), {&refused, 1});
+      return;
+    }
+    if (auto refusal = resources->reserveOrdinaryCall(limit, ordinaryDescriptorBudget, lane)) {
+      refuseOrdinary(socket.get(), extended, *refusal);
+      return;
+    }
+
+    // Transfer the descriptor and its charge to the new thread. A failed
+    // pthread creation leaves both owned here, before any admission receipt.
+    using Resource = threaded::OrdinaryResource;
+    const int fd = socket.release();
+    std::thread call;
+    try {
+      call = std::thread([this, fd, extended]() { runOrdinaryCall(fd, extended); });
+    } catch (const std::system_error& error) {
+      socket = kj::AutoCloseFd(fd);
+      resources->releaseOrdinaryCall();
+      growthFailures.fetch_add(1);
+      refuseOrdinary(fd, extended, {error.code() == std::errc::not_enough_memory
+              ? Resource::MEMORY : Resource::THREADS});
+      return;
+    } catch (const std::bad_alloc&) {
+      socket = kj::AutoCloseFd(fd);
+      resources->releaseOrdinaryCall();
+      growthFailures.fetch_add(1);
+      refuseOrdinary(fd, extended, {Resource::MEMORY});
+      return;
+    }
+    // The process owns the server until exit. No supervisor holds onto a
+    // successful call's native thread handle or a per-slot wake descriptor.
+    call.detach();
+  }
+
+  void failOrdinarySetup(int fd, bool extended, int failure) {
+    using Resource = threaded::OrdinaryResource;
+    growthFailures.fetch_add(1);
+    if (failure == EMFILE || failure == ENFILE) {
+      refuseOrdinary(fd, extended, {Resource::DESCRIPTORS});
+    } else if (failure == ENOMEM) {
+      refuseOrdinary(fd, extended, {Resource::MEMORY});
+    } else {
+      KJ_LOG(WARNING, "ordinary invocation event loop setup failed", failure);
+    }
+  }
+
+  void runOrdinaryCall(int fd, bool extended) {
+    liveThreads.fetch_add(1);
+    KJ_DEFER({
+      liveThreads.fetch_sub(1);
+      resources->releaseOrdinaryCall();
+    });
+    kj::AutoCloseFd socket(fd);
+    pthread_setname_np(pthread_self(), "cwkd-call");
+    std::unique_ptr<ThreadState> storage;
+    kj::Own<kj::AsyncIoStream> stream;
+    try {
+      const int spare = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      if (spare < 0) {
+        failOrdinarySetup(fd, extended, errno);
+        return;
+      }
+      errno = 0;
+      storage = std::make_unique<ThreadState>(kj::AutoCloseFd(spare));
+      stream = storage->io.lowLevelProvider->wrapSocketFd(
+          fd, kj::LowLevelAsyncIoProvider::ALREADY_NONBLOCK |
+              kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC);
+    } catch (const std::bad_alloc&) {
+      failOrdinarySetup(fd, extended, ENOMEM);
+      return;
+    } catch (const kj::Exception& error) {
+      // KJ maps native resource errors to OVERLOADED. An unknown failure
+      // closes the connection without giving the node a retry receipt.
+      failOrdinarySetup(fd, extended, error.getType() == kj::Exception::Type::OVERLOADED ? errno : 0);
+      return;
+    }
+    constexpr char accepted = 'A';
+    if (!sendOrdinaryDecision(fd, {&accepted, 1})) return;
+
+    auto& state = *storage;
+    auto error = kj::runCatchingExceptions([&]() {
+      capnp::TwoPartyServer session(kj::heap<Bootstrap>(*this, state));
+      session.accept(*stream).wait(state.io.waitScope);
+    });
+    stream = nullptr;
+    socket = nullptr;
+    KJ_IF_SOME(exception, error) {
+      // The exception may include the invocation envelope or user data.
+      if (exception.getType() != kj::Exception::Type::DISCONNECTED)
+        KJ_LOG(INFO, "threaded invocation connection failed");
+    }
+    auto backgroundError = kj::runCatchingExceptions([&]() {
+      settleBackground(state.io.provider->getTimer(), state.tasks).wait(state.io.waitScope);
+    });
+    if (backgroundError != kj::none) state.tasks.clear();
+  }
+
   void manage() {
     pthread_setname_np(pthread_self(), "cwkd-pool");
-    // The initial high watermark is the in-flight limit. Readiness waits for
-    // all native loops, so a cold burst never makes the accept thread
-    // initialize one.
-    try {
-      threads.reserve(limit + CONTROL_THREADS);
-      const auto count = limit + (durableAdmission ? 0 : CONTROL_THREADS);
-      for (uint i = 0; i < count; ++i) {
-        auto item = std::make_unique<Thread>(i >= limit, i == limit + CONTROL_THREADS - 1);
-        if (durableAdmission) item->home.emplace();
-        if (durableAdmission) item->homeId = i + 1;
-        auto *pointer = item.get();
-        liveThreads.fetch_add(1);
-        item->thread = std::thread([this, pointer]() { runThread(*pointer); });
-        threads.push_back(std::move(item));
+    if (durableAdmission) {
+      try {
+        threads.reserve(limit);
+        for (uint i = 0; i < limit; ++i) {
+          auto item = std::make_unique<Thread>();
+          item->home.emplace();
+          item->homeId = i + 1;
+          liveThreads.fetch_add(1);
+          item->thread = std::thread([this, pointer = item.get()] { runDurableHome(*pointer); });
+          threads.push_back(std::move(item));
+        }
+      } catch (...) {
+        fprintf(stderr,
+            "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"call-thread-pool\"}\n");
+        _exit(70);
       }
+      for (auto& item: threads)
+        while (!item->ready.load(std::memory_order_acquire)) usleep(1000);
+      ready.store(true, std::memory_order_release);
+      return serveBudgetReleases();
+    }
+
+    // Maintenance needs a native context for isolate teardown. Its single
+    // event loop is the whole ordinary pool at startup.
+    std::optional<ThreadState> maintenance;
+    try {
+      maintenance.emplace();
     } catch (...) {
       fprintf(stderr,
-          "[threaded-start] "
-          "{\"event\":\"startup-rejected\",\"resource\":\"call-"
-          "thread-pool\"}\n");
+          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"call-event-loop\"}\n");
       _exit(70);
     }
-    for (auto &item: threads)
-      while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
+    liveThreads.fetch_add(1);
     ready.store(true, std::memory_order_release);
-    if (durableAdmission) return serveBudgetReleases();
-    int held = -1;
-    auto nextMaintenance = nowNs();
-    auto idleMs = configuredCount("COWORKERD_THREADED_THREAD_IDLE_MS", 60000);
     for (;;) {
-      for (auto &item: threads) {
-        if (item->descriptor.load() == STOPPED && item->thread.joinable()) item->thread.join();
-      }
-      auto now = nowNs();
-      if (now >= nextMaintenance) {
-        nextMaintenance = now + 100000000;
-        for (auto &item: threads) {
-          if (!item->maintenanceOnly) continue;
-          int idle = -1;
-          if (item->descriptor.compare_exchange_strong(idle, MAINTAIN)) {
-            wake(item->wake);
-            break;
-          }
-        }
-        auto remaining = liveThreads.load();
-        if (idleMs != 0)
-          for (auto &item: threads) {
-            if (item->control || remaining <= std::min(limit, 32u) + CONTROL_THREADS ||
-                now - kj::min(now, item->idleSince.load()) < idleMs * 1000000)
-              continue;
-            int idle = -1;
-            if (item->descriptor.compare_exchange_strong(idle, STOP)) {
-              --remaining;
-              wake(item->wake);
-            }
-          }
-      }
-      if (held < 0) held = pending.pop();
-      if (held >= 0) {
-        bool assigned = false;
-        for (auto &item: threads) {
-          if (item->control) continue;
-          int idle = -1;
-          if (item->descriptor.compare_exchange_strong(idle, held)) {
-            item->invocation.store(true);
-            wake(item->wake);
-            held = -1;
-            assigned = true;
-            break;
-          }
-        }
-        if (assigned) continue;
-        uint growing = 0;
-        for (auto &item: threads) {
-          if (item->control || item->descriptor.load() != STOPPED || growing == 16) continue;
-          if (item->thread.joinable()) item->thread.join();
-          item->descriptor.store(-2);
-          liveThreads.fetch_add(1);
-          try {
-            item->thread = std::thread([this, pointer = item.get()] { runThread(*pointer); });
-            ++growing;
-          } catch (...) {
-            liveThreads.fetch_sub(1);
-            item->descriptor.store(STOPPED);
-            growthFailures.fetch_add(1);
-          }
-        }
-        // Dedicated control loops can decode a descriptor and confirm a refusal
-        // even while every execution loop owns an invocation's background work.
-        const bool warming = std::any_of(threads.begin(), threads.end(), [](const auto &item) {
-          const auto descriptor = item->descriptor.load();
-          return !item->control && (descriptor == -2 || descriptor == STOP);
-        });
-        if (growing == 0 && !warming)
-          for (auto &item: threads) {
-            if (!item->control || item->maintenanceOnly) continue;
-            int idle = -1;
-            if (item->descriptor.compare_exchange_strong(idle, held)) {
-              item->invocation.store(true);
-              wake(item->wake);
-              held = -1;
-              assigned = true;
-              break;
-            }
-          }
-        if (assigned) continue;
-      }
+      auto ignored = kj::runCatchingExceptions([&]() { maintain(); });
       pollfd wait{managerWake, POLLIN, 0};
       int result;
       do {
-        result = poll(&wait, 1, held >= 0 ? 1 : 100);
+        result = poll(&wait, 1, 100);
       } while (result < 0 && errno == EINTR);
-      if (result < 0) {
-        growthFailures.fetch_add(1);
-        usleep(1000);
-        continue;
-      }
+      if (result < 0) usleep(1000);
       uint64_t count;
       while (read(managerWake, &count, sizeof(count)) > 0) {}
     }
   }
-  void runThread(Thread &thread) {
-    pthread_setname_np(pthread_self(), thread.control ? "cwkd-refuse" : "cwkd-call");
+
+  void runDurableHome(Thread& thread) {
+    pthread_setname_np(pthread_self(), "cwkd-call");
     std::unique_ptr<ThreadState> storage;
     try {
       storage = std::make_unique<ThreadState>();
     } catch (...) {
       fprintf(stderr,
-          "[threaded-start] "
-          "{\"event\":\"startup-rejected\",\"resource\":\"call-"
-          "event-loop\"}\n");
-      if (!ready.load()) _exit(70);
-      growthFailures.fetch_add(1);
-      liveThreads.fetch_sub(1);
-      thread.descriptor.store(STOPPED);
-      wake(managerWake);
-      return;
+          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"call-event-loop\"}\n");
+      _exit(70);
     }
-    auto &state = *storage;
-    state.rejectOnly = thread.control;
+    auto& state = *storage;
     state.durableHome = thread.homeId;
-    if (thread.home && durableLog) {
+    if (durableLog) {
       state.wal = durableLog->attachHome(
           [this, &state](uint64_t openId, server::ThreadedWalLog::CloseReason why) {
         for (auto& [id, root]: state.durableRoots) {
@@ -4022,79 +4105,32 @@ struct ThreadedServer {
                 "DO_CODE_UPDATED"_kj);
             beginDurableReset(state, id, reason);
             root.stopFacets(&reason);
-            root.actor->abort(kj::mv(reason));
+            root.actor->abort(reason);
           }
           break;
         }
       }, thread.home->walFull);
     }
-    thread.idleSince.store(nowNs());
-    thread.descriptor.store(-1, std::memory_order_release);
+    thread.ready.store(true, std::memory_order_release);
     wake(managerWake);
-    if (thread.home) {
-      // Blocking on this promise pumps the home's KJ loop while it waits
-      // for the accept thread to hand over the next private RPC connection.
-      auto signal = state.io.lowLevelProvider->wrapInputFd(thread.wake);
-      for (;;) {
-        kj::byte notifications[sizeof(uint64_t)];
-        signal->read(kj::arrayPtr(notifications))
-            .exclusiveJoin(state.io.provider->getTimer().afterDelay(250 * kj::MILLISECONDS))
-            .wait(state.io.waitScope);
-        std::vector<DurableIncoming> incoming;
-        {
-          std::lock_guard lock(durableRoutingMutex);
-          incoming.swap(thread.home->incoming);
-        }
-        for (auto &call: incoming) {
-          state.tasks.add(startDurableSession(state, std::move(call)));
-        }
-        retireIdleDurableRoots(state);
-      }
-    }
+    // Blocking on this promise pumps the home's KJ loop while it waits
+    // for the accept thread to hand over the next private RPC connection.
+    auto signal = state.io.lowLevelProvider->wrapInputFd(thread.wake);
     for (;;) {
-      uint64_t count;
-      ssize_t n;
-      do {
-        n = read(thread.wake, &count, sizeof(count));
-      } while (n < 0 && errno == EINTR);
-      KJ_REQUIRE(n == sizeof(count));
-      auto fd = thread.descriptor.exchange(-2);
-      if (fd == STOP) break;
-      if (fd == MAINTAIN) {
-        auto ignored = kj::runCatchingExceptions([&] { maintain(); });
-        thread.descriptor.store(-1, std::memory_order_release);
-        wake(managerWake);
-        continue;
+      kj::byte notifications[sizeof(uint64_t)];
+      signal->read(kj::arrayPtr(notifications))
+          .exclusiveJoin(state.io.provider->getTimer().afterDelay(250 * kj::MILLISECONDS))
+          .wait(state.io.waitScope);
+      std::vector<DurableIncoming> incoming;
+      {
+        std::lock_guard lock(durableRoutingMutex);
+        incoming.swap(thread.home->incoming);
       }
-      KJ_REQUIRE(fd >= 0);
-      // The idle mailbox wait is outside KJ. Refresh its cached I/O time before
-      // an already-buffered RPC can enter JavaScript without another OS poll.
-      state.io.unixEventPort.poll();
-      auto error = kj::runCatchingExceptions([&]() {
-        auto stream = state.io.lowLevelProvider->wrapSocketFd(
-            fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
-        capnp::TwoPartyServer session(kj::heap<Bootstrap>(*this, state));
-        session.accept(*stream).wait(state.io.waitScope);
-      });
-      KJ_IF_SOME(exception, error) {
-        // Never print the descriptor, variables, secret values, or request
-        // body.
-        if (exception.getType() != kj::Exception::Type::DISCONNECTED)
-          KJ_LOG(INFO, "threaded invocation connection failed");
+      for (auto& call: incoming) {
+        state.tasks.add(startDurableSession(state, std::move(call)));
       }
-      auto backgroundError = kj::runCatchingExceptions([&]() {
-        settleBackground(state.io.provider->getTimer(), state.tasks).wait(state.io.waitScope);
-      });
-      if (backgroundError != kj::none) state.tasks.clear();
-      thread.invocation.store(false);
-      thread.idleSince.store(nowNs());
-      thread.descriptor.store(-1, std::memory_order_release);
-      wake(managerWake);
+      retireIdleDurableRoots(state);
     }
-    storage.reset();
-    liveThreads.fetch_sub(1);
-    thread.descriptor.store(STOPPED);
-    wake(managerWake);
   }
 
   kj::Promise<kj::String> fetchSource(Json::Reader descriptor, ThreadState &state, Slot &slot) {
@@ -7626,7 +7662,6 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
   bool tenantCapacity = false;
   kj::Maybe<kj::Exception> loadFailure;
   try {
-    if (state.rejectOnly) kj::throwRecoverableException(capacityError());
     tenant = server.admitTenant(input);
     slot = co_await server.getWorker(input, state, coldLoaded);
     preparation = server.prepareSlot(slot);
@@ -7711,7 +7746,6 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
   std::shared_ptr<ResourcePreparation> preparation;
   std::shared_ptr<TenantPermit> tenant;
   try {
-    if (state.rejectOnly) kj::throwRecoverableException(capacityError());
     tenant = server.admitTenant(input);
     slot = co_await server.getWorker(input, state, coldLoaded);
     if (!trial) preparation = server.prepareSlot(slot);
@@ -7858,6 +7892,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
   };
   struct Connection {
     std::string input, output;
+    bool ordinaryPrefix = false;
     size_t sent = 0;
     std::optional<Admission::Ticket> durableCredit;
     std::optional<DurableRoute> durableRoute;
@@ -7875,6 +7910,12 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
     epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
     ::close(fd);
     connections.erase(found);
+  };
+  auto handoffOrdinary = [&](auto found, threaded::OrdinaryLane lane) {
+    const int fd = found->first;
+    epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
+    connections.erase(found);
+    server.acceptOrdinary(kj::AutoCloseFd(fd), lane);
   };
   for (;;) {
     if (!listening && nowNs() >= retryAt) {
@@ -7939,22 +7980,39 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
         }
         continue;
       }
-      if (connection.input.empty() && connection.output.empty()) {
+      const auto readPrefaceByte = [&](char& byte, int flags) {
+        ssize_t size;
+        do {
+          size = recv(fd, &byte, 1, flags | MSG_DONTWAIT);
+        } while (size < 0 && errno == EINTR);
+        return size;
+      };
+      if (!connection.ordinaryPrefix && connection.input.empty() && connection.output.empty()) {
         char prefix;
-        auto size = recv(fd, &prefix, 1, MSG_PEEK | MSG_DONTWAIT);
-        if (size == 1 && prefix == 'T') {
-          (void)!recv(fd, &prefix, 1, MSG_DONTWAIT);
-          epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
-          connections.erase(found);
-          char admission = !server.durableStorage && server.pending.hasSpace() ? 'A' : 'R';
-          auto sent = send(fd, &admission, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
-          if (sent != 1 || admission == 'R')
-            ::close(fd);
-          else if (!server.enqueue(fd))
-            ::close(fd);
-          continue;
+        auto size = readPrefaceByte(prefix, MSG_PEEK);
+        if (size == 1 && (prefix == 'T' || prefix == threaded::ORDINARY_ADMISSION_PREFIX)) {
+          if (readPrefaceByte(prefix, 0) != 1) {
+            closeConnection(found);
+            continue;
+          }
+          if (prefix == 'T') {
+            handoffOrdinary(found, threaded::OrdinaryLane::LEGACY);
+            continue;
+          }
+          connection.ordinaryPrefix = true;
         }
         if (size == 0) close = true;
+      }
+      if (connection.ordinaryPrefix) {
+        char lane;
+        const auto size = readPrefaceByte(lane, 0);
+        if (size == 1 && (lane == 'r' || lane == 'n')) {
+          handoffOrdinary(found, lane == 'r' ? threaded::OrdinaryLane::ROOT : threaded::OrdinaryLane::NESTED);
+        } else if (size >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK) ||
+            (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))) {
+          closeConnection(found);
+        }
+        continue;
       }
       if (connection.output.empty() && !close) {
         char bytes[2048];
@@ -8001,20 +8059,17 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
         if (connection.input.find("\r\n\r\n") != std::string::npos) {
           auto body = server.identity;
           if (connection.input.starts_with("GET /__coworkerd/threaded ")) {
-            uint busy = 0;
-            if (server.ready.load(std::memory_order_acquire))
-              for (auto &thread: server.threads)
-                if (!thread->control && thread->invocation.load()) ++busy;
+            const auto ordinary = server.durableAdmission
+                ? ThreadedServer::OrdinaryAdmissionSample{} : server.ordinaryAdmissionSample();
             body = "{\"threadLimit\":" + std::to_string(server.limit) +
-                ",\"busyThreads\":" + std::to_string(busy) +
+                ",\"busyThreads\":" + std::to_string(ordinary.calls) +
                 ",\"idleConnections\":" + std::to_string(connections.size() - 1) +
                 ",\"compilations\":" + std::to_string(server.compilations.load()) +
                 ",\"isolateCreationAttempts\":" +
                 std::to_string(server.isolateCreationAttempts.load()) +
                 ",\"canceledLoads\":" + std::to_string(server.canceledLoads.load()) +
                 ",\"liveThreads\":" + std::to_string(server.liveThreads.load()) +
-                ",\"controlThreads\":" +
-                std::to_string(server.durableAdmission ? 0 : server.CONTROL_THREADS) +
+                ",\"controlThreads\":" + std::to_string(server.durableAdmission ? 0 : 1) +
                 ",\"threadGrowthFailures\":" + std::to_string(server.growthFailures.load()) +
                 ",\"acceptFailures\":" + std::to_string(server.acceptFailures.load()) +
                 ",\"subrequestsActive\":" + std::to_string(server.subrequestBudget.active.load()) +
@@ -8026,6 +8081,10 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                 ",\"logFlushFailures\":" + std::to_string(server.logFlushFailures.load()) +
                 ",\"logPeakQueuedBytes\":" + std::to_string(server.logPeakQueuedBytes.load()) + "}";
             if (server.durableAdmission) server.reportDurable(false, &body);
+            else {
+              body.pop_back();
+              body += ",\"ordinaryAdmission\":" + server.ordinaryAdmissionJson(ordinary) + "}";
+            }
           }
           const bool walReady = !server.durableLog || server.durableLog->ready();
           auto status = server.ready.load(std::memory_order_acquire) && walReady
@@ -8040,7 +8099,8 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
               "\r\nX-Coworkerd-Threaded-Protocol: 3" +
               (server.durableLog
                       ? "\r\nX-Coworkerd-Threaded-Role: durable\r\nX-Coworkerd-WAL-Protocol: 1"
-                      : server.durableStorage ? "\r\nX-Coworkerd-Threaded-Role: durable-test" : "") +
+                      : server.durableStorage ? "\r\nX-Coworkerd-Threaded-Role: durable-test"
+                                              : "\r\nX-Coworkerd-Ordinary-Admission: 1") +
               "\r\nContent-Length: " + std::to_string(body.size()) +
               "\r\nConnection: close\r\n\r\n" + body;
         }
@@ -8083,6 +8143,10 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
 
 int main(int argc, char **argv) {
   using namespace workerd;
+  if (argc == 2 && strcmp(argv[1], "--ordinary-admission-version") == 0) {
+    puts("1");
+    return 0;
+  }
   if (argc == 2 && strcmp(argv[1], "--sandbox-facts") == 0) {
     // The node's startup probe of this build: one [coworkerd-sandbox] row on stderr, with V8's mode
     // and this build's sandbox layout ("mode":"off" without the sandbox); exit 78 with the problem
@@ -8106,7 +8170,8 @@ int main(int argc, char **argv) {
   }
   char *end = nullptr;
   auto limit = strtoul(argv[4], &end, 10);
-  if (!*argv[4] || !end || *end || limit == 0 || limit > 16384) return 64;
+  if (!*argv[4] || !end || *end || limit == 0 ||
+      limit > (disposable || persistent ? 16384u : threaded::ORDINARY_MAX_IN_FLIGHT)) return 64;
   if (disposable && getenv("COWORKERD_DO_WAL_FD") != nullptr) {
     fprintf(stderr, "durable test storage refuses a persistent durable log channel\n");
     return 78;
@@ -8119,7 +8184,9 @@ int main(int argc, char **argv) {
       return 78;
     }
   }
-  if (!prepareDescriptors(limit)) return 78;
+  const auto descriptorLimit = prepareDescriptors(disposable || persistent ? limit : 0);
+  if (!descriptorLimit) return 78;
+  const auto ordinaryDescriptorBudget = *descriptorLimit - threaded::ORDINARY_FD_HEADROOM;
   auto event = limitEventFd();
   if (event >= 0) {
     auto flags = fcntl(event, F_GETFL);
@@ -8176,7 +8243,8 @@ int main(int argc, char **argv) {
     } else if (disposable) {
       directory = newDurableTestDirectory(listener);
     }
-    server = new ThreadedServer(limit, argv[2], argv[3], parent, kj::mv(directory), kj::mv(wal));
+    server = new ThreadedServer(limit, argv[2], argv[3], parent, kj::mv(directory), kj::mv(wal),
+        nullptr, kj::systemPreciseMonotonicClock(), ordinaryDescriptorBudget);
     server->start();
   } catch (...) {
     fprintf(stderr,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <initializer_list>
@@ -14,6 +15,32 @@ namespace workerd::threaded {
 inline constexpr uint64_t descriptorBudget(uint32_t callThreads) {
   return uint64_t(callThreads) * 8 + 256;
 }
+
+inline constexpr uint32_t ORDINARY_MAX_IN_FLIGHT = 1u << 20;
+inline constexpr uint64_t ORDINARY_FD_HEADROOM = 256;
+inline constexpr uint64_t ORDINARY_FDS_PER_CALL = 8;
+inline constexpr char ORDINARY_ADMISSION_PREFIX = 'O';
+enum class OrdinaryLane { LEGACY, ROOT, NESTED };
+
+enum class OrdinaryResource : char { MEMORY = 'M', DESCRIPTORS = 'F', THREADS = 'T', CEILING = 'C' };
+
+struct OrdinaryRefusal {
+  OrdinaryResource resource;
+  uint64_t current = 0;
+  uint64_t budget = 0;
+
+  // Extended refusal on the private socket. The complete record is the proof
+  // that workerd refused the call before giving it to Cap'n Proto.
+  std::array<char, 18> encode() const {
+    std::array<char, 18> reply{'R', static_cast<char>(resource)};
+    for (size_t i = 0; i < sizeof(uint64_t); ++i) {
+      const auto shift = (sizeof(uint64_t) - i - 1) * 8;
+      reply[2 + i] = static_cast<char>(current >> shift);
+      reply[10 + i] = static_cast<char>(budget >> shift);
+    }
+    return reply;
+  }
+};
 
 // The existing trace budget is 256 KiB per event. A separate line bound also
 // covers empty console calls, whose native objects still occupy memory.
