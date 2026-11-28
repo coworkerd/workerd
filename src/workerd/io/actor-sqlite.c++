@@ -391,17 +391,16 @@ kj::Promise<void> ActorSqlite::startImplicitTxnImpl(kj::Own<ImplicitTxn> txn) {
   // transaction by evaluating by awaiting kj::yield() first, which runs the function on the next
   // turn of the event loop
   co_await kj::yield();
-  if (txn->wasRolledBackForSqlMemory()) co_return;
 
-  // If there were tasks blocking the transaction, wait for them.
-  if (!blockTasks.isEmpty()) {
+  // A rolled-back transaction must not wait on tasks started by its replacement.
+  if (!txn->wasRolledBackForSqlMemory() && !blockTasks.isEmpty()) {
     co_await blockTasks.onEmpty();
   }
-  if (txn->wasRolledBackForSqlMemory()) co_return;
 
-  // Don't commit if shutdown() has been called, or if one of the blockTasks threw, or we broke
-  // for any other reason before the transaction could complete.
+  // Fail the existing output lock if rollback broke the actor, including when a
+  // response was already waiting for this commit.
   requireNotBroken();
+  if (txn->wasRolledBackForSqlMemory()) co_return;
 
   // Start the schedule request before commit(), for correctness in workerd.
   auto precommitAlarmState = startPrecommitAlarmScheduling();

@@ -2029,7 +2029,7 @@ struct ThreadState {
     bool idleClosing = false;
     bool cancelExpiredWork = false;
     bool admissionClosing = false;
-    bool sqliteTrimmed = false;
+    std::optional<server::DurableIdleLifecycle::Time> sqliteTrimmedForIdleSince;
     std::shared_ptr<class DurableNodeSockets> nodeSockets;
     kj::Function<bool()> hasLocalSockets;
     kj::Function<kj::Promise<SocketParkResult>()> parkSockets;
@@ -3375,7 +3375,6 @@ struct ThreadedServer {
     KJ_REQUIRE(durableAdmission->markSocket(ticket, state.durableHome), "the durable tree is closing");
     KJ_ASSERT(root.sockets.emplace(ticket.event, session).second);
     root.idle->eventFinished(durableIdleNow());
-    root.sqliteTrimmed = false;
   }
 
   bool finishDurable(server::DurableAdmission::Ticket ticket, bool databaseCanRetire = false) {
@@ -3463,7 +3462,6 @@ struct ThreadedServer {
         if (root != state.durableRoots.end() && !root->second.resetting) {
           root->second.sockets.erase(call.ticket.event);
           root->second.idle->eventFinished(durableIdleNow());
-          root->second.sqliteTrimmed = false;
         }
       }
     });
@@ -3643,10 +3641,11 @@ struct ThreadedServer {
           decision = Decision::CANCEL_PENDING;
       }
       if (decision == Decision::WAIT) {
-        if (!ordinarySocket && !root.sqliteTrimmed &&
+        const auto idleSince = root.idle->idleSince();
+        if (root.sqliteTrimmedForIdleSince != idleSince &&
             root.idle->idleFor(now, std::chrono::seconds(1))) {
           trimIdleObjectSqlite(*root.tree);
-          root.sqliteTrimmed = true;
+          root.sqliteTrimmedForIdleSince = idleSince;
         }
         continue;
       }

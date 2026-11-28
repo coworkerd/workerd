@@ -827,15 +827,29 @@ KJ_TEST(
   KJ_EXPECT(t.rows() == 2);
 }
 
-KJ_TEST("ordinary object SQLite refusal fails the output gate for earlier writes") {
+KJ_TEST("ordinary object SQLite refusal of the first write keeps the connection open") {
+  ObjectSqlHeapTest t(ObjectSqlHeapTest::MiB);
+  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
+      t.run("INSERT INTO entries VALUES (2, randomblob(?))", ObjectSqlHeapTest::largeBlob));
+  KJ_EXPECT(!t.db->observedCriticalError());
+  KJ_EXPECT(t.rows() == 1);
+  t.flush();
+  KJ_EXPECT(t.commits == 1);
+  t.run("INSERT INTO entries VALUES (3, NULL)");
+  t.flush();
+  KJ_EXPECT(t.commits == 2);
+  KJ_EXPECT(t.rows() == 2);
+}
+
+KJ_TEST("ordinary object SQLite refusal fails a response already waiting on the output gate") {
   ObjectSqlHeapTest t(ObjectSqlHeapTest::MiB);
   t.run("INSERT INTO entries VALUES (2, NULL)");
-  {
-    SqliteDatabase::ObjectSqlTransaction txn(*t.db);
-    t.db->run("SAVEPOINT object_sync");
-    KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
-        t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob));
-  }
+  t.actor->blockTransaction(kj::NEVER_DONE);
+  auto waitingResponse = t.gate.wait(nullptr);
+  KJ_REQUIRE(!waitingResponse.poll(t.waitScope));
+  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
+      t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob));
+  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED", waitingResponse.wait(t.waitScope));
   KJ_EXPECT(t.db->observedCriticalError());
   KJ_EXPECT(t.rows() == 1);
   KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED", t.flush());

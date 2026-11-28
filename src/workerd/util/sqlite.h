@@ -333,6 +333,7 @@ class SqliteDatabase {
     if (!hasObjectSqlBudget()) return func();
     requireObjectSqlTransaction();
     KJ_ASSERT(objectSqlRefusal == nullptr);
+    const bool transactionWasOpen = inTransaction || !savepoints.empty();
     auto refusal = SqliteMemoryScope::LimitRefusal::NONE;
     objectSqlRefusal = &refusal;
     KJ_DEFER(objectSqlRefusal = nullptr);
@@ -340,7 +341,9 @@ class SqliteDatabase {
       return func();
     } catch (...) {
       objectSqlRefusal = nullptr;
-      if (refusal != SqliteMemoryScope::LimitRefusal::NONE) settleObjectSqlRefusal(refusal);
+      if (refusal != SqliteMemoryScope::LimitRefusal::NONE) {
+        settleObjectSqlRefusal(refusal, transactionWasOpen);
+      }
       throw;
     }
   }
@@ -559,7 +562,8 @@ class SqliteDatabase {
   bool objectSqlTransactionWasOpen = false;
   kj::Maybe<kj::Function<bool(bool, const kj::Exception&)>> objectSqlRollback;
   bool hasObjectSqlBudget() const;
-  [[noreturn]] void settleObjectSqlRefusal(SqliteMemoryScope::LimitRefusal refusal);
+  [[noreturn]] void settleObjectSqlRefusal(
+      SqliteMemoryScope::LimitRefusal refusal, bool transactionWasOpen);
 
   kj::Maybe<kj::Function<void(bool allowUnconfirmed)>> onWriteCallback;
   kj::Maybe<kj::Function<void(kj::StringPtr errorMessage, kj::Maybe<kj::Exception> maybeException)>>

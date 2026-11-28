@@ -946,7 +946,8 @@ static kj::Exception objectSqlMemoryException(SqliteMemoryScope::LimitRefusal re
       "SQL_MEMORY_LIMIT_EXCEEDED");
 }
 
-void SqliteDatabase::settleObjectSqlRefusal(SqliteMemoryScope::LimitRefusal refusal) {
+void SqliteDatabase::settleObjectSqlRefusal(
+    SqliteMemoryScope::LimitRefusal refusal, bool transactionWasOpen) {
   if (objectSqlTransactionDepth != 0) objectSqlTransactionRefusal = refusal;
   auto exception = objectSqlMemoryException(refusal);
   try {
@@ -955,7 +956,8 @@ void SqliteDatabase::settleObjectSqlRefusal(SqliteMemoryScope::LimitRefusal refu
       clearCommitCheck();
       // A rolled-back implicit turn could contain writes outside a callback,
       // including writes by other events whose responses are waiting on it.
-      const bool needsFailedOutput = objectSqlTransactionDepth == 0 || objectSqlTransactionWasOpen;
+      const bool needsFailedOutput =
+          objectSqlTransactionDepth == 0 ? transactionWasOpen : objectSqlTransactionWasOpen;
       KJ_IF_SOME(callback, objectSqlRollback) {
         criticalErrorOccurred = callback(needsFailedOutput, exception);
       }
