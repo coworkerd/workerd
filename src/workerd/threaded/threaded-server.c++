@@ -1968,6 +1968,7 @@ server::DurableIdleLifecycle::Time durableIdleNow() {
 }
 
 struct DurableTreeContext;
+bool hasDurableWalRegistrations(const DurableTreeContext& tree);
 class DurableActorHooks;
 
 struct ThreadState {
@@ -2040,6 +2041,8 @@ struct ThreadState {
   };
   std::map<Worker::Actor *, uint64_t> durableActorTrees;
   std::map<uint64_t, DurableRoot> durableRoots;
+  // A retired actor can still have a reference held by a settling facet or task.
+  std::map<uint64_t, std::shared_ptr<DurableTreeContext>> admissionWalClosing;
   kj::TaskSet tasks{errors};
 
   ~ThreadState() noexcept(false) {
@@ -2667,6 +2670,7 @@ struct ObjectRetirement {
   uint64_t tree;
   Time lastUse;
   Time deadline;
+  bool awaitingWal = false;
   bool operator==(const ObjectRetirement&) const = default;
 };
 
@@ -3280,7 +3284,7 @@ struct ThreadedServer {
     if (databaseVictim && now >= databaseVictim->deadline) {
       finishDatabaseRetirement(databaseVictim->outcome(now, false, false), now);
     }
-    if (objectVictim && now >= objectVictim->deadline) {
+    if (objectVictim && !objectVictim->awaitingWal && now >= objectVictim->deadline) {
       // Do not choose the same home again until its loop shows progress.
       threads[objectVictim->home - 1]->home->admissionTurnDelayed = true;
       objectVictim.reset();
@@ -3655,7 +3659,8 @@ struct ThreadedServer {
         durableAdmission->stopIdleTree(selected.tree, selected.home);
   }
 
-  // Called after dropping the actor under the routing lock.
+  // Called under the routing lock after dropping the actor and, for admission
+  // retirement, after the home's WAL registrations have been returned.
   bool releaseDurableTree(uint64_t tree, uint64_t homeId, bool admissionClosing) {
     KJ_ASSERT(durableAdmission->releaseTree(tree, homeId));
     if (admissionClosing && databaseVictim && databaseVictim->tree == tree &&
@@ -3669,10 +3674,33 @@ struct ThreadedServer {
     home.resident.erase(tree);
     home.idleObjects.erase(tree);
     if (objectVictim && objectVictim->tree == tree) objectVictim.reset();
+    if (admissionClosing) durableAdmissionRetirements.fetch_add(1);
     home.databaseCanRetire = false;
     home.databaseLastUse = 0;
     if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
     return home.resident.empty();
+  }
+
+  void waitForAdmissionWal(
+      ThreadState& state, uint64_t tree, const std::shared_ptr<DurableTreeContext>& context) {
+    KJ_ASSERT(state.admissionWalClosing.emplace(tree, context).second);
+    std::lock_guard lock(durableRoutingMutex);
+    if (objectVictim && objectVictim->tree == tree) objectVictim->awaitingWal = true;
+  }
+
+  void releaseClosedAdmissionTrees(ThreadState& state) {
+    for (auto it = state.admissionWalClosing.begin(); it != state.admissionWalClosing.end();) {
+      const auto current = it++;
+      if (hasDurableWalRegistrations(*current->second)) continue;
+      const auto tree = current->first;
+      state.admissionWalClosing.erase(current);
+      // The home thread has finished unregistering the shippers and publishing
+      // walFull before the router can observe the returned tree credit.
+      std::lock_guard lock(durableRoutingMutex);
+      if (releaseDurableTree(tree, state.durableHome, true)) {
+        state.durableSlot->lastUseNs.store(nowNs());
+      }
+    }
   }
 
   void retireIdleDurableRoots(ThreadState &state) {
@@ -3683,7 +3711,7 @@ struct ThreadedServer {
       return std::pair(databaseVictim && databaseVictim->home == homeId ? databaseVictim : std::nullopt,
           objectVictim && objectVictim->home == homeId ? objectVictim : std::nullopt);
     }();
-    KJ_DEFER(if (selectedObject) {
+    KJ_DEFER(if (selectedObject && !selectedObject->awaitingWal) {
       const auto root = state.durableRoots.find(selectedObject->tree);
       if (root == state.durableRoots.end() || !root->second.admissionClosing) {
         std::lock_guard lock(durableRoutingMutex);
@@ -3818,7 +3846,7 @@ struct ThreadedServer {
       }
       const bool admissionClosing = root.admissionClosing;
       if (admissionClosing) {
-        durableAdmissionRetirements.fetch_add(1);
+        waitForAdmissionWal(state, tree, root.tree);
       } else if (!explicitClose || root.idleClosing) {
         if (pressured && !root.idleClosing) {
           durablePressureRetirements.fetch_add(1);
@@ -3831,12 +3859,13 @@ struct ThreadedServer {
       current->second.stopFacets(nullptr);
       actor.shutdown(0);
       state.durableRoots.erase(current);
-      {
+      if (!admissionClosing) {
         std::lock_guard lock(durableRoutingMutex);
-        if (releaseDurableTree(tree, homeId, admissionClosing))
+        if (releaseDurableTree(tree, homeId, false))
           state.durableSlot->lastUseNs.store(nowNs());
       }
     }
+    releaseClosedAdmissionTrees(state);
     if (reclaimed) {
       // Actor teardown outside the isolate lock defers JSG handle destruction.
       // Take the Worker lock to drop those roots before collecting their memory.
@@ -6509,6 +6538,10 @@ struct DurableTreeContext {
     return *index;
   }
 };
+
+bool hasDurableWalRegistrations(const DurableTreeContext& tree) {
+  return !tree.shippers.empty();
+}
 
 void beginDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation) {
   KJ_ASSERT(tree.socketUpgradeInvocations.emplace(invocation.begin(), invocation.end()).second);

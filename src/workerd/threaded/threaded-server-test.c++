@@ -582,6 +582,66 @@ KJ_TEST("ordinary retirement avoids a running home and looks elsewhere after it 
   oldHome.load.end(deadline);
 }
 
+KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registration returns") {
+  using Status = ObjectAdmissionFixture::Status;
+  ObjectAdmissionFixture test(0);
+  const auto firstRoute = test.route("existing", "matching");
+  const auto first = test.start(firstRoute);
+  const auto other = test.start(test.route("second", "matching"));
+  test.finish(first, test.now - std::chrono::seconds(1));
+  test.finish(other, test.now);
+  auto& server = test.server;
+  auto& table = *server.durableAdmission;
+  for (auto& thread: server.threads) thread->home->walFull = true;
+
+  const auto incoming = test.route("incoming", "matching");
+  KJ_EXPECT(test.queue(incoming).status == Status::RETIRING);
+  KJ_REQUIRE(server.objectVictim.has_value());
+  const auto picked = *server.objectVictim;
+  KJ_REQUIRE(picked.tree == first.tree);
+
+  ThreadState state;
+  state.durableHome = picked.home;
+  state.durableSlot = std::make_shared<Slot>();
+  auto closing = std::make_shared<DurableTreeContext>(DurableTreeContext{
+    .state = state,
+    .server = server,
+    .tree = picked.tree,
+  });
+  // Model a root and a facet retaining their shipper registrations after
+  // admission has fenced the tree. The map values are never dereferenced.
+  closing->shippers.emplace(0, nullptr);
+  closing->shippers.emplace(1, nullptr);
+  {
+    std::lock_guard lock(server.durableRoutingMutex);
+    KJ_REQUIRE(server.stopObjectAdmissionVictim(picked, test.now));
+  }
+  server.waitForAdmissionWal(state, picked.tree, closing);
+  server.releaseClosedAdmissionTrees(state);
+  KJ_EXPECT(table.homeFor(picked.tree) == picked.home);
+  KJ_EXPECT(server.durableAdmissionRetirements.load() == 0);
+
+  // The real Home publishes walFull as soon as a slot comes back. Routing
+  // credit waits for the entire tree, while unrelated existing roots can run.
+  closing->shippers.erase(0);
+  server.threads[picked.home - 1]->home->walFull = false;
+  server.releaseClosedAdmissionTrees(state);
+  server.expireDurableAdmissions(picked.deadline);
+  KJ_EXPECT(table.homeFor(picked.tree) == picked.home);
+  KJ_EXPECT(server.queueDurable(incoming, 0, test.lease, picked.deadline).status == Status::RETIRING);
+  KJ_REQUIRE(server.objectVictim.has_value());
+  KJ_EXPECT(server.objectVictim->tree == picked.tree);
+
+  closing->shippers.erase(1);
+  server.releaseClosedAdmissionTrees(state);
+  KJ_EXPECT(!table.homeFor(picked.tree));
+  KJ_EXPECT(server.durableAdmissionRetirements.load() == 1);
+  const auto retry = server.queueDurable(incoming, 0, test.lease, picked.deadline).ticket;
+  KJ_REQUIRE(retry.has_value());
+  KJ_EXPECT(table.homeFor(retry->tree) == picked.home);
+  KJ_EXPECT(table.homeFor(other.tree) == picked.home);
+}
+
 // Exercise the server's routing and accounting without starting homes or creating actors.
 struct DatabaseAdmissionFixture {
   using Admission = server::DurableAdmission;
