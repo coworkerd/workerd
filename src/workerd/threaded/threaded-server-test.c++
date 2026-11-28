@@ -935,8 +935,7 @@ KJ_TEST("an ordinary ceiling has no idle cost, and live calls share the Worker b
   constexpr auto descriptors = threaded::ORDINARY_FDS_PER_CALL;
   auto makeServer = [](uint ceiling) {
     return std::make_unique<ThreadedServer>(ceiling, "", "", -1,
-        kj::Own<const kj::Directory>(), kj::Own<server::ThreadedWalLog>(),
-        &initializeV8(), kj::systemPreciseMonotonicClock(), 128 * descriptors);
+        kj::Own<const kj::Directory>(), kj::Own<server::ThreadedWalLog>(), &initializeV8());
   };
   auto low = makeServer(1);
   auto high = makeServer(threaded::ORDINARY_MAX_IN_FLIGHT);
@@ -1008,8 +1007,8 @@ void waitForOrdinaryCallRelease(ThreadedServer& server) {
 
 KJ_TEST("ordinary admission only acknowledges a call with a live native loop and returns its charge") {
   using Lane = threaded::OrdinaryLane;
-  ThreadedServer server{1, "", "", -1, {}, {}, &initializeV8(),
-    kj::systemPreciseMonotonicClock(), 128};
+  ThreadedServer server{1, "", "", -1, {}, {}, &initializeV8()};
+  server.ordinaryDescriptorBudget = 128;
   server.ready.store(true);
   const auto idle = server.ordinaryAdmissionSample().memory;
 
@@ -1042,8 +1041,8 @@ KJ_TEST("ordinary admission only acknowledges a call with a live native loop and
 
 KJ_TEST("ordinary native loop descriptor exhaustion is a refusal before acknowledgement") {
   using Lane = threaded::OrdinaryLane;
-  ThreadedServer server{8, "", "", -1, {}, {}, &initializeV8(),
-    kj::systemPreciseMonotonicClock(), 256};
+  ThreadedServer server{8, "", "", -1, {}, {}, &initializeV8()};
+  server.ordinaryDescriptorBudget = 256;
   server.ready.store(true);
   auto call = ordinaryTestSocket();
   const auto idle = server.ordinaryAdmissionSample().memory;

@@ -2786,7 +2786,7 @@ struct ThreadedServer {
   std::map<std::string, std::shared_ptr<Slot>> registry;
   std::vector<std::shared_ptr<Slot>> retiredSlots;
   const uint limit;
-  const uint64_t ordinaryDescriptorBudget;
+  uint64_t ordinaryDescriptorBudget = 0;  // Set before ready is published.
   std::atomic<uint64_t> refusedOrdinaryMemory{0}, refusedOrdinaryDescriptors{0},
       refusedOrdinaryThreads{0}, refusedOrdinaryCeiling{0};
   std::shared_ptr<ResourceBudget> resources;
@@ -2843,8 +2843,7 @@ struct ThreadedServer {
       kj::Own<const kj::Directory> durableDirectory = {},
       kj::Own<server::ThreadedWalLog> durableLog = {},
       jsg::V8System* existingV8 = nullptr,
-      const kj::MonotonicClock& isolateBusyClock = kj::systemPreciseMonotonicClock(),
-      uint64_t ordinaryDescriptorBudget = 0)
+      const kj::MonotonicClock& isolateBusyClock = kj::systemPreciseMonotonicClock())
       : engine(existingV8 == nullptr ? std::make_unique<Engine>() : nullptr),
         v8(existingV8 == nullptr ? engine->v8 : *existingV8),
         isolateBusyClock(isolateBusyClock),
@@ -2872,7 +2871,6 @@ struct ThreadedServer {
             this->durableStorage && !this->durableLog
                 ? configuredCount("COWORKERD_DO_TEST_COMMIT_DELAY_MS", 0) : 0),
         limit(limit),
-        ordinaryDescriptorBudget(ordinaryDescriptorBudget),
         resources(std::make_shared<ResourceBudget>(
             configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) -
                 (this->durableStorage
@@ -2926,7 +2924,8 @@ struct ThreadedServer {
     }
   }
 
-  void start() {
+  void start(uint64_t descriptorLimit) {
+    if (!durableStorage) ordinaryDescriptorBudget = descriptorLimit - threaded::ORDINARY_FD_HEADROOM;
     managerWake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     KJ_REQUIRE(managerWake >= 0);
     registerRoleFatalHandler(durableAdmission.has_value(), &v8::V8::SetFatalErrorHandler);
@@ -8186,7 +8185,6 @@ int main(int argc, char **argv) {
   }
   const auto descriptorLimit = prepareDescriptors(disposable || persistent ? limit : 0);
   if (!descriptorLimit) return 78;
-  const auto ordinaryDescriptorBudget = *descriptorLimit - threaded::ORDINARY_FD_HEADROOM;
   auto event = limitEventFd();
   if (event >= 0) {
     auto flags = fcntl(event, F_GETFL);
@@ -8243,9 +8241,8 @@ int main(int argc, char **argv) {
     } else if (disposable) {
       directory = newDurableTestDirectory(listener);
     }
-    server = new ThreadedServer(limit, argv[2], argv[3], parent, kj::mv(directory), kj::mv(wal),
-        nullptr, kj::systemPreciseMonotonicClock(), ordinaryDescriptorBudget);
-    server->start();
+    server = new ThreadedServer(limit, argv[2], argv[3], parent, kj::mv(directory), kj::mv(wal));
+    server->start(*descriptorLimit);
   } catch (...) {
     fprintf(stderr,
         "[threaded-start] "
