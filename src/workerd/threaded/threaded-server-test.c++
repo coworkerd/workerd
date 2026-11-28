@@ -3060,6 +3060,139 @@ KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing th
   KJ_EXPECT(events.asPtr() == expected.asPtr());
 }
 
+KJ_TEST("normal retirement collects actor handles after live and queued work drains") {
+  ThreadedServer server{
+    1, "", "retirement:1", -1, kj::newInMemoryDirectory(kj::nullClock()), {}, &initializeV8()};
+  kj::AutoCloseFd managerWake(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+  server.managerWake = managerWake.get();
+  auto home = std::make_unique<ThreadedServer::Thread>(false, false);
+  kj::AutoCloseFd homeWake(home->wake);
+  home->homeId = 1;
+  home->home.emplace();
+  home->home->warmDefinition = "definition";
+  server.threads.push_back(std::move(home));
+  server.ready.store(true);
+
+  ThreadState state;
+  state.durableHome = 1;
+  state.durableSlot = std::make_shared<Slot>();
+  auto& slot = *state.durableSlot;
+  slot.planRevision = "definition";
+  constexpr auto source = R"(
+    import { DurableObject } from 'cloudflare:workers';
+    export class Store extends DurableObject {}
+    export default { fetch() { return new Response('ok'); } };
+  )"_kj;
+  JsonDoc descriptor(kj::str(R"({"workerId":"test/retirement","versionId":"v1",
+      "mainModule":"index.js","compatibilityDate":"2026-11-01","memoryLimitMiB":128,"contentHash":")",
+      digest(source.asBytes()).c_str(), "\"}"));
+  slot.worker = server.compile(slot, descriptor.get(), source);
+  auto& worker = *KJ_ASSERT_NONNULL(slot.worker);
+  const auto takeLock = Worker::Lock::TakeSynchronously(kj::none);
+
+  struct Marker {
+    v8::Global<v8::Object> weak;
+    bool collected = false;
+  } retired, neighbor;
+  const auto now = durableIdleNow();
+  const auto oldUse = now - server::DurableAdmission::IDLE_DELAY;
+  auto open = [&](kj::StringPtr name, Marker& marker, bool keepEventActive) {
+    DurableRoute route{{"tenant", name.cStr()}, {1, 1, 1, 1, "definition", "Store"}, {}, {}, {}};
+    auto& admission = *server.durableAdmission;
+    auto ticket = server.queueDurable(route, 0, now + std::chrono::seconds(5), now).ticket;
+    KJ_REQUIRE(ticket.has_value());
+    KJ_REQUIRE(admission.begin(*ticket, 1, route.key, route.open, now) ==
+        server::DurableAdmission::Delivery::ACCEPTED);
+    auto storageId = digest(name.asBytes());
+    auto tree = std::make_shared<DurableTreeContext>(DurableTreeContext{
+      .state = state,
+      .server = server,
+      .slot = state.durableSlot,
+      .tree = ticket->tree,
+      .uniqueKey = kj::str("coworkerd-do-root-v1-", storageId.c_str()),
+      .storageId = kj::str(storageId.c_str()),
+      .objectName = kj::str(name),
+      .idle = std::make_shared<server::DurableIdleLifecycle>(oldUse, std::chrono::seconds(70)),
+    });
+    if (!keepEventActive) {
+      auto database = server.durableStorage->open(tree->uniqueKey, tree->storageId);
+      database->run("CREATE TABLE saved (value INTEGER)");
+      database->run("INSERT INTO saved VALUES (29)");
+    }
+    auto actor = makeDurableActor(tree, worker, kj::str(name), "Store"_kj, Frankenvalue(), 0, 0);
+    // This handle follows the actor's lifetime and is deferred when it dies outside the lock.
+    auto owned = worker.runInLockScope(takeLock, [&](Worker::Lock& lock) {
+      auto* isolate = lock.getIsolate();
+      v8::HandleScope handles(isolate);
+      v8::Context::Scope context(lock.getContext());
+      auto object = v8::Object::New(isolate);
+      marker.weak.Reset(isolate, object);
+      marker.weak.SetWeak(&marker, [](const v8::WeakCallbackInfo<Marker>& info) {
+        auto& marker = *info.GetParameter();
+        marker.weak.Reset();
+        marker.collected = true;
+      }, v8::WeakCallbackType::kParameter);
+      return static_cast<jsg::Lock&>(lock).v8Ref(object);
+    });
+    state.durableRoots.emplace(tree->tree,
+        ThreadState::DurableRoot{
+          .actor = kj::mv(actor.value).attachToThisReference(kj::mv(owned)),
+          .tree = tree,
+          .hooks = actor.hooks,
+          .idle = tree->idle,
+          .facetsBusy = [](bool) { return false; },
+          .facetHasOrdinaryWebSocket = [] { return false; },
+          .stopFacets = [](const kj::Exception*) {},
+        });
+    server.publishDurableRoot(1, tree->tree);
+    if (!keepEventActive) {
+      KJ_REQUIRE(admission.complete(*ticket, 1));
+    }
+    return std::pair{tree, *ticket};
+  };
+  auto oldTree = open("retired"_kj, retired, false).first;
+  auto [liveTree, liveEvent] = open("neighbor"_kj, neighbor, true);
+  server.retireIdleDurableRoots(state, now);
+  KJ_EXPECT(server.durableIdleRetirements.load() == 1);
+  KJ_EXPECT(!state.durableRoots.contains(oldTree->tree));
+  KJ_EXPECT(state.durableRoots.contains(liveTree->tree));
+
+  const auto later = now + std::chrono::seconds(2);
+  server.retireIdleDurableRoots(state, later);
+  KJ_EXPECT(!retired.collected && !server.releaseDurableMemoryRequested.load());
+  KJ_EXPECT(!neighbor.collected && state.durableRoots.contains(liveTree->tree));
+  KJ_EXPECT(server.durableAdmission->hasActiveEvent(liveTree->tree));
+
+  KJ_REQUIRE(server.durableAdmission->complete(liveEvent, 1));
+  DurableRoute newRoute{{"tenant", "queued"}, {1, 1, 1, 1, "definition", "Store"}, {}, {}, {}};
+  auto queued = server.queueDurable(newRoute, 0, now + std::chrono::seconds(5), now).ticket;
+  KJ_REQUIRE(queued.has_value());
+  server.retireIdleDurableRoots(state, later);
+  KJ_EXPECT(state.durableRoots.empty());
+  KJ_EXPECT(!retired.collected && !neighbor.collected);
+  KJ_EXPECT(!server.releaseDurableMemoryRequested.load());
+
+  server.finishDurable(*queued);
+  server.retireIdleDurableRoots(state, later);
+  KJ_EXPECT(retired.collected && neighbor.collected);
+  KJ_EXPECT(server.releaseDurableMemoryRequested.load());
+  auto reopened = server.durableStorage->open(oldTree->uniqueKey, oldTree->storageId);
+  KJ_EXPECT(reopened->run("SELECT value FROM saved").getInt(0) == 29);
+
+  // Keep the copy observable after the home drops it. The drop needs no collection first.
+  auto retainedCopy = state.durableSlot;
+  Marker dropped;
+  open("dropped"_kj, dropped, false);
+  auto& pressure = server.threads.front()->home->pressure;
+  using Action = server::DurablePressure::Action;
+  KJ_REQUIRE(pressure.sample(true, true, false) == Action::CLOSE_PLACEMENT);
+  KJ_REQUIRE(pressure.sample(true, true, false) == Action::RESET);
+  server.releaseDurableMemoryRequested.store(false);
+  server.retireIdleDurableRoots(state, later);
+  KJ_EXPECT(state.durableSlot == nullptr && retainedCopy->worker != kj::none);
+  KJ_EXPECT(!dropped.collected && server.releaseDurableMemoryRequested.load());
+}
+
 KJ_TEST("a reclaim requested during maintenance never waits for that pass") {
   initializeV8();
   auto budget = std::make_shared<ResourceBudget>(2ull << 30, 4, 1);

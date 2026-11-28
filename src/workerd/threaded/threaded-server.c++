@@ -41,6 +41,7 @@
 #include <workerd/util/sqlite-metering.h>
 #include <workerd/util/stream-utils.h>
 
+#include <absl/time/time.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -58,6 +59,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <tcmalloc/malloc_extension.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -2054,6 +2056,7 @@ struct ThreadState {
   };
   std::map<Worker::Actor *, uint64_t> durableActorTrees;
   std::map<uint64_t, DurableRoot> durableRoots;
+  bool retiredActors = false;
   // A retired actor can still have a reference held by a settling facet or task.
   struct AdmissionWalClose {
     std::shared_ptr<DurableTreeContext> context;
@@ -2840,6 +2843,7 @@ struct ThreadedServer {
   const int parent;
   std::mutex budgetReleaseMutex;
   std::deque<uint64_t> budgetReleases;
+  std::atomic<bool> releaseDurableMemoryRequested{false};
   std::atomic<bool> ready{false};
   std::atomic<uint32_t> liveThreads{0};
   std::atomic<uint64_t> growthFailures{0};
@@ -3172,10 +3176,39 @@ struct ThreadedServer {
     budgetReleases.push_back(ticket);
     if (needsWake) wake(managerWake);
   }
-  // The durable pool manager already sets up the homes. After readiness it can drain the
-  // per-process mailbox without blocking a home or keeping a per-invocation connection open.
-  void serveBudgetReleases() {
+  void requestDurableMemoryRelease() {
+    if (!releaseDurableMemoryRequested.exchange(true)) wake(managerWake);
+  }
+
+  void releaseIdleDurablePages() {
+    {
+      std::lock_guard lock(durableRoutingMutex);
+      if (durableAdmission->state().trees != 0) return;
+      if (!releaseDurableMemoryRequested.exchange(false)) return;
+    }
+    using Allocator = tcmalloc::MallocExtension;
+    const auto free = Allocator::GetNumericProperty("tcmalloc.pageheap_free_bytes").value_or(0);
+    if (free == 0) return;
+
+    // Honor TCMalloc's demand history during normal operation. The idle trim can return free
+    // portions of huge pages even when the allocation peak was recent.
+    const auto shortInterval = Allocator::GetSkipSubreleaseShortInterval();
+    const auto longInterval = Allocator::GetSkipSubreleaseLongInterval();
+    KJ_DEFER({
+      Allocator::SetSkipSubreleaseShortInterval(shortInterval);
+      Allocator::SetSkipSubreleaseLongInterval(longInterval);
+    });
+    Allocator::SetSkipSubreleaseShortInterval(absl::ZeroDuration());
+    Allocator::SetSkipSubreleaseLongInterval(absl::ZeroDuration());
+    Allocator::ReleaseMemoryToSystem(free);
+  }
+
+  // The durable pool manager drains the budget mailbox and returns free allocator pages.
+  // Neither operation holds a home, isolate, or routing lock.
+  void manageDurable() {
     if (parent < 0) return;
+    constexpr uint64_t MIN_RELEASE_INTERVAL_NS = 1000000000;
+    auto nextRelease = nowNs();
     size_t offset = 0;
     for (;;) {
       bool pending;
@@ -3201,6 +3234,10 @@ struct ThreadedServer {
         }
         pending = !budgetReleases.empty();
       }
+      if (nowNs() >= nextRelease && releaseDurableMemoryRequested.load()) {
+        releaseIdleDurablePages();
+        nextRelease = nowNs() + MIN_RELEASE_INTERVAL_NS;
+      }
       // Keep a partially sent ticket at the front until the parent receives it.
       if (retry) {
         (void)poll(nullptr, 0, 10);
@@ -3208,8 +3245,9 @@ struct ThreadedServer {
       }
       pollfd waits[] = {{managerWake, POLLIN, 0}, {parent, short(pending ? POLLOUT : 0), 0}};
       int result;
+      const int timeout = releaseDurableMemoryRequested.load() ? 1000 : -1;
       do {
-        result = poll(waits, 2, -1);
+        result = poll(waits, 2, timeout);
       } while (result < 0 && errno == EINTR);
       if (result >= 0 && (waits[1].revents & POLLHUP)) return;
       if (result < 0 || (waits[1].revents & (POLLERR | POLLNVAL))) (void)poll(nullptr, 0, 10);
@@ -3752,7 +3790,8 @@ struct ThreadedServer {
     }
   }
 
-  void retireIdleDurableRoots(ThreadState &state) {
+  void retireIdleDurableRoots(
+      ThreadState &state, server::DurableIdleLifecycle::Time now = durableIdleNow()) {
     const auto homeId = state.durableHome;
     const auto [victim, selectedObject] = [&] {
       std::lock_guard lock(durableRoutingMutex);
@@ -3779,7 +3818,6 @@ struct ThreadedServer {
       }
     });
     if (!state.durableSlot) return;
-    const auto now = durableIdleNow();
     auto &memory = *state.durableSlot->limits->memory;
     const auto accounted = [&] { return memory.heap.load() + memory.external.load(); };
     const auto placementLimit = kj::min(durablePlacement.placementBytes, memory.maximum * 3 / 4);
@@ -3911,6 +3949,9 @@ struct ThreadedServer {
         }
       }
       if (current->second.resetting && memory.durableProcessPressure.load()) reclaimed = true;
+      if (!explicitClose || root.idleClosing || admissionClosing) {
+        state.retiredActors = true;
+      }
       current->second.stopFacets(nullptr);
       actor.shutdown(0);
       state.durableRoots.erase(current);
@@ -3923,30 +3964,30 @@ struct ThreadedServer {
       }
     }
     releaseClosedAdmissionTrees(state);
-    if (reclaimed) {
-      // Actor teardown outside the isolate lock defers JSG handle destruction.
-      // Take the Worker lock to drop those roots before collecting their memory.
-      auto &worker = *KJ_REQUIRE_NONNULL(state.durableSlot->worker);
-      worker.runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock &lock) {
-        lock.getIsolate()->LowMemoryNotification();
-        memory.observe(true);
-      });
-    }
     const bool databaseCanRetire = database && state.durableRoots.size() == 1 &&
         canRetireAtAdmission(state.durableRoots.begin()->second);
-    server::DurablePressure::Action pressureAction;
+    using Action = server::DurablePressure::Action;
+    const auto samplePressure = [&](auto &home, bool onlyIfRelieved) {
+      home.heapBytes = memory.heap.load();
+      home.memory = home.heapBytes + memory.external.load();
+      const bool rejectedGrowth =
+          memory.cause->load() == LimitCause::MEMORY || memory.durableProcessPressure.load();
+      const bool abovePlacement = home.memory >= placementLimit || rejectedGrowth;
+      if (onlyIfRelieved && abovePlacement) return Action::WAIT;
+      return home.pressure.sample(abovePlacement,
+          home.memory >= memory.maximum - memory.maximum / 10 || rejectedGrowth, reclaimed);
+    };
+    Action pressureAction = Action::WAIT;
     bool releaseCopy;
+    bool drained;
     {
       std::lock_guard lock(durableRoutingMutex);
       auto &home = *threads[homeId - 1]->home;
       home.databaseCanRetire = databaseCanRetire;
       home.idleObjects = std::move(idleObjects);
-      home.heapBytes = memory.heap.load();
-      home.memory = home.heapBytes + memory.external.load();
-      const bool rejectedGrowth =
-          memory.cause->load() == LimitCause::MEMORY || memory.durableProcessPressure.load();
-      pressureAction = home.pressure.sample(home.memory >= placementLimit || rejectedGrowth,
-          home.memory >= memory.maximum - memory.maximum / 10 || rejectedGrowth, reclaimed);
+      // A pressure reclamation can reopen placement or request another eviction. It cannot
+      // start a reset, so a retained copy can be sampled after its collection.
+      if (!reclaimed) pressureAction = samplePressure(home, false);
       const auto idleMs = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000);
       const auto lastUse = state.durableSlot->lastUseNs.load();
       // An empty database copy still charges the process budget. Release it when its
@@ -3954,6 +3995,24 @@ struct ThreadedServer {
       releaseCopy = shouldReleaseDurableCopy(home.reservedTrees, !state.durableRoots.empty(),
           state.durableSlot->planRevision,
           home.pressure.resetting() || (idleMs && nowNs() - lastUse >= idleMs * 1000000));
+      // Reserved trees include starts still queued or preparing. The home owns the event loop,
+      // so no new JavaScript can enter before this maintenance turn ends.
+      drained = state.retiredActors && state.durableRoots.empty() &&
+          state.durableActorTrees.empty() && state.admissionWalClosing.empty() &&
+          home.reservedTrees == 0;
+    }
+    if (!releaseCopy && (reclaimed || drained)) {
+      // Actor teardown outside the isolate lock defers JSG handle destruction.
+      // Take the Worker lock to drop those roots before collecting their memory.
+      auto &worker = *KJ_REQUIRE_NONNULL(state.durableSlot->worker);
+      worker.runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock &lock) {
+        lock.getIsolate()->LowMemoryNotification();
+        memory.observe(true);
+      });
+      std::lock_guard lock(durableRoutingMutex);
+      // Idle collection can reopen placement after relieving pressure. A still-pressured copy
+      // keeps the decision already made for this turn.
+      pressureAction = samplePressure(*threads[homeId - 1]->home, !reclaimed);
     }
     if (pressureAction == server::DurablePressure::Action::RESET) {
       for (auto &[tree, root]: state.durableRoots) {
@@ -3982,10 +4041,14 @@ struct ThreadedServer {
       home.warmDefinition.clear();
       home.databaseReservation.reset();
       if (home.reservedTrees == 0) home.definition.clear();
-      if (home.pressure.resetting()) {
-        home.pressure.closed();
-        durableIsolateResets.fetch_add(1);
-      }
+      if (home.pressure.resetting()) durableIsolateResets.fetch_add(1);
+      home.pressure.closed();
+    }
+    if (drained || releaseCopy) {
+      state.retiredActors = false;
+      // Return the freed allocations in this thread's cache before returning process pages.
+      tcmalloc::MallocExtension::MarkThreadIdle();
+      requestDurableMemoryRelease();
     }
   }
 
@@ -4099,7 +4162,7 @@ struct ThreadedServer {
     for (auto &item: threads)
       while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
     ready.store(true, std::memory_order_release);
-    if (durableAdmission) return serveBudgetReleases();
+    if (durableAdmission) return manageDurable();
     int held = -1;
     auto nextMaintenance = nowNs();
     auto idleMs = configuredCount("COWORKERD_THREADED_THREAD_IDLE_MS", 60000);
