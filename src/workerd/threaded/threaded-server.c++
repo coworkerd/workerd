@@ -244,7 +244,7 @@ constexpr uint64_t MAX_SINGLE_HEAP_OBJECT =
 static_assert(MAX_SINGLE_HEAP_OBJECT < (2ull << 30));
 // The tenant limit counts live bytes, but V8's ceiling counts pages, and pages
 // are not filled exactly: regular objects never span a 256 KiB page, so large
-// ones waste up to half of it (cwkd-p40: 126 MiB live in 88 KB double arrays
+// ones waste up to half of it (126 MiB live in 88 KB double arrays
 // took 1212.0 MB of pages with the maximum string, 1150.1 MB live). Pages stay
 // under twice the limit, so the ceiling keeps the limit itself plus 32 MiB for
 // the other spaces on top of one maximum object: finishing that object never
@@ -346,7 +346,7 @@ struct ResourceBudget {
   const uint64_t memoryMaximum, admissionMaximum, addressMaximum, baselineMemory;
   // The node's per-process limit, and the one in force: the first time the address space has no
   // room for another isolate's V8 sandbox, the limit is lowered to the residents it does hold
-  // (lowerResidentMaximum(), r50 §6.5 B3), so that the next Worker evicts an idle one instead of
+  // (lowerResidentMaximum()), so that the next Worker evicts an idle one instead of
   // being refused again.
   const uint32_t configuredResidentMaximum;
   std::atomic<uint32_t> residentMaximum;
@@ -703,7 +703,7 @@ kj::Exception capacityError(CapacityScope scope = CapacityScope::PROCESS) {
 // the Worker again instead of receiving this failure: one before the source was fetched, a caller
 // failure (DISCONNECTED), memory pressure at startup (which becomes capacityError()), and any
 // capacity refusal -- in particular no room for another isolate's V8 sandbox. Kept, a refused
-// group answered 503 for this Worker in this process until its slot idled out (r50 §6.5 B1).
+// group answered 503 for this Worker in this process until its slot idled out.
 // A tenant's own failure (its script throws, a binding is invalid) stays the Worker's failure.
 bool loadFailureRetryable(kj::Maybe<kj::Exception> &error, bool fetched, bool memoryPressure) {
   if (memoryPressure) error = capacityError();
@@ -961,7 +961,7 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
   // With a V8 sandbox per isolate group, no single buffer and no resizable buffer's reservation
   // beyond the group's pool (V8's default is 32 GiB, more than the buffer half of an 8 GiB
   // sandbox). Not the Worker's limit: a buffer above it reaches reserve(), which marks MEMORY and
-  // ends the execution (r50 §6.5 B2).
+  // ends the execution.
   size_t MaxAllocationSize() const override {
     return server::sandboxMaxAllocationSize(inner->MaxAllocationSize());
   }
@@ -1086,8 +1086,8 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     // V8 takes the first object of the young large-object space without a
     // collection, so no tenant check sees it until the next one, and the next
     // large allocation can then meet the fixed ceiling with that object live
-    // (cwkd-p40: a 500 MB string, then a maximum string, ended the process,
-    // raw/s27-x500). Near the ceiling the isolate is over its limit: it is
+    // (a 500 MB string followed by a maximum-size string caused a fatal OOM).
+    // Near the ceiling, the isolate has exceeded its limit and is
     // terminated as such, and its ceiling is raised by one maximum object so
     // that the allocation in progress finishes; its call ends with
     // MEMORY_LIMIT_EXCEEDED and the isolate is retired, as any isolate over
@@ -1107,8 +1107,8 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     }, this);
   }
   // The new ceiling. The heap can already be past the old one: young large
-  // objects are promoted without a limit check (cwkd-p40, v138: a structured
-  // clone of three maximum strings had 2.0 GiB live at a 1313 MiB ceiling, so
+  // objects are promoted without a limit check (a structured clone of three
+  // maximum strings had 2.0 GiB live at a 1313 MiB ceiling, so
   // raising the ceiling itself by one maximum object left no room for the
   // third and V8's OOM ended the process). So the room is counted from what is
   // in use. The first raise is one maximum object, whatever else is in use. A
@@ -1126,7 +1126,7 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
     const uint64_t used = stats.total_heap_size();
     // With a V8 sandbox per isolate group the isolate's heap has a pointer cage of its own, which
     // bounds every raise whatever the process budget has left (with one shared cage its remainder
-    // over all isolates does, below: v138 §8.1's interface with r50's S3a).
+    // over all isolates does, below).
     const uint64_t wanted = ownCageCeiling(kj::max(uint64_t(current), used) + MAX_SINGLE_HEAP_OBJECT);
     const bool first = ceilingRaised.load() == 0;
     if (!first && !reservation) return current;
@@ -1785,9 +1785,9 @@ struct RequestLimits final: LimitEnforcer {
   kj::Promise<void> limitDrain() override {
     // This invocation keeps its CPU and heap limits while draining. A live
     // request may end the drain sooner than the per-invocation ceiling. That
-    // ceiling starts once the response body finishes or the client disconnects
-    // (v138 section 4). KJ's timer does not advance while JavaScript runs, so
-    // take the deadline from the monotonic clock (or the timer if it is ahead).
+    // ceiling starts once the response body finishes or the client disconnects.
+    // KJ's timer does not advance while JavaScript runs, so take the deadline
+    // from the monotonic clock (or the timer if it is ahead).
     if (drainLimitDisabledForTest()) return kj::NEVER_DONE;
     auto deadline = [this]() {
       return timer.timer.atTime(kj::max(kj::systemPreciseMonotonicClock().now(), timer.timer.now()) + WAIT_UNTIL_LIMIT);
@@ -2661,7 +2661,7 @@ struct SubrequestBudget {
 // One console line for the node's log post: at most LOG_MESSAGE_BYTES of the
 // message, and when it was longer its size, so that the node marks the line
 // truncated and counts it as it does for any line past its own limit (a cut
-// here without the size reached the node as an ordinary line, v138).
+// here without the size reached the node as an ordinary line).
 constexpr size_t LOG_MESSAGE_BYTES = 4096;
 kj::String consoleLogRow(kj::StringPtr level, kj::StringPtr message) {
   capnp::MallocMessageBuilder arena;
@@ -8033,8 +8033,8 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
           if (!connection.input.starts_with("GET /__coworkerd/probe ") &&
               !connection.input.starts_with("GET /__coworkerd/threaded ")) {
             status = "501 Not Implemented";
-            body = "{\"code\":\"NOT_SUPPORTED\",\"message\":\"threaded "
-                   "lifecycle controls require S1c\"}";
+            body = "{\"code\":\"NOT_SUPPORTED\",\"message\":\"the threaded server "
+                   "does not implement this control request\"}";
           }
           connection.output = "HTTP/1.1 " + std::string(status) +
               "\r\nX-Coworkerd-Threaded-Protocol: 3" +
