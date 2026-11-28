@@ -671,6 +671,25 @@ struct DatabaseAdmissionFixture {
   }
 };
 
+KJ_TEST("durable placement skips a full WAL Home for fresh trees and keeps existing routes") {
+  DatabaseAdmissionFixture test;
+  auto& table = *test.server.durableAdmission;
+  for (auto& thread: test.server.threads) thread->home->walFull = true;
+
+  auto existing = test.queue(test.victim, test.now).ticket;
+  KJ_REQUIRE(existing.has_value());
+  KJ_EXPECT(table.homeFor(existing->tree) == 1u);
+
+  auto refused = test.queue(test.neighbor, test.now);
+  KJ_EXPECT(refused.status == DatabaseAdmissionFixture::Admission::Status::OVERLOADED);
+  KJ_EXPECT(!refused.ticket.has_value());
+
+  test.server.threads[1]->home->walFull = false;
+  auto replacement = test.queue(test.neighbor, test.now).ticket;
+  KJ_REQUIRE(replacement.has_value());
+  KJ_EXPECT(table.homeFor(replacement->tree) == 2u);
+}
+
 KJ_TEST("accept expiry releases every waiter and limits replacement to the actual pre-release total") {
   DatabaseAdmissionFixture test;
   auto& server = test.server;

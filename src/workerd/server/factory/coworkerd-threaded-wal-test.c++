@@ -92,6 +92,12 @@ struct WirePair {
     reply(response.finish(openId));
   }
 
+  void checkpoint(uint64_t openId) {
+    Writer response;
+    response.u8(MSG_CHECKPOINT_ASKED);
+    reply(response.finish(openId));
+  }
+
   void expectGiveUp(uint64_t openId, uint64_t request, kj::StringPtr key) {
     auto body = receive(MSG_GAVE_UP, openId);
     Writer expected;
@@ -118,6 +124,10 @@ KJ_TEST("threaded WAL routes interleaved home writes and ignores an old open and
   auto first = std::make_shared<Inbox>();
   auto second = std::make_shared<Inbox>();
   auto post = [&](uint8_t type, uint64_t openId, const std::shared_ptr<Inbox>& inbox) {
+    if (type == MSG_OPEN) {
+      KJ_REQUIRE(inbox->tryRegister(openId));
+    }
+    if (type == MSG_CLOSED) inbox->unregister(openId);
     Writer frame;
     frame.u8(type);
     KJ_REQUIRE(shared.post({.bytes = frame.finish(openId), .openId = openId, .inbox = inbox}, true));
@@ -136,12 +146,6 @@ KJ_TEST("threaded WAL routes interleaved home writes and ignores an old open and
         getLe64(observed.begin() + 9) == request);
     return kj::mv(paf.promise);
   };
-  auto checkpoint = [&](uint64_t openId) {
-    Writer reply;
-    reply.u8(MSG_CHECKPOINT_ASKED);
-    link.reply(reply.finish(openId));
-  };
-
   post(MSG_OPEN, 1, first);
   post(MSG_OPEN, 2, second);
   auto held = append(1, 3);
@@ -156,8 +160,8 @@ KJ_TEST("threaded WAL routes interleaved home writes and ignores an old open and
   post(MSG_OPEN, 5, first);
   auto reopened = append(5, 6);
   link.ack(3);
-  checkpoint(1);
-  checkpoint(5);
+  link.checkpoint(1);
+  link.checkpoint(5);
   auto notice = link.wait(first->next());
   KJ_EXPECT(KJ_ASSERT_NONNULL(notice).openId == 5);
   KJ_EXPECT(!reopened.poll(link.io.waitScope));
@@ -553,6 +557,145 @@ kj::Promise<void> sendFrames(
   auto observed = test.link.receive(MSG_FRAMES, root.id());
   KJ_REQUIRE(observed.size() == 17 && getLe64(observed.begin() + 9) == request);
   return answer;
+}
+
+KJ_TEST("a full threaded WAL home inbox leaves another home ready and drains in order") {
+  HomeSession test;
+  auto paused = std::make_shared<Inbox>(1);
+  const auto heldId = ++test.shared->nextId;
+  KJ_REQUIRE(paused->tryRegister(heldId));
+  Writer open;
+  open.u8(MSG_OPEN);
+  KJ_REQUIRE(
+      test.shared->post({.bytes = open.finish(heldId), .openId = heldId, .inbox = paused}, true));
+  test.link.receive(MSG_OPEN, heldId);
+
+  auto closed = kj::newPromiseAndFulfiller<uint64_t>();
+  auto ready = test.attachHome([&](uint64_t id, CloseReason reason) {
+    KJ_EXPECT(reason == CloseReason::DRAIN);
+    closed.fulfiller->fulfill(kj::mv(id));
+  });
+  TestRoot other(test, *ready, "namespace/ready/epoch"_kj);
+  acceptOpen(test, *ready, other);
+
+  auto tellSeal = [&](uint32_t salt, uint32_t frame) {
+    Writer seal;
+    seal.u8(MSG_SEALED);
+    seal.u32(salt);
+    seal.u32(0);
+    seal.u32(frame);
+    test.link.reply(seal.finish(heldId));
+  };
+  auto tellBreak = [&](kj::StringPtr reason) {
+    Writer broken;
+    broken.u8(MSG_BREAK);
+    broken.str(reason);
+    test.link.reply(broken.finish(heldId));
+  };
+  test.link.opened(heldId, ACK_QUOTA);
+  tellSeal(1, 12);
+  test.link.checkpoint(heldId);
+  const std::string heldReason(1024, 'x');
+  tellBreak(heldReason.c_str());
+  test.link.requestClose(heldId, MSG_CLOSE_ASKED);
+  tellSeal(2, 20);
+  test.link.requestClose(heldId, MSG_CLOSE_FOR_CODE_UPDATE);
+
+  // Every kind now has a pending slot. Repeated advisory traffic still fits,
+  // and a fresh open cannot claim another slot on the paused home.
+  tellSeal(2, 18);
+  tellBreak("a second report"_kj);
+  for (auto i KJ_UNUSED: kj::zeroTo(16)) {
+    test.link.checkpoint(heldId);
+  }
+  const auto freshId = ++test.shared->nextId;
+  KJ_EXPECT(!paused->tryRegister(freshId));
+
+  KJ_REQUIRE(other.db.run("PRAGMA journal_mode = WAL").getText(0) == "wal"_kj);
+  other.db.run("CREATE TABLE entries (value INTEGER)");
+  other.db.run("INSERT INTO entries VALUES (42)");
+  auto confirmation = other.shipper.onCommit();
+  auto frames = test.link.receive(MSG_FRAMES, other.id());
+  KJ_REQUIRE(frames.size() > 17);
+  KJ_EXPECT(other.shipper.hasPendingWrites());
+  KJ_EXPECT(!confirmation.poll(test.link.io.waitScope));
+  test.link.ack(getLe64(frames.begin() + 9));
+  test.link.wait(kj::mv(confirmation));
+  KJ_EXPECT(!other.shipper.hasPendingWrites());
+  KJ_EXPECT(other.db.run("SELECT value FROM entries").getInt(0) == 42);
+  test.link.requestClose(other.id(), MSG_CLOSE_ASKED);
+  KJ_EXPECT(test.link.wait(kj::mv(closed.promise)) == other.id());
+  KJ_REQUIRE(test.shared->negotiated());
+
+  auto take = [&](uint8_t type) {
+    auto next = test.link.wait(paused->next());
+    auto notice = kj::mv(KJ_ASSERT_NONNULL(next));
+    KJ_EXPECT(notice.type == type, notice.type, type);
+    KJ_EXPECT(notice.openId == heldId);
+    return notice;
+  };
+  KJ_EXPECT(take(MSG_OPENED).status == ACK_QUOTA);
+  take(MSG_CHECKPOINT_ASKED);
+  const auto broken = take(MSG_BREAK);
+  KJ_EXPECT(broken.reason == kj::StringPtr(heldReason.c_str()).first(MAX_BREAK_REASON_BYTES));
+  take(MSG_CLOSE_ASKED);
+  auto seal = take(MSG_SEALED);
+  KJ_EXPECT(seal.salt1 == 2 && seal.upToFrame == 20);
+  take(MSG_CLOSE_FOR_CODE_UPDATE);
+  auto noMore = paused->next();
+  KJ_EXPECT(!noMore.poll(test.link.io.waitScope));
+
+  // Retiring the local shipper discards queued and late notices for its ID.
+  noMore = nullptr;
+  paused->push({.type = MSG_CLOSE_ASKED, .openId = heldId});
+  paused->unregister(heldId);
+  paused->push({.type = MSG_CLOSE_FOR_CODE_UPDATE, .openId = heldId});
+  KJ_EXPECT(paused->tryRegister(freshId));
+  paused->push({.type = MSG_OPENED, .openId = freshId});
+  auto fresh = test.link.wait(paused->next());
+  KJ_EXPECT(KJ_ASSERT_NONNULL(fresh).openId == freshId);
+}
+
+KJ_TEST("threaded WAL Home publishes its registration limit and closes its inbox") {
+  HomeSession test;
+  std::atomic<bool> full{false};
+  auto inbox = std::make_shared<Inbox>(1);
+  auto home = kj::heap<Home>(test.shared, [](uint64_t, CloseReason) {}, test.clock, full, inbox);
+  KJ_EXPECT(!full.load());
+  uint64_t openId;
+  {
+    TestRoot root(test, *home, "namespace/capacity/epoch"_kj);
+    openId = root.id();
+    acceptOpen(test, *home, root);
+    KJ_EXPECT(full.load());
+    auto refusal = kj::runCatchingExceptions(
+        [&] { TestRoot rejected(test, *home, "namespace/refused/epoch"_kj); });
+    const auto& error = KJ_ASSERT_NONNULL(refusal);
+    KJ_EXPECT(error.getType() == kj::Exception::Type::OVERLOADED);
+    KJ_EXPECT(error.getDescription() == HOME_CAPACITY_REFUSAL);
+    KJ_EXPECT(error.getDetail(ThreadedWalLog::HOME_CAPACITY_DETAIL) != kj::none);
+  }
+  test.link.receive(MSG_CLOSED, openId);
+  KJ_EXPECT(!full.load());
+  home = nullptr;
+  KJ_EXPECT(full.load());
+  KJ_EXPECT(test.link.wait(inbox->next()) == kj::none);
+  KJ_EXPECT(test.shared->negotiated());
+}
+
+KJ_TEST("threaded WAL Home returns capacity across more opens than its slot limit") {
+  HomeSession test;
+  auto home = test.attachHome();
+  for (auto i KJ_UNUSED: kj::zeroTo(HOME_OPEN_LIMIT + 1)) {
+    uint64_t openId;
+    {
+      TestRoot root(test, *home, "namespace/retired/epoch"_kj);
+      openId = root.id();
+      acceptOpen(test, *home, root);
+    }
+    test.link.receive(MSG_CLOSED, openId);
+  }
+  KJ_EXPECT(test.shared->negotiated());
 }
 
 KJ_TEST("threaded WAL home gives up a pending write at its deadline after caller cancellation") {

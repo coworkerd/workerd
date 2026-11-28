@@ -2785,6 +2785,7 @@ struct ThreadedServer {
       bool admissionTurnDelayed = false;
       server::DurableHomeLoad load{std::chrono::seconds(4)};
       server::DurablePressure pressure;
+      std::atomic<bool> walFull{false};
       std::vector<DurableIncoming> incoming;
       std::set<uint64_t> resident;
       std::map<uint64_t, server::DurableAdmission::Time> idleObjects;
@@ -3316,6 +3317,7 @@ struct ThreadedServer {
       const auto& thread = *threads[id - 1];
       if (!thread.home || (databaseVictim && databaseVictim->home == id)) continue;
       const auto& home = *thread.home;
+      if (home.walFull.load(std::memory_order_relaxed)) continue;
       if (!database && now < home.databasePreferredUntil) continue;
       // New-root eligibility is checked here, including on the empty-home path.
       // The empty copy owns its old isolate until the home releases it.
@@ -4142,7 +4144,7 @@ struct ThreadedServer {
           }
           break;
         }
-      });
+      }, thread.home->walFull);
     }
     thread.idleSince.store(nowNs());
     thread.descriptor.store(-1, std::memory_order_release);
