@@ -13,14 +13,17 @@ namespace {
 
 using Resources = DurableAdmission::Resources;
 
-bool reserve(Resources& used, Resources limit, Resources amount) {
+const char* reservationRefusal(Resources used, Resources limit, Resources amount) {
   // Compare against the remaining capacity to avoid overflow.
-  if (amount.threads > limit.threads - used.threads ||
-      amount.descriptors > limit.descriptors - used.descriptors ||
-      amount.memory > limit.memory - used.memory ||
-      amount.addressSpace > limit.addressSpace - used.addressSpace) {
-    return false;
-  }
+  if (amount.threads > limit.threads - used.threads) return "threads";
+  if (amount.descriptors > limit.descriptors - used.descriptors) return "descriptors";
+  if (amount.memory > limit.memory - used.memory) return "memory";
+  if (amount.addressSpace > limit.addressSpace - used.addressSpace) return "address-space";
+  return nullptr;
+}
+
+bool reserve(Resources& used, Resources limit, Resources amount) {
+  if (reservationRefusal(used, limit, amount)) return false;
   used.threads += amount.threads;
   used.descriptors += amount.descriptors;
   used.memory += amount.memory;
@@ -67,35 +70,42 @@ DurableAdmission::Result DurableAdmission::queue(
     if (tree->closing) return {tree->idleClosing ? Status::RETIRING : Status::STALE};
   }
 
-  auto refuse = [&](bool newTreeCapacityRefused = false) -> Result {
+  auto refuse = [&](const char* reason, bool newTreeCapacityRefused = false) -> Result {
     if (!(newTreeCapacityRefused && (database || deferNewTreeOverload))) recordOverload();
-    return {.status = Status::OVERLOADED, .newTreeCapacityRefused = newTreeCapacityRefused};
+    return {.status = Status::OVERLOADED, .newTreeCapacityRefused = newTreeCapacityRefused,
+      .refusal = reason};
   };
   if (bytes > limits.mailboxBytes ||
-      (tree != nullptr &&
-          (tree->waiting >= limits.mailboxDepth ||
-              bytes > limits.mailboxBytes - tree->waitingBytes))) {
-    return refuse();
+      (tree != nullptr && bytes > limits.mailboxBytes - tree->waitingBytes)) {
+    return refuse("mailbox-bytes");
   }
+  if (tree != nullptr && tree->waiting >= limits.mailboxDepth) return refuse("mailbox-events");
+
   const bool newTree = tree == nullptr;
   auto reserved = counters.reserved;
-  if (!reserve(reserved, limits.capacity, limits.event) ||
-      !reserve(reserved, limits.capacity, {.memory = bytes})) {
-    // An ordinary tree cannot make up missing event credit. Keep the database
-    // path's existing copy and event reservation recovery.
-    return refuse(database && newTree);
+  // An ordinary tree cannot make up missing event credit. Keep the database
+  // path's existing copy and event reservation recovery.
+  if (auto reason = reservationRefusal(reserved, limits.capacity, limits.event)) {
+    return refuse(reason, database && newTree);
   }
-  if (newTree &&
-      ((limits.residentTarget != 0 && counters.trees >= limits.residentTarget) ||
-          !reserve(reserved, limits.capacity, limits.tree))) {
-    return refuse(true);
+  KJ_ASSERT(reserve(reserved, limits.capacity, limits.event));
+  if (!reserve(reserved, limits.capacity, {.memory = bytes})) {
+    return refuse("memory", database && newTree);
+  }
+  if (newTree) {
+    if (limits.residentTarget != 0 && counters.trees >= limits.residentTarget) {
+      return refuse("resident-target", true);
+    }
+    if (auto reason = reservationRefusal(reserved, limits.capacity, limits.tree)) {
+      return refuse(reason, true);
+    }
+    KJ_ASSERT(reserve(reserved, limits.capacity, limits.tree));
   }
   if (newTree && !database && now < databaseTreePreferredUntil) {
-    auto includingPreferredTree = reserved;
-    if ((limits.residentTarget != 0 && counters.trees + 1 >= limits.residentTarget) ||
-        !reserve(includingPreferredTree, limits.capacity, limits.tree)) {
-      return refuse();
+    if (limits.residentTarget != 0 && counters.trees + 1 >= limits.residentTarget) {
+      return refuse("resident-target");
     }
+    if (auto reason = reservationRefusal(reserved, limits.capacity, limits.tree)) return refuse(reason);
   }
 
   KJ_ASSERT(nextTree != 0 && nextEvent != 0);
@@ -128,6 +138,10 @@ bool DurableAdmission::publishHome(uint64_t tree, uint64_t home) {
   if (entry == trees.end() || entry->second.home != 0 || home == 0) return false;
   entry->second.home = home;
   return true;
+}
+
+const char* DurableAdmission::auxiliaryRefusal(Resources amount) const {
+  return reservationRefusal(counters.reserved, limits.capacity, amount);
 }
 
 bool DurableAdmission::reserveAuxiliary(Resources amount) {

@@ -399,13 +399,13 @@ struct ObjectAdmissionFixture {
       auto thread = std::make_unique<ThreadedServer::Thread>(false, false);
       thread->homeId = id;
       thread->home.emplace();
-      server.threads.push_back(std::move(thread));
+      server.durableHomes.emplace(id, std::move(thread));
     }
     server.ready.store(true);
   }
 
   ~ObjectAdmissionFixture() {
-    for (const auto& thread: server.threads) close(thread->wake);
+    for (const auto& [_, thread]: server.durableHomes) close(thread->wake);
   }
 
   static DurableRoute route(const char* object, const char* definition = nullptr) {
@@ -426,7 +426,7 @@ struct ObjectAdmissionFixture {
     KJ_REQUIRE(table.begin(*ticket, *home, route.key, route.open, now) ==
         Admission::Delivery::ACCEPTED);
     server.publishDurableRoot(*home, ticket->tree);
-    server.threads[*home - 1]->home->warmDefinition = route.open.definition;
+    server.durableHomes.at(*home)->home->warmDefinition = route.open.definition;
     return *ticket;
   }
 
@@ -502,6 +502,27 @@ KJ_TEST("an event on any selected home tree cancels the whole home retirement") 
   std::lock_guard lock(test.server.durableRoutingMutex);
   KJ_EXPECT(test.server.durableAdmission->isIdleTree(late.tree, picked.home));
   KJ_EXPECT(!test.server.fenceHome(picked, test.now));
+}
+
+KJ_TEST("a fenced home stays selected while its trees finish closing") {
+  using Status = ObjectAdmissionFixture::Status;
+  ObjectAdmissionFixture test(0);
+  auto& server = test.server;
+  for (const auto* definition: {"oldest", "young", "youngest"}) {
+    test.finish(test.start(test.route(definition)), test.now);
+  }
+
+  const auto incoming = test.route("incoming");
+  KJ_REQUIRE(test.queue(incoming).status == Status::RETIRING);
+  KJ_REQUIRE(server.homeVictim.has_value());
+  const auto chosen = *server.homeVictim;
+  {
+    std::lock_guard lock(server.durableRoutingMutex);
+    KJ_REQUIRE(server.fenceHome(chosen, test.now));
+  }
+  server.expireDurableAdmissions(chosen.deadline);
+  KJ_EXPECT(server.queueDurable(incoming, 0, test.lease, chosen.deadline).status == Status::RETIRING);
+  KJ_EXPECT(server.homeVictim == chosen);
 }
 
 KJ_TEST("ordinary admission selects the least recently used eligible tree across homes") {
@@ -635,7 +656,7 @@ KJ_TEST("ordinary retirement avoids a running home and looks elsewhere after it 
   test.finish(oldest, test.now - std::chrono::seconds(1));
   test.finish(younger, test.now);
   const auto request = test.route("incoming");
-  auto& oldHome = *server.threads[0]->home;
+  auto& oldHome = *server.durableHomes.at(1)->home;
   oldHome.load.begin(test.now);
   KJ_EXPECT(test.queue(request).status == Status::RETIRING);
   KJ_REQUIRE(server.objectVictim.has_value());
@@ -648,7 +669,7 @@ KJ_TEST("ordinary retirement avoids a running home and looks elsewhere after it 
   KJ_EXPECT(server.queueDurable(request, 0, test.lease, deadline).status == Status::RETIRING);
   KJ_REQUIRE(server.objectVictim.has_value());
   KJ_EXPECT(server.objectVictim->tree == oldest.tree);
-  KJ_EXPECT(server.threads[1]->home->admissionTurnDelayed);
+  KJ_EXPECT(server.durableHomes.at(2)->home->admissionTurnDelayed);
   oldHome.load.end(deadline);
 }
 
@@ -662,7 +683,7 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
   test.finish(other, test.now);
   auto& server = test.server;
   auto& table = *server.durableAdmission;
-  for (auto& thread: server.threads) thread->home->walFull = true;
+  for (auto& [_, thread]: server.durableHomes) thread->home->walFull = true;
 
   const auto incoming = test.route("incoming", "matching");
   KJ_EXPECT(test.queue(incoming).status == Status::RETIRING);
@@ -695,7 +716,7 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
   // The real Home publishes walFull as soon as a slot comes back. Routing
   // credit waits for the entire tree, while unrelated existing roots can run.
   closing->shippers.erase(0);
-  server.threads[picked.home - 1]->home->walFull = false;
+  server.durableHomes.at(picked.home)->home->walFull = false;
   server.releaseClosedAdmissionTrees(state, picked.deadline);
   server.expireDurableAdmissions(picked.deadline);
   KJ_EXPECT(table.homeFor(picked.tree) == picked.home);
@@ -727,7 +748,7 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
   test.finish(next, test.now - std::chrono::seconds(1));
   test.finish(firstNeighbor, test.now);
   test.finish(nextNeighbor, test.now);
-  for (auto& thread: server.threads) thread->home->walFull = true;
+  for (auto& [_, thread]: server.durableHomes) thread->home->walFull = true;
 
   const auto incoming = test.route("incoming", "matching");
   KJ_REQUIRE(test.queue(incoming).status == Status::RETIRING);
@@ -761,7 +782,7 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
     // The accept loop advances without any further pass by the first home.
     server.expireDurableAdmissions(deadline);
     KJ_EXPECT(!table.homeFor(stalled.tree));
-    KJ_EXPECT(server.threads[stalled.home - 1]->home->walFull.load());
+    KJ_EXPECT(server.durableHomes.at(stalled.home)->home->walFull.load());
     KJ_EXPECT(server.durableAdmissionWalTimeouts.load() == 1);
     KJ_REQUIRE(server.queueDurable(incoming, 0, test.lease, deadline).status == Status::RETIRING);
     KJ_REQUIRE(server.objectVictim.has_value());
@@ -783,7 +804,7 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
   {
     std::lock_guard lock(server.durableRoutingMutex);
     KJ_REQUIRE(server.stopObjectAdmissionVictim(nextVictim, deadline));
-    server.threads[nextVictim.home - 1]->home->walFull = false;
+    server.durableHomes.at(nextVictim.home)->home->walFull = false;
   }
   server.waitForAdmissionWal(nextHome, nextVictim.tree,
       std::make_shared<DurableTreeContext>(DurableTreeContext{
@@ -831,7 +852,7 @@ struct DatabaseAdmissionFixture {
       auto thread = std::make_unique<ThreadedServer::Thread>(false, false);
       thread->homeId = id;
       thread->home.emplace();
-      server.threads.push_back(std::move(thread));
+      server.durableHomes.emplace(id, std::move(thread));
     }
     server.ready.store(true);
     KJ_REQUIRE(held->registerPreparation());
@@ -843,7 +864,7 @@ struct DatabaseAdmissionFixture {
   }
 
   ~DatabaseAdmissionFixture() {
-    for (auto& thread: server.threads) close(thread->wake);
+    for (auto& [_, thread]: server.durableHomes) close(thread->wake);
   }
 
   static DurableRoute route(const char* object, bool database) {
@@ -854,7 +875,7 @@ struct DatabaseAdmissionFixture {
   }
 
   ThreadedServer::Thread::DurableHome& home() {
-    return *server.threads.front()->home;
+    return *server.durableHomes.at(1)->home;
   }
 
   Admission::Result queue(const DurableRoute& route, Admission::Time at) {
@@ -870,7 +891,7 @@ struct DatabaseAdmissionFixture {
     KJ_REQUIRE(table.begin(*ticket, *homeId, route.key, route.open, now) ==
         Admission::Delivery::ACCEPTED);
     KJ_REQUIRE(table.complete(*ticket, *homeId));
-    auto& home = *server.threads[*homeId - 1]->home;
+    auto& home = *server.durableHomes.at(*homeId)->home;
     home.resident.insert(ticket->tree);
     home.warmDefinition = route.open.definition;
     return ticket->tree;
@@ -887,10 +908,40 @@ struct DatabaseAdmissionFixture {
   }
 };
 
+KJ_TEST("an exited database home leaves its brief placement preference with the router") {
+  using Admission = server::DurableAdmission;
+  ThreadedServer server{3, "", "", -1, {}, {}, &initializeV8()};
+  server.durableAdmission.emplace(Admission::Limits{
+    .capacity = ThreadedServer::HOME_RESERVATION,
+    .tree = {.memory = 16},
+    .event = {.memory = 4},
+    .residentTarget = 1,
+    .mailboxDepth = 1,
+    .mailboxBytes = 8,
+  }, 1);
+  KJ_REQUIRE(server.durableAdmission->reserveAuxiliary(ThreadedServer::HOME_RESERVATION));
+  const auto now = Admission::Clock::now();
+  auto thread = std::make_unique<ThreadedServer::Thread>(false, false);
+  thread->home.emplace();
+  thread->homeId = 1;
+  thread->home->databasePreferredUntil = now + DATABASE_ADMISSION_GRACE;
+  thread->thread = std::thread([] {});
+  thread->descriptor = ThreadedServer::STOPPED;
+  server.durableHomes.emplace(1, std::move(thread));
+  server.liveThreads = 1;
+
+  std::lock_guard lock(server.durableRoutingMutex);
+  server.reapDurableHomes(now);
+  KJ_EXPECT(server.durableHomes.empty());
+  KJ_EXPECT(server.liveThreads.load() == 0);
+  KJ_EXPECT(server.durableAdmission->state().reserved == Admission::Resources{});
+  KJ_EXPECT(server.databaseHomePreferredUntil == now + DATABASE_ADMISSION_GRACE);
+}
+
 KJ_TEST("durable placement skips a full WAL Home for fresh trees and keeps existing routes") {
   DatabaseAdmissionFixture test;
   auto& table = *test.server.durableAdmission;
-  for (auto& thread: test.server.threads) thread->home->walFull = true;
+  for (auto& [_, thread]: test.server.durableHomes) thread->home->walFull = true;
 
   auto existing = test.queue(test.victim, test.now).ticket;
   KJ_REQUIRE(existing.has_value());
@@ -900,7 +951,7 @@ KJ_TEST("durable placement skips a full WAL Home for fresh trees and keeps exist
   KJ_EXPECT(refused.status == DatabaseAdmissionFixture::Admission::Status::OVERLOADED);
   KJ_EXPECT(!refused.ticket.has_value());
 
-  test.server.threads[1]->home->walFull = false;
+  test.server.durableHomes.at(2)->home->walFull = false;
   auto replacement = test.queue(test.neighbor, test.now).ticket;
   KJ_REQUIRE(replacement.has_value());
   KJ_EXPECT(table.homeFor(replacement->tree) == 2u);
@@ -3139,7 +3190,7 @@ KJ_TEST("normal retirement collects actor handles after live and queued work dra
   home->homeId = 1;
   home->home.emplace();
   home->home->warmDefinition = "definition";
-  server.threads.push_back(std::move(home));
+  server.durableHomes.emplace(1, std::move(home));
   server.ready.store(true);
 
   ThreadState state;
@@ -3252,7 +3303,7 @@ KJ_TEST("normal retirement collects actor handles after live and queued work dra
   auto retainedCopy = state.durableSlot;
   Marker dropped;
   open("dropped"_kj, dropped, false);
-  auto& pressure = server.threads.front()->home->pressure;
+  auto& pressure = server.durableHomes.at(1)->home->pressure;
   using Action = server::DurablePressure::Action;
   KJ_REQUIRE(pressure.sample(true, true, false) == Action::CLOSE_PLACEMENT);
   KJ_REQUIRE(pressure.sample(true, true, false) == Action::RESET);

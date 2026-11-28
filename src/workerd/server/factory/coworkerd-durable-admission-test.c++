@@ -392,14 +392,19 @@ KJ_TEST("each durable reservation ceiling refuses before publishing a new tree")
   auto below = limits;
   // The resident count is disabled. Cap capacity at one tree and event in each dimension in turn.
   below.residentTarget = 0;
-  for (auto dimension: {&Admission::Resources::threads, &Admission::Resources::descriptors,
-         &Admission::Resources::memory, &Admission::Resources::addressSpace}) {
+  for (auto [dimension, reason]: {std::pair{&Admission::Resources::threads, "threads"},
+         std::pair{&Admission::Resources::descriptors, "descriptors"},
+         std::pair{&Admission::Resources::memory, "memory"},
+         std::pair{&Admission::Resources::addressSpace, "address-space"}}) {
     below.capacity = limits.capacity;
     below.capacity.*dimension = limits.tree.*dimension + limits.event.*dimension;
     Admission table(below, 1);
     const auto reservation = queued(table.queue(first, open, 0, deadline, now), true);
     const auto before = table.state().reserved;
-    KJ_EXPECT(table.queue(second, open, 0, deadline, now).status == Status::OVERLOADED);
+    const auto refused = table.queue(second, open, 0, deadline, now);
+    KJ_EXPECT(refused.status == Status::OVERLOADED);
+    KJ_REQUIRE(refused.refusal != nullptr);
+    KJ_EXPECT(std::string_view(refused.refusal) == reason);
     KJ_EXPECT(table.state().trees == 1);
     KJ_EXPECT((table.state().reserved == before));
     KJ_EXPECT((table.failOpen(reservation.tree) == std::vector{reservation}));
@@ -410,7 +415,10 @@ KJ_TEST("each durable reservation ceiling refuses before publishing a new tree")
   below.residentTarget = 1;
   Admission table(below, 1);
   const auto reservation = queued(table.queue(first, open, 0, deadline, now), true);
-  KJ_EXPECT(table.queue(second, open, 0, deadline, now).status == Status::OVERLOADED);
+  const auto refused = table.queue(second, open, 0, deadline, now);
+  KJ_EXPECT(refused.status == Status::OVERLOADED);
+  KJ_REQUIRE(refused.refusal != nullptr);
+  KJ_EXPECT(std::string_view(refused.refusal) == "resident-target");
   KJ_EXPECT((table.failOpen(reservation.tree) == std::vector{reservation}));
   queued(table.queue(second, open, 0, deadline, now), true);
 }
