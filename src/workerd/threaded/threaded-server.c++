@@ -2790,6 +2790,7 @@ struct ThreadedServer {
       uint64_t memory = 0;
       server::DurableHomeLoad load{std::chrono::seconds(4)};
       server::DurablePressure pressure;
+      std::atomic<bool> walFull{false};
       std::vector<DurableIncoming> incoming;
       std::set<uint64_t> resident;
       uint64_t databaseLastUse = 0;
@@ -3311,6 +3312,7 @@ struct ThreadedServer {
         if (!threads[i]->home) continue;
         if (databaseVictim && databaseVictim->home == i + 1) continue;
         auto &home = *threads[i]->home;
+        if (home.walFull.load(std::memory_order_relaxed)) continue;
         if (!database && now < home.databasePreferredUntil) continue;
         // An empty copy keeps its definition until its isolate is released.
         // Prefer a matching warm copy, then an unused home, then a different empty copy.
@@ -4024,7 +4026,7 @@ struct ThreadedServer {
           }
           break;
         }
-      });
+      }, thread.home->walFull);
     }
     thread.idleSince.store(nowNs());
     thread.descriptor.store(-1, std::memory_order_release);
