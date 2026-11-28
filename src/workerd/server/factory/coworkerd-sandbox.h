@@ -68,13 +68,13 @@ constexpr size_t SANDBOX_POOL_BYTES = size_t(2) << 30;
 // With a V8 sandbox per isolate group no buffer can be larger than the group's pool, so V8 refuses
 // one above SANDBOX_POOL_BYTES before reserving anything; otherwise, and in a build without the
 // sandbox, V8's own value. Never the Worker's memory limit: a buffer above it still reaches the
-// allocator, which ends the execution with the limit's own cause (r50 §6.5 B2).
+// allocator, which ends the execution with the limit's own cause.
 size_t sandboxMaxAllocationSize(size_t inner);
 
 // How many isolate groups this process can still create: creates them until tryNewIsolateGroup()
 // refuses, then releases them. V8 places each sandbox at a random address, so the address space
 // holds about three quarters of what its size divided by one reservation suggests (random
-// sequential packing; 720 on a 47-bit user address space with 136 GiB reservations, cwkd-p40).
+// sequential packing; 720 on a 47-bit user address space with 136 GiB reservations).
 // 0 in a build with one shared pointer-compression cage.
 size_t measureGroupCapacity(size_t limit = 65536);
 

@@ -4,7 +4,7 @@
 #include <kj/string.h>
 
 namespace workerd::jsg {
-// Assigned by the v76 RPC error-detail contract. Keep in sync with the node's
+// The platform RPC error-detail ID must match the node's declaration in
 // common/rpc-error.h. The value is a platform code's bytes, without a trailing NUL.
 inline constexpr kj::Exception::DetailTypeId COWORKERD_CODE_DETAIL_ID = 0xc6f4a09d8b3e2175ull;
 
