@@ -417,7 +417,7 @@ class Session {
   }
 };
 
-class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+class Home final: public ThreadedWalLog::HomeChannel, private kj::TaskSet::ErrorHandler {
  public:
   Home(std::shared_ptr<Shared> shared,
       kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose,
@@ -440,6 +440,7 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
   }
 
   bool enabled() const override { return true; }
+  bool hasRegistrations() const override { return !shippers.empty(); }
   uint64_t nextRequest() override { return ++shared->nextId; }
 
   uint64_t registerShipper(DurableLogShipper& shipper) override {
@@ -705,7 +706,7 @@ uint64_t ThreadedWalLog::unconfirmedCloseIdentities() const {
   return impl->shared->unconfirmedCloseIdentities.load(std::memory_order_relaxed);
 }
 
-kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
+kj::Own<ThreadedWalLog::HomeChannel> ThreadedWalLog::attachHome(
     kj::Function<void(uint64_t, CloseReason)> requestClose, kj::Maybe<std::atomic<bool>&> walFull) {
   return kj::heap<Home>(
       impl->shared, kj::mv(requestClose), kj::systemPreciseMonotonicClock(), walFull);

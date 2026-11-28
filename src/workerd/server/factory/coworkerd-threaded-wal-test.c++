@@ -662,12 +662,14 @@ KJ_TEST("threaded WAL Home publishes its registration limit and closes its inbox
   auto inbox = std::make_shared<Inbox>(1);
   auto home = kj::heap<Home>(test.shared, [](uint64_t, CloseReason) {}, test.clock, full, inbox);
   KJ_EXPECT(!full.load());
+  KJ_EXPECT(!home->hasRegistrations());
   uint64_t openId;
   {
     TestRoot root(test, *home, "namespace/capacity/epoch"_kj);
     openId = root.id();
     acceptOpen(test, *home, root);
     KJ_EXPECT(full.load());
+    KJ_EXPECT(home->hasRegistrations());
     auto refusal = kj::runCatchingExceptions(
         [&] { TestRoot rejected(test, *home, "namespace/refused/epoch"_kj); });
     const auto& error = KJ_ASSERT_NONNULL(refusal);
@@ -677,6 +679,7 @@ KJ_TEST("threaded WAL Home publishes its registration limit and closes its inbox
   }
   test.link.receive(MSG_CLOSED, openId);
   KJ_EXPECT(!full.load());
+  KJ_EXPECT(!home->hasRegistrations());
   home = nullptr;
   KJ_EXPECT(full.load());
   KJ_EXPECT(test.link.wait(inbox->next()) == kj::none);

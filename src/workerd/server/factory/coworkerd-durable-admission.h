@@ -69,6 +69,7 @@ class DurableAdmission {
     std::optional<Ticket> ticket = std::nullopt;
     bool needsHome = false;
     bool newTreeCapacityRefused = false;
+    const char* refusal = nullptr;
   };
 
   enum class Cancellation { GONE, RELEASED, SIGNAL_HOME };
@@ -122,6 +123,7 @@ class DurableAdmission {
   // The home failed to open. Releases all waiting credits without a close acknowledgement.
   std::vector<Ticket> failOpen(uint64_t tree);
   bool releaseUnassigned(uint64_t tree);
+  const char* auxiliaryRefusal(Resources amount) const;
   bool reserveAuxiliary(Resources amount);
   void releaseAuxiliary(Resources amount);
 
