@@ -229,10 +229,10 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     if (!tenantWorker && gcSettings().staticHeapBytes) recordStaticHeapLimit(value, name);
   }
   bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
-  // Whether a request of this isolate carries the memory execution identity (v33's attribution of a fatal
-  // OOM): this isolate has a memory limit -- its Worker's own (v49) or the process's -- or the process has
-  // one while this isolate has none, as before v49, so that every isolate of a process with a memory limit
-  // keeps reporting who was executing.
+  // Report the execution identity so a fatal OOM can be attributed to the request.
+  // A Worker-specific memory limit enables reporting for its isolate. A process-wide
+  // memory limit enables reporting for every isolate, even those without their own
+  // limit.
   bool memoryIdentityWanted() const { return memory != nullptr || memoryLimitFromEnvironment() != 0; }
   // The limits in force here, whichever named them: what the state endpoint shows as applied.
   CoworkerdAppliedLimits applied() const {
