@@ -55,6 +55,23 @@ ActorSqlite::ActorSqlite(kj::Own<SqliteDatabase> dbParam,
       debugAlarmSync(debugAlarmSyncParam) {
   db->onWrite(KJ_BIND_METHOD(*this, onWrite));
   db->onCriticalError(KJ_BIND_METHOD(*this, onCriticalError));
+  db->onObjectSqlRollback([this](bool needsFailedOutput, const kj::Exception& exception) {
+    bool alarmTouched = false;
+    KJ_IF_SOME(implicit, currentTxn.tryGet<ImplicitTxn*>()) {
+      alarmTouched = implicit->touchedAlarm();
+      implicit->storageRolledBack();
+      currentTxn.init<NoTxn>();
+    } else KJ_IF_SOME(explicitTxn, currentTxn.tryGet<ExplicitTxn*>()) {
+      alarmTouched = explicitTxn->getAlarmDirty();
+    }
+    if (needsFailedOutput || alarmTouched) {
+      // Existing writes and alarm bookkeeping require the actor's normal
+      // storage failure path. All responses waiting on this turn must fail.
+      onCriticalError(exception.getDescription(), exception.clone());
+    }
+    blockTasks.clear();
+    return broken != kj::none;
+  });
   lastConfirmedAlarmDbState = metadata.getAlarm();
 
   // Because we preserve an invariant that scheduled alarms are always at or earlier than
@@ -76,7 +93,7 @@ ActorSqlite::ImplicitTxn::~ImplicitTxn() noexcept(false) {
       parent.currentTxn.init<NoTxn>();
     }
   }
-  if (!committed && parent.broken == kj::none) {
+  if (!committed && !rolledBackForSqlMemory && parent.broken == kj::none) {
     // Failed to commit, so roll back.
     //
     // This should only happen in cases of catastrophic error. Since this is rarely actually
@@ -125,7 +142,9 @@ kj::Promise<void> ActorSqlite::ImplicitTxn::waitForCompletion() {
   }
 }
 
-ActorSqlite::ExplicitTxn::ExplicitTxn(ActorSqlite& actorSqlite): actorSqlite(actorSqlite) {
+ActorSqlite::ExplicitTxn::ExplicitTxn(ActorSqlite& actorSqlite)
+    : actorSqlite(actorSqlite),
+      objectSqlTxn(*actorSqlite.db) {
   KJ_SWITCH_ONEOF(actorSqlite.currentTxn) {
     KJ_CASE_ONEOF(_, NoTxn) {}
     KJ_CASE_ONEOF(implicit, ImplicitTxn*) {
@@ -219,6 +238,7 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::ExplicitTxn::commit() {
 
 void ActorSqlite::ExplicitTxn::commitImpl() {
   actorSqlite.requireNotBroken();
+  actorSqlite.db->requireObjectSqlTransaction();
   KJ_REQUIRE(!hasChild,
       "critical sections should have prevented committing transaction while "
       "nested txn is outstanding");
@@ -287,6 +307,8 @@ kj::Promise<void> ActorSqlite::ExplicitTxn::rollback() {
 void ActorSqlite::ExplicitTxn::rollbackImpl() noexcept(false) {
   // Cancel any blocking async tasks that were scheduled as part of the transaction.
   actorSqlite.blockTasks.clear();
+
+  if (objectSqlTxn.wasRefused()) return;
 
   if (parent == kj::none && actorSqlite.db->getWalTransactionLimit() != nullptr) {
     actorSqlite.db->rollbackWalTransaction();
@@ -370,14 +392,15 @@ kj::Promise<void> ActorSqlite::startImplicitTxnImpl(kj::Own<ImplicitTxn> txn) {
   // turn of the event loop
   co_await kj::yield();
 
-  // If there were tasks blocking the transaction, wait for them.
-  if (!blockTasks.isEmpty()) {
+  // A rolled-back transaction must not wait on tasks started by its replacement.
+  if (!txn->wasRolledBackForSqlMemory() && !blockTasks.isEmpty()) {
     co_await blockTasks.onEmpty();
   }
 
-  // Don't commit if shutdown() has been called, or if one of the blockTasks threw, or we broke
-  // for any other reason before the transaction could complete.
+  // Fail the existing output lock if rollback broke the actor, including when a
+  // response was already waiting for this commit.
   requireNotBroken();
+  if (txn->wasRolledBackForSqlMemory()) co_return;
 
   // Start the schedule request before commit(), for correctness in workerd.
   auto precommitAlarmState = startPrecommitAlarmScheduling();
@@ -405,6 +428,7 @@ kj::Promise<void> ActorSqlite::startImplicitTxnImpl(kj::Own<ImplicitTxn> txn) {
 
 void ActorSqlite::onWrite(bool allowUnconfirmed) {
   requireNotBroken();
+  db->requireObjectSqlTransaction();
   if (currentTxn.is<NoTxn>()) {
     startImplicitTxn();
   }
@@ -859,6 +883,9 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::setAlarm(
   KJ_IF_SOME(exp, currentTxn.tryGet<ExplicitTxn*>()) {
     exp->setAlarmDirty();
   } else {
+    KJ_IF_SOME(implicit, currentTxn.tryGet<ImplicitTxn*>()) {
+      implicit->touchAlarm();
+    }
     haveDeferredDelete = false;
   }
 
@@ -868,6 +895,7 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::setAlarm(
 kj::OneOf<kj::Own<ActorCacheInterface::Transaction>, kj::Promise<void>> ActorSqlite::
     startTransaction() {
   requireNotBroken();
+  db->requireObjectSqlTransaction();
 
   KJ_IF_SOME(itxn, currentTxn.tryGet<ImplicitTxn*>()) {
     return itxn->waitForCompletion();
@@ -885,6 +913,7 @@ kj::OneOf<kj::Own<ActorCacheInterface::Transaction>, kj::Promise<void>> ActorSql
 ActorCacheInterface::DeleteAllResults ActorSqlite::deleteAll(
     WriteOptions options, SpanParent traceSpan, DeleteAllOptions deleteAllOptions) {
   requireNotBroken();
+  db->requireObjectSqlTransaction();
   disableAllowUnconfirmed(options, "deleteAll is not supported");
 
   // Capture trace span for the output gate lock (deleteAll always requires confirmation).

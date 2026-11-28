@@ -384,11 +384,19 @@ void DurableIdleLifecycle::pendingFinished(Pending operation, Time now) {
   if (pending.empty()) lastUnblocked = now;
 }
 
+DurableIdleLifecycle::Time DurableIdleLifecycle::idleSince() const {
+  return std::max(lastEvent, lastUnblocked);
+}
+
+bool DurableIdleLifecycle::idleFor(Time now, std::chrono::seconds interval) const {
+  return pending.empty() && now - idleSince() >= interval;
+}
+
 DurableIdleLifecycle::Decision DurableIdleLifecycle::check(
     Time now, bool hasOrdinarySocket, bool pressured) {
   if (ordinarySocket && !hasOrdinarySocket) lastUnblocked = now;
   ordinarySocket = hasOrdinarySocket;
-  const auto idle = now - std::max(lastEvent, lastUnblocked);
+  const auto idle = now - idleSince();
   if (!pending.empty() && now - *pending.rbegin() < std::chrono::minutes(15)) {
     return Decision::WAIT;
   }

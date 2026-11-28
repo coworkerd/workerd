@@ -2047,6 +2047,7 @@ server::DurableIdleLifecycle::Time durableIdleNow() {
 }
 
 struct DurableTreeContext;
+void trimIdleObjectSqlite(DurableTreeContext &tree);
 class DurableActorHooks;
 
 struct ThreadState {
@@ -2110,6 +2111,7 @@ struct ThreadState {
     bool idleClosing = false;
     bool cancelExpiredWork = false;
     bool admissionClosing = false;
+    std::optional<server::DurableIdleLifecycle::Time> sqliteTrimmedForIdleSince;
     std::shared_ptr<class DurableNodeSockets> nodeSockets;
     kj::Function<bool()> hasLocalSockets;
     kj::Function<kj::Promise<SocketParkResult>()> parkSockets;
@@ -2778,6 +2780,7 @@ struct ThreadedServer {
   std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<DatabaseReplacement>>> databaseCapacityWaiters;
   std::atomic<uint64_t> durableHomeSessions{0};
   std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
+  std::atomic<uint64_t> objectSqliteConnections{0};
   std::atomic<uint64_t> durableAdmissionRetirements{0};
   std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
   std::atomic<uint64_t> nextDurableActor{0};
@@ -3677,7 +3680,15 @@ struct ThreadedServer {
         else if (root.cancelExpiredWork)
           decision = Decision::CANCEL_PENDING;
       }
-      if (decision == Decision::WAIT) continue;
+      if (decision == Decision::WAIT) {
+        const auto idleSince = root.idle->idleSince();
+        if (root.sqliteTrimmedForIdleSince != idleSince &&
+            root.idle->idleFor(now, std::chrono::seconds(1))) {
+          trimIdleObjectSqlite(*root.tree);
+          root.sqliteTrimmedForIdleSince = idleSince;
+        }
+        continue;
+      }
       const bool cancelPending = decision == Decision::CANCEL_PENDING;
       const bool closeSocketSessions = !root.sockets.empty() && !root.resetting && !root.idleClosing;
       if (root.resetting || root.idleClosing) root.stopFacets(nullptr);
@@ -3870,6 +3881,7 @@ struct ThreadedServer {
         ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
         ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
         ",\"sqliteHeapReservedBytes\":" + std::to_string(resources->sqliteMemoryReserved.load()) +
+        ",\"objectSqliteConnections\":" + std::to_string(objectSqliteConnections.load()) +
         ",\"copyMemoryReservedBytes\":" + std::to_string(resources->memoryReserved.load()) +
         ",\"copyMemoryMaximum\":" + std::to_string(resources->memoryMaximum) +
         ",\"overloaded\":" + std::to_string(state.overloads) +
@@ -6412,6 +6424,7 @@ struct DurableTreeContext {
   kj::Own<server::FacetTreeIndex> index;
   std::shared_ptr<server::DurableIdleLifecycle> idle;
   std::map<uint, server::DurableLogShipper*> shippers;
+  std::map<uint, SqliteDatabase *> sqliteConnections;
   uint liveFacets = 0;
   std::shared_ptr<DurableNodeSockets> nodeSockets;
   std::map<uint, SocketManager> socketManagers;
@@ -6436,6 +6449,10 @@ struct DurableTreeContext {
     return *index;
   }
 };
+
+void trimIdleObjectSqlite(DurableTreeContext &tree) {
+  for (auto &[facet, connection]: tree.sqliteConnections) connection->trimIdleObjectSqlHeap();
+}
 
 void beginDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation) {
   KJ_ASSERT(tree.socketUpgradeInvocations.emplace(invocation.begin(), invocation.end()).second);
@@ -7266,19 +7283,22 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
   auto *borrowedObserver = observer.get();
   if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
   auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName),
-                       prepared = kj::mv(prepared), borrowedHooks, sqlWalFrameLimitBytes](
-                       const ActorCache::SharedLru &, OutputGate &gate, ActorCache::Hooks &,
+                       prepared = kj::mv(prepared), borrowedHooks, platformDatabase,
+                       sqlWalFrameLimitBytes](const ActorCache::SharedLru &, OutputGate &gate,
+                       ActorCache::Hooks &,
                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
     const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
-    const auto memoryLimit = sqlWalFrameLimitBytes != 0
-        ? boundedDurableSetting("COWORKERD_DO_TEST_SQL_MEMORY_BYTES",
+    const bool budgeted = !platformDatabase || sqlWalFrameLimitBytes != 0;
+    const auto memoryLimit = budgeted
+        ? boundedDurableSetting(platformDatabase ? "COWORKERD_DO_TEST_SQL_MEMORY_BYTES"
+                                                 : "COWORKERD_DO_TEST_OBJECT_SQL_MEMORY_BYTES",
               SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES,
               SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES)
         : kj::maxValue;
     std::shared_ptr<SqliteProcessMemoryBudget> sqliteProcessBudget;
-    if (sqlWalFrameLimitBytes != 0) {
+    if (budgeted) {
       auto slot = tree->slot.lock();
-      KJ_REQUIRE(slot != nullptr, "database storage opened without its isolate reservation");
+      KJ_REQUIRE(slot != nullptr, "durable storage opened without its isolate reservation");
       sqliteProcessBudget = slot->reservation;
     }
     KJ_ASSERT(tree->server.durableLog.get() == nullptr || prepared != kj::none,
@@ -7293,6 +7313,15 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
     }
     auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet,
         sqlWalFrameLimitBytes, memoryLimit, std::move(sqliteProcessBudget));
+    if (!platformDatabase) {
+      KJ_REQUIRE(tree->sqliteConnections.emplace(facet, database.get()).second,
+          "durable SQLite connection is already registered");
+      tree->server.objectSqliteConnections.fetch_add(1);
+      database = kj::mv(database).attach(kj::defer([tree, facet] {
+        tree->sqliteConnections.erase(facet);
+        tree->server.objectSqliteConnections.fetch_sub(1);
+      }));
+    }
     if (tree->state.wal) {
       kj::Maybe<kj::Function<void(SqliteDatabase::CloseOutcome)>> confirmClose;
       KJ_IF_SOME(open, prepared) confirmClose = open.trackClose();

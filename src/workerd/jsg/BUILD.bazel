@@ -126,7 +126,6 @@ wd_cc_library(
         "snapshot.h",
         "unwrap-args.h",
         "util.h",
-        "coworkerd-rpc-code.h",
         "v8-platform-wrapper.h",
         "web-idl.h",
         "wrappable.h",
@@ -281,7 +280,7 @@ wd_cc_library(
 wd_cc_library(
     name = "exception",
     srcs = ["exception.c++"],
-    hdrs = ["exception.h"],
+    hdrs = ["coworkerd-rpc-code.h", "exception.h"],
     visibility = ["//visibility:public"],
     deps = [
         "@capnp-cpp//src/kj",
