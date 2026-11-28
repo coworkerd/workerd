@@ -2040,7 +2040,7 @@ struct ThreadState {
   uint64_t durableHome = 0;
   // Shippers and SQLite's deferred close callbacks borrow this channel. Keep it alive
   // until the home has canceled its tasks and destroyed its actors and isolate copy.
-  kj::Own<server::DurableWalChannel> wal;
+  kj::Own<server::ThreadedWalLog::HomeChannel> wal;
   std::shared_ptr<Slot> durableSlot;
   // The cold load in flight on this home. Its waiters all want its definition, and it
   // ends with the last of them, so a canceled load is never left for a later tree.
@@ -2872,6 +2872,7 @@ struct ThreadedServer {
       uint64_t memory = 0, heapBytes = 0, copyInstance = 0;
       bool admissionTurnDelayed = false;
       bool reclaiming = false;
+      bool releaseWarmCopy = false;
       bool stopping = false;
       uint64_t activity = 0;
       server::DurableAdmission::Time lastUse{};
@@ -3436,8 +3437,9 @@ struct ThreadedServer {
       finishDatabaseRetirement(databaseVictim->outcome(now, false, false), now);
     }
     reapDurableHomes(now);
-    if (homeVictim && now >= homeVictim->deadline &&
-        !durableHomes.at(homeVictim->home)->home->reclaiming) {
+    if (homeVictim && now >= homeVictim->deadline) {
+      // Release the shared selection. The owner's fence still protects
+      // in-flight parking and WAL work in the original home.
       durableHomes.at(homeVictim->home)->home->admissionTurnDelayed = true;
       homeVictim.reset();
     }
@@ -3493,7 +3495,9 @@ struct ThreadedServer {
               (home.definition.empty() && !durableHomes.at(spare)->home->definition.empty()))) {
         spare = id;
       }
-      if (!home.definition.empty()) candidates.push_back(durableCopyCandidate(id, now));
+      if (!home.definition.empty() && !home.releaseWarmCopy) {
+        candidates.push_back(durableCopyCandidate(id, now));
+      }
     }
     if (auto warm = server::chooseDurableCopy(candidates, route.open.definition, durablePlacement)) {
       return warm;
@@ -3541,8 +3545,8 @@ struct ThreadedServer {
   // fences the set, since the router only has each loop's idle snapshot.
   bool canReclaimHome(const Thread& thread) const {
     const auto& home = *thread.home;
-    if (home.definition.empty() || home.stopping || home.reclaiming || home.pressure.resetting() ||
-        home.admissionTurnDelayed || home.load.hasRunningTurn() ||
+    if (home.definition.empty() || home.stopping || home.reclaiming || home.releaseWarmCopy ||
+        home.pressure.resetting() || home.admissionTurnDelayed || home.load.hasRunningTurn() ||
         home.reservedTrees != home.resident.size()) return false;
     const bool database = home.warmDefinition.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
     if (database ? (home.reservedTrees != 0 && !home.databaseCanRetire)
@@ -3592,32 +3596,45 @@ struct ThreadedServer {
     return true;
   }
 
+  enum class HomePlacement { PLACED, RELEASING_WARM_COPY, REFUSED };
+
   // The accept loop holds placement and admission together before acknowledging a connection.
-  bool reserveDurableHome(
+  HomePlacement reserveDurableHome(
       const DurableRoute &route, server::DurableAdmission::Ticket ticket, bool database,
       server::DurableAdmission::Time now, const char*& refusal) {
     auto assigned = durableAdmission->homeFor(ticket.tree);
     if (!assigned) {
       assigned = findDurableHome(route, database, now);
-      const bool cold = !assigned ||
-          (durableHomes.at(*assigned)->home->reservedTrees == 0 &&
-              durableHomes.at(*assigned)->home->warmDefinition != route.open.definition);
+      bool cold = true;
+      if (assigned) {
+        auto& thread = *durableHomes.at(*assigned);
+        auto& home = *thread.home;
+        cold = home.reservedTrees == 0 && home.warmDefinition != route.open.definition;
+        if (home.releaseWarmCopy || (cold && !home.warmDefinition.empty())) {
+          // Drop the old isolate on its owner before charging its replacement.
+          if (!home.releaseWarmCopy) {
+            home.releaseWarmCopy = true;
+            wake(thread.wake);
+          }
+          return HomePlacement::RELEASING_WARM_COPY;
+        }
+      }
       std::shared_ptr<ResourceReservation> preparation;
       if (maxDurableHomes != 0 && cold) {
-        if (!assigned && !canStartDurableHome(database, now, refusal)) return false;
+        if (!assigned && !canStartDurableHome(database, now, refusal)) return HomePlacement::REFUSED;
         preparation = std::make_shared<ResourceReservation>(resources, 0, database);
         if (!preparation->registerPreparation(nullptr, &refusal)) {
           if (!database || !databaseRoutingReplacement ||
               now >= databaseRoutingReplacementUntil ||
               !preparation->registerPreparation(databaseRoutingReplacement.get(), &refusal)) {
-            return false;
+            return HomePlacement::REFUSED;
           }
         }
       }
       if (!assigned) {
-        if (maxDurableHomes == 0) return false;
+        if (maxDurableHomes == 0) return HomePlacement::REFUSED;
         assigned = startDurableHome(refusal);
-        if (!assigned) return false;
+        if (!assigned) return HomePlacement::REFUSED;
       }
       auto& home = *durableHomes.at(*assigned)->home;
       if (preparation) home.preparation = std::move(preparation);
@@ -3627,9 +3644,9 @@ struct ThreadedServer {
       ++home.reservedTrees;
     }
     auto& home = *durableHomes.at(*assigned)->home;
-    if (home.pressure.resetting() || home.reclaiming) return false;
+    if (home.pressure.resetting() || home.reclaiming) return HomePlacement::REFUSED;
     ++home.activity;
-    return true;
+    return HomePlacement::PLACED;
   }
 
   server::DurableAdmission::Result queueDurable(
@@ -3648,10 +3665,15 @@ struct ThreadedServer {
         route.key, route.open, bytes, deadline, now, database, true);
     bool needsPlacement = false;
     const char* refusal = nullptr;
-    if (result.ticket && !reserveDurableHome(route, *result.ticket, database, now, refusal)) {
+    const auto placement = result.ticket ? reserveDurableHome(route, *result.ticket, database, now, refusal)
+                                         : HomePlacement::PLACED;
+    if (placement != HomePlacement::PLACED) {
       needsPlacement = result.needsHome;
       KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket, !needsPlacement));
       durableAdmission->releaseUnassigned(result.ticket->tree);
+      if (placement == HomePlacement::RELEASING_WARM_COPY) {
+        return {.status = Admission::Status::RETIRING};
+      }
       result = {.status = Admission::Status::OVERLOADED, .newTreeCapacityRefused = result.needsHome,
         .refusal = refusal != nullptr ? refusal : "home-placement"};
     } else if (database && result.ticket && result.needsHome) {
@@ -4213,7 +4235,7 @@ struct ThreadedServer {
       releaseCopy = state.admissionWalClosing.empty() &&
           shouldReleaseDurableCopy(home.reservedTrees, !state.durableRoots.empty(),
               state.durableSlot->planRevision, state.durableSlot->hasHostedDurableRoot,
-              home.pressure.resetting() || (home.reclaiming && !closingForAdmission) ||
+              home.releaseWarmCopy || home.pressure.resetting() || (home.reclaiming && !closingForAdmission) ||
                   (idleMs && nowNs() - lastUse >= idleMs * 1000000));
       // Reserved trees include starts still queued or preparing. The home owns the event loop,
       // so no new JavaScript can enter before this maintenance turn ends.
@@ -4259,6 +4281,7 @@ struct ThreadedServer {
       auto &home = *durableHomes.at(homeId)->home;
       home.memory = home.heapBytes = home.copyInstance = 0;
       home.warmDefinition.clear();
+      home.releaseWarmCopy = false;
       home.databaseReservation.reset();
       if (home.reservedTrees == 0) home.definition.clear();
       if (home.pressure.resetting()) durableIsolateResets.fetch_add(1);
@@ -4640,6 +4663,7 @@ struct ThreadedServer {
         std::lock_guard lock(durableRoutingMutex);
         if (!state.durableSlot && !state.durableLoad && state.durableSessions.empty() &&
             state.admissionWalClosing.empty() && thread.home->reservedTrees == 0 &&
+            (!state.wal || !state.wal->hasRegistrations()) &&
             !(databaseVictim && databaseVictim->home == thread.homeId)) {
           thread.home->stopping = true;
           break;

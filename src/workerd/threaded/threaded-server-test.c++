@@ -506,7 +506,7 @@ KJ_TEST("an event on any selected home tree cancels the whole home retirement") 
   KJ_EXPECT(!test.server.fenceHome(picked, test.now));
 }
 
-KJ_TEST("a fenced home stays selected while its trees finish closing") {
+KJ_TEST("a fenced home yields the selection at the deadline without resuming its trees") {
   using Status = ObjectAdmissionFixture::Status;
   ObjectAdmissionFixture test(0);
   auto& server = test.server;
@@ -523,8 +523,32 @@ KJ_TEST("a fenced home stays selected while its trees finish closing") {
     KJ_REQUIRE(server.fenceHome(chosen, test.now));
   }
   server.expireDurableAdmissions(chosen.deadline);
+  KJ_EXPECT(!server.homeVictim);
+  KJ_EXPECT(server.durableHomes.at(chosen.home)->home->reclaiming);
   KJ_EXPECT(server.queueDurable(incoming, 0, test.lease, chosen.deadline).status == Status::RETIRING);
-  KJ_EXPECT(server.homeVictim == chosen);
+  KJ_REQUIRE(server.homeVictim.has_value());
+  KJ_EXPECT(server.homeVictim->home != chosen.home);
+  for (const auto tree: server.durableHomes.at(chosen.home)->home->resident) {
+    KJ_EXPECT(!server.durableAdmission->isIdleTree(tree, chosen.home));
+    KJ_EXPECT(server.durableAdmission->homeFor(tree) == chosen.home);
+  }
+}
+
+KJ_TEST("a mismatched warm spare is released before retiring another Worker's home") {
+  using Status = ObjectAdmissionFixture::Status;
+  ObjectAdmissionFixture test(0);
+  auto& server = test.server;
+  test.finish(test.start(test.route("idle")), test.now);
+  test.start(test.route("busy"));
+  auto& spare = *server.durableHomes.at(3)->home;
+  spare.definition = spare.warmDefinition = "warm";
+
+  KJ_EXPECT(test.queue(test.route("incoming")).status == Status::RETIRING);
+  KJ_EXPECT(spare.releaseWarmCopy);
+  KJ_EXPECT(!server.homeVictim);
+  KJ_EXPECT(test.queue(test.route("warm")).status == Status::RETIRING);
+  KJ_EXPECT(spare.reservedTrees == 0);
+  KJ_EXPECT(!server.homeVictim);
 }
 
 KJ_TEST("ordinary admission selects the least recently used eligible tree across homes") {
@@ -3073,23 +3097,28 @@ KJ_TEST("a call thread cancels background work that outlives the drain limit") {
   KJ_EXPECT(BACKGROUND_BACKSTOP > WAIT_UNTIL_LIMIT);
 }
 
-class TeardownWalChannel final: public server::DurableWalChannel {
+class TeardownWalChannel final: public server::ThreadedWalLog::HomeChannel {
  public:
   kj::Vector<kj::StringPtr> events;
 
   bool enabled() const override {
     return true;
   }
+  bool hasRegistrations() const override {
+    return registrations != 0;
+  }
   uint64_t nextRequest() override {
     return ++request;
   }
 
   uint64_t registerShipper(server::DurableLogShipper&) override {
+    ++registrations;
     return nextRequest();
   }
   void unregisterShipper(server::DurableLogShipper& shipper) override {
     auto openId = shipper.getOpenId();
     KJ_REQUIRE(openId == 1 || openId == 2);
+    --registrations;
     events.add(openId == 1 ? "unregister root"_kj : "unregister facet"_kj);
   }
   void send(uint64_t openId, kj::Array<kj::byte> message) override {
@@ -3117,6 +3146,7 @@ class TeardownWalChannel final: public server::DurableWalChannel {
 
  private:
   uint64_t request = 0;
+  size_t registrations = 0;
 };
 
 KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing the WAL Home") {
@@ -3286,6 +3316,7 @@ KJ_TEST("normal retirement collects actor handles after live and queued work dra
           .stopFacets = [](const kj::Exception*) {},
         });
     server.publishDurableRoot(1, tree->tree);
+    slot.hasHostedDurableRoot = true;
     if (!keepEventActive) {
       KJ_REQUIRE(admission.complete(*ticket, 1));
     }

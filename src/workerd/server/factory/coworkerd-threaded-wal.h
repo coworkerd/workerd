@@ -23,8 +23,13 @@ class ThreadedWalLog {
   static constexpr kj::Exception::DetailTypeId CLOSE_UNCONFIRMED_DETAIL = 0x997a5d73b0e11893ull;
   static constexpr kj::Exception::DetailTypeId HOME_CAPACITY_DETAIL = 0xb81762c5823219dfull;
   enum class CloseReason { DRAIN, CODE_UPDATED };
+  class HomeChannel: public DurableWalChannel {
+   public:
+    // The owner thread must keep pumping while a shipper holds this channel.
+    virtual bool hasRegistrations() const = 0;
+  };
   // If supplied, the routing flag outlives the Home and is updated on its owning thread.
-  kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t, CloseReason)> requestClose,
+  kj::Own<HomeChannel> attachHome(kj::Function<void(uint64_t, CloseReason)> requestClose,
       kj::Maybe<std::atomic<bool>&> walFull = kj::none);
 
   class PreparedOpen {
