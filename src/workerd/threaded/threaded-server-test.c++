@@ -4,6 +4,7 @@
 #include "threaded-server.c++"
 #undef main
 
+#include <workerd/jsg/coworkerd-rpc-code.h>
 #include <workerd/server/factory/coworkerd-wal-wire.h>
 
 #include <spawn.h>
@@ -771,6 +772,154 @@ KJ_TEST("SQLite heap held by multiple databases meets the process ceiling and re
   KJ_EXPECT(budget->memoryReserved.load() == beforeOpen + buffers);
   competitor.freeExternal(buffers);
   KJ_EXPECT(budget->memoryReserved.load() == beforeOpen);
+}
+
+struct ObjectSqlHeapTest {
+  static constexpr auto MiB = ResourceBudget::MiB;
+  static constexpr int largeBlob = int(MiB) + 192 * 1024;
+  const std::shared_ptr<ResourceBudget> budget =
+      std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
+  std::shared_ptr<ResourceReservation> copy = std::make_shared<ResourceReservation>(budget, 64);
+  kj::EventLoop loop;
+  kj::WaitScope waitScope{loop};
+  OutputGate gate;
+  kj::Own<const kj::Directory> dir;
+  kj::Own<SqliteDatabase::Vfs> vfs;
+  SqliteDatabase* db;
+  unsigned commits = 0;
+  kj::Own<ActorSqlite> actor;
+
+  explicit ObjectSqlHeapTest(size_t memoryLimit) {
+    KJ_REQUIRE(copy->registerPreparation());
+    installSqliteCustomAllocator();
+    dir = kj::newInMemoryDirectory(kj::nullClock());
+    vfs = kj::heap<SqliteDatabase::Vfs>(*dir);
+    auto connection = kj::heap<SqliteDatabase>(*vfs, kj::Path({"object.db"}),
+        kj::WriteMode::CREATE | kj::WriteMode::MODIFY, memoryLimit, kj::maxValue,
+        SqliteObserver::DEFAULT, kj::none, copy);
+    db = connection.get();
+    actor = kj::heap<ActorSqlite>(kj::mv(connection), gate, [this](SpanParent) {
+      ++commits;
+      return kj::READY_NOW;
+    });
+    run("CREATE TABLE entries (id INTEGER PRIMARY KEY, payload BLOB)");
+    run("INSERT INTO entries VALUES (1, NULL)");
+    flush();
+    KJ_REQUIRE(commits == 1);
+  }
+
+  template <typename... Params>
+  void run(kj::StringPtr sql, Params... params) {
+    db->executeObjectSql([&] { db->run({.regulator = SqliteDatabase::TRUSTED}, sql, params...); });
+  }
+
+  int rows() {
+    return db->executeObjectSql([&] { return db->run("SELECT count(*) FROM entries").getInt(0); });
+  }
+
+  void flush() {
+    KJ_REQUIRE_NONNULL(actor->onNoPendingFlush(nullptr)).wait(waitScope);
+  }
+};
+
+KJ_TEST(
+    "ordinary object SQLite heap refusal rolls back and leaves the implicit commit gate usable") {
+  ObjectSqlHeapTest t(ObjectSqlHeapTest::MiB);
+  {
+    SqliteDatabase::ObjectSqlTransaction txn(*t.db);
+    t.db->notifyWrite();
+    t.db->run("SAVEPOINT object_sync");
+    t.run("INSERT INTO entries VALUES (2, NULL)");
+    KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
+        t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob));
+    KJ_EXPECT(txn.wasRefused());
+    KJ_EXPECT_THROW_MESSAGE(
+        "SQL_MEMORY_LIMIT_EXCEEDED", t.run("INSERT INTO entries VALUES (4, NULL)"));
+  }
+  KJ_EXPECT(t.rows() == 1);
+  KJ_EXPECT(!t.db->observedCriticalError());
+  t.flush();
+  KJ_EXPECT(t.commits == 1);
+  t.run("INSERT INTO entries VALUES (5, NULL)");
+  t.flush();
+  KJ_EXPECT(t.commits == 2);
+  KJ_EXPECT(t.rows() == 2);
+}
+
+KJ_TEST("ordinary object SQLite refusal of the first write keeps the connection open") {
+  ObjectSqlHeapTest t(ObjectSqlHeapTest::MiB);
+  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
+      t.run("INSERT INTO entries VALUES (2, randomblob(?))", ObjectSqlHeapTest::largeBlob));
+  KJ_EXPECT(!t.db->observedCriticalError());
+  KJ_EXPECT(t.rows() == 1);
+  t.flush();
+  KJ_EXPECT(t.commits == 1);
+  t.run("INSERT INTO entries VALUES (3, NULL)");
+  t.flush();
+  KJ_EXPECT(t.commits == 2);
+  KJ_EXPECT(t.rows() == 2);
+}
+
+KJ_TEST("ordinary object SQLite refusal fails a response already waiting on the output gate") {
+  ObjectSqlHeapTest t(ObjectSqlHeapTest::MiB);
+  t.run("INSERT INTO entries VALUES (2, NULL)");
+  t.actor->blockTransaction(kj::NEVER_DONE);
+  auto waitingResponse = t.gate.wait(nullptr);
+  KJ_REQUIRE(!waitingResponse.poll(t.waitScope));
+  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
+      t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob));
+  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED", waitingResponse.wait(t.waitScope));
+  KJ_EXPECT(t.db->observedCriticalError());
+  KJ_EXPECT(t.rows() == 1);
+  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED", t.flush());
+  KJ_EXPECT(t.commits == 1);
+}
+
+KJ_TEST("ordinary object SQLite process refusal rolls back and retries on the same connection") {
+  constexpr auto MiB = ObjectSqlHeapTest::MiB;
+  ObjectSqlHeapTest t(4 * MiB);
+  ResourceReservation other(t.budget, 64);
+  KJ_REQUIRE(other.registerPreparation());
+  const auto available = t.budget->memoryMaximum - t.budget->memoryReserved.load();
+  KJ_REQUIRE(other.allocateExternal(available));
+  {
+    SqliteDatabase::ObjectSqlTransaction txn(*t.db);
+    t.db->notifyWrite();
+    t.db->run("SAVEPOINT object_sync");
+    t.run("INSERT INTO entries VALUES (2, NULL)");
+    auto refusal = kj::runCatchingExceptions([&] {
+      t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob);
+    });
+    auto& error = KJ_REQUIRE_NONNULL(refusal);
+    KJ_EXPECT(error.getType() == kj::Exception::Type::OVERLOADED);
+    KJ_EXPECT(KJ_REQUIRE_NONNULL(error.getDetail(jsg::COWORKERD_CODE_DETAIL_ID)).asChars() ==
+        kj::StringPtr("OVERLOADED").asArray());
+    KJ_EXPECT(error.getDetail(jsg::COWORKERD_SQL_RETRY_DETAIL_ID) != kj::none);
+  }
+  KJ_EXPECT(!t.db->observedCriticalError());
+  KJ_EXPECT(t.rows() == 1);
+  t.flush();
+  KJ_EXPECT(t.commits == 1);
+  other.freeExternal(available);
+  t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob);
+  t.flush();
+  KJ_EXPECT(t.commits == 2);
+  KJ_EXPECT(t.rows() == 2);
+
+  const auto warmCharge = t.copy->sqliteMemoryCharge();
+  t.db->trimIdleObjectSqlHeap();
+  KJ_EXPECT(t.copy->sqliteMemoryCharge() < warmCharge);
+  auto statement = t.db->prepare("SELECT payload FROM entries WHERE id = 3");
+  auto held = t.db->executeObjectSql([&] { return statement.run(); });
+  const auto charge = t.copy->sqliteMemoryCharge();
+  const auto roundUp = ObjectSqlHeapReservation::chargeFor(t.db->getSqliteMemoryBytes());
+  KJ_EXPECT(charge >= roundUp && charge <= roundUp + ObjectSqlHeapReservation::STEP_BYTES);
+  KJ_EXPECT(charge > MiB);
+  KJ_EXPECT(t.budget->sqliteMemoryReserved.load() == charge);
+  t.db->close();
+  KJ_EXPECT(t.copy->sqliteMemoryCharge() == 0);
+  KJ_EXPECT(t.budget->sqliteMemoryReserved.load() == 0);
+  KJ_EXPECT_THROW_MESSAGE("database has been closed", held.getBlob(0));
 }
 
 KJ_TEST("a copy logs SQLite charge drift and returns its recorded memory once") {
