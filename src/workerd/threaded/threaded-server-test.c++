@@ -2535,7 +2535,7 @@ KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing th
   KJ_EXPECT(events.asPtr() == expected.asPtr());
 }
 
-KJ_TEST("normal retirement collects actor handles while a neighbor and stored state survive") {
+KJ_TEST("normal retirement collects actor handles after live and queued work drains") {
   ThreadedServer server{
     1, "", "retirement:1", -1, kj::newInMemoryDirectory(kj::nullClock()), {}, &initializeV8()};
   kj::AutoCloseFd managerWake(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
@@ -2622,24 +2622,36 @@ KJ_TEST("normal retirement collects actor handles while a neighbor and stored st
     if (!keepEventActive) {
       KJ_REQUIRE(admission.complete(*ticket, 1));
     }
-    return tree;
+    return std::pair{tree, *ticket};
   };
-  auto oldTree = open("retired"_kj, retired, false);
-  auto liveTree = open("neighbor"_kj, neighbor, true);
+  auto oldTree = open("retired"_kj, retired, false).first;
+  auto [liveTree, liveEvent] = open("neighbor"_kj, neighbor, true);
   server.retireIdleDurableRoots(state, now);
   KJ_EXPECT(server.durableIdleRetirements.load() == 1);
   KJ_EXPECT(!state.durableRoots.contains(oldTree->tree));
   KJ_EXPECT(state.durableRoots.contains(liveTree->tree));
-  KJ_EXPECT(!retired.collected && !server.releaseDurableMemoryRequested.load());
 
-  server.retireIdleDurableRoots(state, now + std::chrono::seconds(2));
-  KJ_EXPECT(retired.collected);
-  KJ_EXPECT(server.releaseDurableMemoryRequested.load());
+  const auto later = now + std::chrono::seconds(2);
+  server.retireIdleDurableRoots(state, later);
+  KJ_EXPECT(!retired.collected && !server.releaseDurableMemoryRequested.load());
   KJ_EXPECT(!neighbor.collected && state.durableRoots.contains(liveTree->tree));
   KJ_EXPECT(server.durableAdmission->hasActiveEvent(liveTree->tree));
+
+  KJ_REQUIRE(server.durableAdmission->complete(liveEvent, 1));
+  DurableRoute newRoute{{"tenant", "queued"}, {1, 1, 1, 1, "definition", "Store"}, {}, {}, {}};
+  auto queued = server.queueDurable(newRoute, 0, now + std::chrono::seconds(5), now).ticket;
+  KJ_REQUIRE(queued.has_value());
+  server.retireIdleDurableRoots(state, later);
+  KJ_EXPECT(state.durableRoots.empty());
+  KJ_EXPECT(!retired.collected && !neighbor.collected);
+  KJ_EXPECT(!server.releaseDurableMemoryRequested.load());
+
+  server.finishDurable(*queued);
+  server.retireIdleDurableRoots(state, later);
+  KJ_EXPECT(retired.collected && neighbor.collected);
+  KJ_EXPECT(server.releaseDurableMemoryRequested.load());
   auto reopened = server.durableStorage->open(oldTree->uniqueKey, oldTree->storageId);
   KJ_EXPECT(reopened->run("SELECT value FROM saved").getInt(0) == 29);
-  worker.runInLockScope(takeLock, [&](Worker::Lock&) { neighbor.weak.Reset(); });
 }
 
 KJ_TEST("a reclaim requested during maintenance never waits for that pass") {
