@@ -110,7 +110,7 @@ KJ_TEST("a stateless isolate starts idle after loading and counts its next HTTP 
   // The first lock taken while serving the request lasts 200 ms on the controlled clock.
   clock.time = 2875 * kj::MILLISECONDS;
   clock.advanceAfterRead = 200 * kj::MILLISECONDS;
-  Invocation invocation(server, state, kj::mv(descriptor), Frankenvalue(), {});
+  Invocation invocation(server, state, kj::mv(descriptor), Frankenvalue(), {}, kj::none);
   auto client = kj::newHttpClient(invocation);
   auto response =
       client->request(kj::HttpMethod::GET, "http://test/busy", kj::HttpHeaders(*state.headers))
@@ -462,6 +462,25 @@ struct DatabaseAdmissionFixture {
     home().databaseReservation.reset();
   }
 };
+
+KJ_TEST("durable placement skips a full WAL Home for fresh trees and keeps existing routes") {
+  DatabaseAdmissionFixture test;
+  auto& table = *test.server.durableAdmission;
+  for (auto& thread: test.server.threads) thread->home->walFull = true;
+
+  auto existing = test.queue(test.victim, test.now).ticket;
+  KJ_REQUIRE(existing.has_value());
+  KJ_EXPECT(table.homeFor(existing->tree) == 1u);
+
+  auto refused = test.queue(test.neighbor, test.now);
+  KJ_EXPECT(refused.status == DatabaseAdmissionFixture::Admission::Status::OVERLOADED);
+  KJ_EXPECT(!refused.ticket.has_value());
+
+  test.server.threads[1]->home->walFull = false;
+  auto replacement = test.queue(test.neighbor, test.now).ticket;
+  KJ_REQUIRE(replacement.has_value());
+  KJ_EXPECT(table.homeFor(replacement->tree) == 2u);
+}
 
 KJ_TEST("accept expiry releases every waiter and limits replacement to the actual pre-release total") {
   DatabaseAdmissionFixture test;
@@ -2502,6 +2521,27 @@ KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handl
   bool ended = drain.poll(waitScope);
   KJ_EXPECT(ended, "waitUntil work must end 30 s after the response ended");
   if (ended) drain.wait(waitScope);
+}
+
+KJ_TEST("a nested Worker drain ends when the ingress lease ends") {
+  initializeV8();
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  const auto start = kj::systemPreciseMonotonicClock().now();
+  kj::TimerImpl clock(start);
+  Timer timer(clock);
+  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/nested\","), nullptr, newGroup());
+  Slot slot;
+  slot.limits = &isolateLimits;
+  Measurement measurement;
+  auto caller = kj::newPromiseAndFulfiller<void>();
+  measurement.requestLeaseEnded = caller.promise.fork();
+  RequestLimits limits(slot, measurement, timer, kj::str("\"workerId\":\"a/nested\","));
+  auto drain = limits.limitDrain();
+  clock.advanceTo(start + 5 * kj::SECONDS);
+  KJ_EXPECT(!drain.poll(waitScope));
+  caller.fulfiller->fulfill();
+  KJ_EXPECT(drain.poll(waitScope), "the nested invocation must not get a new 30-second drain");
 }
 
 KJ_TEST("a call thread cancels background work that outlives the drain limit") {
