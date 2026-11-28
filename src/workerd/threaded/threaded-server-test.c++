@@ -959,6 +959,11 @@ KJ_TEST("an ordinary ceiling has no idle cost, and live calls share the Worker b
   auto nested = budget.reserveOrdinaryCall(high->limit, 128 * descriptors, Lane::NESTED);
   KJ_REQUIRE(nested.has_value() && nested->resource == Resource::MEMORY);
   KJ_EXPECT(nested->budget == idle.memoryCeiling && nested->current == nested->budget);
+  {
+    ResourceReservation worker(high->resources, 128);
+    KJ_REQUIRE(worker.registerPreparation(), "a call at the limit can still prepare its Worker");
+    KJ_EXPECT(budget.memoryReserved.load() == budget.admissionMaximum);
+  }
   for (uint i = 0; i < 8; ++i) budget.releaseOrdinaryCall();
   KJ_REQUIRE(budget.change(nonCallCharge, 0, 0, 0));
   KJ_EXPECT(high->ordinaryAdmissionSample().memory == idle.memory);
@@ -1034,6 +1039,11 @@ KJ_TEST("ordinary admission only acknowledges a call with a live native loop and
     KJ_REQUIRE(recv(blocked[0], refusal.data(), refusal.size(), MSG_WAITALL) == refusal.size());
     KJ_EXPECT(refusal == expected);
   }
+
+  auto disconnected = ordinaryTestSocket();
+  disconnected[0] = nullptr;
+  server.acceptOrdinary(kj::mv(disconnected[1]), Lane::ROOT);
+  waitForOrdinaryCallRelease(server);
   KJ_EXPECT(server.liveThreads.load() == 0);
   KJ_EXPECT(server.ordinaryAdmissionSample().memory == idle);
   KJ_EXPECT(server.refusedOrdinaryCeiling.load() == 2);
