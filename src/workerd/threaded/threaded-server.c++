@@ -598,6 +598,11 @@ struct ResourceReservation final: SqliteProcessMemoryBudget {
     ++preparing;
     return true;
   }
+  void prepareResident() {
+    std::lock_guard lock(mutex);
+    KJ_ASSERT(registered);
+    ++preparing;
+  }
   void prepared() {
     std::lock_guard lock(mutex);
     KJ_ASSERT(preparing > 0);
@@ -3159,7 +3164,14 @@ struct ThreadedServer {
     return true;
   }
 
-  std::shared_ptr<ResourcePreparation> prepareSlot(const std::shared_ptr<Slot> &slot) {
+  std::shared_ptr<ResourcePreparation> prepareSlot(const std::shared_ptr<Slot> &slot,
+      bool residentDurableRoot = false) {
+    if (residentDurableRoot) {
+      // The copy already carries this root. The separate event reservation
+      // was acquired at routing, and future growth still checks the budget.
+      slot->reservation->prepareResident();
+      return std::make_shared<ResourcePreparation>(slot->reservation);
+    }
     const bool durable = bool(slot->resetDurableRoot);
     if (durable && refuseCopyReservationForTest()) {
       kj::throwRecoverableException(durableCopyBudgetRefusal("copy-memory"));
@@ -8025,8 +8037,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
       "durable class missing from pinned Worker");
   // Confirm the event's copy credit before opening a new actor or its SQLite
   // connection. A trusted refusal here can still prove the event did not run.
-  auto preparation = server.prepareSlot(slot);
   auto found = state.durableRoots.find(ticket.tree);
+  auto preparation = server.prepareSlot(slot, found != state.durableRoots.end());
   // Keep sharing the preparation until a home publishes the root. There can
   // be new arrivals between the scanner's completion and opening SQLite.
   std::shared_ptr<ThreadState::WalPreparation> walPreparation;

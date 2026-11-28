@@ -1590,6 +1590,25 @@ KJ_TEST("descriptor queue: empty, full, FIFO, SPSC handoff and close") {
   KJ_EXPECT(received == 2000 && concurrent.pop() == -1);
 }
 
+KJ_TEST("resident durable event preparation uses its existing charge above the admission ceiling") {
+  auto budget = std::make_shared<ResourceBudget>(256ull << 20, 10, 16);
+  ResourceReservation copy(budget, 128);
+  KJ_ASSERT(copy.registerPreparation());
+  const auto borrowed = budget->admissionMaximum - budget->memoryReserved.load() + 1;
+  KJ_ASSERT(budget->change(0, borrowed, 0, 0));
+  const auto held = budget->memoryReserved.load();
+  const char* refusal = nullptr;
+  KJ_EXPECT(!copy.prepare(&refusal));
+  KJ_REQUIRE(refusal != nullptr);
+  KJ_EXPECT(kj::StringPtr(refusal) == "copy-memory"_kj);
+  copy.prepareResident();
+  KJ_EXPECT(budget->memoryReserved.load() == held);
+  KJ_EXPECT(copy.preparing == 2);
+  copy.prepared();
+  KJ_EXPECT(copy.preparing == 1);
+  KJ_ASSERT(budget->change(borrowed, 0, 0, 0));
+}
+
 KJ_TEST("actual reservation arithmetic, both watermarks and RAII release") {
   initializeV8();
   auto budget = std::make_shared<ResourceBudget>(2ull << 30, 10, 512);
