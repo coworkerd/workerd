@@ -396,7 +396,7 @@ struct ObjectAdmissionFixture {
       .mailboxBytes = 64,
     }, 1);
     for (uint64_t id = 1; id <= 3; ++id) {
-      auto thread = std::make_unique<ThreadedServer::Thread>(false, false);
+      auto thread = std::make_unique<ThreadedServer::Thread>();
       thread->homeId = id;
       thread->home.emplace();
       server.threads.push_back(std::move(thread));
