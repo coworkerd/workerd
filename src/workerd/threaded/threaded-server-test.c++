@@ -2609,15 +2609,16 @@ KJ_TEST("normal retirement collects actor handles after live and queued work dra
       }, v8::WeakCallbackType::kParameter);
       return static_cast<jsg::Lock&>(lock).v8Ref(object);
     });
-    state.durableRoots.emplace(tree->tree, ThreadState::DurableRoot{
-      .actor = kj::mv(actor.value).attachToThisReference(kj::mv(owned)),
-      .tree = tree,
-      .hooks = actor.hooks,
-      .idle = tree->idle,
-      .facetsBusy = [](bool) { return false; },
-      .facetHasOrdinaryWebSocket = [] { return false; },
-      .stopFacets = [](const kj::Exception*) {},
-    });
+    state.durableRoots.emplace(tree->tree,
+        ThreadState::DurableRoot{
+          .actor = kj::mv(actor.value).attachToThisReference(kj::mv(owned)),
+          .tree = tree,
+          .hooks = actor.hooks,
+          .idle = tree->idle,
+          .facetsBusy = [](bool) { return false; },
+          .facetHasOrdinaryWebSocket = [] { return false; },
+          .stopFacets = [](const kj::Exception*) {},
+        });
     server.publishDurableRoot(1, tree->tree);
     if (!keepEventActive) {
       KJ_REQUIRE(admission.complete(*ticket, 1));

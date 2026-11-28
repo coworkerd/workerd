@@ -41,8 +41,6 @@
 #include <workerd/util/stream-utils.h>
 
 #include <absl/time/time.h>
-#include <tcmalloc/malloc_extension.h>
-
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -60,6 +58,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <tcmalloc/malloc_extension.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -3617,7 +3616,7 @@ struct ThreadedServer {
   }
 
   void retireIdleDurableRoots(
-      ThreadState& state, server::DurableIdleLifecycle::Time now = durableIdleNow()) {
+      ThreadState &state, server::DurableIdleLifecycle::Time now = durableIdleNow()) {
     const auto homeId = state.durableHome;
     const auto victim = [&]() -> std::optional<DatabaseRetirement> {
       std::lock_guard lock(durableRoutingMutex);
